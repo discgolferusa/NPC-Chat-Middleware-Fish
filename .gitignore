@@ -72,3 +72,7 @@ ehthumbs.db
 # --- Windows / local install artifacts ---
 # Local venv path used by install.bat (if ever created inside the repo)
 .python-version
+
+
+#Project unneeded files
+.uploads/
