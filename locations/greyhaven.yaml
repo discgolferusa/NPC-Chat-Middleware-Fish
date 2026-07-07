@@ -1,0 +1,46 @@
+id: greyhaven
+campaign_id: greyhaven_intro
+name: Greyhaven
+type: city
+summary: 'Greyhaven is a river city built around old stone canals, crowded markets,
+  military barracks, and decaying noble estates.
+
+  '
+current_events:
+- Several people have gone missing near the old aqueduct.
+- The mayor has increased patrols but refuses to explain why.
+- Merchants are complaining about late shipments from Briarford.
+important_locations:
+- name: Old Aqueduct
+  description: A sealed underground waterway beneath the eastern district.
+  public_knowledge: Most citizens believe it is unsafe and abandoned.
+- name: Crooked Lantern Inn
+  description: A busy inn favored by guards, smugglers, and caravan workers.
+  public_knowledge: People go there to hear rumors.
+- name: Watch Barracks
+  description: Headquarters of the city watch.
+  public_knowledge: Captain Varra commands the night patrol from here.
+notable_npcs:
+- name: Mayor Halden
+  role: Mayor of Greyhaven
+  public_knowledge: Polished, ambitious, and very concerned with public order.
+- name: Marla Fenwick
+  role: Innkeeper of the Crooked Lantern
+  public_knowledge: Knows more rumors than she admits.
+- name: Torin Ashhand
+  role: Blacksmith
+  public_knowledge: Sells practical weapons and occasionally repairs unusual blades.
+rumors:
+- A black glass token was found near one of the disappearances.
+- Something has been heard moving beneath the old aqueduct.
+- The mayor’s men removed records from the archive last week.
+local_tone:
+- tense
+- suspicious
+- rainy
+- crowded
+- politically cautious
+knowledge_rules:
+- NPCs in Greyhaven generally know public locations and current events.
+- NPCs do not automatically know private secrets belonging to other NPCs.
+- Rumors should be treated as uncertain unless confirmed elsewhere.

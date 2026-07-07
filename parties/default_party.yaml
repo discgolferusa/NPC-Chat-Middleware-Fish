@@ -1,0 +1,22 @@
+party_id: default_party
+label: Default Party
+campaign_id: greyhaven_intro
+members:
+- player_id: player_alden
+  name: Alden Mor
+  race: Human
+  class: Fighter
+  party_id: default_party
+  campaign_id: greyhaven_intro
+- player_id: player_sera
+  name: Sera Vale
+  race: Elf
+  class: Wizard
+  party_id: default_party
+  campaign_id: greyhaven_intro
+- player_id: player_bram
+  name: Bram Stoneheel
+  race: Dwarf
+  class: Cleric
+  party_id: default_party
+  campaign_id: greyhaven_intro

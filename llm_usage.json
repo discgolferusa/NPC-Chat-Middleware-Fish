@@ -1,0 +1,110 @@
+[
+  {
+    "timestamp": "2026-06-27T13:20:22Z",
+    "provider": "groq",
+    "model_id": "groq-llama-4-scout",
+    "model": "meta-llama/llama-4-scout-17b-16e-instruct",
+    "prompt_tokens": 2103,
+    "completion_tokens": 77,
+    "total_tokens": 2180,
+    "success": true,
+    "fallback": false,
+    "error": null
+  },
+  {
+    "timestamp": "2026-06-27T13:20:22Z",
+    "provider": "groq",
+    "model_id": "groq-llama-4-scout",
+    "model": "meta-llama/llama-4-scout-17b-16e-instruct",
+    "prompt_tokens": 331,
+    "completion_tokens": 37,
+    "total_tokens": 368,
+    "success": true,
+    "fallback": false,
+    "error": null
+  },
+  {
+    "timestamp": "2026-06-27T13:28:23Z",
+    "provider": "groq",
+    "model_id": "groq-llama-4-scout",
+    "model": "meta-llama/llama-4-scout-17b-16e-instruct",
+    "prompt_tokens": 1889,
+    "completion_tokens": 66,
+    "total_tokens": 1955,
+    "success": true,
+    "fallback": false,
+    "error": null
+  },
+  {
+    "timestamp": "2026-06-27T13:28:24Z",
+    "provider": "groq",
+    "model_id": "groq-llama-4-scout",
+    "model": "meta-llama/llama-4-scout-17b-16e-instruct",
+    "prompt_tokens": 308,
+    "completion_tokens": 36,
+    "total_tokens": 344,
+    "success": true,
+    "fallback": false,
+    "error": null
+  },
+  {
+    "timestamp": "2026-06-27T13:29:40Z",
+    "provider": "groq",
+    "model_id": "groq-llama-4-scout",
+    "model": "meta-llama/llama-4-scout-17b-16e-instruct",
+    "prompt_tokens": 2097,
+    "completion_tokens": 47,
+    "total_tokens": 2144,
+    "success": true,
+    "fallback": false,
+    "error": null
+  },
+  {
+    "timestamp": "2026-06-27T13:37:25Z",
+    "provider": "groq",
+    "model_id": "groq-llama-4-scout",
+    "model": "meta-llama/llama-4-scout-17b-16e-instruct",
+    "prompt_tokens": 1970,
+    "completion_tokens": 132,
+    "total_tokens": 2102,
+    "success": true,
+    "fallback": false,
+    "error": null
+  },
+  {
+    "timestamp": "2026-06-27T13:37:26Z",
+    "provider": "groq",
+    "model_id": "groq-llama-4-scout",
+    "model": "meta-llama/llama-4-scout-17b-16e-instruct",
+    "prompt_tokens": 367,
+    "completion_tokens": 53,
+    "total_tokens": 420,
+    "success": true,
+    "fallback": false,
+    "error": null
+  },
+  {
+    "timestamp": "2026-06-27T13:38:41Z",
+    "provider": "groq",
+    "model_id": "groq-llama-4-scout",
+    "model": "meta-llama/llama-4-scout-17b-16e-instruct",
+    "prompt_tokens": 1974,
+    "completion_tokens": 76,
+    "total_tokens": 2050,
+    "success": true,
+    "fallback": false,
+    "error": null
+  },
+  {
+    "timestamp": "2026-06-27T13:38:42Z",
+    "provider": "groq",
+    "model_id": "groq-llama-4-scout",
+    "model": "meta-llama/llama-4-scout-17b-16e-instruct",
+    "prompt_tokens": 333,
+    "completion_tokens": 23,
+    "total_tokens": 356,
+    "success": true,
+    "fallback": false,
+    "error": null
+  }
+]

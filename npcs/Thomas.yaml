@@ -1,0 +1,11 @@
+name: New NPC
+role: ''
+voice: []
+voice_model: \\GameServer\AI\Voices\en\en_US\ryan\medium\en_US-ryan-medium.onnx
+tts_length_scale: 1.15
+campaign_id: greyhaven_intro
+location_id: ''
+personality: []
+public_facts: []
+known_facts: []
+secrets: []

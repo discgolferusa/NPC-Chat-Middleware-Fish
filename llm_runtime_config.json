@@ -1,0 +1,5 @@
+{
+  "model_id": "groq-llama-4-scout",
+  "provider_mode": "groq_with_local_fallback",
+  "updated_at": "2026-06-21T16:23:40Z"
+}

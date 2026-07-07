@@ -1,0 +1,4 @@
+narrator:
+  voice_model: C:\AI\Voices\en\en_US\fallout4\low\dlc03maleoldlongfellow.onnx
+  length_scale: '1.08'
+  fallback_voice_model: C:\AI\Voices\en\en_US\ryan\medium\en_US-ryan-medium.onnx
