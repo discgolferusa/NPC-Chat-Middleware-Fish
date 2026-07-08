@@ -6,8 +6,9 @@ This repo is part of the **NPC Platform** multi-root workspace with `NPC-Yaml-Ed
 
 1. **Branch off `main`** before any code changes (never commit directly to `main`).
 2. **Commit on the feature branch** when implementation is complete — do not leave finished work uncommitted.
-3. **Open a PR to `main`** when work is ready to publish (use `gh pr create --base main`).
-4. For API/route/contract changes, update the paired yaml-editor repo and cross-link PRs.
+3. **`git push -u origin HEAD`** immediately after every commit — do not leave work local-only.
+4. **Open a PR to `main`** when work is ready for review (use `gh pr create --base main`).
+5. For API/route/contract changes, update the paired yaml-editor repo and cross-link PRs.
 
 See `.cursor/rules/git-branch-and-pr-workflow.mdc` and the **npc-platform-coordinator** skill.
 

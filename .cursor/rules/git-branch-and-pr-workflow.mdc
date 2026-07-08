@@ -1,11 +1,13 @@
 ---
-description: Require feature branch off main, commit on branch, and PR for every code change
+description: Require feature branch off main, commit, push, and PR for every code change
 alwaysApply: true
 ---
 
 # Git branch and PR workflow (required)
 
-Every code change must use a **feature branch off `main`**, **commits on that branch**, and a **pull request**. Never commit or push directly to `main`.
+Every code change must use a **feature branch off `main`**, **commit on that branch**, **push to origin**, and a **pull request**. Never commit or push directly to `main`.
+
+The user reviews PRs and tests — agents own branch/commit/push.
 
 ## Before writing code
 
@@ -23,26 +25,25 @@ git checkout -b <branch-slug>
 
 Do not implement on stale feature branches unless the user explicitly says to continue that branch.
 
-## Commits (required — do not skip)
+## Commit and push (required — do not skip)
 
 When implementation is complete on a feature branch:
 
 1. `git status` — confirm you are on the feature branch, not `main`.
 2. `git add` all relevant files (code, docs, `.cursor/rules` updates; not secrets).
 3. `git commit` with a concise message focused on **why**.
-4. Report the branch name and commit hash when handing off.
+4. **`git push -u origin HEAD`** — always push after commit; do not leave work local-only.
+5. Report branch name, commit hash, and that the branch was pushed.
 
-**Do not leave finished work uncommitted** on the feature branch. The user expects changes checked in on the branch before the task is considered done.
+**Do not leave finished work uncommitted or unpushed.**
 
 - Never commit secrets (`GAME_API_KEY`, `llm_secrets.env`, `.env`).
-- Do not push unless the user asks or you are opening a PR.
 
 ## Pull requests
 
-When the user asks to open a PR, or when publishing for review:
+When work is ready for review (or when the user asks):
 
 ```bash
-git push -u origin HEAD
 gh pr create --base main --title "<title>" --body "<summary + test plan>"
 ```
 
