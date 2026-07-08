@@ -1,4 +1,6 @@
 from flask import Flask, request, jsonify, send_file, make_response
+import os
+import secrets
 import yaml
 import re
 import json
@@ -99,6 +101,12 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 
 PIPER_EXE = Path(r"C:\AI\npc-server\.venv\Scripts\piper.exe")
 DEFAULT_VOICE_MODEL = Path(r"C:\AI\Voices\en\en_US\ryan\medium\en_US-ryan-medium.onnx")
+VOICES_DIR = Path(os.environ.get("VOICES_DIR", str(DEFAULT_VOICE_MODEL.parent.parent)))
+VOICE_PREVIEW_TEXT = os.environ.get(
+    "VOICE_PREVIEW_TEXT",
+    "Mary had a little lamb, whose fleece was white as snow. "
+    "And everywhere that Mary went, the lamb was sure to go.",
+)
 SEGMENT_PAUSE_SECONDS = 0.18
 PIPER_SENTENCE_SILENCE = 0.2
 
@@ -130,6 +138,41 @@ PRELOADED_CONTEXTS = {}
 STT_MODEL = WhisperModel("base.en", device="cpu", compute_type="int8")
 
 app = Flask(__name__)
+
+# Alpha / Funnel: bind localhost only; require Bearer token when GAME_API_KEY is set.
+GAME_API_KEY = os.environ.get("GAME_API_KEY", "").strip()
+REQUIRE_GAME_API_KEY = os.environ.get("REQUIRE_GAME_API_KEY", "").strip().lower() in ("1", "true", "yes")
+GAME_API_HOST = os.environ.get("GAME_API_HOST", "127.0.0.1").strip() or "127.0.0.1"
+GAME_API_PORT = int(os.environ.get("GAME_API_PORT", "5000"))
+AUTH_EXEMPT_PATHS = frozenset({"/health"})
+
+
+def _extract_game_api_key():
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        return auth[7:].strip()
+    return request.headers.get("X-Game-Api-Key", "").strip()
+
+
+@app.before_request
+def require_game_api_key():
+    if request.method == "OPTIONS":
+        return None
+
+    if REQUIRE_GAME_API_KEY and request.path == "/llm/reset-usage":
+        return jsonify({"error": "Not found"}), 404
+
+    if GAME_API_KEY and request.path not in AUTH_EXEMPT_PATHS:
+        provided = _extract_game_api_key()
+        if not provided or not secrets.compare_digest(provided, GAME_API_KEY):
+            print(
+                f"[AUTH] rejected request to {request.path} from {request.remote_addr}",
+                flush=True,
+            )
+            return jsonify({"error": "Unauthorized"}), 401
+
+    return None
+
 
 def log_timing(request_id: str, label: str, start_time: float):
     elapsed = time.perf_counter() - start_time
@@ -1282,6 +1325,37 @@ def synthesize_speech(
         encoding="utf-8",
         check=True
     )
+
+
+def resolve_voice_model_path(voice_model: str | None) -> Path:
+    if not voice_model or not str(voice_model).strip():
+        return DEFAULT_VOICE_MODEL
+
+    model_path = Path(str(voice_model).strip())
+    if model_path.exists():
+        return model_path
+
+    relative = str(voice_model).strip().replace("\\", "/")
+    candidate = VOICES_DIR / relative
+    if candidate.exists():
+        return candidate
+
+    raise FileNotFoundError(f"Piper voice model not found: {voice_model}")
+
+
+def list_piper_voices() -> list[dict[str, str]]:
+    if not VOICES_DIR.exists():
+        return []
+
+    voices: list[dict[str, str]] = []
+    for path in sorted(VOICES_DIR.rglob("*.onnx"), key=lambda item: str(item).lower()):
+        try:
+            label = path.relative_to(VOICES_DIR).as_posix()
+        except ValueError:
+            label = path.name
+        voices.append({"label": label, "path": str(path)})
+
+    return voices
 
 
 def extract_memories_from_exchange(
@@ -2503,6 +2577,53 @@ def dm_followup_audio(filename: str):
     )
 
 
+@app.get("/voices")
+def list_voices():
+    return jsonify({
+        "voices": list_piper_voices(),
+        "voice_enabled": True,
+    })
+
+
+@app.post("/voices/preview")
+def preview_voice():
+    body = request.get_json(force=True, silent=True) or {}
+    voice_path = (body.get("voice_path") or body.get("voice_model") or "").strip()
+    if not voice_path:
+        return jsonify({"error": "Missing voice_path"}), 400
+
+    text = (body.get("text") or VOICE_PREVIEW_TEXT).strip()
+    if not text:
+        return jsonify({"error": "Missing text"}), 400
+
+    try:
+        length_scale = float(body.get("length_scale", 1.15))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Invalid length_scale"}), 400
+
+    raw_path = OUTPUT_DIR / f"{uuid.uuid4().hex}_voice_preview_raw.wav"
+    output_path = OUTPUT_DIR / f"{uuid.uuid4().hex}_voice_preview.wav"
+    try:
+        model_path = resolve_voice_model_path(voice_path)
+        synthesize_speech(text, str(model_path), raw_path, length_scale)
+        convert_wav_to_standard_format(raw_path, output_path)
+        return send_file(
+            output_path,
+            mimetype="audio/wav",
+            as_attachment=False,
+            download_name="voice_preview.wav",
+        )
+    except FileNotFoundError as ex:
+        return jsonify({"error": str(ex)}), 404
+    except subprocess.CalledProcessError as ex:
+        return jsonify({"error": f"Piper synthesis failed: {ex}"}), 500
+    except Exception as ex:
+        print(f"[VOICE] preview failed: {ex!r}", flush=True)
+        return jsonify({"error": str(ex)}), 500
+    finally:
+        raw_path.unlink(missing_ok=True)
+
+
 @app.get("/health")
 def health():
     return jsonify({
@@ -2545,6 +2666,8 @@ def health():
             "/dm/ruling",
             "/dm/detect",
             "/dm/followup-audio/<filename>",
+            "/voices",
+            "/voices/preview",
         ]
     })
 
@@ -2650,4 +2773,10 @@ print(
 
 if __name__ == "__main__":
     # threaded=True keeps /health, /campaigns, etc. responsive during long voice/LLM turns
-    app.run(host="0.0.0.0", port=5000, threaded=True)
+    print(
+        f"[GAME_API] listening on {GAME_API_HOST}:{GAME_API_PORT} "
+        f"(auth={'on' if GAME_API_KEY else 'off'}, "
+        f"require_key_mode={'on' if REQUIRE_GAME_API_KEY else 'off'})",
+        flush=True,
+    )
+    app.run(host=GAME_API_HOST, port=GAME_API_PORT, threaded=True)

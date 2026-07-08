@@ -1,0 +1,60 @@
+---
+description: Require feature branch off main, commit on branch, and PR for every code change
+alwaysApply: true
+---
+
+# Git branch and PR workflow (required)
+
+Every code change must use a **feature branch off `main`**, **commits on that branch**, and a **pull request**. Never commit or push directly to `main`.
+
+## Before writing code
+
+1. State which repo(s) are affected (yaml-editor only, middleware only, or paired).
+2. Pick one kebab-case **branch slug** (e.g. `feature/middleware-voice-preview`). Use the **same slug** in both repos for paired work.
+3. In each affected repo, branch from latest `main`:
+
+```bash
+cd <repo-path>
+git fetch origin
+git checkout main
+git pull origin main
+git checkout -b <branch-slug>
+```
+
+Do not implement on stale feature branches unless the user explicitly says to continue that branch.
+
+## Commits (required — do not skip)
+
+When implementation is complete on a feature branch:
+
+1. `git status` — confirm you are on the feature branch, not `main`.
+2. `git add` all relevant files (code, docs, `.cursor/rules` updates; not secrets).
+3. `git commit` with a concise message focused on **why**.
+4. Report the branch name and commit hash when handing off.
+
+**Do not leave finished work uncommitted** on the feature branch. The user expects changes checked in on the branch before the task is considered done.
+
+- Never commit secrets (`GAME_API_KEY`, `llm_secrets.env`, `.env`).
+- Do not push unless the user asks or you are opening a PR.
+
+## Pull requests
+
+When the user asks to open a PR, or when publishing for review:
+
+```bash
+git push -u origin HEAD
+gh pr create --base main --title "<title>" --body "<summary + test plan>"
+```
+
+- Base branch is always **`main`**.
+- Return the PR URL.
+- Cross-link paired PRs for cross-repo work. Use **npc-platform-coordinator** skill.
+
+## Repo
+
+| Item | Value |
+|------|--------|
+| GitHub | `discgolferusa/NPC-Chat-Middleware` |
+| Default branch | `main` |
+| Paired repo | `NPC-Yaml-Editor-CSharp` |
+| Workspace | `C:\Users\jayhi\source\repos\NPC-Platform.code-workspace` |

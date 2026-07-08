@@ -1,0 +1,25 @@
+---
+description: Remind agent that Yaml Editor and NPC-Chat-Middleware are paired repos
+alwaysApply: true
+---
+
+# NPC platform pairing
+
+This repo is part of a **two-repo platform** with `NPC-Chat-Middleware` (Python) and `NPC-Yaml-Editor-CSharp` (C#).
+
+## Git (required)
+
+Follow **git-branch-and-pr-workflow** in this repo: branch off `main`, **commit on the feature branch before finishing**, never commit to `main`, open PRs with `--base main`. Use the same branch slug in both repos for paired work.
+
+When changing API routes, proxy behavior, DM/voice flows, JSON contracts, or audio format:
+
+1. Check the other repository for callers/implementations.
+2. Use the **npc-platform-coordinator** skill for branch + paired PR workflow.
+3. Read yaml-editor `docs/MIDDLEWARE_INTEGRATION.md` before contract changes.
+
+Local paths:
+
+- Yaml Editor: `C:\Users\jayhi\source\repos\NPC-Yaml-Editor-CSharp`
+- Middleware: `C:\Users\jayhi\source\repos\NPC-Chat-Middleware`
+- Multi-root workspace: `C:\Users\jayhi\source\repos\NPC-Platform.code-workspace`
+- Platform AGENTS: `C:\Users\jayhi\source\repos\NPC-Platform\AGENTS.md`
