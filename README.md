@@ -37,7 +37,7 @@ Browser ──HTTPS──► SmarterASP (Yaml Editor)
 
 ### 1. Environment variables (Ryzen)
 
-Generate a long random secret and set on the middleware host (`.env` or shell — **never commit**):
+Generate a long random secret and save it in **`game_api.env`** next to `server.py` (copy from `game_api.env.example` — **never commit** `game_api.env`):
 
 | Variable | Example | Purpose |
 |----------|---------|---------|
@@ -45,6 +45,17 @@ Generate a long random secret and set on the middleware host (`.env` or shell �
 | `GAME_API_PORT` | `5000` | Port |
 | `GAME_API_KEY` | `<random-secret>` | Require Bearer token on game routes |
 | `REQUIRE_GAME_API_KEY` | `true` | Block `/llm/reset-usage` when funneled |
+
+```powershell
+copy game_api.env.example game_api.env
+# Edit game_api.env — set GAME_API_KEY to a long random value
+
+.\start-middleware.ps1
+```
+
+`server.py` loads `game_api.env` on every start. Shell variables still override the file if you set both.
+
+One-time alternative (lost when you close PowerShell):
 
 ```powershell
 $env:GAME_API_HOST = "127.0.0.1"

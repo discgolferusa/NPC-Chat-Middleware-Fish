@@ -139,6 +139,32 @@ STT_MODEL = WhisperModel("base.en", device="cpu", compute_type="int8")
 
 app = Flask(__name__)
 
+GAME_API_ENV_FILE = BASE_DIR / "game_api.env"
+
+
+def _load_game_api_env_file() -> None:
+    """Load GAME_API_* from game_api.env when not already set in the shell."""
+    if not GAME_API_ENV_FILE.exists():
+        return
+
+    try:
+        for line in GAME_API_ENV_FILE.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+    except OSError as ex:
+        print(f"[GAME_API] failed to read env file: {ex}", flush=True)
+
+
+_load_game_api_env_file()
+if GAME_API_ENV_FILE.exists():
+    print(f"[GAME_API] loaded settings from {GAME_API_ENV_FILE.name}", flush=True)
+
 # Alpha / Funnel: bind localhost only; require Bearer token when GAME_API_KEY is set.
 GAME_API_KEY = os.environ.get("GAME_API_KEY", "").strip()
 REQUIRE_GAME_API_KEY = os.environ.get("REQUIRE_GAME_API_KEY", "").strip().lower() in ("1", "true", "yes")
