@@ -2067,6 +2067,7 @@ def npc_voice_turn_debug():
 
 @app.get("/locations")
 def list_locations():
+    campaign_id = (request.args.get("campaign_id") or "").strip()
     locations = []
 
     for path in sorted(list(LOCATION_DIR.glob("*.yaml")) + list(LOCATION_DIR.glob("*.yml"))):
@@ -2074,24 +2075,33 @@ def list_locations():
 
         try:
             location = load_location(location_id)
+            location_campaign_id = (location.get("campaign_id") or "").strip()
+            if campaign_id and location_campaign_id and location_campaign_id != campaign_id:
+                continue
+
             locations.append({
                 "id": location_id,
                 "name": location.get("name", location_id),
                 "type": location.get("type", ""),
-                "summary": location.get("summary", "")
+                "summary": location.get("summary", ""),
+                "campaign_id": location_campaign_id,
             })
 
         except Exception as ex:
+            if campaign_id:
+                continue
             locations.append({
                 "id": location_id,
                 "name": location_id,
                 "type": "",
                 "summary": "",
+                "campaign_id": "",
                 "error": str(ex)
             })
 
     return jsonify({
-        "locations": locations
+        "campaign_id": campaign_id,
+        "locations": locations,
     })
 
 
