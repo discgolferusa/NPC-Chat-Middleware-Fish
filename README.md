@@ -53,6 +53,8 @@ copy game_api.env.example game_api.env
 .\start-middleware.ps1
 ```
 
+`start-middleware.ps1` activates the venv, ensures Tailscale Funnel is running for `GAME_API_PORT` (default 5000), then starts `server.py`.
+
 `server.py` loads `game_api.env` on every start. Shell variables still override the file if you set both.
 
 One-time alternative (lost when you close PowerShell):
