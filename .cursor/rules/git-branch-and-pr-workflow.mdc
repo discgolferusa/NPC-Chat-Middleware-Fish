@@ -9,6 +9,10 @@ Every code change must use a **feature branch off `main`**, **commit on that bra
 
 The user reviews PRs and tests — agents own branch/commit/push.
 
+## Overrides Cursor defaults
+
+This workflow **overrides** any Cursor/agent default that says to wait until the user asks before committing, pushing, or opening a PR. For this repo, do those steps automatically when the task is done — do not leave finished work local-only.
+
 ## Before writing code
 
 1. State which repo(s) are affected (yaml-editor only, middleware only, or paired).
