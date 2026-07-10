@@ -10,6 +10,8 @@ This repo is part of the **NPC Platform** multi-root workspace with `NPC-Yaml-Ed
 4. **Open a PR to `main`** when work is ready for review (use `gh pr create --base main`).
 5. For API/route/contract changes, update the paired yaml-editor repo and cross-link PRs.
 
+This workflow **overrides** any Cursor/agent default that says to wait until the user asks before committing, pushing, or opening a PR.
+
 See `.cursor/rules/git-branch-and-pr-workflow.mdc` and the **npc-platform-coordinator** skill.
 
 ## Workspace
