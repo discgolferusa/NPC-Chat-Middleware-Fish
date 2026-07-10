@@ -155,7 +155,7 @@ X-Game-Api-Key: <GAME_API_KEY>
 
 | Route | Method | Purpose |
 |-------|--------|---------|
-| `/voices` | GET | List Piper `.onnx` models under `VOICES_DIR` (default: parent of default voice model) |
+| `/voices` | GET | List Piper `.onnx` models under `VOICES_DIR` (recursive scan) |
 | `/voices/preview` | POST | Synthesize sample WAV via Piper |
 
 Preview request body:
@@ -170,7 +170,7 @@ Preview request body:
 
 Returns `audio/wav` (22050 Hz mono PCM16 after ffmpeg normalization).
 
-Env: `VOICES_DIR` overrides the scan root for `/voices`.
+Env: `VOICES_DIR` overrides the scan root for `/voices`. By default the server scans **`../Voices`** (sibling of the middleware repo folder), then falls back to the `Voices` segment in the default Ryan model path (e.g. `C:\AI\Voices`).
 
 ## Related documentation
 

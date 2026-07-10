@@ -101,7 +101,6 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 
 PIPER_EXE = Path(r"C:\AI\npc-server\.venv\Scripts\piper.exe")
 DEFAULT_VOICE_MODEL = Path(r"C:\AI\Voices\en\en_US\ryan\medium\en_US-ryan-medium.onnx")
-VOICES_DIR = Path(os.environ.get("VOICES_DIR", str(DEFAULT_VOICE_MODEL.parent.parent)))
 VOICE_PREVIEW_TEXT = os.environ.get(
     "VOICE_PREVIEW_TEXT",
     "Mary had a little lamb, whose fleece was white as snow. "
@@ -164,6 +163,27 @@ def _load_game_api_env_file() -> None:
 _load_game_api_env_file()
 if GAME_API_ENV_FILE.exists():
     print(f"[GAME_API] loaded settings from {GAME_API_ENV_FILE.name}", flush=True)
+
+
+def resolve_voices_dir() -> Path:
+    """Root folder to scan recursively for Piper *.onnx voice models."""
+    explicit = os.environ.get("VOICES_DIR", "").strip()
+    if explicit:
+        return Path(explicit)
+
+    # Default: sibling Voices folder above the middleware repo (e.g. C:\AI\Voices).
+    sibling = BASE_DIR.parent / "Voices"
+    if sibling.exists():
+        return sibling
+
+    for parent in DEFAULT_VOICE_MODEL.parents:
+        if parent.name.lower() == "voices":
+            return parent
+
+    return DEFAULT_VOICE_MODEL.parent.parent
+
+
+VOICES_DIR = resolve_voices_dir()
 
 # Alpha / Funnel: bind localhost only; require Bearer token when GAME_API_KEY is set.
 GAME_API_KEY = os.environ.get("GAME_API_KEY", "").strip()
@@ -1357,14 +1377,27 @@ def resolve_voice_model_path(voice_model: str | None) -> Path:
     if not voice_model or not str(voice_model).strip():
         return DEFAULT_VOICE_MODEL
 
-    model_path = Path(str(voice_model).strip())
+    raw = str(voice_model).strip()
+    model_path = Path(raw)
     if model_path.exists():
         return model_path
 
-    relative = str(voice_model).strip().replace("\\", "/")
-    candidate = VOICES_DIR / relative
+    normalized = raw.replace("\\", "/")
+    if normalized.startswith("//"):
+        unc = Path(raw)
+        if unc.exists():
+            return unc
+
+    candidate = VOICES_DIR / normalized
     if candidate.exists():
         return candidate
+
+    # Match by filename when YAML stores a partial path or UNC tail.
+    target_name = Path(normalized).name.lower()
+    if target_name:
+        for path in VOICES_DIR.rglob(target_name):
+            if path.is_file():
+                return path
 
     raise FileNotFoundError(f"Piper voice model not found: {voice_model}")
 
@@ -1374,7 +1407,13 @@ def list_piper_voices() -> list[dict[str, str]]:
         return []
 
     voices: list[dict[str, str]] = []
+    seen: set[str] = set()
     for path in sorted(VOICES_DIR.rglob("*.onnx"), key=lambda item: str(item).lower()):
+        key = str(path.resolve()).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+
         try:
             label = path.relative_to(VOICES_DIR).as_posix()
         except ValueError:
@@ -1382,6 +1421,15 @@ def list_piper_voices() -> list[dict[str, str]]:
         voices.append({"label": label, "path": str(path)})
 
     return voices
+
+
+if VOICES_DIR.exists():
+    print(
+        f"[VOICES] Piper scan root: {VOICES_DIR} ({len(list_piper_voices())} model(s))",
+        flush=True,
+    )
+else:
+    print(f"[VOICES] Piper scan root not found: {VOICES_DIR}", flush=True)
 
 
 def extract_memories_from_exchange(
@@ -2067,7 +2115,6 @@ def npc_voice_turn_debug():
 
 @app.get("/locations")
 def list_locations():
-    campaign_id = (request.args.get("campaign_id") or "").strip()
     locations = []
 
     for path in sorted(list(LOCATION_DIR.glob("*.yaml")) + list(LOCATION_DIR.glob("*.yml"))):
@@ -2075,33 +2122,24 @@ def list_locations():
 
         try:
             location = load_location(location_id)
-            location_campaign_id = (location.get("campaign_id") or "").strip()
-            if campaign_id and location_campaign_id and location_campaign_id != campaign_id:
-                continue
-
             locations.append({
                 "id": location_id,
                 "name": location.get("name", location_id),
                 "type": location.get("type", ""),
                 "summary": location.get("summary", ""),
-                "campaign_id": location_campaign_id,
             })
 
         except Exception as ex:
-            if campaign_id:
-                continue
             locations.append({
                 "id": location_id,
                 "name": location_id,
                 "type": "",
                 "summary": "",
-                "campaign_id": "",
                 "error": str(ex)
             })
 
     return jsonify({
-        "campaign_id": campaign_id,
-        "locations": locations,
+        "locations": locations
     })
 
 
@@ -2173,7 +2211,7 @@ def llm_status():
 def llm_select():
     body = request.get_json(force=True, silent=True) or {}
 
-    model_id = body.get("model_id")
+    model_id = body.get("model_id") or body.get("model")
     provider_mode = body.get("provider_mode")
 
     if not model_id:
@@ -2618,6 +2656,7 @@ def list_voices():
     return jsonify({
         "voices": list_piper_voices(),
         "voice_enabled": True,
+        "voices_dir": str(VOICES_DIR),
     })
 
 
