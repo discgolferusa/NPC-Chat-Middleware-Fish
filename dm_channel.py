@@ -13,6 +13,40 @@ from typing import Any
 BASE_DIR = Path(__file__).resolve().parent
 MEMORY_DB = BASE_DIR / "npc_memory.db"
 
+# Existing unscoped rows are attributed to this campaign on first migration.
+LEGACY_CAMPAIGN_BACKFILL_ID = "greyhaven_intro"
+
+
+def normalize_campaign_id(campaign_id: str | None) -> str:
+    return (campaign_id or "").strip()
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def ensure_campaign_id_column(
+    conn: sqlite3.Connection,
+    table: str,
+    *,
+    backfill: str = LEGACY_CAMPAIGN_BACKFILL_ID,
+) -> None:
+    """Add campaign_id if missing and backfill legacy empty rows once."""
+    columns = _table_columns(conn, table)
+    if "campaign_id" not in columns:
+        conn.execute(
+            f"ALTER TABLE {table} ADD COLUMN campaign_id TEXT NOT NULL DEFAULT ''"
+        )
+        if backfill:
+            conn.execute(
+                f"UPDATE {table} SET campaign_id = ? WHERE campaign_id = '' OR campaign_id IS NULL",
+                (backfill,),
+            )
+    conn.execute(
+        f"CREATE INDEX IF NOT EXISTS idx_{table}_campaign_npc_player "
+        f"ON {table} (campaign_id, npc_id, player_id)"
+    )
+
 DM_CHECK_TAG_PATTERN = re.compile(
     r"\[DM CHECK:\s*(.+?)\]\s*$",
     re.IGNORECASE | re.DOTALL,
@@ -109,6 +143,7 @@ def init_dm_tables() -> None:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS dm_messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                campaign_id TEXT NOT NULL DEFAULT '',
                 npc_id TEXT NOT NULL,
                 player_id TEXT NOT NULL,
                 content TEXT NOT NULL,
@@ -122,6 +157,7 @@ def init_dm_tables() -> None:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS dm_pending_checks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                campaign_id TEXT NOT NULL DEFAULT '',
                 npc_id TEXT NOT NULL,
                 player_id TEXT NOT NULL,
                 claim_summary TEXT NOT NULL,
@@ -138,6 +174,7 @@ def init_dm_tables() -> None:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS dm_rulings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                campaign_id TEXT NOT NULL DEFAULT '',
                 npc_id TEXT NOT NULL,
                 player_id TEXT NOT NULL,
                 claim_summary TEXT NOT NULL,
@@ -148,6 +185,9 @@ def init_dm_tables() -> None:
                 created_at TEXT NOT NULL
             )
         """)
+
+        for table in ("dm_messages", "dm_pending_checks", "dm_rulings"):
+            ensure_campaign_id_column(conn, table)
 
         conn.commit()
 
@@ -355,8 +395,12 @@ def _find_related_open_pending(
     player_id: str,
     claim_summary: str,
     player_text: str | None = None,
+    *,
+    campaign_id: str = "",
 ) -> dict[str, Any] | None:
-    pending_items = load_pending_checks(npc_id, player_id, status="pending")
+    pending_items = load_pending_checks(
+        npc_id, player_id, status="pending", campaign_id=campaign_id
+    )
     if not pending_items:
         return None
 
@@ -422,7 +466,9 @@ def save_pending_check(
     npc_text: str | None = None,
     source: str = "npc",
     merge_pending_id: int | None = None,
+    campaign_id: str = "",
 ) -> int | None:
+    campaign_id = normalize_campaign_id(campaign_id)
     claim_summary = (claim_summary or "").strip()
     if not claim_summary:
         return None
@@ -430,7 +476,9 @@ def save_pending_check(
     if merge_pending_id is not None:
         existing = next(
             (
-                pending for pending in load_pending_checks(npc_id, player_id, status="pending")
+                pending for pending in load_pending_checks(
+                    npc_id, player_id, status="pending", campaign_id=campaign_id
+                )
                 if pending["id"] == merge_pending_id
             ),
             None,
@@ -448,12 +496,14 @@ def save_pending_check(
         )
         print(
             f"[DM] merged pending check #{merge_pending_id} npc={npc_id} player={player_id} "
-            f"source={source} claim={claim_summary[:120]!r}",
+            f"campaign={campaign_id or '(none)'} source={source} claim={claim_summary[:120]!r}",
             flush=True,
         )
         return merge_pending_id
 
-    for pending in load_pending_checks(npc_id, player_id, status="pending"):
+    for pending in load_pending_checks(
+        npc_id, player_id, status="pending", campaign_id=campaign_id
+    ):
         if _claims_same_exchange(
             pending["claim_summary"],
             claim_summary,
@@ -467,7 +517,9 @@ def save_pending_check(
                 source=source if pending.get("source") == source else f"{pending.get('source')}+{source}",
             )
 
-    related = _find_related_open_pending(npc_id, player_id, claim_summary, player_text)
+    related = _find_related_open_pending(
+        npc_id, player_id, claim_summary, player_text, campaign_id=campaign_id
+    )
     if related:
         merged_source = source if related.get("source") == source else f"{related.get('source')}+{source}"
         return update_pending_check(
@@ -482,10 +534,11 @@ def save_pending_check(
     with get_db() as conn:
         cur = conn.execute("""
             INSERT INTO dm_pending_checks
-                (npc_id, player_id, claim_summary, player_text, npc_text, source, status, created_at)
+                (campaign_id, npc_id, player_id, claim_summary, player_text, npc_text, source, status, created_at)
             VALUES
-                (?, ?, ?, ?, ?, ?, 'pending', ?)
+                (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
         """, (
+            campaign_id,
             npc_id,
             player_id,
             claim_summary,
@@ -499,7 +552,7 @@ def save_pending_check(
 
     print(
         f"[DM] pending check #{pending_id} npc={npc_id} player={player_id} "
-        f"source={source} claim={claim_summary[:120]!r}",
+        f"campaign={campaign_id or '(none)'} source={source} claim={claim_summary[:120]!r}",
         flush=True,
     )
     return pending_id
@@ -524,8 +577,12 @@ def _find_matching_pending(
     npc_id: str,
     player_id: str,
     claim_hint: str | None,
+    *,
+    campaign_id: str = "",
 ) -> dict[str, Any] | None:
-    pending_items = load_pending_checks(npc_id, player_id, status="pending")
+    pending_items = load_pending_checks(
+        npc_id, player_id, status="pending", campaign_id=campaign_id
+    )
     if not pending_items:
         return None
 
@@ -546,15 +603,18 @@ def save_ruling(
     ruling_text: str,
     source: str,
     pending_check_id: int | None = None,
+    campaign_id: str = "",
 ) -> int:
+    campaign_id = normalize_campaign_id(campaign_id)
     created_at = _utc_now_iso()
     with get_db() as conn:
         cur = conn.execute("""
             INSERT INTO dm_rulings
-                (npc_id, player_id, claim_summary, verdict, ruling_text, source, pending_check_id, created_at)
+                (campaign_id, npc_id, player_id, claim_summary, verdict, ruling_text, source, pending_check_id, created_at)
             VALUES
-                (?, ?, ?, ?, ?, ?, ?, ?)
+                (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
+            campaign_id,
             npc_id,
             player_id,
             claim_summary,
@@ -579,7 +639,9 @@ def save_dm_message(
     player_id: str,
     content: str,
     verdict_override: str | None = None,
+    campaign_id: str = "",
 ) -> dict[str, Any]:
+    campaign_id = normalize_campaign_id(campaign_id)
     content = (content or "").strip()
     if not content:
         raise ValueError("Missing DM message content")
@@ -593,10 +655,11 @@ def save_dm_message(
     with get_db() as conn:
         cur = conn.execute("""
             INSERT INTO dm_messages
-                (npc_id, player_id, content, detected_verdict, detected_claim, detection_confidence, created_at)
+                (campaign_id, npc_id, player_id, content, detected_verdict, detected_claim, detection_confidence, created_at)
             VALUES
-                (?, ?, ?, ?, ?, ?, ?)
+                (?, ?, ?, ?, ?, ?, ?, ?)
         """, (
+            campaign_id,
             npc_id,
             player_id,
             content,
@@ -613,7 +676,9 @@ def save_dm_message(
     claim_summary = detection.get("claim")
 
     if verdict in ("confirmed", "denied"):
-        pending = _find_matching_pending(npc_id, player_id, claim_summary)
+        pending = _find_matching_pending(
+            npc_id, player_id, claim_summary, campaign_id=campaign_id
+        )
         if pending:
             pending_check_id = pending["id"]
             if not claim_summary:
@@ -630,10 +695,12 @@ def save_dm_message(
             ruling_text=content,
             source="manual" if verdict_override else "auto",
             pending_check_id=pending_check_id,
+            campaign_id=campaign_id,
         )
 
     return {
         "id": message_id,
+        "campaign_id": campaign_id,
         "npc_id": npc_id,
         "player_id": player_id,
         "content": content,
@@ -647,16 +714,24 @@ def save_dm_message(
     }
 
 
-def load_dm_messages(npc_id: str, player_id: str, limit: int = 50) -> list[dict[str, Any]]:
+def load_dm_messages(
+    npc_id: str,
+    player_id: str,
+    limit: int = 50,
+    *,
+    campaign_id: str = "",
+) -> list[dict[str, Any]]:
+    campaign_id = normalize_campaign_id(campaign_id)
     with get_db() as conn:
         rows = conn.execute("""
             SELECT id, content, detected_verdict, detected_claim, detection_confidence, created_at
             FROM dm_messages
-            WHERE npc_id = ?
+            WHERE campaign_id = ?
+              AND npc_id = ?
               AND player_id = ?
             ORDER BY id DESC
             LIMIT ?
-        """, (npc_id, player_id, limit)).fetchall()
+        """, (campaign_id, npc_id, player_id, limit)).fetchall()
 
     return [
         {
@@ -677,14 +752,17 @@ def load_pending_checks(
     *,
     status: str | None = "pending",
     limit: int = 20,
+    campaign_id: str = "",
 ) -> list[dict[str, Any]]:
+    campaign_id = normalize_campaign_id(campaign_id)
     query = """
         SELECT id, claim_summary, player_text, npc_text, source, status, ruling_id, created_at, resolved_at
         FROM dm_pending_checks
-        WHERE npc_id = ?
+        WHERE campaign_id = ?
+          AND npc_id = ?
           AND player_id = ?
     """
-    params: list[Any] = [npc_id, player_id]
+    params: list[Any] = [campaign_id, npc_id, player_id]
 
     if status:
         query += " AND status = ?"
@@ -713,16 +791,24 @@ def load_pending_checks(
     return list(reversed(items))
 
 
-def load_rulings(npc_id: str, player_id: str, limit: int = 20) -> list[dict[str, Any]]:
+def load_rulings(
+    npc_id: str,
+    player_id: str,
+    limit: int = 20,
+    *,
+    campaign_id: str = "",
+) -> list[dict[str, Any]]:
+    campaign_id = normalize_campaign_id(campaign_id)
     with get_db() as conn:
         rows = conn.execute("""
             SELECT id, claim_summary, verdict, ruling_text, source, pending_check_id, created_at
             FROM dm_rulings
-            WHERE npc_id = ?
+            WHERE campaign_id = ?
+              AND npc_id = ?
               AND player_id = ?
             ORDER BY id DESC
             LIMIT ?
-        """, (npc_id, player_id, limit)).fetchall()
+        """, (campaign_id, npc_id, player_id, limit)).fetchall()
 
     return [
         {
@@ -741,7 +827,7 @@ def load_rulings(npc_id: str, player_id: str, limit: int = 20) -> list[dict[str,
 def load_ruling_by_id(ruling_id: int) -> dict[str, Any] | None:
     with get_db() as conn:
         row = conn.execute("""
-            SELECT id, npc_id, player_id, claim_summary, verdict, ruling_text, source, pending_check_id, created_at
+            SELECT id, campaign_id, npc_id, player_id, claim_summary, verdict, ruling_text, source, pending_check_id, created_at
             FROM dm_rulings
             WHERE id = ?
         """, (ruling_id,)).fetchone()
@@ -751,6 +837,7 @@ def load_ruling_by_id(ruling_id: int) -> dict[str, Any] | None:
 
     return {
         "id": row["id"],
+        "campaign_id": row["campaign_id"] if "campaign_id" in row.keys() else "",
         "npc_id": row["npc_id"],
         "player_id": row["player_id"],
         "claim_summary": row["claim_summary"],
@@ -762,11 +849,15 @@ def load_ruling_by_id(ruling_id: int) -> dict[str, Any] | None:
     }
 
 
-def get_dm_context(npc_id: str, player_id: str) -> dict[str, Any]:
+def get_dm_context(npc_id: str, player_id: str, campaign_id: str = "") -> dict[str, Any]:
+    campaign_id = normalize_campaign_id(campaign_id)
     return {
-        "messages": load_dm_messages(npc_id, player_id, limit=10),
-        "pending_checks": load_pending_checks(npc_id, player_id, status="pending", limit=10),
-        "rulings": load_rulings(npc_id, player_id, limit=10),
+        "campaign_id": campaign_id,
+        "messages": load_dm_messages(npc_id, player_id, limit=10, campaign_id=campaign_id),
+        "pending_checks": load_pending_checks(
+            npc_id, player_id, status="pending", limit=10, campaign_id=campaign_id
+        ),
+        "rulings": load_rulings(npc_id, player_id, limit=10, campaign_id=campaign_id),
     }
 
 
@@ -833,7 +924,13 @@ def build_dm_injection_messages(dm_context: dict[str, Any] | None) -> list[dict[
     return injections
 
 
-def process_player_message(npc_id: str, player_id: str, player_text: str) -> dict[str, Any] | None:
+def process_player_message(
+    npc_id: str,
+    player_id: str,
+    player_text: str,
+    *,
+    campaign_id: str = "",
+) -> dict[str, Any] | None:
     detected = detect_player_claim(player_text)
     if not detected:
         return None
@@ -844,6 +941,7 @@ def process_player_message(npc_id: str, player_id: str, player_text: str) -> dic
         claim_summary=detected["claim_summary"],
         player_text=player_text,
         source="player",
+        campaign_id=campaign_id,
     )
 
     return {
@@ -859,6 +957,7 @@ def process_npc_response(
     npc_text: str,
     *,
     player_pending_id: int | None = None,
+    campaign_id: str = "",
 ) -> dict[str, Any]:
     spoken_text, dm_check_claim = strip_dm_check_tag(npc_text)
     pending_id = None
@@ -874,6 +973,7 @@ def process_npc_response(
             npc_text=spoken_text,
             source="npc",
             merge_pending_id=merge_pending_id,
+            campaign_id=campaign_id,
         )
         pending_source = "npc_tag"
     else:
@@ -889,6 +989,7 @@ def process_npc_response(
                 npc_text=spoken_text,
                 source="npc_deferral",
                 merge_pending_id=merge_pending_id,
+                campaign_id=campaign_id,
             )
             pending_source = "npc_deferral"
 
@@ -929,7 +1030,9 @@ def create_manual_ruling(
     verdict: str,
     notes: str = "",
     pending_check_id: int | None = None,
+    campaign_id: str = "",
 ) -> dict[str, Any]:
+    campaign_id = normalize_campaign_id(campaign_id)
     verdict = verdict.strip().lower()
     if verdict not in ("confirmed", "denied"):
         raise ValueError("verdict must be confirmed or denied")
@@ -941,7 +1044,9 @@ def create_manual_ruling(
     ruling_text = (notes or "").strip() or f"DM ruling: {verdict} for {claim_summary}"
 
     if pending_check_id is None:
-        pending = _find_matching_pending(npc_id, player_id, claim_summary)
+        pending = _find_matching_pending(
+            npc_id, player_id, claim_summary, campaign_id=campaign_id
+        )
         if pending:
             pending_check_id = pending["id"]
 
@@ -953,16 +1058,18 @@ def create_manual_ruling(
         ruling_text=ruling_text,
         source="manual",
         pending_check_id=pending_check_id,
+        campaign_id=campaign_id,
     )
 
     created_at = _utc_now_iso()
     with get_db() as conn:
         cur = conn.execute("""
             INSERT INTO dm_messages
-                (npc_id, player_id, content, detected_verdict, detected_claim, detection_confidence, created_at)
+                (campaign_id, npc_id, player_id, content, detected_verdict, detected_claim, detection_confidence, created_at)
             VALUES
-                (?, ?, ?, ?, ?, ?, ?)
+                (?, ?, ?, ?, ?, ?, ?, ?)
         """, (
+            campaign_id,
             npc_id,
             player_id,
             ruling_text,
@@ -977,6 +1084,7 @@ def create_manual_ruling(
     return {
         "ruling_id": ruling_id,
         "message_id": message_id,
+        "campaign_id": campaign_id,
         "claim_summary": claim_summary,
         "verdict": verdict,
         "ruling_text": ruling_text,
@@ -995,7 +1103,9 @@ def log_dm_turn(
     player_text: str | None = None,
     player_claim: dict | None = None,
     npc_response: dict | None = None,
+    campaign_id: str = "",
 ) -> None:
+    campaign_id = normalize_campaign_id(campaign_id)
     parts = [
         "[DM]",
         f"route={route}",
@@ -1003,6 +1113,7 @@ def log_dm_turn(
         f"request_id={request_id}",
         f"npc={npc_id}",
         f"player={player_id}",
+        f"campaign={campaign_id or '(none)'}",
     ]
 
     if player_text is not None:
@@ -1020,28 +1131,31 @@ def log_dm_turn(
         parts.append(f"pending_check_id={npc_response.get('pending_check_id')}")
 
     if stage in ("complete", "summary"):
-        pending = load_pending_checks(npc_id, player_id, status="pending", limit=50)
+        pending = load_pending_checks(
+            npc_id, player_id, status="pending", limit=50, campaign_id=campaign_id
+        )
         parts.append(f"pending_count={len(pending)}")
 
     print(" ".join(str(part) for part in parts), flush=True)
 
 
-def clear_dm_data(npc_id: str, player_id: str) -> dict[str, int]:
+def clear_dm_data(npc_id: str, player_id: str, campaign_id: str = "") -> dict[str, int]:
+    campaign_id = normalize_campaign_id(campaign_id)
     with get_db() as conn:
         deleted_messages = conn.execute("""
             DELETE FROM dm_messages
-            WHERE npc_id = ? AND player_id = ?
-        """, (npc_id, player_id)).rowcount
+            WHERE campaign_id = ? AND npc_id = ? AND player_id = ?
+        """, (campaign_id, npc_id, player_id)).rowcount
 
         deleted_pending = conn.execute("""
             DELETE FROM dm_pending_checks
-            WHERE npc_id = ? AND player_id = ?
-        """, (npc_id, player_id)).rowcount
+            WHERE campaign_id = ? AND npc_id = ? AND player_id = ?
+        """, (campaign_id, npc_id, player_id)).rowcount
 
         deleted_rulings = conn.execute("""
             DELETE FROM dm_rulings
-            WHERE npc_id = ? AND player_id = ?
-        """, (npc_id, player_id)).rowcount
+            WHERE campaign_id = ? AND npc_id = ? AND player_id = ?
+        """, (campaign_id, npc_id, player_id)).rowcount
 
         conn.commit()
 
