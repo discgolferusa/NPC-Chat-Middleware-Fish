@@ -7,6 +7,7 @@ import json
 import sqlite3
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 import uuid
 import subprocess
 import wave
@@ -184,6 +185,83 @@ def resolve_voices_dir() -> Path:
 
 
 VOICES_DIR = resolve_voices_dir()
+
+# Cached Piper inventory — full-tree rglob on a large Voices share is slow enough
+# to 504 the Yaml Editor /api/voices proxy (30s) when scanned on every request.
+_VOICE_CACHE_LOCK = threading.Lock()
+_VOICE_CACHE: dict[str, Any] = {
+    "built_at": 0.0,
+    "voices": [],
+    "by_name": {},
+}
+_VOICE_CACHE_TTL_SECONDS = float(os.environ.get("VOICES_CACHE_TTL_SECONDS", "300"))
+
+
+def _build_voice_inventory() -> tuple[list[dict[str, str]], dict[str, Path]]:
+    if not VOICES_DIR.exists():
+        return [], {}
+
+    voices: list[dict[str, str]] = []
+    by_name: dict[str, Path] = {}
+    seen: set[str] = set()
+
+    # Avoid Path.resolve() here — on UNC/network trees it can be very expensive.
+    for path in sorted(VOICES_DIR.rglob("*.onnx"), key=lambda item: str(item).lower()):
+        key = str(path).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+
+        try:
+            label = path.relative_to(VOICES_DIR).as_posix()
+        except ValueError:
+            label = path.name
+
+        voices.append({"label": label, "path": str(path)})
+        name_key = path.name.lower()
+        by_name.setdefault(name_key, path)
+
+    return voices, by_name
+
+
+def refresh_voice_inventory(*, force: bool = False) -> list[dict[str, str]]:
+    now = time.perf_counter()
+    with _VOICE_CACHE_LOCK:
+        age = now - float(_VOICE_CACHE.get("built_at") or 0.0)
+        if not force and _VOICE_CACHE["voices"] and age < _VOICE_CACHE_TTL_SECONDS:
+            return list(_VOICE_CACHE["voices"])
+
+    voices, by_name = _build_voice_inventory()
+    with _VOICE_CACHE_LOCK:
+        _VOICE_CACHE["built_at"] = time.perf_counter()
+        _VOICE_CACHE["voices"] = voices
+        _VOICE_CACHE["by_name"] = by_name
+        return list(voices)
+
+
+def list_piper_voices() -> list[dict[str, str]]:
+    return refresh_voice_inventory(force=False)
+
+
+def lookup_cached_voice_by_name(filename: str) -> Path | None:
+    name = Path(filename).name.lower()
+    if not name:
+        return None
+
+    refresh_voice_inventory(force=False)
+    with _VOICE_CACHE_LOCK:
+        path = _VOICE_CACHE["by_name"].get(name)
+        return path if isinstance(path, Path) else None
+
+
+if VOICES_DIR.exists():
+    _startup_voices = refresh_voice_inventory(force=True)
+    print(
+        f"[VOICES] Piper scan root: {VOICES_DIR} ({len(_startup_voices)} model(s))",
+        flush=True,
+    )
+else:
+    print(f"[VOICES] Piper scan root not found: {VOICES_DIR}", flush=True)
 
 # Alpha / Funnel: bind localhost only; require Bearer token when GAME_API_KEY is set.
 GAME_API_KEY = os.environ.get("GAME_API_KEY", "").strip()
@@ -901,6 +979,8 @@ def run_dm_ruling_auto_response(
     include_audio: bool = True,
     scene_description: str = "",
     party_context: dict | None = None,
+    voice_model: str | None = None,
+    tts_length_scale: Any = None,
 ) -> dict:
     verdict = (ruling.get("verdict") or "").strip().lower()
     if verdict not in ("confirmed", "denied"):
@@ -953,9 +1033,9 @@ def run_dm_ruling_auto_response(
             output_path = OUTPUT_DIR / audio_filename
             synthesize_segmented_speech(
                 npc_text=npc_text,
-                npc_voice_model=npc.get("voice_model"),
+                npc_voice_model=pick_npc_voice_model(npc, voice_model),
                 output_path=output_path,
-                npc_length_scale=float(npc.get("tts_length_scale", 1.15)),
+                npc_length_scale=pick_npc_length_scale(npc, tts_length_scale),
             )
             audio_url = f"/dm/followup-audio/{audio_filename}"
 
@@ -1344,13 +1424,38 @@ def synthesize_segmented_speech(
                 pass
 
 
+def pick_npc_voice_model(npc: dict, override: str | None = None) -> str | None:
+    """Prefer request/editor override, then NPC YAML voice_model."""
+    raw = (override or "").strip()
+    if raw:
+        return raw
+    value = npc.get("voice_model")
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def pick_npc_length_scale(npc: dict, override: Any = None) -> float:
+    if override is not None and str(override).strip() != "":
+        try:
+            return float(override)
+        except (TypeError, ValueError):
+            pass
+    try:
+        return float(npc.get("tts_length_scale", 1.15))
+    except (TypeError, ValueError):
+        return 1.15
+
+
 def synthesize_speech(
     text: str,
     voice_model: str | None,
     output_path: Path,
     length_scale: float = 1.15
 ) -> None:
-    model_path = Path(voice_model) if voice_model else DEFAULT_VOICE_MODEL
+    # Same resolution as /voices/preview so UNC/partial/editor paths work at runtime.
+    model_path = resolve_voice_model_path(voice_model)
 
     if not PIPER_EXE.exists():
         raise FileNotFoundError(f"Piper executable not found: {PIPER_EXE}")
@@ -1392,44 +1497,13 @@ def resolve_voice_model_path(voice_model: str | None) -> Path:
     if candidate.exists():
         return candidate
 
-    # Match by filename when YAML stores a partial path or UNC tail.
+    # Match by filename using the cached inventory (no per-request full-tree rglob).
     target_name = Path(normalized).name.lower()
-    if target_name:
-        for path in VOICES_DIR.rglob(target_name):
-            if path.is_file():
-                return path
+    cached = lookup_cached_voice_by_name(target_name)
+    if cached is not None and cached.exists():
+        return cached
 
     raise FileNotFoundError(f"Piper voice model not found: {voice_model}")
-
-
-def list_piper_voices() -> list[dict[str, str]]:
-    if not VOICES_DIR.exists():
-        return []
-
-    voices: list[dict[str, str]] = []
-    seen: set[str] = set()
-    for path in sorted(VOICES_DIR.rglob("*.onnx"), key=lambda item: str(item).lower()):
-        key = str(path.resolve()).lower()
-        if key in seen:
-            continue
-        seen.add(key)
-
-        try:
-            label = path.relative_to(VOICES_DIR).as_posix()
-        except ValueError:
-            label = path.name
-        voices.append({"label": label, "path": str(path)})
-
-    return voices
-
-
-if VOICES_DIR.exists():
-    print(
-        f"[VOICES] Piper scan root: {VOICES_DIR} ({len(list_piper_voices())} model(s))",
-        flush=True,
-    )
-else:
-    print(f"[VOICES] Piper scan root not found: {VOICES_DIR}", flush=True)
 
 
 def extract_memories_from_exchange(
@@ -1856,9 +1930,15 @@ def npc_voice_turn():
         set_turn_progress(request_id, "generating_voice")
         synthesize_segmented_speech(
             npc_text=npc_text,
-            npc_voice_model=npc.get("voice_model"),
+            npc_voice_model=pick_npc_voice_model(
+                npc,
+                (request.form.get("voice_model") or "").strip() or None,
+            ),
             output_path=output_path,
-            npc_length_scale=float(npc.get("tts_length_scale", 1.15))
+            npc_length_scale=pick_npc_length_scale(
+                npc,
+                request.form.get("tts_length_scale"),
+            ),
         )
         step_start = log_timing(request_id, "piper segmented tts", step_start)
 
@@ -2054,9 +2134,15 @@ def npc_voice_turn_debug():
 
         synthesize_segmented_speech(
             npc_text=npc_text,
-            npc_voice_model=npc.get("voice_model"),
+            npc_voice_model=pick_npc_voice_model(
+                npc,
+                (request.form.get("voice_model") or "").strip() or None,
+            ),
             output_path=output_path,
-            npc_length_scale=float(npc.get("tts_length_scale", 1.15))
+            npc_length_scale=pick_npc_length_scale(
+                npc,
+                request.form.get("tts_length_scale"),
+            ),
         )
         step_start = log_timing(request_id, "debug piper segmented tts", step_start)
 
@@ -2506,6 +2592,8 @@ def dm_message_post():
                     include_audio=_json_body_flag(body.get("include_audio"), True),
                     scene_description=(body.get("scene") or "").strip(),
                     party_context=session["party_context"],
+                    voice_model=(body.get("voice_model") or "").strip() or None,
+                    tts_length_scale=body.get("tts_length_scale"),
                 )
 
         return jsonify({
@@ -2597,6 +2685,8 @@ def dm_ruling_post():
                     include_audio=_json_body_flag(body.get("include_audio"), True),
                     scene_description=(body.get("scene") or "").strip(),
                     party_context=session["party_context"],
+                    voice_model=(body.get("voice_model") or "").strip() or None,
+                    tts_length_scale=body.get("tts_length_scale"),
                 )
 
         return jsonify({
@@ -2653,10 +2743,13 @@ def dm_followup_audio(filename: str):
 
 @app.get("/voices")
 def list_voices():
+    force_refresh = (request.args.get("refresh") or "").strip().lower() in ("1", "true", "yes")
+    voices = refresh_voice_inventory(force=force_refresh)
     return jsonify({
-        "voices": list_piper_voices(),
+        "voices": voices,
         "voice_enabled": True,
         "voices_dir": str(VOICES_DIR),
+        "cached": not force_refresh,
     })
 
 
