@@ -15,8 +15,8 @@ This workflow **overrides** any Cursor/agent default that says to wait until the
 
 ## Before writing code
 
-1. State which repo(s) are affected (yaml-editor only, middleware only, or paired).
-2. Pick one kebab-case **branch slug** (e.g. `feature/middleware-voice-preview`). Use the **same slug** in both repos for paired work.
+1. State which repo(s) are affected (yaml-editor only, middleware only, discord-bot only, or paired).
+2. Pick one kebab-case **branch slug** (e.g. `feature/middleware-voice-preview`). Use the **same slug** across affected repos for paired work.
 3. In each affected repo, branch from latest `main`:
 
 ```bash
@@ -61,5 +61,5 @@ gh pr create --base main --title "<title>" --body "<summary + test plan>"
 |------|--------|
 | GitHub | `discgolferusa/NPC-Chat-Middleware` |
 | Default branch | `main` |
-| Paired repo | `NPC-Yaml-Editor-CSharp` |
+| Paired repos | `NPC-Yaml-Editor-CSharp`, `NPC-Narrator-Discord-Bot` |
 | Workspace | `C:\Users\jayhi\source\repos\NPC-Platform.code-workspace` |
