@@ -29,6 +29,7 @@ from dm_channel import (
     clear_dm_data,
     create_manual_ruling,
     detect_ruling,
+    ensure_campaign_id_column,
     format_dm_context_for_prompt,
     get_dm_context,
     init_dm_tables,
@@ -37,6 +38,7 @@ from dm_channel import (
     load_ruling_by_id,
     load_rulings,
     log_dm_turn,
+    normalize_campaign_id,
     process_npc_response,
     process_player_message,
     save_dm_message,
@@ -315,6 +317,7 @@ def init_memory_db():
         conn.execute("""
             CREATE TABLE IF NOT EXISTS conversation_turns (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                campaign_id TEXT NOT NULL DEFAULT '',
                 npc_id TEXT NOT NULL,
                 player_id TEXT NOT NULL,
                 role TEXT NOT NULL,
@@ -326,6 +329,7 @@ def init_memory_db():
         conn.execute("""
             CREATE TABLE IF NOT EXISTS npc_memories (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                campaign_id TEXT NOT NULL DEFAULT '',
                 npc_id TEXT NOT NULL,
                 player_id TEXT NOT NULL,
                 memory TEXT NOT NULL,
@@ -333,12 +337,16 @@ def init_memory_db():
             )
         """)
 
+        ensure_campaign_id_column(conn, "conversation_turns")
+        ensure_campaign_id_column(conn, "npc_memories")
+
         conn.commit()
 
     init_dm_tables()
 
 
-def save_turn(npc_id: str, player_id: str, role: str, content: str):
+def save_turn(npc_id: str, player_id: str, role: str, content: str, campaign_id: str = ""):
+    campaign_id = normalize_campaign_id(campaign_id)
     content = (content or "").strip()
     if not content:
         return
@@ -346,10 +354,11 @@ def save_turn(npc_id: str, player_id: str, role: str, content: str):
     with get_db() as conn:
         conn.execute("""
             INSERT INTO conversation_turns
-                (npc_id, player_id, role, content, created_at)
+                (campaign_id, npc_id, player_id, role, content, created_at)
             VALUES
-                (?, ?, ?, ?, ?)
+                (?, ?, ?, ?, ?, ?)
         """, (
+            campaign_id,
             npc_id,
             player_id,
             role,
@@ -359,21 +368,24 @@ def save_turn(npc_id: str, player_id: str, role: str, content: str):
         conn.commit()
 
 
-def load_recent_turns(npc_id: str, player_id: str, limit: int = 10):
+def load_recent_turns(npc_id: str, player_id: str, limit: int = 10, campaign_id: str = ""):
+    campaign_id = normalize_campaign_id(campaign_id)
     with get_db() as conn:
         rows = conn.execute("""
             SELECT role, content
             FROM conversation_turns
-            WHERE npc_id = ?
+            WHERE campaign_id = ?
+              AND npc_id = ?
               AND player_id = ?
             ORDER BY id DESC
             LIMIT ?
-        """, (npc_id, player_id, limit)).fetchall()
+        """, (campaign_id, npc_id, player_id, limit)).fetchall()
 
     return list(reversed(rows))
 
 
-def save_memory(npc_id: str, player_id: str, memory: str):
+def save_memory(npc_id: str, player_id: str, memory: str, campaign_id: str = ""):
+    campaign_id = normalize_campaign_id(campaign_id)
     memory = (memory or "").strip()
     if not memory:
         return
@@ -381,10 +393,11 @@ def save_memory(npc_id: str, player_id: str, memory: str):
     with get_db() as conn:
         conn.execute("""
             INSERT INTO npc_memories
-                (npc_id, player_id, memory, created_at)
+                (campaign_id, npc_id, player_id, memory, created_at)
             VALUES
-                (?, ?, ?, ?)
+                (?, ?, ?, ?, ?)
         """, (
+            campaign_id,
             npc_id,
             player_id,
             memory,
@@ -393,7 +406,8 @@ def save_memory(npc_id: str, player_id: str, memory: str):
         conn.commit()
 
 
-def memory_exists(npc_id: str, player_id: str, memory: str) -> bool:
+def memory_exists(npc_id: str, player_id: str, memory: str, campaign_id: str = "") -> bool:
+    campaign_id = normalize_campaign_id(campaign_id)
     normalized = (memory or "").strip().lower()
 
     if not normalized:
@@ -403,9 +417,10 @@ def memory_exists(npc_id: str, player_id: str, memory: str) -> bool:
         rows = conn.execute("""
             SELECT memory
             FROM npc_memories
-            WHERE npc_id = ?
+            WHERE campaign_id = ?
+              AND npc_id = ?
               AND player_id = ?
-        """, (npc_id, player_id)).fetchall()
+        """, (campaign_id, npc_id, player_id)).fetchall()
 
     for row in rows:
         if row["memory"].strip().lower() == normalized:
@@ -414,50 +429,56 @@ def memory_exists(npc_id: str, player_id: str, memory: str) -> bool:
     return False
 
 
-def save_memory_if_new(npc_id: str, player_id: str, memory: str):
+def save_memory_if_new(npc_id: str, player_id: str, memory: str, campaign_id: str = ""):
     memory = (memory or "").strip()
 
     if not memory:
         return
 
-    if memory_exists(npc_id, player_id, memory):
+    if memory_exists(npc_id, player_id, memory, campaign_id=campaign_id):
         return
 
-    save_memory(npc_id, player_id, memory)
+    save_memory(npc_id, player_id, memory, campaign_id=campaign_id)
 
 
-def load_memories(npc_id: str, player_id: str, limit: int = 20):
+def load_memories(npc_id: str, player_id: str, limit: int = 20, campaign_id: str = ""):
+    campaign_id = normalize_campaign_id(campaign_id)
     with get_db() as conn:
         rows = conn.execute("""
             SELECT memory
             FROM npc_memories
-            WHERE npc_id = ?
+            WHERE campaign_id = ?
+              AND npc_id = ?
               AND player_id = ?
             ORDER BY id DESC
             LIMIT ?
-        """, (npc_id, player_id, limit)).fetchall()
+        """, (campaign_id, npc_id, player_id, limit)).fetchall()
 
     return [row["memory"] for row in reversed(rows)]
 
 
-def clear_memories(npc_id: str, player_id: str) -> int:
+def clear_memories(npc_id: str, player_id: str, campaign_id: str = "") -> int:
+    campaign_id = normalize_campaign_id(campaign_id)
     with get_db() as conn:
         cur = conn.execute("""
             DELETE FROM npc_memories
-            WHERE npc_id = ?
+            WHERE campaign_id = ?
+              AND npc_id = ?
               AND player_id = ?
-        """, (npc_id, player_id))
+        """, (campaign_id, npc_id, player_id))
         conn.commit()
         return cur.rowcount
 
 
-def clear_recent_turns(npc_id: str, player_id: str) -> int:
+def clear_recent_turns(npc_id: str, player_id: str, campaign_id: str = "") -> int:
+    campaign_id = normalize_campaign_id(campaign_id)
     with get_db() as conn:
         cur = conn.execute("""
             DELETE FROM conversation_turns
-            WHERE npc_id = ?
+            WHERE campaign_id = ?
+              AND npc_id = ?
               AND player_id = ?
-        """, (npc_id, player_id))
+        """, (campaign_id, npc_id, player_id))
         conn.commit()
         return cur.rowcount
 
@@ -596,6 +617,7 @@ def get_npc_context(
     npc_id: str,
     player_id: str = DEFAULT_PLAYER_ID,
     party_context: dict | None = None,
+    campaign_id: str | None = None,
 ) -> dict:
     """
     Load all context pieces used for an NPC turn.
@@ -605,27 +627,34 @@ def get_npc_context(
     """
     npc = load_npc(npc_id)
     location = load_location(npc.get("location_id"))
-    memories = load_memories(npc_id, player_id, limit=MEMORY_PROMPT_LIMIT)
-    recent_turns = load_recent_turns(npc_id, player_id, limit=RECENT_TURN_LIMIT)
     party_context = party_context or build_party_context(player_id=player_id)
+    resolved_campaign_id = normalize_campaign_id(
+        campaign_id if campaign_id is not None else party_context.get("campaign_id")
+    )
+    memories = load_memories(
+        npc_id, player_id, limit=MEMORY_PROMPT_LIMIT, campaign_id=resolved_campaign_id
+    )
+    recent_turns = load_recent_turns(
+        npc_id, player_id, limit=RECENT_TURN_LIMIT, campaign_id=resolved_campaign_id
+    )
     scene_context = build_scene_context(npc.get("location_id"))
 
     context = {
         "npc_id": npc_id,
         "player_id": player_id,
         "party_id": party_context.get("party_id"),
-        "campaign_id": party_context.get("campaign_id"),
+        "campaign_id": resolved_campaign_id,
         "party_context": party_context,
         "scene_context": scene_context,
         "npc": npc,
         "location": location,
         "memories": memories,
         "recent_turns": recent_turns,
-        "dm_context": get_dm_context(npc_id, player_id),
+        "dm_context": get_dm_context(npc_id, player_id, campaign_id=resolved_campaign_id),
     }
 
     with CACHE_LOCK:
-        PRELOADED_CONTEXTS[(npc_id, player_id)] = context
+        PRELOADED_CONTEXTS[(resolved_campaign_id, npc_id, player_id)] = context
 
     return context
 
@@ -639,7 +668,8 @@ def run_memory_extraction_background(
     npc_id: str,
     player_id: str,
     player_text: str,
-    npc_text: str
+    npc_text: str,
+    campaign_id: str = "",
 ) -> None:
     if not AUTO_MEMORY_EXTRACTION_ENABLED:
         return
@@ -651,7 +681,8 @@ def run_memory_extraction_background(
                 npc_id=npc_id,
                 player_id=player_id,
                 player_text=player_text,
-                npc_text=npc_text
+                npc_text=npc_text,
+                campaign_id=campaign_id,
             )
         except Exception:
             # Memory extraction must never break live play.
@@ -981,6 +1012,7 @@ def run_dm_ruling_auto_response(
     party_context: dict | None = None,
     voice_model: str | None = None,
     tts_length_scale: Any = None,
+    campaign_id: str = "",
 ) -> dict:
     verdict = (ruling.get("verdict") or "").strip().lower()
     if verdict not in ("confirmed", "denied"):
@@ -992,12 +1024,18 @@ def run_dm_ruling_auto_response(
     request_id = uuid.uuid4().hex
 
     try:
-        context = get_npc_context(npc_id, player_id, party_context=party_context)
+        campaign_id = normalize_campaign_id(
+            campaign_id or (party_context or {}).get("campaign_id") or ruling.get("campaign_id")
+        )
+        context = get_npc_context(
+            npc_id, player_id, party_context=party_context, campaign_id=campaign_id
+        )
         npc = context["npc"]
         memories = context["memories"]
         recent_turns = context["recent_turns"]
         location = context["location"]
-        dm_context = get_dm_context(npc_id, player_id)
+        campaign_id = context["campaign_id"]
+        dm_context = get_dm_context(npc_id, player_id, campaign_id=campaign_id)
         party_context = context.get("party_context") or party_context
         scene_context = context.get("scene_context")
 
@@ -1014,13 +1052,15 @@ def run_dm_ruling_auto_response(
         )
 
         npc_text_raw = ask_llm(messages)
-        npc_response = process_npc_response(npc_id, player_id, "", npc_text_raw)
+        npc_response = process_npc_response(
+            npc_id, player_id, "", npc_text_raw, campaign_id=campaign_id
+        )
         npc_text = npc_response["spoken_text"]
 
         if not npc_text:
             npc_text = "Very well."
 
-        save_turn(npc_id, player_id, "assistant", npc_text)
+        save_turn(npc_id, player_id, "assistant", npc_text, campaign_id=campaign_id)
 
         tts_segments = split_narration_and_dialogue(npc_text)
         tts_text = " ".join(segment["text"] for segment in tts_segments).strip()
@@ -1604,8 +1644,10 @@ def save_extracted_memories(
     npc_id: str,
     player_id: str,
     player_text: str,
-    npc_text: str
+    npc_text: str,
+    campaign_id: str = "",
 ) -> list[str]:
+    campaign_id = normalize_campaign_id(campaign_id)
     memories = extract_memories_from_exchange(
         npc=npc,
         npc_id=npc_id,
@@ -1617,8 +1659,8 @@ def save_extracted_memories(
     saved = []
 
     for memory in memories:
-        if not memory_exists(npc_id, player_id, memory):
-            save_memory(npc_id, player_id, memory)
+        if not memory_exists(npc_id, player_id, memory, campaign_id=campaign_id):
+            save_memory(npc_id, player_id, memory, campaign_id=campaign_id)
             saved.append(memory)
 
     return saved
@@ -1634,6 +1676,7 @@ def npc_turn():
     history = body.get("history", [])
     session = resolve_request_session(body=body)
     player_id = session["player_id"]
+    campaign_id = session["campaign_id"]
     party_context = session["party_context"]
 
     request_id = new_request_id(body.get("request_id"))
@@ -1660,7 +1703,7 @@ def npc_turn():
         )
 
         set_turn_progress(request_id, "loading_context")
-        context = get_npc_context(npc_id, player_id, party_context=party_context)
+        context = get_npc_context(npc_id, player_id, party_context=party_context, campaign_id=campaign_id)
         npc = context["npc"]
         memories = context["memories"]
         location = context["location"]
@@ -1668,8 +1711,8 @@ def npc_turn():
         scene_context = context["scene_context"]
         step_start = log_timing(request_id, "load npc context", step_start)
 
-        player_claim = process_player_message(npc_id, player_id, player_text)
-        dm_context = get_dm_context(npc_id, player_id)
+        player_claim = process_player_message(npc_id, player_id, player_text, campaign_id=campaign_id)
+        dm_context = get_dm_context(npc_id, player_id, campaign_id=campaign_id)
 
         set_turn_progress(request_id, "preparing_prompt")
         messages = build_npc_llm_messages(
@@ -1702,11 +1745,12 @@ def npc_turn():
             player_text,
             npc_text_raw,
             player_pending_id=player_claim.get("pending_check_id") if player_claim else None,
-        )
+                campaign_id=campaign_id,
+            )
         npc_text = npc_response["spoken_text"]
 
-        save_turn(npc_id, player_id, "user", player_text)
-        save_turn(npc_id, player_id, "assistant", npc_text)
+        save_turn(npc_id, player_id, "user", player_text, campaign_id=campaign_id)
+        save_turn(npc_id, player_id, "assistant", npc_text, campaign_id=campaign_id)
         step_start = log_timing(request_id, "save text conversation turns", step_start)
 
         saved_memories = []
@@ -1719,7 +1763,8 @@ def npc_turn():
                 npc_id=npc_id,
                 player_id=player_id,
                 player_text=player_text,
-                npc_text=npc_text
+                npc_text=npc_text,
+                campaign_id=campaign_id,
             )
         elif AUTO_MEMORY_EXTRACTION_ENABLED:
             memory_extraction_mode = "sync"
@@ -1728,7 +1773,8 @@ def npc_turn():
                 npc_id=npc_id,
                 player_id=player_id,
                 player_text=player_text,
-                npc_text=npc_text
+                npc_text=npc_text,
+                campaign_id=campaign_id,
             )
             step_start = log_timing(request_id, "sync text memory extraction/save", step_start)
 
@@ -1764,7 +1810,7 @@ def npc_turn():
             "dm_check_claim": npc_response.get("dm_check_claim"),
             "dm_pending_check_id": npc_response.get("pending_check_id"),
             "detected_player_claim": player_claim,
-            "dm_pending": load_pending_checks(npc_id, player_id, status="pending", limit=5),
+            "dm_pending": load_pending_checks(npc_id, player_id, status="pending", limit=5, campaign_id=campaign_id),
         })
 
     except Exception as ex:
@@ -1789,6 +1835,7 @@ def npc_voice_turn():
     scene_description = request.form.get("scene", "")
     session = resolve_request_session(form=request.form)
     player_id = session["player_id"]
+    campaign_id = session["campaign_id"]
     party_context = session["party_context"]
 
     if "audio" not in request.files:
@@ -1840,7 +1887,7 @@ def npc_voice_turn():
         )
 
         set_turn_progress(request_id, "loading_context")
-        context = get_npc_context(npc_id, player_id, party_context=party_context)
+        context = get_npc_context(npc_id, player_id, party_context=party_context, campaign_id=campaign_id)
         npc = context["npc"]
         memories = context["memories"]
         recent_turns = context["recent_turns"]
@@ -1849,8 +1896,8 @@ def npc_voice_turn():
         scene_context = context["scene_context"]
         step_start = log_timing(request_id, "load npc/location/memory/recent turns", step_start)
 
-        player_claim = process_player_message(npc_id, player_id, player_text)
-        dm_context = get_dm_context(npc_id, player_id)
+        player_claim = process_player_message(npc_id, player_id, player_text, campaign_id=campaign_id)
+        dm_context = get_dm_context(npc_id, player_id, campaign_id=campaign_id)
 
         set_turn_progress(request_id, "preparing_prompt")
         messages = build_npc_llm_messages(
@@ -1883,7 +1930,8 @@ def npc_voice_turn():
             player_text,
             npc_text_raw,
             player_pending_id=player_claim.get("pending_check_id") if player_claim else None,
-        )
+                campaign_id=campaign_id,
+            )
         npc_text = npc_response["spoken_text"]
 
         tts_segments = split_narration_and_dialogue(npc_text)
@@ -1901,8 +1949,8 @@ def npc_voice_turn():
             tts_text = npc_text
             tts_segments = [{"type": "npc", "text": tts_text}]
 
-        save_turn(npc_id, player_id, "user", player_text)
-        save_turn(npc_id, player_id, "assistant", npc_text)
+        save_turn(npc_id, player_id, "user", player_text, campaign_id=campaign_id)
+        save_turn(npc_id, player_id, "assistant", npc_text, campaign_id=campaign_id)
         step_start = log_timing(request_id, "save conversation turns", step_start)
 
         memory_extraction_mode = "disabled"
@@ -1913,7 +1961,8 @@ def npc_voice_turn():
                 npc_id=npc_id,
                 player_id=player_id,
                 player_text=player_text,
-                npc_text=npc_text
+                npc_text=npc_text,
+                campaign_id=campaign_id,
             )
             step_start = log_timing(request_id, "schedule async memory extraction", step_start)
         elif AUTO_MEMORY_EXTRACTION_ENABLED:
@@ -1923,7 +1972,8 @@ def npc_voice_turn():
                 npc_id=npc_id,
                 player_id=player_id,
                 player_text=player_text,
-                npc_text=npc_text
+                npc_text=npc_text,
+                campaign_id=campaign_id,
             )
             step_start = log_timing(request_id, "sync memory extraction/save", step_start)
 
@@ -1949,7 +1999,7 @@ def npc_voice_turn():
             flush=True
         )
 
-        pending_items = load_pending_checks(npc_id, player_id, status="pending", limit=10)
+        pending_items = load_pending_checks(npc_id, player_id, status="pending", limit=10, campaign_id=campaign_id)
         log_dm_turn(
             request_id=request_id,
             route="/npc-voice-turn",
@@ -2008,6 +2058,7 @@ def npc_voice_turn_debug():
     scene_description = request.form.get("scene", "")
     session = resolve_request_session(form=request.form)
     player_id = session["player_id"]
+    campaign_id = session["campaign_id"]
     party_context = session["party_context"]
 
     if "audio" not in request.files:
@@ -2047,7 +2098,7 @@ def npc_voice_turn_debug():
             player_text=player_text,
         )
 
-        context = get_npc_context(npc_id, player_id, party_context=party_context)
+        context = get_npc_context(npc_id, player_id, party_context=party_context, campaign_id=campaign_id)
         npc = context["npc"]
         memories = context["memories"]
         recent_turns = context["recent_turns"]
@@ -2056,8 +2107,8 @@ def npc_voice_turn_debug():
         scene_context = context["scene_context"]
         step_start = log_timing(request_id, "debug load npc/location/memory/recent turns", step_start)
 
-        player_claim = process_player_message(npc_id, player_id, player_text)
-        dm_context = get_dm_context(npc_id, player_id)
+        player_claim = process_player_message(npc_id, player_id, player_text, campaign_id=campaign_id)
+        dm_context = get_dm_context(npc_id, player_id, campaign_id=campaign_id)
 
         messages = build_npc_llm_messages(
             npc,
@@ -2087,7 +2138,8 @@ def npc_voice_turn_debug():
             player_text,
             npc_text_raw,
             player_pending_id=player_claim.get("pending_check_id") if player_claim else None,
-        )
+                campaign_id=campaign_id,
+            )
         npc_text = npc_response["spoken_text"]
 
         tts_segments = split_narration_and_dialogue(npc_text)
@@ -2105,8 +2157,8 @@ def npc_voice_turn_debug():
         )
         step_start = log_timing(request_id, "debug split tts segments", step_start)
 
-        save_turn(npc_id, player_id, "user", player_text)
-        save_turn(npc_id, player_id, "assistant", npc_text)
+        save_turn(npc_id, player_id, "user", player_text, campaign_id=campaign_id)
+        save_turn(npc_id, player_id, "assistant", npc_text, campaign_id=campaign_id)
         step_start = log_timing(request_id, "debug save conversation turns", step_start)
 
         saved_memories = []
@@ -2118,7 +2170,8 @@ def npc_voice_turn_debug():
                 npc_id=npc_id,
                 player_id=player_id,
                 player_text=player_text,
-                npc_text=npc_text
+                npc_text=npc_text,
+                campaign_id=campaign_id,
             )
             step_start = log_timing(request_id, "debug schedule async memory extraction", step_start)
         elif AUTO_MEMORY_EXTRACTION_ENABLED:
@@ -2128,7 +2181,8 @@ def npc_voice_turn_debug():
                 npc_id=npc_id,
                 player_id=player_id,
                 player_text=player_text,
-                npc_text=npc_text
+                npc_text=npc_text,
+                campaign_id=campaign_id,
             )
             step_start = log_timing(request_id, "debug sync memory extraction/save", step_start)
 
@@ -2187,7 +2241,7 @@ def npc_voice_turn_debug():
             "dm_check_claim": npc_response.get("dm_check_claim"),
             "dm_pending_check_id": npc_response.get("pending_check_id"),
             "detected_player_claim": player_claim,
-            "dm_pending": load_pending_checks(npc_id, player_id, status="pending", limit=5),
+            "dm_pending": load_pending_checks(npc_id, player_id, status="pending", limit=5, campaign_id=campaign_id),
         })
 
     except Exception as ex:
@@ -2236,10 +2290,11 @@ def npc_preload():
     npc_id = body.get("npc_id") or request.args.get("npc_id") or "captain_varra"
     session = resolve_request_session(body=body, args=request.args)
     player_id = session["player_id"]
+    campaign_id = session["campaign_id"]
     party_context = session["party_context"]
 
     try:
-        context = get_npc_context(npc_id, player_id, party_context=party_context)
+        context = get_npc_context(npc_id, player_id, party_context=party_context, campaign_id=campaign_id)
         npc = context["npc"]
         location = context["location"]
 
@@ -2532,6 +2587,7 @@ def dm_status():
     npc_id = request.args.get("npc_id", "captain_varra")
     session = resolve_request_session(args=request.args)
     player_id = session["player_id"]
+    campaign_id = session["campaign_id"]
 
     return jsonify({
         "npc_id": npc_id,
@@ -2539,7 +2595,7 @@ def dm_status():
         "party_id": session["party_id"],
         "campaign_id": session["campaign_id"],
         "speaking_member": session["party_context"].get("speaking_member"),
-        **get_dm_context(npc_id, player_id),
+        **get_dm_context(npc_id, player_id, campaign_id=campaign_id),
     })
 
 
@@ -2548,6 +2604,7 @@ def dm_messages():
     npc_id = request.args.get("npc_id", "captain_varra")
     session = resolve_request_session(args=request.args)
     player_id = session["player_id"]
+    campaign_id = session["campaign_id"]
     limit = int(request.args.get("limit", 50))
 
     return jsonify({
@@ -2555,7 +2612,7 @@ def dm_messages():
         "player_id": player_id,
         "party_id": session["party_id"],
         "campaign_id": session["campaign_id"],
-        "messages": load_dm_messages(npc_id, player_id, limit=limit),
+        "messages": load_dm_messages(npc_id, player_id, limit=limit, campaign_id=campaign_id),
     })
 
 
@@ -2566,6 +2623,7 @@ def dm_message_post():
     npc_id = body.get("npc_id", "captain_varra")
     session = resolve_request_session(body=body)
     player_id = session["player_id"]
+    campaign_id = session["campaign_id"]
     text = (body.get("text") or body.get("content") or "").strip()
     verdict_override = body.get("verdict")
 
@@ -2578,7 +2636,8 @@ def dm_message_post():
             player_id=player_id,
             content=text,
             verdict_override=verdict_override,
-        )
+                campaign_id=campaign_id,
+            )
 
         auto_response = None
         verdict = (saved.get("detected_verdict") or "").lower()
@@ -2594,7 +2653,8 @@ def dm_message_post():
                     party_context=session["party_context"],
                     voice_model=(body.get("voice_model") or "").strip() or None,
                     tts_length_scale=body.get("tts_length_scale"),
-                )
+                campaign_id=campaign_id,
+            )
 
         return jsonify({
             "status": "saved",
@@ -2605,8 +2665,8 @@ def dm_message_post():
             "speaking_member": session["party_context"].get("speaking_member"),
             "message": saved,
             "auto_response": auto_response,
-            "pending": load_pending_checks(npc_id, player_id, status="pending", limit=10),
-            "rulings": load_rulings(npc_id, player_id, limit=10),
+            "pending": load_pending_checks(npc_id, player_id, status="pending", limit=10, campaign_id=campaign_id),
+            "rulings": load_rulings(npc_id, player_id, limit=10, campaign_id=campaign_id),
         })
     except ValueError as ex:
         return jsonify({"error": str(ex)}), 400
@@ -2620,6 +2680,7 @@ def dm_pending():
     npc_id = request.args.get("npc_id", "captain_varra")
     session = resolve_request_session(args=request.args)
     player_id = session["player_id"]
+    campaign_id = session["campaign_id"]
     status = request.args.get("status", "pending")
 
     return jsonify({
@@ -2627,7 +2688,7 @@ def dm_pending():
         "player_id": player_id,
         "party_id": session["party_id"],
         "campaign_id": session["campaign_id"],
-        "pending_checks": load_pending_checks(npc_id, player_id, status=status or None, limit=50),
+        "pending_checks": load_pending_checks(npc_id, player_id, status=status or None, limit=50, campaign_id=campaign_id),
     })
 
 
@@ -2636,6 +2697,7 @@ def dm_rulings():
     npc_id = request.args.get("npc_id", "captain_varra")
     session = resolve_request_session(args=request.args)
     player_id = session["player_id"]
+    campaign_id = session["campaign_id"]
     limit = int(request.args.get("limit", 20))
 
     return jsonify({
@@ -2643,7 +2705,7 @@ def dm_rulings():
         "player_id": player_id,
         "party_id": session["party_id"],
         "campaign_id": session["campaign_id"],
-        "rulings": load_rulings(npc_id, player_id, limit=limit),
+        "rulings": load_rulings(npc_id, player_id, limit=limit, campaign_id=campaign_id),
     })
 
 
@@ -2654,6 +2716,7 @@ def dm_ruling_post():
     npc_id = body.get("npc_id", "captain_varra")
     session = resolve_request_session(body=body)
     player_id = session["player_id"]
+    campaign_id = session["campaign_id"]
     claim_summary = (body.get("claim_summary") or body.get("claim") or "").strip()
     verdict = (body.get("verdict") or "").strip().lower()
     notes = (body.get("notes") or body.get("text") or "").strip()
@@ -2672,7 +2735,8 @@ def dm_ruling_post():
             verdict=verdict,
             notes=notes,
             pending_check_id=pending_check_id,
-        )
+                campaign_id=campaign_id,
+            )
 
         auto_response = None
         if _json_body_flag(body.get("auto_respond"), True) and result.get("ruling_id"):
@@ -2687,7 +2751,8 @@ def dm_ruling_post():
                     party_context=session["party_context"],
                     voice_model=(body.get("voice_model") or "").strip() or None,
                     tts_length_scale=body.get("tts_length_scale"),
-                )
+                campaign_id=campaign_id,
+            )
 
         return jsonify({
             "status": "saved",
@@ -2698,8 +2763,8 @@ def dm_ruling_post():
             "speaking_member": session["party_context"].get("speaking_member"),
             **result,
             "auto_response": auto_response,
-            "pending": load_pending_checks(npc_id, player_id, status="pending", limit=10),
-            "rulings": load_rulings(npc_id, player_id, limit=10),
+            "pending": load_pending_checks(npc_id, player_id, status="pending", limit=10, campaign_id=campaign_id),
+            "rulings": load_rulings(npc_id, player_id, limit=10, campaign_id=campaign_id),
         })
     except ValueError as ex:
         return jsonify({"error": str(ex)}), 400
@@ -2845,9 +2910,10 @@ def get_npc_memory():
     npc_id = request.args.get("npc_id", "captain_varra")
     session = resolve_request_session(args=request.args)
     player_id = session["player_id"]
+    campaign_id = session["campaign_id"]
 
-    memories = load_memories(npc_id, player_id, limit=100)
-    recent_turns = load_recent_turns(npc_id, player_id, limit=20)
+    memories = load_memories(npc_id, player_id, limit=100, campaign_id=campaign_id)
+    recent_turns = load_recent_turns(npc_id, player_id, limit=20, campaign_id=campaign_id)
 
     return jsonify({
         "npc_id": npc_id,
@@ -2872,12 +2938,13 @@ def post_npc_memory():
     npc_id = body.get("npc_id", "captain_varra")
     session = resolve_request_session(body=body)
     player_id = session["player_id"]
+    campaign_id = session["campaign_id"]
     memory = body.get("memory", "").strip()
 
     if not memory:
         return jsonify({"error": "Missing memory"}), 400
 
-    save_memory_if_new(npc_id, player_id, memory)
+    save_memory_if_new(npc_id, player_id, memory, campaign_id=campaign_id)
 
     return jsonify({
         "status": "saved",
@@ -2896,6 +2963,7 @@ def clear_npc_memory():
     npc_id = body.get("npc_id", "captain_varra")
     session = resolve_request_session(body=body)
     player_id = session["player_id"]
+    campaign_id = session["campaign_id"]
     clear_type = body.get("clear_type", "memories").strip().lower()
 
     valid_clear_types = ("memories", "turns", "history", "conversation", "dm", "all")
@@ -2910,13 +2978,13 @@ def clear_npc_memory():
     deleted_dm = {}
 
     if clear_type in ("memories", "all"):
-        deleted_memories = clear_memories(npc_id, player_id)
+        deleted_memories = clear_memories(npc_id, player_id, campaign_id=campaign_id)
 
     if clear_type in ("turns", "history", "conversation", "all"):
-        deleted_turns = clear_recent_turns(npc_id, player_id)
+        deleted_turns = clear_recent_turns(npc_id, player_id, campaign_id=campaign_id)
 
     if clear_type in ("dm", "all"):
-        deleted_dm = clear_dm_data(npc_id, player_id)
+        deleted_dm = clear_dm_data(npc_id, player_id, campaign_id=campaign_id)
 
     return jsonify({
         "status": "cleared",
