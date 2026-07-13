@@ -1155,11 +1155,36 @@ def save_uploaded_audio(file_storage, request_id: str) -> Path:
     raw_path = UPLOAD_DIR / f"{request_id}{suffix}"
     wav_path = UPLOAD_DIR / f"{request_id}.wav"
     file_storage.save(raw_path)
+    raw_bytes = raw_path.stat().st_size if raw_path.exists() else 0
+    print(
+        f"[PLAYER-AUDIO] request_id={request_id} saved name={original_name!r} "
+        f"content_type={content_type!r} suffix={suffix} bytes={raw_bytes} path={raw_path}",
+        flush=True,
+    )
+
+    if raw_bytes < 1000:
+        print(
+            f"[PLAYER-AUDIO] request_id={request_id} ERROR empty_or_short_upload bytes={raw_bytes}",
+            flush=True,
+        )
 
     if suffix == ".wav":
         return raw_path
 
-    convert_wav_to_standard_format(raw_path, wav_path)
+    try:
+        convert_wav_to_standard_format(raw_path, wav_path)
+        wav_bytes = wav_path.stat().st_size if wav_path.exists() else 0
+        print(
+            f"[PLAYER-AUDIO] request_id={request_id} convert_ok out_bytes={wav_bytes} path={wav_path}",
+            flush=True,
+        )
+    except Exception as ex:
+        print(
+            f"[PLAYER-AUDIO] request_id={request_id} ERROR convert_failed "
+            f"suffix={suffix} in_bytes={raw_bytes} error={ex!r}",
+            flush=True,
+        )
+        raise
     return wav_path
 
 
@@ -1913,6 +1938,11 @@ def npc_voice_turn():
         step_start = log_timing(request_id, "speech-to-text", step_start)
 
         if not player_text:
+            print(
+                f"[PLAYER-AUDIO] request_id={request_id} ERROR no_speech_detected "
+                f"path={input_path} bytes={input_path.stat().st_size if input_path.exists() else 0}",
+                flush=True,
+            )
             fail_turn_progress(request_id, "No speech detected")
             return jsonify({"error": "No speech detected", "request_id": request_id}), 400
 
