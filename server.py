@@ -12,6 +12,7 @@ from typing import Any
 import uuid
 import subprocess
 import wave
+import array
 import threading
 import time
 import shutil
@@ -1188,21 +1189,64 @@ def save_uploaded_audio(file_storage, request_id: str) -> Path:
     return wav_path
 
 
+def _wav_peak_stats(audio_path: Path) -> str:
+    """Return a short duration/amplitude summary for STT diagnostics."""
+    try:
+        with wave.open(str(audio_path), "rb") as wav_file:
+            frames = wav_file.getnframes()
+            rate = wav_file.getframerate() or 1
+            channels = wav_file.getnchannels() or 1
+            sample_width = wav_file.getsampwidth()
+            duration = frames / float(rate)
+            raw = wav_file.readframes(frames)
+        if sample_width != 2 or not raw:
+            return f"duration={duration:.2f}s frames={frames} width={sample_width}"
+        samples = array.array("h")
+        samples.frombytes(raw)
+        if channels > 1:
+            samples = samples[::channels]
+        if not samples:
+            return f"duration={duration:.2f}s empty"
+        peak = max(abs(s) for s in samples)
+        # Sparse RMS over up to 20k samples for speed.
+        step = max(1, len(samples) // 20000)
+        subset = samples[::step]
+        rms = (sum(s * s for s in subset) / max(1, len(subset))) ** 0.5
+        return f"duration={duration:.2f}s peak={peak} rms={rms:.1f} rate={rate}"
+    except Exception as ex:
+        return f"stats_unavailable error={ex!r}"
+
+
 def transcribe_audio(audio_path: Path) -> str:
-    segments, info = STT_MODEL.transcribe(
-        str(audio_path),
-        language="en",
-        beam_size=1,
-        vad_filter=True
-    )
+    stats = _wav_peak_stats(audio_path)
+    print(f"[PLAYER-AUDIO] stt_input path={audio_path} {stats}", flush=True)
 
-    text_parts = []
-    for segment in segments:
-        text = segment.text.strip()
-        if text:
-            text_parts.append(text)
+    def _run(*, vad_filter: bool) -> str:
+        segments, info = STT_MODEL.transcribe(
+            str(audio_path),
+            language="en",
+            beam_size=1,
+            vad_filter=vad_filter,
+        )
+        text_parts = []
+        for segment in segments:
+            text = segment.text.strip()
+            if text:
+                text_parts.append(text)
+        duration = getattr(info, "duration", None)
+        print(
+            f"[PLAYER-AUDIO] stt_pass vad={vad_filter} duration={duration} "
+            f"parts={len(text_parts)} text={(' '.join(text_parts))[:120]!r}",
+            flush=True,
+        )
+        return " ".join(text_parts).strip()
 
-    return " ".join(text_parts).strip()
+    # VAD can drop quiet laptop-mic speech; retry without it before failing the turn.
+    text = _run(vad_filter=True)
+    if not text:
+        print(f"[PLAYER-AUDIO] stt empty with VAD; retrying without VAD path={audio_path}", flush=True)
+        text = _run(vad_filter=False)
+    return text
 
 
 def clean_for_tts(text: str) -> str:
