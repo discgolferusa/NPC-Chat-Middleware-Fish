@@ -1133,6 +1133,36 @@ def ask_llm(messages):
     )
 
 
+def save_uploaded_audio(file_storage, request_id: str) -> Path:
+    """
+    Persist browser uploads with a real extension, then normalize to WAV for Whisper.
+    Phone clients usually send webm/opus (or mp4), not WAV.
+    """
+    original_name = (getattr(file_storage, "filename", None) or "").strip().lower()
+    content_type = (getattr(file_storage, "content_type", None) or "").strip().lower()
+
+    if original_name.endswith(".webm") or "webm" in content_type:
+        suffix = ".webm"
+    elif original_name.endswith(".m4a") or original_name.endswith(".mp4") or "mp4" in content_type:
+        suffix = ".m4a"
+    elif original_name.endswith(".ogg") or "ogg" in content_type:
+        suffix = ".ogg"
+    elif original_name.endswith(".wav") or "wav" in content_type:
+        suffix = ".wav"
+    else:
+        suffix = ".webm"
+
+    raw_path = UPLOAD_DIR / f"{request_id}{suffix}"
+    wav_path = UPLOAD_DIR / f"{request_id}.wav"
+    file_storage.save(raw_path)
+
+    if suffix == ".wav":
+        return raw_path
+
+    convert_wav_to_standard_format(raw_path, wav_path)
+    return wav_path
+
+
 def transcribe_audio(audio_path: Path) -> str:
     segments, info = STT_MODEL.transcribe(
         str(audio_path),
@@ -1872,10 +1902,9 @@ def npc_voice_turn():
         stage="start",
     )
 
-    input_path = UPLOAD_DIR / f"{request_id}.wav"
     output_path = OUTPUT_DIR / f"{request_id}_response.wav"
 
-    request.files["audio"].save(input_path)
+    input_path = save_uploaded_audio(request.files["audio"], request_id)
     step_start = log_timing(request_id, "save uploaded audio", step_start)
 
     try:
@@ -2092,10 +2121,9 @@ def npc_voice_turn_debug():
         stage="start",
     )
 
-    input_path = UPLOAD_DIR / f"{request_id}.wav"
     output_path = OUTPUT_DIR / f"{request_id}_response.wav"
 
-    request.files["audio"].save(input_path)
+    input_path = save_uploaded_audio(request.files["audio"], request_id)
     step_start = log_timing(request_id, "debug save uploaded audio", step_start)
 
     try:
