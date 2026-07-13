@@ -27,6 +27,7 @@ VOICE_TURN_STEPS: tuple[dict[str, Any], ...] = (
     {"key": "processing_response", "message": "Shaping the NPC's response..."},
     {"key": "text_ready", "message": "Reply text ready — preparing voices..."},
     {"key": "generating_voice", "message": "Generating the narrator and NPC voices..."},
+    {"key": "clip_ready", "message": "Playing the first response parts..."},
     {"key": "narration_ready", "message": "Narration ready — still generating speech..."},
     {"key": "speech_ready", "message": "Speech ready — finishing up..."},
     {"key": "finishing", "message": "Almost ready — finishing up..."},
