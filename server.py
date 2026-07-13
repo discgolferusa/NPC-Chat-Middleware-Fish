@@ -5,6 +5,7 @@ import yaml
 import re
 import json
 import sqlite3
+import base64
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -304,6 +305,15 @@ def log_timing(request_id: str, label: str, start_time: float):
     elapsed = time.perf_counter() - start_time
     print(f"[TIMING] {request_id} {label}: {elapsed:.3f}s", flush=True)
     return time.perf_counter()
+
+
+def _header_b64(value: str | None, *, max_chars: int = 6000) -> str:
+    """UTF-8 text as base64url for HTTP response headers (ASCII-safe)."""
+    text = (value or "").strip()
+    if len(text) > max_chars:
+        text = text[: max_chars - 1].rstrip() + "…"
+    raw = text.encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
 
 def get_db():
@@ -2031,6 +2041,12 @@ def npc_voice_turn():
             response.headers["X-DM-Player-Claim-Detected"] = "1"
         if npc_response.get("npc_deferral_detected"):
             response.headers["X-DM-Npc-Deferral-Detected"] = "1"
+        # Text surfaces for editor campaign-text routing (works alongside WAV voice).
+        response.headers["X-Npc-Id"] = str(npc_id or "")
+        response.headers["X-Npc-Name"] = str((npc or {}).get("name") or npc_id or "")
+        response.headers["X-Player-Id"] = str(player_id or "")
+        response.headers["X-Npc-Text"] = _header_b64(npc_text)
+        response.headers["X-Player-Transcript"] = _header_b64(player_text)
         return response
 
     except Exception as ex:
