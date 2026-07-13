@@ -25,7 +25,10 @@ VOICE_TURN_STEPS: tuple[dict[str, Any], ...] = (
     {"key": "preparing_prompt", "message": "Building the NPC's view of the conversation..."},
     {"key": "waiting_llm", "message": "Waiting for the NPC to think of a reply..."},
     {"key": "processing_response", "message": "Shaping the NPC's response..."},
-    {"key": "generating_voice", "message": "Generating the NPC's voice response..."},
+    {"key": "text_ready", "message": "Reply text ready — preparing voices..."},
+    {"key": "generating_voice", "message": "Generating the narrator and NPC voices..."},
+    {"key": "narration_ready", "message": "Narration ready — still generating speech..."},
+    {"key": "speech_ready", "message": "Speech ready — finishing up..."},
     {"key": "finishing", "message": "Almost ready — finishing up..."},
     {"key": "complete", "message": "Response ready."},
 )
@@ -37,6 +40,7 @@ TEXT_TURN_STEPS: tuple[dict[str, Any], ...] = (
     {"key": "preparing_prompt", "message": "Building the NPC's view of the conversation..."},
     {"key": "waiting_llm", "message": "Waiting for the NPC to think of a reply..."},
     {"key": "processing_response", "message": "Shaping the NPC's response..."},
+    {"key": "text_ready", "message": "Reply text ready..."},
     {"key": "finishing", "message": "Almost ready — finishing up..."},
     {"key": "complete", "message": "Response ready."},
 )
@@ -122,6 +126,10 @@ def register_turn_progress(
         "step_count": _step_count(mode),
         "detail": "",
         "error": "",
+        "player_text": "",
+        "narration_text": "",
+        "dialogue_text": "",
+        "clips": [],
         "created_at": _utc_now_iso(),
         "updated_at": _utc_now_iso(),
         "expires_at": now + PROGRESS_TTL_SECONDS,
@@ -140,6 +148,10 @@ def set_turn_progress(
     *,
     detail: str = "",
     message: str | None = None,
+    player_text: str | None = None,
+    narration_text: str | None = None,
+    dialogue_text: str | None = None,
+    clips: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     request_id = normalize_client_request_id(request_id)
     if not request_id:
@@ -158,6 +170,14 @@ def set_turn_progress(
         entry["step_index"] = _step_index(mode, step_key)
         entry["step_count"] = _step_count(mode)
         entry["status"] = "in_progress"
+        if player_text is not None:
+            entry["player_text"] = player_text
+        if narration_text is not None:
+            entry["narration_text"] = narration_text
+        if dialogue_text is not None:
+            entry["dialogue_text"] = dialogue_text
+        if clips is not None:
+            entry["clips"] = list(clips)
         entry["updated_at"] = _utc_now_iso()
         entry["expires_at"] = time.time() + PROGRESS_TTL_SECONDS
         return public_progress(entry)
@@ -237,6 +257,10 @@ def public_progress(entry: dict[str, Any]) -> dict[str, Any]:
         "step_index": entry.get("step_index"),
         "step_count": entry.get("step_count"),
         "error": entry.get("error") or "",
+        "player_text": entry.get("player_text") or "",
+        "narration_text": entry.get("narration_text") or "",
+        "dialogue_text": entry.get("dialogue_text") or "",
+        "clips": list(entry.get("clips") or []),
         "created_at": entry.get("created_at"),
         "updated_at": entry.get("updated_at"),
     }
@@ -250,10 +274,13 @@ def get_turn_progress_catalog() -> dict[str, Any]:
             "register": "/turn/progress/register",
             "status": "/turn/progress/<request_id>",
             "catalog": "/turn/progress/steps",
+            "turn_audio": "/turn-audio/<request_id>/<clip>",
         },
         "usage": (
             "Generate a 32-character hex request_id on the Pi, optionally POST "
             "/turn/progress/register before upload, include request_id in the turn "
-            "request, and poll GET /turn/progress/<request_id> while waiting."
+            "request, and poll GET /turn/progress/<request_id> while waiting. "
+            "Narration/speech WAVs are served from /turn-audio/<request_id>/<clip> "
+            "once progress reports narration_ready / speech_ready."
         ),
     }

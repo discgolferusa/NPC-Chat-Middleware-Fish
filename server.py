@@ -79,6 +79,7 @@ from turn_progress import (
     get_turn_progress,
     get_turn_progress_catalog,
     new_request_id,
+    normalize_client_request_id,
     register_turn_progress,
     set_turn_progress,
 )
@@ -1078,21 +1079,31 @@ def run_dm_ruling_auto_response(
 
         audio_url = None
         audio_filename = None
+        audio_clips: list[dict[str, str]] = []
+        narration_text = ""
+        dialogue_text = ""
 
         if include_audio:
-            audio_filename = f"{request_id}_dm_followup.wav"
-            output_path = OUTPUT_DIR / audio_filename
-            synthesize_segmented_speech(
+            clip_result = synthesize_segmented_speech_clips(
                 npc_text=npc_text,
                 npc_voice_model=pick_npc_voice_model(npc, voice_model),
-                output_path=output_path,
+                request_id=request_id,
                 npc_length_scale=pick_npc_length_scale(npc, tts_length_scale),
             )
-            audio_url = f"/dm/followup-audio/{audio_filename}"
+            audio_clips = clip_result["clips"]
+            narration_text = clip_result["narration_text"]
+            dialogue_text = clip_result["dialogue_text"]
+            # Legacy single URL points at speech when present, else narration.
+            if clip_result.get("speech_path"):
+                audio_url = turn_audio_url(request_id, "speech")
+                audio_filename = turn_audio_path(request_id, "speech").name
+            elif clip_result.get("narration_path"):
+                audio_url = turn_audio_url(request_id, "narration")
+                audio_filename = turn_audio_path(request_id, "narration").name
 
         print(
             f"[DM] auto-response request_id={request_id} npc={npc_id} player={player_id} "
-            f"verdict={verdict} chars={len(npc_text)} audio={bool(audio_url)}",
+            f"verdict={verdict} chars={len(npc_text)} audio={bool(audio_url)} clips={len(audio_clips)}",
             flush=True,
         )
 
@@ -1105,10 +1116,13 @@ def run_dm_ruling_auto_response(
             "ruling_id": ruling.get("id"),
             "verdict": verdict,
             "npc_text": npc_text,
+            "narration_text": narration_text,
+            "dialogue_text": dialogue_text,
             "tts_text": tts_text,
             "tts_segments": tts_segments,
             "audio_url": audio_url,
             "audio_filename": audio_filename,
+            "audio_clips": audio_clips,
         }
 
     except Exception as ex:
@@ -1582,6 +1596,91 @@ def concatenate_wav_files(input_paths: list[Path], output_path: Path, pause_seco
             pass
 
 
+def turn_audio_path(request_id: str, clip: str) -> Path:
+    """Stable on-disk path for a per-turn narration/speech WAV."""
+    safe_id = normalize_client_request_id(request_id) or re.sub(r"[^a-f0-9]", "", str(request_id).lower())
+    safe_clip = "narration" if clip == "narration" else "speech"
+    return OUTPUT_DIR / f"{safe_id}_{safe_clip}.wav"
+
+
+def turn_audio_url(request_id: str, clip: str) -> str:
+    safe_id = normalize_client_request_id(request_id) or str(request_id)
+    safe_clip = "narration" if clip == "narration" else "speech"
+    return f"/turn-audio/{safe_id}/{safe_clip}"
+
+
+def synthesize_segmented_speech_clips(
+    npc_text: str,
+    npc_voice_model: str | None,
+    request_id: str,
+    npc_length_scale: float = 1.15,
+    on_narration_ready: Any = None,
+) -> dict[str, Any]:
+    """
+    Synthesize narrator and NPC dialogue as separate WAV files (no concatenation).
+
+    Narration is written first and on_narration_ready(path, text, clips) is invoked
+    so callers can publish early playback before NPC speech TTS finishes.
+    """
+    segments = split_narration_and_dialogue(npc_text)
+    if not segments:
+        segments = [{"type": "npc", "text": "I have nothing more to say."}]
+
+    narration_text = next((s["text"] for s in segments if s["type"] == "narrator"), "")
+    dialogue_text = next((s["text"] for s in segments if s["type"] == "npc"), "")
+
+    narrator_tts = get_narrator_tts_settings()
+    narration_path: Path | None = None
+    speech_path: Path | None = None
+    clips: list[dict[str, str]] = []
+    temp_raw: list[Path] = []
+
+    try:
+        for segment in segments:
+            raw_path = OUTPUT_DIR / f"{request_id}_raw_{segment['type']}.wav"
+            temp_raw.append(raw_path)
+
+            if segment["type"] == "narrator":
+                out_path = turn_audio_path(request_id, "narration")
+                synthesize_speech(
+                    segment["text"],
+                    narrator_tts["resolved_voice_model"],
+                    raw_path,
+                    narrator_tts["length_scale"],
+                )
+                convert_wav_to_standard_format(raw_path, out_path)
+                narration_path = out_path
+                clips.append({"type": "narration", "url": turn_audio_url(request_id, "narration")})
+                if callable(on_narration_ready):
+                    on_narration_ready(out_path, segment["text"], list(clips))
+            else:
+                out_path = turn_audio_path(request_id, "speech")
+                synthesize_speech(
+                    segment["text"],
+                    npc_voice_model,
+                    raw_path,
+                    npc_length_scale,
+                )
+                convert_wav_to_standard_format(raw_path, out_path)
+                speech_path = out_path
+                clips.append({"type": "speech", "url": turn_audio_url(request_id, "speech")})
+
+        return {
+            "segments": segments,
+            "narration_text": narration_text,
+            "dialogue_text": dialogue_text,
+            "narration_path": narration_path,
+            "speech_path": speech_path,
+            "clips": clips,
+        }
+    finally:
+        for raw_path in temp_raw:
+            try:
+                raw_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
 def synthesize_segmented_speech(
     npc_text: str,
     npc_voice_model: str | None,
@@ -1589,66 +1688,29 @@ def synthesize_segmented_speech(
     npc_length_scale: float = 1.15
 ) -> list[dict]:
     """
-    Speak stage directions with the global narrator voice and dialogue with the NPC voice.
-
-    Each raw Piper segment is converted to the same WAV format before concatenation,
-    so different narrator/NPC voice models can be mixed safely.
+    Legacy helper: synthesize separate clips then concatenate into output_path.
+    Prefer synthesize_segmented_speech_clips for early narration playback.
     """
-    segments = split_narration_and_dialogue(npc_text)
+    request_id = output_path.stem.replace("_response", "").replace("_dm_followup", "")
+    if not normalize_client_request_id(request_id):
+        request_id = uuid.uuid4().hex
 
-    if not segments:
-        segments = [{"type": "npc", "text": "I have nothing more to say."}]
+    result = synthesize_segmented_speech_clips(
+        npc_text=npc_text,
+        npc_voice_model=npc_voice_model,
+        request_id=request_id,
+        npc_length_scale=npc_length_scale,
+    )
 
-    temp_paths = []
-    standardized_paths = []
-    narrator_tts = get_narrator_tts_settings()
+    paths = [p for p in (result.get("narration_path"), result.get("speech_path")) if p and p.exists()]
+    if not paths:
+        raise RuntimeError("No TTS segments were produced.")
+    if len(paths) == 1:
+        output_path.write_bytes(paths[0].read_bytes())
+    else:
+        concatenate_wav_files(paths, output_path)
 
-    try:
-        for index, segment in enumerate(segments):
-            raw_segment_path = output_path.with_name(
-                f"{output_path.stem}_raw_segment_{index:02d}.wav"
-            )
-            standard_segment_path = output_path.with_name(
-                f"{output_path.stem}_segment_{index:02d}.wav"
-            )
-
-            temp_paths.append(raw_segment_path)
-            temp_paths.append(standard_segment_path)
-            standardized_paths.append(standard_segment_path)
-
-            if segment["type"] == "narrator":
-                synthesize_speech(
-                    segment["text"],
-                    narrator_tts["resolved_voice_model"],
-                    raw_segment_path,
-                    narrator_tts["length_scale"],
-                )
-            else:
-                synthesize_speech(
-                    segment["text"],
-                    npc_voice_model,
-                    raw_segment_path,
-                    npc_length_scale
-                )
-
-            convert_wav_to_standard_format(
-                raw_segment_path,
-                standard_segment_path
-            )
-
-        if len(standardized_paths) == 1:
-            output_path.write_bytes(standardized_paths[0].read_bytes())
-        else:
-            concatenate_wav_files(standardized_paths, output_path)
-
-        return segments
-
-    finally:
-        for temp_path in temp_paths:
-            try:
-                temp_path.unlink(missing_ok=True)
-            except Exception:
-                pass
+    return result["segments"]
 
 
 def pick_npc_voice_model(npc: dict, override: str | None = None) -> str | None:
@@ -2138,10 +2200,25 @@ def npc_voice_turn():
         )
         step_start = log_timing(request_id, "split tts segments", step_start)
 
+        set_turn_progress(
+            request_id,
+            "text_ready",
+            player_text=player_text,
+            narration_text=next((s["text"] for s in tts_segments if s["type"] == "narrator"), ""),
+            dialogue_text=next((s["text"] for s in tts_segments if s["type"] == "npc"), ""),
+        )
+
         if not tts_text:
             npc_text = "I have nothing more to say."
             tts_text = npc_text
             tts_segments = [{"type": "npc", "text": tts_text}]
+            set_turn_progress(
+                request_id,
+                "text_ready",
+                player_text=player_text,
+                narration_text="",
+                dialogue_text=tts_text,
+            )
 
         save_turn(npc_id, player_id, "user", player_text, campaign_id=campaign_id)
         save_turn(npc_id, player_id, "assistant", npc_text, campaign_id=campaign_id)
@@ -2172,24 +2249,52 @@ def npc_voice_turn():
             step_start = log_timing(request_id, "sync memory extraction/save", step_start)
 
         set_turn_progress(request_id, "generating_voice")
-        synthesize_segmented_speech(
+
+        def _on_narration_ready(_path, narration_body, clips_so_far):
+            set_turn_progress(
+                request_id,
+                "narration_ready",
+                player_text=player_text,
+                narration_text=narration_body,
+                dialogue_text=next((s["text"] for s in tts_segments if s["type"] == "npc"), ""),
+                clips=clips_so_far,
+            )
+
+        clip_result = synthesize_segmented_speech_clips(
             npc_text=npc_text,
             npc_voice_model=pick_npc_voice_model(
                 npc,
                 (request.form.get("voice_model") or "").strip() or None,
             ),
-            output_path=output_path,
+            request_id=request_id,
             npc_length_scale=pick_npc_length_scale(
                 npc,
                 request.form.get("tts_length_scale"),
             ),
+            on_narration_ready=_on_narration_ready,
         )
         step_start = log_timing(request_id, "piper segmented tts", step_start)
+
+        narration_text = clip_result["narration_text"]
+        dialogue_text = clip_result["dialogue_text"]
+        clips = clip_result["clips"]
+        speech_path = clip_result.get("speech_path")
+        narration_path = clip_result.get("narration_path")
+        response_path = speech_path or narration_path or output_path
+
+        set_turn_progress(
+            request_id,
+            "speech_ready" if speech_path else "narration_ready",
+            player_text=player_text,
+            narration_text=narration_text,
+            dialogue_text=dialogue_text,
+            clips=clips,
+        )
 
         total_elapsed = time.perf_counter() - total_start
         print(
             f"[TIMING] {request_id} TOTAL: {total_elapsed:.3f}s "
-            f"memory_mode={memory_extraction_mode}",
+            f"memory_mode={memory_extraction_mode} clips={len(clips)}",
             flush=True
         )
 
@@ -2205,11 +2310,11 @@ def npc_voice_turn():
             npc_response=npc_response,
         )
 
-        set_turn_progress(request_id, "finishing")
+        set_turn_progress(request_id, "finishing", clips=clips)
         complete_turn_progress(request_id)
 
         response = make_response(send_file(
-            output_path,
+            response_path,
             mimetype="audio/wav",
             as_attachment=False,
             download_name="npc_response.wav"
@@ -2225,12 +2330,18 @@ def npc_voice_turn():
             response.headers["X-DM-Player-Claim-Detected"] = "1"
         if npc_response.get("npc_deferral_detected"):
             response.headers["X-DM-Npc-Deferral-Detected"] = "1"
-        # Text surfaces for editor campaign-text routing (works alongside WAV voice).
         response.headers["X-Npc-Id"] = str(npc_id or "")
         response.headers["X-Npc-Name"] = str((npc or {}).get("name") or npc_id or "")
         response.headers["X-Player-Id"] = str(player_id or "")
         response.headers["X-Npc-Text"] = _header_b64(npc_text)
         response.headers["X-Player-Transcript"] = _header_b64(player_text)
+        response.headers["X-Narration-Text"] = _header_b64(narration_text)
+        response.headers["X-Dialogue-Text"] = _header_b64(dialogue_text)
+        response.headers["X-Audio-Clips"] = ",".join(c["type"] for c in clips)
+        if narration_path:
+            response.headers["X-Narration-Audio-Url"] = turn_audio_url(request_id, "narration")
+        if speech_path:
+            response.headers["X-Speech-Audio-Url"] = turn_audio_url(request_id, "speech")
         return response
 
     except Exception as ex:
@@ -2387,18 +2498,23 @@ def npc_voice_turn_debug():
             )
             step_start = log_timing(request_id, "debug sync memory extraction/save", step_start)
 
-        synthesize_segmented_speech(
+        clip_result = synthesize_segmented_speech_clips(
             npc_text=npc_text,
             npc_voice_model=pick_npc_voice_model(
                 npc,
                 (request.form.get("voice_model") or "").strip() or None,
             ),
-            output_path=output_path,
+            request_id=request_id,
             npc_length_scale=pick_npc_length_scale(
                 npc,
                 request.form.get("tts_length_scale"),
             ),
         )
+        paths = [p for p in (clip_result.get("narration_path"), clip_result.get("speech_path")) if p]
+        if len(paths) == 1:
+            output_path.write_bytes(paths[0].read_bytes())
+        elif paths:
+            concatenate_wav_files(paths, output_path)
         step_start = log_timing(request_id, "debug piper segmented tts", step_start)
 
         total_elapsed = time.perf_counter() - total_start
@@ -2429,8 +2545,11 @@ def npc_voice_turn_debug():
             "party_members": party_context.get("party_members"),
             "transcript": player_text,
             "npc_text": npc_text,
+            "narration_text": clip_result["narration_text"],
+            "dialogue_text": clip_result["dialogue_text"],
             "tts_text": tts_text,
             "tts_segments": tts_segments,
+            "audio_clips": clip_result["clips"],
             "location_id": npc.get("location_id", ""),
             "location_name": location.get("name", location.get("id", "")) if isinstance(location, dict) else "",
             "prompt_messages": len(messages),
@@ -2686,6 +2805,29 @@ def turn_progress_status(request_id: str):
         }), 404
 
     return jsonify(progress)
+
+
+@app.get("/turn-audio/<request_id>/<clip>")
+def turn_audio_clip(request_id: str, clip: str):
+    """Serve per-turn narration or speech WAV for early SignalR playback."""
+    normalized = normalize_client_request_id(request_id)
+    if not normalized:
+        return jsonify({"error": "Invalid request_id."}), 400
+
+    clip_key = (clip or "").strip().lower()
+    if clip_key not in ("narration", "speech"):
+        return jsonify({"error": "clip must be narration or speech."}), 400
+
+    path = turn_audio_path(normalized, clip_key)
+    if not path.exists():
+        return jsonify({"error": "Audio clip not ready.", "request_id": normalized, "clip": clip_key}), 404
+
+    return send_file(
+        path,
+        mimetype="audio/wav",
+        as_attachment=False,
+        download_name=f"{normalized}_{clip_key}.wav",
+    )
 
 
 @app.get("/campaigns")
@@ -3085,6 +3227,7 @@ def health():
             "/turn/progress/steps",
             "/turn/progress/register",
             "/turn/progress/<request_id>",
+            "/turn-audio/<request_id>/<clip>",
             "/campaigns",
             "/campaign/active",
             "/campaign/select",
