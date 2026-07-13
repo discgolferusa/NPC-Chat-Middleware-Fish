@@ -1189,6 +1189,58 @@ def save_uploaded_audio(file_storage, request_id: str) -> Path:
     return wav_path
 
 
+def _wav_duration_seconds(audio_path: Path) -> float:
+    try:
+        with wave.open(str(audio_path), "rb") as wav_file:
+            frames = wav_file.getnframes()
+            rate = wav_file.getframerate() or 1
+            return frames / float(rate)
+    except Exception:
+        return 0.0
+
+
+def _pad_wav_for_short_speech(audio_path: Path, *, pad_seconds: float = 0.5) -> Path:
+    """
+    Pad short clips with silence so Whisper is more likely to catch one-word replies.
+    Returns a new path when padding is applied; otherwise the original path.
+    """
+    duration = _wav_duration_seconds(audio_path)
+    if duration <= 0 or duration >= 2.5:
+        return audio_path
+
+    padded_path = audio_path.with_name(f"{audio_path.stem}_padded{audio_path.suffix}")
+    try:
+        ffmpeg_exe = find_ffmpeg_exe()
+        # adelay needs ms; pad both ends for short yes/no/ok utterances.
+        pad_ms = int(pad_seconds * 1000)
+        subprocess.run(
+            [
+                ffmpeg_exe,
+                "-y",
+                "-hide_banner",
+                "-loglevel", "error",
+                "-i", str(audio_path),
+                "-af", f"adelay={pad_ms}|{pad_ms},apad=pad_dur={pad_seconds}",
+                "-ac", "1",
+                "-ar", "16000",
+                "-sample_fmt", "s16",
+                "-c:a", "pcm_s16le",
+                "-f", "wav",
+                str(padded_path),
+            ],
+            check=True,
+        )
+        print(
+            f"[PLAYER-AUDIO] padded short clip duration={duration:.2f}s "
+            f"pad={pad_seconds}s path={padded_path}",
+            flush=True,
+        )
+        return padded_path
+    except Exception as ex:
+        print(f"[PLAYER-AUDIO] pad_failed path={audio_path} error={ex!r}", flush=True)
+        return audio_path
+
+
 def _wav_peak_stats(audio_path: Path) -> str:
     """Return a short duration/amplitude summary for STT diagnostics."""
     try:
@@ -1218,34 +1270,60 @@ def _wav_peak_stats(audio_path: Path) -> str:
 
 
 def transcribe_audio(audio_path: Path) -> str:
-    stats = _wav_peak_stats(audio_path)
-    print(f"[PLAYER-AUDIO] stt_input path={audio_path} {stats}", flush=True)
+    """
+    Transcribe player/DM mic audio, optimized for short replies (yes/ok/go).
+    Skips VAD on short clips, pads brief audio, and retries with looser thresholds.
+    """
+    stt_path = _pad_wav_for_short_speech(audio_path)
+    stats = _wav_peak_stats(stt_path)
+    duration = _wav_duration_seconds(stt_path)
+    print(f"[PLAYER-AUDIO] stt_input path={stt_path} {stats}", flush=True)
 
-    def _run(*, vad_filter: bool) -> str:
+    def _run(*, vad_filter: bool, beam_size: int, no_speech_threshold: float) -> str:
         segments, info = STT_MODEL.transcribe(
-            str(audio_path),
+            str(stt_path),
             language="en",
-            beam_size=1,
+            beam_size=beam_size,
+            best_of=beam_size,
             vad_filter=vad_filter,
+            condition_on_previous_text=False,
+            no_speech_threshold=no_speech_threshold,
+            compression_ratio_threshold=2.8,
+            # Light bias toward common tabletop short replies without forcing them.
+            initial_prompt="Yes. No. Okay. Sure. Hello. Ready. Go. Wait.",
         )
         text_parts = []
         for segment in segments:
             text = segment.text.strip()
             if text:
                 text_parts.append(text)
-        duration = getattr(info, "duration", None)
+        info_duration = getattr(info, "duration", None)
         print(
-            f"[PLAYER-AUDIO] stt_pass vad={vad_filter} duration={duration} "
+            f"[PLAYER-AUDIO] stt_pass vad={vad_filter} beam={beam_size} "
+            f"no_speech={no_speech_threshold} duration={info_duration} "
             f"parts={len(text_parts)} text={(' '.join(text_parts))[:120]!r}",
             flush=True,
         )
         return " ".join(text_parts).strip()
 
-    # VAD can drop quiet laptop-mic speech; retry without it before failing the turn.
-    text = _run(vad_filter=True)
-    if not text:
-        print(f"[PLAYER-AUDIO] stt empty with VAD; retrying without VAD path={audio_path}", flush=True)
-        text = _run(vad_filter=False)
+    # Short clips: skip VAD first — Silero often eats one-word replies.
+    prefer_no_vad = duration < 3.0
+    attempts = []
+    if prefer_no_vad:
+        attempts.append(dict(vad_filter=False, beam_size=5, no_speech_threshold=0.35))
+        attempts.append(dict(vad_filter=False, beam_size=5, no_speech_threshold=0.2))
+        attempts.append(dict(vad_filter=True, beam_size=5, no_speech_threshold=0.35))
+    else:
+        attempts.append(dict(vad_filter=True, beam_size=1, no_speech_threshold=0.6))
+        attempts.append(dict(vad_filter=False, beam_size=5, no_speech_threshold=0.35))
+        attempts.append(dict(vad_filter=False, beam_size=5, no_speech_threshold=0.2))
+
+    text = ""
+    for attempt in attempts:
+        text = _run(**attempt)
+        if text:
+            break
+
     return text
 
 
@@ -1987,8 +2065,11 @@ def npc_voice_turn():
                 f"path={input_path} bytes={input_path.stat().st_size if input_path.exists() else 0}",
                 flush=True,
             )
-            fail_turn_progress(request_id, "No speech detected")
-            return jsonify({"error": "No speech detected", "request_id": request_id}), 400
+            fail_turn_progress(request_id, "Couldn't catch that — try again")
+            return jsonify({
+                "error": "Couldn't catch that. Speak a bit clearer or hold a moment longer, then try again.",
+                "request_id": request_id,
+            }), 400
 
         log_dm_turn(
             request_id=request_id,
@@ -2205,7 +2286,9 @@ def npc_voice_turn_debug():
         step_start = log_timing(request_id, "debug speech-to-text", step_start)
 
         if not player_text:
-            return jsonify({"error": "No speech detected"}), 400
+            return jsonify({
+                "error": "Couldn't catch that. Speak a bit clearer or hold a moment longer, then try again.",
+            }), 400
 
         log_dm_turn(
             request_id=request_id,
