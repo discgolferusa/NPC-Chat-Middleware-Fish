@@ -1283,6 +1283,24 @@ def _wav_peak_stats(audio_path: Path) -> str:
         return f"stats_unavailable error={ex!r}"
 
 
+def _is_stt_hallucination(text: str) -> bool:
+    """
+    Detect common Whisper garbage (especially when initial_prompt or silence biases output).
+    Examples: 'No. No. No. No.' or 'Thank you. Thank you.'
+    """
+    cleaned = re.sub(r"[^\w\s]", " ", (text or "").strip(), flags=re.IGNORECASE)
+    words = [w.lower() for w in cleaned.split() if w]
+    if len(words) < 3:
+        return False
+    # Same token repeated (allowing a short filler like "no no no")
+    unique = set(words)
+    if len(unique) == 1 and len(words) >= 3:
+        return True
+    if len(words) >= 4 and len(unique) <= 2 and max(words.count(w) for w in unique) >= 3:
+        return True
+    return False
+
+
 def transcribe_audio(audio_path: Path) -> str:
     """
     Transcribe player/DM mic audio, optimized for short replies (yes/ok/go).
@@ -1298,13 +1316,11 @@ def transcribe_audio(audio_path: Path) -> str:
             str(stt_path),
             language="en",
             beam_size=beam_size,
-            best_of=beam_size,
+            best_of=max(1, beam_size),
             vad_filter=vad_filter,
             condition_on_previous_text=False,
             no_speech_threshold=no_speech_threshold,
-            compression_ratio_threshold=2.8,
-            # Light bias toward common tabletop short replies without forcing them.
-            initial_prompt="Yes. No. Okay. Sure. Hello. Ready. Go. Wait.",
+            compression_ratio_threshold=2.4,
         )
         text_parts = []
         for segment in segments:
@@ -1312,13 +1328,14 @@ def transcribe_audio(audio_path: Path) -> str:
             if text:
                 text_parts.append(text)
         info_duration = getattr(info, "duration", None)
+        joined = " ".join(text_parts).strip()
         print(
             f"[PLAYER-AUDIO] stt_pass vad={vad_filter} beam={beam_size} "
             f"no_speech={no_speech_threshold} duration={info_duration} "
-            f"parts={len(text_parts)} text={(' '.join(text_parts))[:120]!r}",
+            f"parts={len(text_parts)} text={joined[:120]!r}",
             flush=True,
         )
-        return " ".join(text_parts).strip()
+        return joined
 
     # Short clips: skip VAD first — Silero often eats one-word replies.
     prefer_no_vad = duration < 3.0
@@ -1335,8 +1352,11 @@ def transcribe_audio(audio_path: Path) -> str:
     text = ""
     for attempt in attempts:
         text = _run(**attempt)
-        if text:
+        if text and not _is_stt_hallucination(text):
             break
+        if text and _is_stt_hallucination(text):
+            print(f"[PLAYER-AUDIO] stt_hallucination rejected text={text[:120]!r}", flush=True)
+            text = ""
 
     return text
 
@@ -2381,10 +2401,10 @@ def npc_voice_turn():
         response.headers["X-Player-Transcript"] = _header_b64(player_text)
         response.headers["X-Narration-Text"] = _header_b64(narration_text)
         response.headers["X-Dialogue-Text"] = _header_b64(dialogue_text)
-        response.headers["X-Audio-Clips"] = ",".join(
+        response.headers["X-Audio-Clips"] = "|".join(
             f"{c.get('index', i)}:{c.get('type')}" for i, c in enumerate(clips)
         )
-        response.headers["X-Audio-Clip-Urls"] = ",".join(c["url"] for c in clips if c.get("url"))
+        response.headers["X-Audio-Clip-Urls"] = "|".join(c["url"] for c in clips if c.get("url"))
         if narration_path:
             response.headers["X-Narration-Audio-Url"] = turn_audio_url(request_id, "narration")
         if speech_path:
