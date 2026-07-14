@@ -2097,7 +2097,34 @@ def npc_turn():
         set_turn_progress(request_id, "finishing")
         complete_turn_progress(request_id)
 
-        return jsonify({
+        include_audio = _json_body_flag(body.get("include_audio"), False)
+        narration_text = ""
+        dialogue_text = ""
+        audio_url = None
+        audio_clips: list[dict[str, str]] = []
+
+        if include_audio:
+            set_turn_progress(request_id, "synthesizing_speech")
+            clip_result = synthesize_segmented_speech_clips(
+                npc_text=npc_text,
+                npc_voice_model=pick_npc_voice_model(npc, body.get("voice_model")),
+                request_id=request_id,
+                npc_length_scale=pick_npc_length_scale(npc, body.get("tts_length_scale")),
+            )
+            audio_clips = clip_result["clips"]
+            narration_text = clip_result["narration_text"]
+            dialogue_text = clip_result["dialogue_text"]
+            if clip_result.get("speech_path"):
+                audio_url = turn_audio_url(request_id, "speech")
+            elif clip_result.get("narration_path"):
+                audio_url = turn_audio_url(request_id, "narration")
+            step_start = log_timing(request_id, "synthesize text-turn speech clips", step_start)
+        else:
+            tts_segments = split_narration_and_dialogue(npc_text)
+            narration_text = " ".join(s["text"] for s in tts_segments if s["type"] == "narrator").strip()
+            dialogue_text = " ".join(s["text"] for s in tts_segments if s["type"] == "npc").strip()
+
+        payload = {
             "request_id": request_id,
             "npc_id": npc_id,
             "npc_name": npc["name"],
@@ -2107,13 +2134,22 @@ def npc_turn():
             "speaking_member": party_context.get("speaking_member"),
             "party_members": party_context.get("party_members"),
             "text": npc_text,
+            "npc_text": npc_text,
+            "player_text": player_text,
+            "narration_text": narration_text,
+            "dialogue_text": dialogue_text,
             "saved_memories": saved_memories,
             "memory_extraction_mode": memory_extraction_mode,
             "dm_check_claim": npc_response.get("dm_check_claim"),
             "dm_pending_check_id": npc_response.get("pending_check_id"),
             "detected_player_claim": player_claim,
             "dm_pending": load_pending_checks(npc_id, player_id, status="pending", limit=5, campaign_id=campaign_id),
-        })
+        }
+        if include_audio:
+            payload["audio_url"] = audio_url
+            payload["audio_clips"] = audio_clips
+
+        return jsonify(payload)
 
     except Exception as ex:
         fail_turn_progress(request_id, str(ex))
