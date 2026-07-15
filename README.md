@@ -155,8 +155,8 @@ X-Game-Api-Key: <GAME_API_KEY>
 
 | Route | Method | Purpose |
 |-------|--------|---------|
-| `/voices` | GET | List Piper `.onnx` models under `VOICES_DIR` (recursive scan) |
-| `/voices/preview` | POST | Synthesize sample WAV via Piper |
+| `/voices` | GET | List Piper `.onnx` models under `VOICES_DIR` (recursive scan; includes quality + speaker metadata) |
+| `/voices/preview` | POST | Synthesize sample WAV via Piper + FFmpeg clarity/FX chain |
 
 Preview request body:
 
@@ -164,11 +164,22 @@ Preview request body:
 {
   "voice_path": "C:\\AI\\Voices\\en\\en_US\\ryan\\medium\\en_US-ryan-medium.onnx",
   "length_scale": 1.15,
+  "noise_scale": 0.667,
+  "noise_w": 0.8,
+  "sentence_silence": 0.2,
+  "speaker_id": 0,
+  "pitch_semitones": 0,
+  "fx_preset": "none",
   "text": "Optional sample text"
 }
 ```
 
-Returns `audio/wav` (22050 Hz mono PCM16 after ffmpeg normalization).
+`fx_preset` values: `none`, `clarity`, `cave`, `radio`, `grit`.
+
+Returns `audio/wav` (22050 Hz mono PCM16 after ffmpeg loudness/EQ normalization).
+
+NPC YAML TTS fields: `voice_model`, `tts_length_scale`, `tts_noise_scale`, `tts_noise_w`,
+`tts_sentence_silence`, `tts_speaker_id`, `tts_pitch_semitones`, `tts_fx`, `tts_pronunciation`.
 
 Env: `VOICES_DIR` overrides the scan root for `/voices`. By default the server scans **`../Voices`** (sibling of the middleware repo folder), then falls back to the `Voices` segment in the default Ryan model path (e.g. `C:\AI\Voices`).
 
