@@ -40,3 +40,12 @@ def test_af_filter_includes_clarity_baseline():
     assert "dynaudnorm" in af
     assert "aecho" in af
     assert "asetrate" in af
+    # Mid-sentence pauses must not be treated as clip end.
+    assert "stop_periods" not in af
+    assert "areverse" in af
+
+
+def test_af_filter_trim_still_removes_edges_only():
+    af = build_af_filter(trim_silence=True)
+    assert af.count("silenceremove=") == 2
+    assert "stop_periods" not in af

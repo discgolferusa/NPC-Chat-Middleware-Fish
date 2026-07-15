@@ -358,11 +358,17 @@ def build_af_filter(
     filters: list[str] = []
 
     if trim_silence:
-        # Trim leading/trailing hush; keep a tiny pad so clips don't click.
+        # Trim only leading/trailing hush. Do NOT use stop_periods=1 — Piper's
+        # sentence_silence inserts mid-clip pauses, and stop_periods would cut
+        # every sentence after the first (e.g. nursery-rhyme preview).
         filters.append(
-            "silenceremove=start_periods=1:start_silence=0.02:start_threshold=-40dB:"
-            "detection=peak:stop_periods=1:stop_silence=0.08:stop_threshold=-40dB"
+            "silenceremove=start_periods=1:start_silence=0.05:start_threshold=-45dB"
         )
+        filters.append("areverse")
+        filters.append(
+            "silenceremove=start_periods=1:start_silence=0.05:start_threshold=-45dB"
+        )
+        filters.append("areverse")
         filters.append("apad=pad_dur=0.04")
 
     # Always-on clarity baseline (ElevenLabs-ish speaker boost / loudness feel).
