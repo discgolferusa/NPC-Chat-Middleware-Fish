@@ -259,9 +259,8 @@ def _build_voice_inventory() -> tuple[list[dict[str, Any]], dict[str, Path]]:
         name_key = path.name.lower()
         by_name.setdefault(name_key, path)
 
-    # Prefer higher-quality variants earlier in the dropdown when labels sort equal-ish.
-    quality_rank = {"high": 0, "medium": 1, "low": 2, "unknown": 3}
-    voices.sort(key=lambda item: (quality_rank.get(str(item.get("quality")), 3), str(item.get("label", "")).lower()))
+    # Alphabetical by display label (case-insensitive).
+    voices.sort(key=lambda item: str(item.get("label", "")).lower())
 
     return voices, by_name
 
