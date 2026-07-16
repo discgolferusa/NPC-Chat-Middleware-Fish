@@ -84,6 +84,19 @@ from turn_progress import (
     set_turn_progress,
 )
 from server_settings import format_llm_rules, get_narrator_tts_settings, load_global_llm_rules
+from tts_processing import (
+    DEFAULT_FX_PRESET,
+    DEFAULT_LENGTH_SCALE,
+    DEFAULT_NOISE_SCALE,
+    DEFAULT_NOISE_W,
+    DEFAULT_SENTENCE_SILENCE,
+    build_af_filter,
+    clean_for_tts,
+    curated_defaults_for_quality,
+    load_piper_model_meta,
+    options_from_request_and_npc,
+    resolve_tts_options,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -113,7 +126,7 @@ VOICE_PREVIEW_TEXT = os.environ.get(
     "And everywhere that Mary went, the lamb was sure to go.",
 )
 SEGMENT_PAUSE_SECONDS = 0.18
-PIPER_SENTENCE_SILENCE = 0.2
+PIPER_SENTENCE_SILENCE = DEFAULT_SENTENCE_SILENCE
 
 # Standard output format for mixed Piper voice segments.
 # Different Piper voices can output different WAV sample rates. Convert all
@@ -202,11 +215,11 @@ _VOICE_CACHE: dict[str, Any] = {
 _VOICE_CACHE_TTL_SECONDS = float(os.environ.get("VOICES_CACHE_TTL_SECONDS", "300"))
 
 
-def _build_voice_inventory() -> tuple[list[dict[str, str]], dict[str, Path]]:
+def _build_voice_inventory() -> tuple[list[dict[str, Any]], dict[str, Path]]:
     if not VOICES_DIR.exists():
         return [], {}
 
-    voices: list[dict[str, str]] = []
+    voices: list[dict[str, Any]] = []
     by_name: dict[str, Path] = {}
     seen: set[str] = set()
 
@@ -222,14 +235,38 @@ def _build_voice_inventory() -> tuple[list[dict[str, str]], dict[str, Path]]:
         except ValueError:
             label = path.name
 
-        voices.append({"label": label, "path": str(path)})
+        meta = load_piper_model_meta(path)
+        curated = curated_defaults_for_quality(meta["quality"])
+        quality = meta["quality"]
+        quality_note = ""
+        if quality != "unknown":
+            quality_note = f" [{quality}]"
+        if meta["num_speakers"] > 1:
+            quality_note += f" ({meta['num_speakers']} speakers)"
+
+        voices.append({
+            "label": f"{label}{quality_note}",
+            "path": str(path),
+            "quality": quality,
+            "num_speakers": meta["num_speakers"],
+            "speakers": meta["speakers"],
+            "recommended": {
+                "length_scale": curated["length_scale"],
+                "noise_scale": curated["noise_scale"],
+                "noise_w": curated["noise_w"],
+            },
+        })
         name_key = path.name.lower()
         by_name.setdefault(name_key, path)
+
+    # Prefer higher-quality variants earlier in the dropdown when labels sort equal-ish.
+    quality_rank = {"high": 0, "medium": 1, "low": 2, "unknown": 3}
+    voices.sort(key=lambda item: (quality_rank.get(str(item.get("quality")), 3), str(item.get("label", "")).lower()))
 
     return voices, by_name
 
 
-def refresh_voice_inventory(*, force: bool = False) -> list[dict[str, str]]:
+def refresh_voice_inventory(*, force: bool = False) -> list[dict[str, Any]]:
     now = time.perf_counter()
     with _VOICE_CACHE_LOCK:
         age = now - float(_VOICE_CACHE.get("built_at") or 0.0)
@@ -244,7 +281,7 @@ def refresh_voice_inventory(*, force: bool = False) -> list[dict[str, str]]:
         return list(voices)
 
 
-def list_piper_voices() -> list[dict[str, str]]:
+def list_piper_voices() -> list[dict[str, Any]]:
     return refresh_voice_inventory(force=False)
 
 
@@ -1024,6 +1061,7 @@ def run_dm_ruling_auto_response(
     party_context: dict | None = None,
     voice_model: str | None = None,
     tts_length_scale: Any = None,
+    tts_options: dict[str, Any] | None = None,
     campaign_id: str = "",
 ) -> dict:
     verdict = (ruling.get("verdict") or "").strip().lower()
@@ -1084,11 +1122,14 @@ def run_dm_ruling_auto_response(
         dialogue_text = ""
 
         if include_audio:
+            request_tts = dict(tts_options or {})
+            if tts_length_scale is not None and "tts_length_scale" not in request_tts:
+                request_tts["tts_length_scale"] = tts_length_scale
             clip_result = synthesize_segmented_speech_clips(
                 npc_text=npc_text,
                 npc_voice_model=pick_npc_voice_model(npc, voice_model),
                 request_id=request_id,
-                npc_length_scale=pick_npc_length_scale(npc, tts_length_scale),
+                npc_tts_options=pick_npc_tts_options(npc, request_tts or None),
             )
             audio_clips = clip_result["clips"]
             narration_text = clip_result["narration_text"]
@@ -1361,31 +1402,10 @@ def transcribe_audio(audio_path: Path) -> str:
     return text
 
 
-def clean_for_tts(text: str) -> str:
-    # Keep stage direction content, but remove markdown wrappers.
-    # Example: "*Varra eyes you suspiciously.*" -> "Varra eyes you suspiciously."
-    text = re.sub(r"\*([^*]{1,500})\*", r"\1", text)
-    text = re.sub(r"_([^_]{1,500})_", r"\1", text)
-
-    # Keep bracket/parenthesis content too, but remove wrappers.
-    text = re.sub(r"\[([^\]]{1,500})\]", r"\1", text)
-    text = re.sub(r"\(([^)]{1,500})\)", r"\1", text)
-
-    # Remove any leftover TTS-problem characters.
-    text = text.replace("*", "")
-    text = text.replace("_", "")
-    text = text.replace("`", "")
-    text = text.replace("~", "")
-
-    # Clean up whitespace.
-    text = re.sub(r"\s+", " ", text).strip()
-
-    return text
-
-
-
-
-def split_into_ordered_tts_segments(text: str) -> list[dict]:
+def split_into_ordered_tts_segments(
+    text: str,
+    pronunciation: dict[str, str] | None = None,
+) -> list[dict]:
     """
     Split raw model output into ordered TTS segments, preserving document order.
 
@@ -1400,7 +1420,7 @@ def split_into_ordered_tts_segments(text: str) -> list[dict]:
     last_end = 0
 
     def _append(segment_type: str, body: str) -> None:
-        cleaned = clean_for_tts(body)
+        cleaned = clean_for_tts(body, pronunciation=pronunciation)
         if cleaned:
             segments.append({"type": segment_type, "text": cleaned})
 
@@ -1420,7 +1440,7 @@ def split_into_ordered_tts_segments(text: str) -> list[dict]:
         _append("npc", after)
 
     if not segments:
-        fallback = clean_for_tts(raw_text)
+        fallback = clean_for_tts(raw_text, pronunciation=pronunciation)
         if fallback:
             segments.append({"type": "npc", "text": fallback})
 
@@ -1474,15 +1494,27 @@ def find_ffmpeg_exe() -> str:
     )
 
 
-def convert_wav_to_standard_format(input_path: Path, output_path: Path) -> None:
+def convert_wav_to_standard_format(
+    input_path: Path,
+    output_path: Path,
+    *,
+    pitch_semitones: float = 0.0,
+    fx_preset: str = DEFAULT_FX_PRESET,
+    trim_silence: bool = True,
+) -> None:
     """
-    Convert a WAV file to standard Piper-friendly PCM.
+    Convert a WAV file to standard Piper-friendly PCM with clarity post-processing.
 
-    Output is 22.05 kHz mono 16-bit PCM WAV. The Pi can still up-convert
-    the final response to 48 kHz stereo for playback. Keeping this close to
-    common Piper output avoids static caused by odd playback expectations.
+    Output is 22.05 kHz mono 16-bit PCM WAV. Applies loudness/EQ/dynamics,
+    optional pitch shift, silence trim, and character FX presets.
     """
     ffmpeg_exe = find_ffmpeg_exe()
+    af = build_af_filter(
+        pitch_semitones=pitch_semitones,
+        fx_preset=fx_preset,
+        trim_silence=trim_silence,
+        sample_rate=STANDARD_WAV_SAMPLE_RATE,
+    )
 
     subprocess.run(
         [
@@ -1492,6 +1524,7 @@ def convert_wav_to_standard_format(input_path: Path, output_path: Path) -> None:
             "-loglevel", "error",
             "-i", str(input_path),
             "-vn",
+            "-af", af,
             "-ac", str(STANDARD_WAV_CHANNELS),
             "-ar", str(STANDARD_WAV_SAMPLE_RATE),
             "-sample_fmt", STANDARD_WAV_SAMPLE_FORMAT,
@@ -1643,7 +1676,8 @@ def synthesize_segmented_speech_clips(
     npc_text: str,
     npc_voice_model: str | None,
     request_id: str,
-    npc_length_scale: float = 1.15,
+    npc_length_scale: float = DEFAULT_LENGTH_SCALE,
+    npc_tts_options: dict[str, Any] | None = None,
     on_clip_ready: Any = None,
     on_narration_ready: Any = None,
 ) -> dict[str, Any]:
@@ -1653,7 +1687,13 @@ def synthesize_segmented_speech_clips(
     Each segment is written and published via on_clip_ready as soon as Piper finishes,
     so the editor can start SignalR playback while later segments are still generating.
     """
-    segments = split_into_ordered_tts_segments(npc_text)
+    npc_opts = npc_tts_options or resolve_tts_options(
+        {},
+        length_scale=npc_length_scale,
+    )
+    pronunciation = npc_opts.get("pronunciation") if isinstance(npc_opts.get("pronunciation"), dict) else None
+
+    segments = split_into_ordered_tts_segments(npc_text, pronunciation=pronunciation)
     if not segments:
         segments = [{"type": "npc", "text": "I have nothing more to say."}]
 
@@ -1661,6 +1701,26 @@ def synthesize_segmented_speech_clips(
     dialogue_text = " ".join(s["text"] for s in segments if s["type"] == "npc").strip()
 
     narrator_tts = get_narrator_tts_settings()
+    narrator_opts = resolve_tts_options(
+        {
+            "voice_model": narrator_tts.get("resolved_voice_model"),
+            "tts_length_scale": narrator_tts.get("length_scale"),
+            "tts_noise_scale": narrator_tts.get("noise_scale"),
+            "tts_noise_w": narrator_tts.get("noise_w"),
+            "tts_sentence_silence": narrator_tts.get("sentence_silence"),
+            "tts_speaker_id": narrator_tts.get("speaker_id"),
+            "tts_pitch_semitones": narrator_tts.get("pitch_semitones"),
+            "tts_fx": narrator_tts.get("fx_preset"),
+        },
+        length_scale=narrator_tts.get("length_scale"),
+        noise_scale=narrator_tts.get("noise_scale"),
+        noise_w=narrator_tts.get("noise_w"),
+        sentence_silence=narrator_tts.get("sentence_silence"),
+        speaker_id=narrator_tts.get("speaker_id"),
+        pitch_semitones=narrator_tts.get("pitch_semitones"),
+        fx_preset=narrator_tts.get("fx_preset") or "clarity",
+    )
+
     narration_path: Path | None = None
     speech_path: Path | None = None
     clips: list[dict[str, Any]] = []
@@ -1672,23 +1732,30 @@ def synthesize_segmented_speech_clips(
             temp_raw.append(raw_path)
             out_path = turn_audio_path(request_id, index)
             clip_type = "narration" if segment["type"] == "narrator" else "speech"
+            opts = narrator_opts if segment["type"] == "narrator" else npc_opts
+            voice = (
+                narrator_tts["resolved_voice_model"]
+                if segment["type"] == "narrator"
+                else npc_voice_model
+            )
 
-            if segment["type"] == "narrator":
-                synthesize_speech(
-                    segment["text"],
-                    narrator_tts["resolved_voice_model"],
-                    raw_path,
-                    narrator_tts["length_scale"],
-                )
-            else:
-                synthesize_speech(
-                    segment["text"],
-                    npc_voice_model,
-                    raw_path,
-                    npc_length_scale,
-                )
+            synthesize_speech(
+                segment["text"],
+                voice,
+                raw_path,
+                length_scale=opts["length_scale"],
+                noise_scale=opts["noise_scale"],
+                noise_w=opts["noise_w"],
+                sentence_silence=opts["sentence_silence"],
+                speaker_id=opts.get("speaker_id"),
+            )
 
-            convert_wav_to_standard_format(raw_path, out_path)
+            convert_wav_to_standard_format(
+                raw_path,
+                out_path,
+                pitch_semitones=float(opts.get("pitch_semitones") or 0.0),
+                fx_preset=str(opts.get("fx_preset") or DEFAULT_FX_PRESET),
+            )
 
             # Keep legacy first-of-type paths for older consumers.
             if clip_type == "narration" and narration_path is None:
@@ -1738,7 +1805,8 @@ def synthesize_segmented_speech(
     npc_text: str,
     npc_voice_model: str | None,
     output_path: Path,
-    npc_length_scale: float = 1.15
+    npc_length_scale: float = DEFAULT_LENGTH_SCALE,
+    npc_tts_options: dict[str, Any] | None = None,
 ) -> list[dict]:
     """
     Legacy helper: synthesize separate clips then concatenate into output_path.
@@ -1753,6 +1821,7 @@ def synthesize_segmented_speech(
         npc_voice_model=npc_voice_model,
         request_id=request_id,
         npc_length_scale=npc_length_scale,
+        npc_tts_options=npc_tts_options,
     )
 
     paths = [p for p in (result.get("narration_path"), result.get("speech_path")) if p and p.exists()]
@@ -1779,22 +1848,53 @@ def pick_npc_voice_model(npc: dict, override: str | None = None) -> str | None:
 
 
 def pick_npc_length_scale(npc: dict, override: Any = None) -> float:
-    if override is not None and str(override).strip() != "":
-        try:
-            return float(override)
-        except (TypeError, ValueError):
-            pass
-    try:
-        return float(npc.get("tts_length_scale", 1.15))
-    except (TypeError, ValueError):
-        return 1.15
+    opts = pick_npc_tts_options(npc, {"tts_length_scale": override} if override is not None else None)
+    return float(opts["length_scale"])
+
+
+def pick_npc_tts_options(npc: dict, request_values: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Resolve full Piper + post-process options for an NPC turn."""
+    return options_from_request_and_npc(request_values, npc)
+
+
+def _tts_request_values_from_mapping(mapping: Any) -> dict[str, Any]:
+    """Pull TTS override fields from a JSON body or form-like mapping."""
+    if mapping is None:
+        return {}
+    getters = {
+        "tts_length_scale": ("tts_length_scale", "length_scale"),
+        "tts_noise_scale": ("tts_noise_scale", "noise_scale"),
+        "tts_noise_w": ("tts_noise_w", "noise_w"),
+        "tts_sentence_silence": ("tts_sentence_silence", "sentence_silence"),
+        "tts_speaker_id": ("tts_speaker_id", "speaker_id"),
+        "tts_pitch_semitones": ("tts_pitch_semitones", "pitch_semitones"),
+        "tts_fx": ("tts_fx", "fx_preset"),
+    }
+    out: dict[str, Any] = {}
+    get = mapping.get if hasattr(mapping, "get") else None
+    if get is None:
+        return out
+    for dest, keys in getters.items():
+        for key in keys:
+            value = get(key)
+            if value is not None and str(value).strip() != "":
+                out[dest] = value
+                break
+    pronunciation = get("tts_pronunciation") or get("pronunciation")
+    if pronunciation is not None:
+        out["tts_pronunciation"] = pronunciation
+    return out
 
 
 def synthesize_speech(
     text: str,
     voice_model: str | None,
     output_path: Path,
-    length_scale: float = 1.15
+    length_scale: float = DEFAULT_LENGTH_SCALE,
+    noise_scale: float = DEFAULT_NOISE_SCALE,
+    noise_w: float = DEFAULT_NOISE_W,
+    sentence_silence: float = DEFAULT_SENTENCE_SILENCE,
+    speaker_id: int | None = None,
 ) -> None:
     # Same resolution as /voices/preview so UNC/partial/editor paths work at runtime.
     model_path = resolve_voice_model_path(voice_model)
@@ -1805,18 +1905,24 @@ def synthesize_speech(
     if not model_path.exists():
         raise FileNotFoundError(f"Piper voice model not found: {model_path}")
 
+    cmd = [
+        str(PIPER_EXE),
+        "--model", str(model_path),
+        "--length_scale", str(length_scale),
+        "--noise_scale", str(noise_scale),
+        "--noise_w", str(noise_w),
+        "--sentence_silence", str(sentence_silence),
+        "--output_file", str(output_path),
+    ]
+    if speaker_id is not None:
+        cmd.extend(["--speaker", str(int(speaker_id))])
+
     subprocess.run(
-        [
-            str(PIPER_EXE),
-            "--model", str(model_path),
-            "--length_scale", str(length_scale),
-            "--sentence_silence", str(PIPER_SENTENCE_SILENCE),
-            "--output_file", str(output_path)
-        ],
+        cmd,
         input=text,
         text=True,
         encoding="utf-8",
-        check=True
+        check=True,
     )
 
 
@@ -2109,7 +2215,7 @@ def npc_turn():
                 npc_text=npc_text,
                 npc_voice_model=pick_npc_voice_model(npc, body.get("voice_model")),
                 request_id=request_id,
-                npc_length_scale=pick_npc_length_scale(npc, body.get("tts_length_scale")),
+                npc_tts_options=pick_npc_tts_options(npc, _tts_request_values_from_mapping(body)),
             )
             audio_clips = clip_result["clips"]
             narration_text = clip_result["narration_text"]
@@ -2366,9 +2472,9 @@ def npc_voice_turn():
                 (request.form.get("voice_model") or "").strip() or None,
             ),
             request_id=request_id,
-            npc_length_scale=pick_npc_length_scale(
+            npc_tts_options=pick_npc_tts_options(
                 npc,
-                request.form.get("tts_length_scale"),
+                _tts_request_values_from_mapping(request.form),
             ),
             on_clip_ready=_on_clip_ready,
         )
@@ -2608,9 +2714,9 @@ def npc_voice_turn_debug():
                 (request.form.get("voice_model") or "").strip() or None,
             ),
             request_id=request_id,
-            npc_length_scale=pick_npc_length_scale(
+            npc_tts_options=pick_npc_tts_options(
                 npc,
-                request.form.get("tts_length_scale"),
+                _tts_request_values_from_mapping(request.form),
             ),
         )
         paths = [p for p in (clip_result.get("narration_path"), clip_result.get("speech_path")) if p]
@@ -3100,8 +3206,9 @@ def dm_message_post():
                     party_context=session["party_context"],
                     voice_model=(body.get("voice_model") or "").strip() or None,
                     tts_length_scale=body.get("tts_length_scale"),
-                campaign_id=campaign_id,
-            )
+                    tts_options=_tts_request_values_from_mapping(body),
+                    campaign_id=campaign_id,
+                )
 
         return jsonify({
             "status": "saved",
@@ -3198,8 +3305,9 @@ def dm_ruling_post():
                     party_context=session["party_context"],
                     voice_model=(body.get("voice_model") or "").strip() or None,
                     tts_length_scale=body.get("tts_length_scale"),
-                campaign_id=campaign_id,
-            )
+                    tts_options=_tts_request_values_from_mapping(body),
+                    campaign_id=campaign_id,
+                )
 
         return jsonify({
             "status": "saved",
@@ -3276,17 +3384,32 @@ def preview_voice():
     if not text:
         return jsonify({"error": "Missing text"}), 400
 
-    try:
-        length_scale = float(body.get("length_scale", 1.15))
-    except (TypeError, ValueError):
-        return jsonify({"error": "Invalid length_scale"}), 400
+    opts = options_from_request_and_npc(
+        _tts_request_values_from_mapping(body),
+        {"voice_model": voice_path},
+    )
+    spoken = clean_for_tts(text, pronunciation=opts.get("pronunciation"))
 
     raw_path = OUTPUT_DIR / f"{uuid.uuid4().hex}_voice_preview_raw.wav"
     output_path = OUTPUT_DIR / f"{uuid.uuid4().hex}_voice_preview.wav"
     try:
         model_path = resolve_voice_model_path(voice_path)
-        synthesize_speech(text, str(model_path), raw_path, length_scale)
-        convert_wav_to_standard_format(raw_path, output_path)
+        synthesize_speech(
+            spoken,
+            str(model_path),
+            raw_path,
+            length_scale=opts["length_scale"],
+            noise_scale=opts["noise_scale"],
+            noise_w=opts["noise_w"],
+            sentence_silence=opts["sentence_silence"],
+            speaker_id=opts.get("speaker_id"),
+        )
+        convert_wav_to_standard_format(
+            raw_path,
+            output_path,
+            pitch_semitones=float(opts.get("pitch_semitones") or 0.0),
+            fx_preset=str(opts.get("fx_preset") or DEFAULT_FX_PRESET),
+        )
         return send_file(
             output_path,
             mimetype="audio/wav",
