@@ -3343,6 +3343,110 @@ def dm_detect():
     })
 
 
+@app.post("/dm/speak")
+def dm_speak():
+    """
+    Speak DM-authored text as the current NPC (no LLM).
+
+    Used for non-interactive dialogue such as speeches. Synthesizes TTS with the
+    NPC voice, optionally saves the line into conversation history, and returns
+    the same audio_clips shape used by DM auto-responses for SignalR fan-out.
+    """
+    body = request.get_json(force=True, silent=True) or {}
+    npc_id = (body.get("npc_id") or "captain_varra").strip() or "captain_varra"
+    text = (body.get("text") or body.get("content") or "").strip()
+    if not text:
+        return jsonify({"error": "Missing text"}), 400
+
+    session = resolve_request_session(body=body)
+    player_id = session["player_id"]
+    campaign_id = session["campaign_id"]
+    include_audio = _json_body_flag(body.get("include_audio"), True)
+    save_history = _json_body_flag(body.get("save_history"), True)
+    request_id = normalize_client_request_id(body.get("request_id")) or uuid.uuid4().hex
+
+    try:
+        context = get_npc_context(
+            npc_id,
+            player_id,
+            party_context=session.get("party_context"),
+            campaign_id=campaign_id,
+        )
+        npc = context["npc"]
+        campaign_id = context.get("campaign_id") or campaign_id
+
+        if save_history:
+            save_turn(npc_id, player_id, "assistant", text, campaign_id=campaign_id)
+
+        narration_text = ""
+        dialogue_text = ""
+        audio_url = None
+        audio_filename = None
+        audio_clips: list[dict[str, Any]] = []
+
+        if include_audio:
+            clip_result = synthesize_segmented_speech_clips(
+                npc_text=text,
+                npc_voice_model=pick_npc_voice_model(
+                    npc,
+                    (body.get("voice_model") or "").strip() or None,
+                ),
+                request_id=request_id,
+                npc_tts_options=pick_npc_tts_options(
+                    npc,
+                    _tts_request_values_from_mapping(body),
+                ),
+            )
+            audio_clips = clip_result["clips"]
+            narration_text = clip_result["narration_text"]
+            dialogue_text = clip_result["dialogue_text"]
+            if clip_result.get("speech_path"):
+                audio_url = turn_audio_url(request_id, "speech")
+                audio_filename = turn_audio_path(request_id, "speech").name
+            elif clip_result.get("narration_path"):
+                audio_url = turn_audio_url(request_id, "narration")
+                audio_filename = turn_audio_path(request_id, "narration").name
+        else:
+            segments = split_narration_and_dialogue(text)
+            narration_text = " ".join(
+                s["text"] for s in segments if s["type"] == "narrator"
+            ).strip()
+            dialogue_text = " ".join(
+                s["text"] for s in segments if s["type"] == "npc"
+            ).strip()
+
+        print(
+            f"[DM] speak request_id={request_id} npc={npc_id} player={player_id} "
+            f"chars={len(text)} audio={bool(audio_url)} clips={len(audio_clips)}",
+            flush=True,
+        )
+
+        return jsonify({
+            "status": "spoken",
+            "generated": True,
+            "request_id": request_id,
+            "npc_id": npc_id,
+            "npc_name": npc.get("name", npc_id),
+            "player_id": player_id,
+            "party_id": session.get("party_id"),
+            "campaign_id": campaign_id,
+            "npc_text": text,
+            "narration_text": narration_text,
+            "dialogue_text": dialogue_text,
+            "audio_url": audio_url,
+            "audio_filename": audio_filename,
+            "audio_clips": audio_clips,
+            "saved_history": save_history,
+        })
+    except FileNotFoundError as ex:
+        return jsonify({"error": str(ex)}), 404
+    except ValueError as ex:
+        return jsonify({"error": str(ex)}), 400
+    except Exception as ex:
+        print(f"[DM] speak failed: {ex!r}", flush=True)
+        return jsonify({"error": str(ex)}), 500
+
+
 @app.get("/dm/followup-audio/<filename>")
 def dm_followup_audio(filename: str):
     safe_name = Path(filename).name
@@ -3469,6 +3573,7 @@ def health():
             "/dm/rulings",
             "/dm/ruling",
             "/dm/detect",
+            "/dm/speak",
             "/dm/followup-audio/<filename>",
             "/voices",
             "/voices/preview",
