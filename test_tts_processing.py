@@ -1,10 +1,14 @@
 """Unit tests for Piper TTS text prep and option resolution."""
 
+import json
+
 from tts_processing import (
     build_af_filter,
     clean_for_tts,
     curated_defaults_for_quality,
+    infer_dataset_name,
     infer_quality_tier,
+    load_piper_model_meta,
     resolve_tts_options,
 )
 
@@ -25,6 +29,36 @@ def test_curated_low_quality_is_less_noisy():
 def test_infer_quality_tier():
     assert infer_quality_tier(r"C:\AI\Voices\en\en_US\ryan\low\x.onnx") == "low"
     assert infer_quality_tier(r"C:\AI\Voices\en\en_US\ryan\high\x.onnx") == "high"
+
+
+def test_infer_dataset_name_from_standard_path():
+    model = r"C:\AI\Voices\en\en_US\lessac\medium\en_US-lessac-medium.onnx"
+    assert infer_dataset_name(model) == "lessac"
+
+
+def test_load_model_meta_exposes_dataset_and_named_speakers(tmp_path):
+    model_dir = tmp_path / "en" / "en_US" / "characters" / "medium"
+    model_dir.mkdir(parents=True)
+    model = model_dir / "en_US-characters-medium.onnx"
+    model.touch()
+    config = {
+        "dataset": "campaign_characters",
+        "num_speakers": 2,
+        "speaker_id_map": {"Narrator": 0, "Guard": 1},
+    }
+    (model_dir / "en_US-characters-medium.onnx.json").write_text(
+        json.dumps(config),
+        encoding="utf-8",
+    )
+
+    meta = load_piper_model_meta(model)
+
+    assert meta["dataset"] == "campaign_characters"
+    assert meta["has_speaker_map"] is True
+    assert meta["speakers"] == [
+        {"id": 0, "name": "Narrator"},
+        {"id": 1, "name": "Guard"},
+    ]
 
 
 def test_resolve_prefers_yaml_override():

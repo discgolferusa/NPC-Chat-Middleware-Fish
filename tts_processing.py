@@ -127,14 +127,38 @@ def infer_quality_tier(path: Path | str) -> str:
     return "unknown"
 
 
+def infer_dataset_name(model_path: Path | str) -> str:
+    """Infer Piper dataset name from its standard folder or filename layout."""
+    normalized = str(model_path).replace("\\", "/")
+    parts = [part for part in normalized.split("/") if part]
+    quality = infer_quality_tier(normalized)
+    if quality != "unknown" and len(parts) >= 3 and parts[-2].lower() == quality:
+        dataset = parts[-3].strip()
+        if dataset:
+            return dataset
+
+    filename = parts[-1] if parts else normalized
+    stem = filename[:-5] if filename.lower().endswith(".onnx") else Path(filename).stem
+    stem = re.sub(
+        r"^(?:[a-z]{2}_[A-Z]{2}|[a-z]{2}-[A-Z]{2})-",
+        "",
+        stem,
+        flags=re.IGNORECASE,
+    )
+    stem = re.sub(r"-(?:x_low|low|medium|high)$", "", stem, flags=re.IGNORECASE)
+    return stem or filename
+
+
 def load_piper_model_meta(model_path: Path) -> dict[str, Any]:
     """
     Read companion .onnx.json for speaker map / recommended defaults when present.
     """
     meta: dict[str, Any] = {
+        "dataset": infer_dataset_name(model_path),
         "quality": infer_quality_tier(model_path),
         "num_speakers": 1,
         "speakers": [],
+        "has_speaker_map": False,
         "speaker_id_map": {},
         "recommended_noise_scale": None,
         "recommended_noise_w": None,
@@ -154,6 +178,10 @@ def load_piper_model_meta(model_path: Path) -> dict[str, Any]:
     except (OSError, json.JSONDecodeError):
         return meta
 
+    dataset = str(data.get("dataset") or data.get("dataset_name") or "").strip()
+    if dataset:
+        meta["dataset"] = dataset
+
     speaker_map = data.get("speaker_id_map") or data.get("speakerIdMap") or {}
     if isinstance(speaker_map, dict) and speaker_map:
         cleaned: dict[str, int] = {}
@@ -163,6 +191,7 @@ def load_piper_model_meta(model_path: Path) -> dict[str, Any]:
             except (TypeError, ValueError):
                 continue
         meta["speaker_id_map"] = cleaned
+        meta["has_speaker_map"] = bool(cleaned)
         meta["speakers"] = [
             {"id": sid, "name": name}
             for name, sid in sorted(cleaned.items(), key=lambda item: item[1])
