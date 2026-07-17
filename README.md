@@ -155,7 +155,7 @@ X-Game-Api-Key: <GAME_API_KEY>
 
 | Route | Method | Purpose |
 |-------|--------|---------|
-| `/voices` | GET | List Piper `.onnx` models under `VOICES_DIR` (recursive scan; includes quality + speaker metadata) |
+| `/voices` | GET | List Piper `.onnx` models under `VOICES_DIR` (recursive scan; includes dataset, quality, and speaker metadata) |
 | `/voices/preview` | POST | Synthesize sample WAV via Piper + FFmpeg clarity/FX chain |
 
 Preview request body:

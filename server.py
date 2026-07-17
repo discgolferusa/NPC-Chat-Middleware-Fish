@@ -247,9 +247,11 @@ def _build_voice_inventory() -> tuple[list[dict[str, Any]], dict[str, Path]]:
         voices.append({
             "label": f"{label}{quality_note}",
             "path": str(path),
+            "dataset": meta["dataset"],
             "quality": quality,
             "num_speakers": meta["num_speakers"],
             "speakers": meta["speakers"],
+            "has_speaker_map": meta["has_speaker_map"],
             "recommended": {
                 "length_scale": curated["length_scale"],
                 "noise_scale": curated["noise_scale"],
