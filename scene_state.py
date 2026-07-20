@@ -58,6 +58,17 @@ def _load_location_yaml(location_id: str) -> dict[str, Any]:
     if not location_id:
         return {}
 
+    try:
+        from content_pack import lookup_document
+
+        packed = lookup_document("location", location_id)
+        if packed is not None:
+            data = deepcopy(packed)
+            data.setdefault("id", location_id)
+            return data
+    except Exception:
+        pass
+
     for suffix in (".yaml", ".yml"):
         path = LOCATION_DIR / f"{location_id}{suffix}"
         if not path.exists():

@@ -48,7 +48,6 @@ from dm_channel import (
 )
 from party_campaign import (
     DEFAULT_PLAYER_ID,
-    apply_editor_content_sync,
     build_party_context,
     format_party_context_for_prompt,
     format_player_message_content,
@@ -61,9 +60,16 @@ from party_campaign import (
     load_party,
     get_active_session_ids,
     resolve_request_session,
-    safe_yaml_filename,
     select_campaign,
     select_character,
+)
+from content_pack import (
+    clear_request_owner,
+    has_pack,
+    install_content_pack,
+    list_document_ids,
+    lookup_document,
+    set_request_owner,
 )
 from scene_state import (
     build_scene_context,
@@ -328,6 +334,21 @@ def require_game_api_key():
     if request.method == "OPTIONS":
         return None
 
+    owner = (
+        request.headers.get("X-Campaign-Owner-User-Id")
+        or request.headers.get("X-Owner-User-Id")
+        or ""
+    ).strip()
+    if not owner and request.method in ("POST", "PUT", "PATCH"):
+        # Best-effort: JSON/form may carry owner for content-pack scoping.
+        if request.mimetype and "json" in (request.mimetype or ""):
+            body = request.get_json(silent=True) or {}
+            if isinstance(body, dict):
+                owner = str(body.get("owner_user_id") or "").strip()
+        if not owner and request.form:
+            owner = str(request.form.get("owner_user_id") or "").strip()
+    set_request_owner(owner)
+
     if REQUIRE_GAME_API_KEY and request.path == "/llm/reset-usage":
         return jsonify({"error": "Not found"}), 404
 
@@ -341,6 +362,11 @@ def require_game_api_key():
             return jsonify({"error": "Unauthorized"}), 401
 
     return None
+
+
+@app.teardown_request
+def _clear_content_owner(_exc=None):
+    clear_request_owner()
 
 
 def log_timing(request_id: str, label: str, start_time: float):
@@ -564,6 +590,14 @@ def load_yaml_file_cached(path: Path, cache: dict, cache_key: str) -> dict:
 
 
 def load_npc(npc_id: str) -> dict:
+    npc_id = (npc_id or "").strip()
+    packed = lookup_document("npc", npc_id)
+    if packed is not None:
+        data = dict(packed)
+        data.setdefault("id", npc_id)
+        data.setdefault("npc_id", npc_id)
+        return data
+
     path = NPC_DIR / f"{npc_id}.yaml"
     if not path.exists():
         # Also support .yml for convenience.
@@ -579,6 +613,12 @@ def load_location(location_id: str | None) -> dict:
     location_id = (location_id or "").strip()
     if not location_id:
         return {}
+
+    packed = lookup_document("location", location_id)
+    if packed is not None:
+        data = dict(packed)
+        data.setdefault("id", location_id)
+        return data
 
     path = LOCATION_DIR / f"{location_id}.yaml"
     if not path.exists():
@@ -750,10 +790,11 @@ def run_memory_extraction_background(
 @app.get("/npcs")
 def list_npcs():
     npcs = []
+    npc_ids = list_document_ids("npc") if has_pack() else [
+        path.stem for path in sorted(list(NPC_DIR.glob("*.yaml")) + list(NPC_DIR.glob("*.yml")))
+    ]
 
-    for path in sorted(list(NPC_DIR.glob("*.yaml")) + list(NPC_DIR.glob("*.yml"))):
-        npc_id = path.stem
-
+    for npc_id in npc_ids:
         try:
             npc = load_npc(npc_id)
             display_name = npc.get("name", npc_id)
@@ -2788,10 +2829,11 @@ def npc_voice_turn_debug():
 @app.get("/locations")
 def list_locations():
     locations = []
+    location_ids = list_document_ids("location") if has_pack() else [
+        path.stem for path in sorted(list(LOCATION_DIR.glob("*.yaml")) + list(LOCATION_DIR.glob("*.yml")))
+    ]
 
-    for path in sorted(list(LOCATION_DIR.glob("*.yaml")) + list(LOCATION_DIR.glob("*.yml"))):
-        location_id = path.stem
-
+    for location_id in location_ids:
         try:
             location = load_location(location_id)
             locations.append({
@@ -3061,29 +3103,6 @@ def campaign_active():
     })
 
 
-def _write_npc_or_location_sync(kind: str, filename: str, content: str) -> None:
-    """Persist editor-synced NPC/location YAML next to middleware runtime files."""
-    safe_name = safe_yaml_filename(filename)
-    text = content if isinstance(content, str) else str(content or "")
-    if not text.strip():
-        raise ValueError(f"Empty YAML content for {kind}/{safe_name}")
-    if not text.endswith("\n"):
-        text += "\n"
-
-    if kind == "npc":
-        dest_dir = NPC_DIR
-        cache = NPC_CACHE
-    elif kind == "location":
-        dest_dir = LOCATION_DIR
-        cache = LOCATION_CACHE
-    else:
-        raise ValueError(f"Unsupported sync kind: {kind}")
-
-    dest_dir.mkdir(exist_ok=True)
-    (dest_dir / safe_name).write_text(text, encoding="utf-8")
-    cache.clear()
-
-
 @app.post("/campaign/select")
 def campaign_select():
     body = request.get_json(force=True, silent=True) or {}
@@ -3093,31 +3112,74 @@ def campaign_select():
         return jsonify({"error": "Missing campaign_id"}), 400
 
     try:
-        files = body.get("files")
-        if not isinstance(files, list):
-            files = []
+        owner_user_id = (
+            str(body.get("owner_user_id") or "").strip()
+            or request.headers.get("X-Campaign-Owner-User-Id", "").strip()
+            or request.headers.get("X-Owner-User-Id", "").strip()
+        )
+        content_pack = body.get("content_pack")
+        files = body.get("files") if isinstance(body.get("files"), list) else None
         yaml_text = body.get("yaml") or body.get("content")
-        if isinstance(yaml_text, str) and yaml_text.strip() and not files:
+        if isinstance(yaml_text, str) and yaml_text.strip() and not files and not content_pack:
             files = [{
                 "kind": "campaign",
                 "filename": f"{campaign_id}.yaml",
                 "content": yaml_text,
             }]
 
-        pending = apply_editor_content_sync(files)
-        for item in pending:
-            _write_npc_or_location_sync(
-                item["kind"],
-                item["filename"],
-                item["content"],
+        pack_info = None
+        if owner_user_id and (content_pack or files):
+            set_request_owner(owner_user_id)
+            pack_info = install_content_pack(
+                owner_user_id,
+                campaign_id=campaign_id,
+                content_pack=content_pack if isinstance(content_pack, dict) else None,
+                files=files,
+            )
+            print(
+                f"[CONTENT] installed pack owner={owner_user_id} campaign={campaign_id} "
+                f"counts={pack_info.get('counts')}",
+                flush=True,
             )
 
         result = select_campaign(campaign_id)
-        return jsonify({"status": "selected", **result})
+        payload = {"status": "selected", **result}
+        if pack_info:
+            payload["content_pack"] = pack_info
+        return jsonify(payload)
     except ValueError as ex:
         return jsonify({"error": str(ex)}), 400
     except Exception as ex:
         print(f"[SESSION] campaign select failed: {ex}", flush=True)
+        return jsonify({"error": str(ex)}), 500
+
+
+@app.post("/content/pack")
+def content_pack_install():
+    """Refresh in-memory tenant YAML without changing the active campaign session."""
+    body = request.get_json(force=True, silent=True) or {}
+    owner_user_id = (
+        str(body.get("owner_user_id") or "").strip()
+        or request.headers.get("X-Campaign-Owner-User-Id", "").strip()
+        or request.headers.get("X-Owner-User-Id", "").strip()
+    )
+    campaign_id = str(body.get("campaign_id") or "").strip()
+    if not owner_user_id:
+        return jsonify({"error": "Missing owner_user_id"}), 400
+
+    try:
+        set_request_owner(owner_user_id)
+        pack_info = install_content_pack(
+            owner_user_id,
+            campaign_id=campaign_id,
+            content_pack=body.get("content_pack") if isinstance(body.get("content_pack"), dict) else None,
+            files=body.get("files") if isinstance(body.get("files"), list) else None,
+        )
+        return jsonify({"status": "installed", **pack_info})
+    except ValueError as ex:
+        return jsonify({"error": str(ex)}), 400
+    except Exception as ex:
+        print(f"[CONTENT] pack install failed: {ex}", flush=True)
         return jsonify({"error": str(ex)}), 500
 
 
