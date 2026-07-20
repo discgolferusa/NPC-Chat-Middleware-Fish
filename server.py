@@ -48,6 +48,7 @@ from dm_channel import (
 )
 from party_campaign import (
     DEFAULT_PLAYER_ID,
+    apply_editor_content_sync,
     build_party_context,
     format_party_context_for_prompt,
     format_player_message_content,
@@ -60,6 +61,7 @@ from party_campaign import (
     load_party,
     get_active_session_ids,
     resolve_request_session,
+    safe_yaml_filename,
     select_campaign,
     select_character,
 )
@@ -3059,6 +3061,29 @@ def campaign_active():
     })
 
 
+def _write_npc_or_location_sync(kind: str, filename: str, content: str) -> None:
+    """Persist editor-synced NPC/location YAML next to middleware runtime files."""
+    safe_name = safe_yaml_filename(filename)
+    text = content if isinstance(content, str) else str(content or "")
+    if not text.strip():
+        raise ValueError(f"Empty YAML content for {kind}/{safe_name}")
+    if not text.endswith("\n"):
+        text += "\n"
+
+    if kind == "npc":
+        dest_dir = NPC_DIR
+        cache = NPC_CACHE
+    elif kind == "location":
+        dest_dir = LOCATION_DIR
+        cache = LOCATION_CACHE
+    else:
+        raise ValueError(f"Unsupported sync kind: {kind}")
+
+    dest_dir.mkdir(exist_ok=True)
+    (dest_dir / safe_name).write_text(text, encoding="utf-8")
+    cache.clear()
+
+
 @app.post("/campaign/select")
 def campaign_select():
     body = request.get_json(force=True, silent=True) or {}
@@ -3068,6 +3093,25 @@ def campaign_select():
         return jsonify({"error": "Missing campaign_id"}), 400
 
     try:
+        files = body.get("files")
+        if not isinstance(files, list):
+            files = []
+        yaml_text = body.get("yaml") or body.get("content")
+        if isinstance(yaml_text, str) and yaml_text.strip() and not files:
+            files = [{
+                "kind": "campaign",
+                "filename": f"{campaign_id}.yaml",
+                "content": yaml_text,
+            }]
+
+        pending = apply_editor_content_sync(files)
+        for item in pending:
+            _write_npc_or_location_sync(
+                item["kind"],
+                item["filename"],
+                item["content"],
+            )
+
         result = select_campaign(campaign_id)
         return jsonify({"status": "selected", **result})
     except ValueError as ex:

@@ -88,8 +88,17 @@ def load_campaign(campaign_id: str) -> dict[str, Any]:
         return {}
 
     for path in _campaign_file_paths():
-        if path.stem == campaign_id:
+        if path.stem.casefold() == campaign_id.casefold():
             data = _load_yaml_cached(path, CAMPAIGN_CACHE, campaign_id)
+            data.setdefault("campaign_id", campaign_id)
+            data.setdefault("id", campaign_id)
+            return data
+
+    # Filename may differ from campaign_id (editor lists by YAML campaign_id).
+    for path in _campaign_file_paths():
+        data = _load_yaml_cached(path, CAMPAIGN_CACHE, path.stem)
+        embedded = str(data.get("campaign_id") or data.get("id") or "").strip()
+        if embedded and embedded.casefold() == campaign_id.casefold():
             data.setdefault("campaign_id", campaign_id)
             data.setdefault("id", campaign_id)
             return data
@@ -101,6 +110,70 @@ def load_campaign(campaign_id: str) -> dict[str, Any]:
         "description": "",
         "error": f"Campaign file not found for campaign_id: {campaign_id}",
     }
+
+
+def safe_yaml_filename(filename: str) -> str:
+    name = Path(str(filename or "")).name.strip()
+    if not name or name in {".", ".."} or "/" in name or "\\" in name:
+        raise ValueError(f"Invalid YAML filename: {filename!r}")
+    lower = name.casefold()
+    if not (lower.endswith(".yaml") or lower.endswith(".yml")):
+        raise ValueError(f"YAML filename must end with .yaml or .yml: {filename!r}")
+    return name
+
+
+def write_synced_yaml(kind: str, filename: str, content: str) -> Path:
+    """Write editor-synced YAML into the local middleware content tree."""
+    kind = (kind or "").strip().lower()
+    safe_name = safe_yaml_filename(filename)
+    text = content if isinstance(content, str) else str(content or "")
+    if not text.strip():
+        raise ValueError(f"Empty YAML content for {kind}/{safe_name}")
+    if not text.endswith("\n"):
+        text += "\n"
+
+    if kind == "campaign":
+        dest_dir = CAMPAIGNS_DIR
+        cache = CAMPAIGN_CACHE
+    elif kind == "party":
+        dest_dir = PARTIES_DIR
+        cache = PARTY_CACHE
+    else:
+        raise ValueError(f"Unsupported sync kind for party_campaign: {kind}")
+
+    dest_dir.mkdir(exist_ok=True)
+    path = dest_dir / safe_name
+    path.write_text(text, encoding="utf-8")
+    with _YAML_CACHE_LOCK:
+        cache.clear()
+    return path
+
+
+def apply_editor_content_sync(files: list[dict[str, Any]] | None) -> list[dict[str, str]]:
+    """
+    Persist campaign/party YAML from the editor. Returns npc/location entries
+    for the Flask layer to write (those dirs live in server.py).
+    """
+    pending: list[dict[str, str]] = []
+    for raw in files or []:
+        if not isinstance(raw, dict):
+            continue
+        kind = str(raw.get("kind") or "").strip().lower()
+        filename = str(raw.get("filename") or "").strip()
+        content = raw.get("content")
+        if content is None:
+            content = raw.get("yaml") or ""
+        content_text = content if isinstance(content, str) else str(content or "")
+        if not kind or not filename:
+            continue
+        if kind in {"npc", "location"}:
+            pending.append({"kind": kind, "filename": filename, "content": content_text})
+            continue
+        if kind in {"campaign", "party"}:
+            write_synced_yaml(kind, filename, content_text)
+            continue
+        raise ValueError(f"Unsupported sync kind: {kind}")
+    return pending
 
 
 def load_party(party_id: str) -> dict[str, Any]:
