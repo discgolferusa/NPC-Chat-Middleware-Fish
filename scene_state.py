@@ -30,8 +30,13 @@ _STATE_LOCK = threading.Lock()
 _LOCATION_CACHE_LOCK = threading.Lock()
 LOCATION_CACHE: dict[str, dict[str, Any]] = {}
 
-ACTIVE_TIME_OF_DAY = ""
-ACTIVE_SUB_LOCATION: dict[str, Any] | None = None
+# session_key(owner, campaign) -> { time_of_day, sub_location, updated_at, touched_at }
+_SCENE_SESSIONS: dict[str, dict[str, Any]] = {}
+_MAX_SCENE_SESSIONS = 2000
+
+# Local/dev fallback when no owner+campaign context is present.
+_FALLBACK_TIME_OF_DAY = ""
+_FALLBACK_SUB_LOCATION: dict[str, Any] | None = None
 
 
 def _utc_now_iso() -> str:
@@ -95,35 +100,73 @@ def _load_location_yaml(location_id: str) -> dict[str, Any]:
     }
 
 
+def _scene_bucket() -> dict[str, Any]:
+    from session_context import session_key
+
+    key = session_key()
+    if not key:
+        return {
+            "time_of_day": _FALLBACK_TIME_OF_DAY,
+            "sub_location": deepcopy(_FALLBACK_SUB_LOCATION),
+            "updated_at": None,
+            "touched_at": 0.0,
+            "_fallback": True,
+        }
+
+    with _STATE_LOCK:
+        bucket = _SCENE_SESSIONS.get(key)
+        if bucket is None:
+            bucket = {
+                "time_of_day": "",
+                "sub_location": None,
+                "updated_at": None,
+                "touched_at": datetime.now(timezone.utc).timestamp(),
+            }
+            _SCENE_SESSIONS[key] = bucket
+            if len(_SCENE_SESSIONS) > _MAX_SCENE_SESSIONS:
+                ordered = sorted(
+                    _SCENE_SESSIONS.items(),
+                    key=lambda item: float(item[1].get("touched_at") or 0),
+                )
+                for old_key, _ in ordered[: len(_SCENE_SESSIONS) - _MAX_SCENE_SESSIONS]:
+                    _SCENE_SESSIONS.pop(old_key, None)
+        else:
+            bucket["touched_at"] = datetime.now(timezone.utc).timestamp()
+        return bucket
+
+
 def _load_runtime_config() -> None:
-    global ACTIVE_TIME_OF_DAY, ACTIVE_SUB_LOCATION
+    global _FALLBACK_TIME_OF_DAY, _FALLBACK_SUB_LOCATION
 
     if not SCENE_RUNTIME_CONFIG_FILE.exists():
-        ACTIVE_TIME_OF_DAY = ""
-        ACTIVE_SUB_LOCATION = None
+        _FALLBACK_TIME_OF_DAY = ""
+        _FALLBACK_SUB_LOCATION = None
         return
 
     try:
         data = json.loads(SCENE_RUNTIME_CONFIG_FILE.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        ACTIVE_TIME_OF_DAY = ""
-        ACTIVE_SUB_LOCATION = None
+        _FALLBACK_TIME_OF_DAY = ""
+        _FALLBACK_SUB_LOCATION = None
         return
 
     try:
-        ACTIVE_TIME_OF_DAY = _normalize_time_of_day(data.get("time_of_day"))
+        _FALLBACK_TIME_OF_DAY = _normalize_time_of_day(data.get("time_of_day"))
     except ValueError:
-        ACTIVE_TIME_OF_DAY = ""
+        _FALLBACK_TIME_OF_DAY = ""
 
     sub_location = data.get("sub_location")
-    ACTIVE_SUB_LOCATION = deepcopy(sub_location) if isinstance(sub_location, dict) else None
+    _FALLBACK_SUB_LOCATION = deepcopy(sub_location) if isinstance(sub_location, dict) else None
 
 
 def _save_runtime_config() -> None:
+    # Persist only anonymous/local fallback; concurrent tables stay in memory.
+    bucket = _scene_bucket()
     payload = {
-        "time_of_day": ACTIVE_TIME_OF_DAY,
-        "sub_location": ACTIVE_SUB_LOCATION,
+        "time_of_day": bucket.get("time_of_day") or "",
+        "sub_location": bucket.get("sub_location"),
         "updated_at": _utc_now_iso(),
+        "note": "Fallback defaults for local/dev; live scene state is keyed by owner+campaign in memory.",
     }
     try:
         SCENE_RUNTIME_CONFIG_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -203,26 +246,32 @@ def _normalize_sub_location(
 
 
 def set_time_of_day(time_of_day: str) -> dict[str, Any]:
-    global ACTIVE_TIME_OF_DAY
-
     normalized = _normalize_time_of_day(time_of_day)
     if not normalized:
         raise ValueError("Missing time_of_day")
 
-    with _STATE_LOCK:
-        ACTIVE_TIME_OF_DAY = normalized
-        _save_runtime_config()
-
+    bucket = _scene_bucket()
+    if bucket.get("_fallback"):
+        global _FALLBACK_TIME_OF_DAY
+        _FALLBACK_TIME_OF_DAY = normalized
+    else:
+        with _STATE_LOCK:
+            bucket["time_of_day"] = normalized
+            bucket["updated_at"] = _utc_now_iso()
+    _save_runtime_config()
     return get_scene_status()
 
 
 def clear_time_of_day() -> dict[str, Any]:
-    global ACTIVE_TIME_OF_DAY
-
-    with _STATE_LOCK:
-        ACTIVE_TIME_OF_DAY = ""
-        _save_runtime_config()
-
+    bucket = _scene_bucket()
+    if bucket.get("_fallback"):
+        global _FALLBACK_TIME_OF_DAY
+        _FALLBACK_TIME_OF_DAY = ""
+    else:
+        with _STATE_LOCK:
+            bucket["time_of_day"] = ""
+            bucket["updated_at"] = _utc_now_iso()
+    _save_runtime_config()
     return get_scene_status()
 
 
@@ -232,28 +281,34 @@ def set_sub_location(
     important_location_name: str | None = None,
     custom: str | None = None,
 ) -> dict[str, Any]:
-    global ACTIVE_SUB_LOCATION
-
     sub_location = _normalize_sub_location(
         location_id=location_id,
         important_location_name=important_location_name,
         custom=custom,
     )
 
-    with _STATE_LOCK:
-        ACTIVE_SUB_LOCATION = sub_location
-        _save_runtime_config()
-
+    bucket = _scene_bucket()
+    if bucket.get("_fallback"):
+        global _FALLBACK_SUB_LOCATION
+        _FALLBACK_SUB_LOCATION = sub_location
+    else:
+        with _STATE_LOCK:
+            bucket["sub_location"] = sub_location
+            bucket["updated_at"] = _utc_now_iso()
+    _save_runtime_config()
     return get_scene_status()
 
 
 def clear_sub_location() -> dict[str, Any]:
-    global ACTIVE_SUB_LOCATION
-
-    with _STATE_LOCK:
-        ACTIVE_SUB_LOCATION = None
-        _save_runtime_config()
-
+    bucket = _scene_bucket()
+    if bucket.get("_fallback"):
+        global _FALLBACK_SUB_LOCATION
+        _FALLBACK_SUB_LOCATION = None
+    else:
+        with _STATE_LOCK:
+            bucket["sub_location"] = None
+            bucket["updated_at"] = _utc_now_iso()
+    _save_runtime_config()
     return get_scene_status()
 
 
@@ -288,10 +343,9 @@ def list_sub_location_options(location_id: str) -> dict[str, Any]:
 
 def build_scene_context(npc_location_id: str | None = None) -> dict[str, Any]:
     npc_location_id = (npc_location_id or "").strip()
-
-    with _STATE_LOCK:
-        time_of_day = ACTIVE_TIME_OF_DAY
-        sub_location = deepcopy(ACTIVE_SUB_LOCATION)
+    bucket = _scene_bucket()
+    time_of_day = bucket.get("time_of_day") or ""
+    sub_location = deepcopy(bucket.get("sub_location"))
 
     applies = bool(
         sub_location
@@ -359,22 +413,15 @@ def format_scene_context_for_prompt(scene_context: dict[str, Any] | None) -> str
 
 
 def get_scene_status(*, include_options: bool = True) -> dict[str, Any]:
-    with _STATE_LOCK:
-        time_of_day = ACTIVE_TIME_OF_DAY
-        sub_location = deepcopy(ACTIVE_SUB_LOCATION)
+    bucket = _scene_bucket()
+    time_of_day = bucket.get("time_of_day") or ""
+    sub_location = deepcopy(bucket.get("sub_location"))
 
     payload: dict[str, Any] = {
         "time_of_day": time_of_day or None,
         "sub_location": sub_location,
-        "updated_at": None,
+        "updated_at": bucket.get("updated_at"),
     }
-
-    if SCENE_RUNTIME_CONFIG_FILE.exists():
-        try:
-            data = json.loads(SCENE_RUNTIME_CONFIG_FILE.read_text(encoding="utf-8"))
-            payload["updated_at"] = data.get("updated_at")
-        except (OSError, json.JSONDecodeError):
-            pass
 
     if include_options:
         payload["time_of_day_options"] = list(TIME_OF_DAY_OPTIONS)
@@ -393,9 +440,12 @@ def get_scene_status(*, include_options: bool = True) -> dict[str, Any]:
 def init_scene_state() -> None:
     LOCATION_DIR.mkdir(exist_ok=True)
     _load_runtime_config()
-    time_label = ACTIVE_TIME_OF_DAY or "(unset)"
-    place_label = (ACTIVE_SUB_LOCATION or {}).get("name") or "(unset)"
-    print(f"[SCENE] ready time={time_label} place={place_label}", flush=True)
+    print(
+        f"[SCENE] multi-table ready "
+        f"(fallback time={_FALLBACK_TIME_OF_DAY or '(unset)'} "
+        f"place={(_FALLBACK_SUB_LOCATION or {}).get('name') or '(unset)'})",
+        flush=True,
+    )
 
 
 init_scene_state()

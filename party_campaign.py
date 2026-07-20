@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
@@ -39,9 +40,15 @@ _YAML_CACHE_LOCK = threading.Lock()
 PARTY_CACHE: dict[str, dict[str, Any]] = {}
 CAMPAIGN_CACHE: dict[str, dict[str, Any]] = {}
 
-ACTIVE_CAMPAIGN_ID = DEFAULT_CAMPAIGN_ID
-ACTIVE_PARTY_ID = DEFAULT_PARTY_ID
-ACTIVE_PLAYER_ID = DEFAULT_PLAYER_ID
+# (owner_user_id, campaign_id) -> play session (party/player selection for that table)
+_PLAY_SESSIONS: dict[str, dict[str, Any]] = {}
+_MAX_PLAY_SESSIONS = 2000
+
+# Legacy single-process defaults only used when request has no owner/campaign context
+# (local smoke tests without headers).
+_FALLBACK_CAMPAIGN_ID = DEFAULT_CAMPAIGN_ID
+_FALLBACK_PARTY_ID = DEFAULT_PARTY_ID
+_FALLBACK_PLAYER_ID = DEFAULT_PLAYER_ID
 
 
 def _utc_now_iso() -> str:
@@ -336,34 +343,107 @@ def get_character_options(campaign_id: str | None = None, party_id: str | None =
     return options
 
 
+def _utc_now_ts() -> float:
+    return time.time()
+
+
+def _prune_play_sessions_locked() -> None:
+    if len(_PLAY_SESSIONS) <= _MAX_PLAY_SESSIONS:
+        return
+    ordered = sorted(
+        _PLAY_SESSIONS.items(),
+        key=lambda item: float(item[1].get("touched_at") or 0),
+    )
+    overflow = len(_PLAY_SESSIONS) - _MAX_PLAY_SESSIONS
+    for key, _ in ordered[:overflow]:
+        _PLAY_SESSIONS.pop(key, None)
+
+
+def get_or_create_play_session(
+    owner_user_id: str,
+    campaign_id: str,
+    *,
+    party_id: str | None = None,
+    player_id: str | None = None,
+) -> dict[str, Any]:
+    from session_context import set_request_context
+
+    owner_user_id = (owner_user_id or "").strip()
+    campaign_id = (campaign_id or "").strip()
+    if not owner_user_id or not campaign_id:
+        raise ValueError("owner_user_id and campaign_id are required for a play session")
+
+    set_request_context(owner_user_id, campaign_id)
+    key = f"{owner_user_id.casefold()}\x1f{campaign_id.casefold()}"
+    with _STATE_LOCK:
+        session = _PLAY_SESSIONS.get(key)
+        if session is None:
+            session = {
+                "owner_user_id": owner_user_id,
+                "campaign_id": campaign_id,
+                "party_id": (party_id or DEFAULT_PARTY_ID).strip() or DEFAULT_PARTY_ID,
+                "player_id": (player_id or DEFAULT_PLAYER_ID).strip() or DEFAULT_PLAYER_ID,
+                "touched_at": _utc_now_ts(),
+            }
+            _PLAY_SESSIONS[key] = session
+            _prune_play_sessions_locked()
+        else:
+            if party_id:
+                session["party_id"] = party_id.strip() or session["party_id"]
+            if player_id:
+                session["player_id"] = player_id.strip() or session["player_id"]
+            session["touched_at"] = _utc_now_ts()
+        return dict(session)
+
+
+def _current_play_ids() -> dict[str, str]:
+    from session_context import get_request_campaign, get_request_owner
+
+    owner = get_request_owner()
+    campaign = get_request_campaign()
+    if owner and campaign:
+        session = get_or_create_play_session(owner, campaign)
+        return {
+            "owner_user_id": session["owner_user_id"],
+            "campaign_id": session["campaign_id"],
+            "party_id": session.get("party_id") or DEFAULT_PARTY_ID,
+            "player_id": session.get("player_id") or DEFAULT_PLAYER_ID,
+        }
+
+    return {
+        "owner_user_id": owner,
+        "campaign_id": campaign or _FALLBACK_CAMPAIGN_ID or "",
+        "party_id": _FALLBACK_PARTY_ID,
+        "player_id": _FALLBACK_PLAYER_ID,
+    }
+
+
 def _load_runtime_config() -> None:
-    global ACTIVE_CAMPAIGN_ID, ACTIVE_PARTY_ID, ACTIVE_PLAYER_ID
+    """Load legacy single-table file into fallbacks for local/dev only."""
+    global _FALLBACK_CAMPAIGN_ID, _FALLBACK_PARTY_ID, _FALLBACK_PLAYER_ID
 
     if not SESSION_RUNTIME_CONFIG_FILE.exists():
-        ACTIVE_CAMPAIGN_ID = DEFAULT_CAMPAIGN_ID
-        ACTIVE_PARTY_ID = DEFAULT_PARTY_ID
-        ACTIVE_PLAYER_ID = DEFAULT_PLAYER_ID
         return
 
     try:
         data = json.loads(SESSION_RUNTIME_CONFIG_FILE.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        ACTIVE_CAMPAIGN_ID = DEFAULT_CAMPAIGN_ID
-        ACTIVE_PARTY_ID = DEFAULT_PARTY_ID
-        ACTIVE_PLAYER_ID = DEFAULT_PLAYER_ID
         return
 
-    ACTIVE_CAMPAIGN_ID = (data.get("campaign_id") or DEFAULT_CAMPAIGN_ID or "").strip()
-    ACTIVE_PARTY_ID = (data.get("party_id") or DEFAULT_PARTY_ID).strip()
-    ACTIVE_PLAYER_ID = (data.get("player_id") or DEFAULT_PLAYER_ID).strip()
+    _FALLBACK_CAMPAIGN_ID = (data.get("campaign_id") or DEFAULT_CAMPAIGN_ID or "").strip()
+    _FALLBACK_PARTY_ID = (data.get("party_id") or DEFAULT_PARTY_ID).strip()
+    _FALLBACK_PLAYER_ID = (data.get("player_id") or DEFAULT_PLAYER_ID).strip()
 
 
 def _save_runtime_config() -> None:
+    # Persist only the anonymous/local fallback — concurrent tables stay in memory.
+    ids = _current_play_ids()
     payload = {
-        "campaign_id": ACTIVE_CAMPAIGN_ID,
-        "party_id": ACTIVE_PARTY_ID,
-        "player_id": ACTIVE_PLAYER_ID,
+        "campaign_id": ids["campaign_id"],
+        "party_id": ids["party_id"],
+        "player_id": ids["player_id"],
         "updated_at": _utc_now_iso(),
+        "note": "Fallback defaults for local/dev; live tables are keyed by owner+campaign in memory.",
     }
     try:
         SESSION_RUNTIME_CONFIG_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -371,20 +451,27 @@ def _save_runtime_config() -> None:
         print(f"[SESSION] failed to save runtime config: {ex}", flush=True)
 
 
-def select_campaign(campaign_id: str) -> dict[str, Any]:
-    global ACTIVE_CAMPAIGN_ID, ACTIVE_PARTY_ID, ACTIVE_PLAYER_ID
+def select_campaign(campaign_id: str, *, owner_user_id: str | None = None) -> dict[str, Any]:
+    from session_context import get_request_owner, set_request_context
 
     campaign_id = (campaign_id or "").strip()
     if not campaign_id:
         raise ValueError("Missing campaign_id")
 
+    owner = (owner_user_id or get_request_owner() or "").strip()
+    if not owner:
+        # Local/dev without multi-tenant headers.
+        owner = "local"
+
+    set_request_context(owner, campaign_id)
+
     campaign = load_campaign(campaign_id)
     if campaign.get("error"):
         raise ValueError(campaign["error"])
 
-    with _STATE_LOCK:
-        current_party_id = ACTIVE_PARTY_ID
-        current_player_id = ACTIVE_PLAYER_ID
+    current = get_or_create_play_session(owner, campaign_id)
+    current_party_id = current.get("party_id") or DEFAULT_PARTY_ID
+    current_player_id = current.get("player_id") or DEFAULT_PLAYER_ID
 
     parties = list_parties(campaign_id=campaign_id)
     if parties:
@@ -407,25 +494,27 @@ def select_campaign(campaign_id: str) -> dict[str, Any]:
     else:
         new_player_id = DEFAULT_PLAYER_ID
 
-    with _STATE_LOCK:
-        ACTIVE_CAMPAIGN_ID = campaign_id
-        ACTIVE_PARTY_ID = new_party_id
-        ACTIVE_PLAYER_ID = new_player_id
-        _save_runtime_config()
-
+    get_or_create_play_session(
+        owner,
+        campaign_id,
+        party_id=new_party_id,
+        player_id=new_player_id,
+    )
+    _save_runtime_config()
     return get_session_status()
 
 
 def select_character(player_id: str, *, party_id: str | None = None) -> dict[str, Any]:
-    global ACTIVE_PLAYER_ID, ACTIVE_PARTY_ID, ACTIVE_CAMPAIGN_ID
+    from session_context import get_request_campaign, get_request_owner, set_request_context
 
     player_id = (player_id or "").strip()
     if not player_id:
         raise ValueError("Missing player_id")
 
-    with _STATE_LOCK:
-        current_party_id = ACTIVE_PARTY_ID
-        current_campaign_id = ACTIVE_CAMPAIGN_ID
+    owner = get_request_owner() or "local"
+    current = _current_play_ids()
+    current_party_id = current["party_id"]
+    current_campaign_id = current["campaign_id"] or get_request_campaign()
 
     new_party_id = party_id.strip() if party_id else current_party_id
     new_campaign_id = current_campaign_id
@@ -444,18 +533,24 @@ def select_character(player_id: str, *, party_id: str | None = None) -> dict[str
         elif player_id != DEFAULT_PLAYER_ID:
             raise ValueError(f"Unknown player_id: {player_id}")
 
-    with _STATE_LOCK:
-        ACTIVE_PARTY_ID = new_party_id
-        ACTIVE_CAMPAIGN_ID = new_campaign_id
-        ACTIVE_PLAYER_ID = player_id
-        _save_runtime_config()
+    if not new_campaign_id:
+        raise ValueError("campaign_id is required to select a character")
 
+    set_request_context(owner, new_campaign_id)
+    get_or_create_play_session(
+        owner,
+        new_campaign_id,
+        party_id=new_party_id,
+        player_id=player_id,
+    )
+    _save_runtime_config()
     return get_session_status()
 
 
 def resolve_member(player_id: str | None = None, party_id: str | None = None) -> dict[str, Any]:
-    player_id = (player_id or ACTIVE_PLAYER_ID or DEFAULT_PLAYER_ID).strip()
-    party_id = (party_id or ACTIVE_PARTY_ID or DEFAULT_PARTY_ID).strip()
+    ids = _current_play_ids()
+    player_id = (player_id or ids["player_id"] or DEFAULT_PLAYER_ID).strip()
+    party_id = (party_id or ids["party_id"] or DEFAULT_PARTY_ID).strip()
 
     member = find_member(party_id, player_id)
     if member:
@@ -466,12 +561,12 @@ def resolve_member(player_id: str | None = None, party_id: str | None = None) ->
         return member
 
     if player_id == DEFAULT_PLAYER_ID:
-        return get_default_party_member(ACTIVE_CAMPAIGN_ID or None)
+        return get_default_party_member(ids["campaign_id"] or None)
 
     return {
         "player_id": player_id,
         "party_id": party_id,
-        "campaign_id": ACTIVE_CAMPAIGN_ID or "",
+        "campaign_id": ids["campaign_id"] or "",
         "name": player_id,
         "race": "Unknown",
         "class": "Adventurer",
@@ -480,13 +575,14 @@ def resolve_member(player_id: str | None = None, party_id: str | None = None) ->
 
 
 def build_party_context(player_id: str | None = None, party_id: str | None = None) -> dict[str, Any]:
-    player_id = (player_id or ACTIVE_PLAYER_ID or DEFAULT_PLAYER_ID).strip()
-    party_id = (party_id or ACTIVE_PARTY_ID or DEFAULT_PARTY_ID).strip()
-    campaign_id = (ACTIVE_CAMPAIGN_ID or "").strip()
+    ids = _current_play_ids()
+    player_id = (player_id or ids["player_id"] or DEFAULT_PLAYER_ID).strip()
+    party_id = (party_id or ids["party_id"] or DEFAULT_PARTY_ID).strip()
+    campaign_id = (ids["campaign_id"] or "").strip()
 
     speaking_member = resolve_member(player_id, party_id)
     party_id = speaking_member.get("party_id") or party_id
-    campaign_id = speaking_member.get("campaign_id") or campaign_id or ACTIVE_CAMPAIGN_ID
+    campaign_id = speaking_member.get("campaign_id") or campaign_id or ids["campaign_id"]
 
     party = load_party(party_id) if party_id else {"members": []}
     if party.get("error"):
@@ -589,31 +685,47 @@ def resolve_request_session(
     args=None,
     form=None,
 ) -> dict[str, Any]:
+    from session_context import get_request_campaign, get_request_owner, set_request_context
+
     body = body or {}
     args = args or {}
     form = form or {}
 
+    owner = (
+        str(body.get("owner_user_id") or form.get("owner_user_id") or args.get("owner_user_id") or "").strip()
+        or get_request_owner()
+        or "local"
+    )
+    campaign_id = (
+        body.get("campaign_id")
+        or form.get("campaign_id")
+        or args.get("campaign_id")
+        or get_request_campaign()
+        or ""
+    )
+    campaign_id = str(campaign_id or "").strip()
+
+    if campaign_id:
+        set_request_context(owner, campaign_id)
+        get_or_create_play_session(owner, campaign_id)
+
+    ids = _current_play_ids()
     player_id = (
         body.get("player_id")
         or form.get("player_id")
         or args.get("player_id")
-        or ACTIVE_PLAYER_ID
+        or ids["player_id"]
         or DEFAULT_PLAYER_ID
     )
     party_id = (
         body.get("party_id")
         or form.get("party_id")
         or args.get("party_id")
-        or ACTIVE_PARTY_ID
+        or ids["party_id"]
         or DEFAULT_PARTY_ID
     )
-    campaign_id = (
-        body.get("campaign_id")
-        or form.get("campaign_id")
-        or args.get("campaign_id")
-        or ACTIVE_CAMPAIGN_ID
-        or ""
-    )
+    if not campaign_id:
+        campaign_id = ids["campaign_id"] or ""
 
     party_context = build_party_context(player_id=player_id, party_id=party_id)
     if campaign_id and not party_context.get("campaign_id"):
@@ -623,22 +735,27 @@ def resolve_request_session(
     return {
         "player_id": party_context["player_id"],
         "party_id": party_context["party_id"],
-        "campaign_id": party_context.get("campaign_id") or "",
+        "campaign_id": party_context.get("campaign_id") or campaign_id or "",
+        "owner_user_id": owner,
         "party_context": party_context,
     }
 
 
 def get_active_session_ids() -> dict[str, str]:
+    ids = _current_play_ids()
     return {
-        "campaign_id": ACTIVE_CAMPAIGN_ID or "",
-        "party_id": ACTIVE_PARTY_ID or DEFAULT_PARTY_ID,
-        "player_id": ACTIVE_PLAYER_ID or DEFAULT_PLAYER_ID,
+        "campaign_id": ids["campaign_id"] or "",
+        "party_id": ids["party_id"] or DEFAULT_PARTY_ID,
+        "player_id": ids["player_id"] or DEFAULT_PLAYER_ID,
+        "owner_user_id": ids.get("owner_user_id") or "",
     }
 
 
 def get_session_status() -> dict[str, Any]:
     party_context = build_party_context()
+    ids = _current_play_ids()
     return {
+        "owner_user_id": ids.get("owner_user_id") or "",
         "campaign_id": party_context.get("campaign_id") or "",
         "party_id": party_context.get("party_id") or DEFAULT_PARTY_ID,
         "player_id": party_context.get("player_id") or DEFAULT_PLAYER_ID,
@@ -668,8 +785,9 @@ def init_party_campaign() -> None:
     init_party_campaign_dirs()
     _load_runtime_config()
     print(
-        f"[SESSION] ready campaign={ACTIVE_CAMPAIGN_ID or '(none)'} "
-        f"party={ACTIVE_PARTY_ID} player={ACTIVE_PLAYER_ID}",
+        f"[SESSION] multi-table ready "
+        f"(fallback campaign={_FALLBACK_CAMPAIGN_ID or '(none)'} "
+        f"party={_FALLBACK_PARTY_ID} player={_FALLBACK_PLAYER_ID})",
         flush=True,
     )
 

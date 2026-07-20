@@ -71,6 +71,12 @@ from content_pack import (
     lookup_document,
     set_request_owner,
 )
+from session_context import (
+    clear_request_context,
+    set_request_campaign,
+    set_request_context,
+)
+
 from scene_state import (
     build_scene_context,
     clear_sub_location,
@@ -339,15 +345,32 @@ def require_game_api_key():
         or request.headers.get("X-Owner-User-Id")
         or ""
     ).strip()
-    if not owner and request.method in ("POST", "PUT", "PATCH"):
-        # Best-effort: JSON/form may carry owner for content-pack scoping.
+    campaign = (
+        request.headers.get("X-Campaign-Id")
+        or request.headers.get("X-Active-Campaign-Id")
+        or ""
+    ).strip()
+
+    if request.method in ("POST", "PUT", "PATCH"):
+        # Best-effort: JSON/form may carry owner/campaign for session scoping.
+        body = None
         if request.mimetype and "json" in (request.mimetype or ""):
             body = request.get_json(silent=True) or {}
             if isinstance(body, dict):
-                owner = str(body.get("owner_user_id") or "").strip()
-        if not owner and request.form:
-            owner = str(request.form.get("owner_user_id") or "").strip()
-    set_request_owner(owner)
+                if not owner:
+                    owner = str(body.get("owner_user_id") or "").strip()
+                if not campaign:
+                    campaign = str(body.get("campaign_id") or body.get("id") or "").strip()
+        if request.form:
+            if not owner:
+                owner = str(request.form.get("owner_user_id") or "").strip()
+            if not campaign:
+                campaign = str(request.form.get("campaign_id") or "").strip()
+
+    if not campaign:
+        campaign = (request.args.get("campaign_id") or "").strip()
+
+    set_request_context(owner or None, campaign or None)
 
     if REQUIRE_GAME_API_KEY and request.path == "/llm/reset-usage":
         return jsonify({"error": "Not found"}), 404
@@ -366,6 +389,7 @@ def require_game_api_key():
 
 @app.teardown_request
 def _clear_content_owner(_exc=None):
+    clear_request_context()
     clear_request_owner()
 
 
@@ -3142,7 +3166,7 @@ def campaign_select():
                 flush=True,
             )
 
-        result = select_campaign(campaign_id)
+        result = select_campaign(campaign_id, owner_user_id=owner_user_id or None)
         payload = {"status": "selected", **result}
         if pack_info:
             payload["content_pack"] = pack_info
