@@ -42,6 +42,7 @@ def _empty_pack(owner_user_id: str, campaign_id: str = "") -> dict[str, Any]:
         "npcs": {},
         "locations": {},
         "parties": {},
+        "tts": None,
         "installed_at": time.time(),
         "touched_at": time.time(),
     }
@@ -127,7 +128,7 @@ def install_content_pack(
     Replace the in-memory pack for this owner+campaign.
 
     Accepts either:
-    - content_pack: { campaigns|npcs|locations|parties: { id: doc|yaml_string } }
+    - content_pack: { campaigns|npcs|locations|parties: { id: doc|yaml_string }, tts?: doc|yaml_string }
     - files: [{ kind, filename, content|yaml }]  (parsed into memory only)
     """
     owner = (owner_user_id or "").strip()
@@ -168,6 +169,8 @@ def install_content_pack(
                         continue
                     pack[bucket][resolved] = doc
 
+        pack["tts"] = _normalize_tts(content_pack.get("tts"))
+
     for raw in files or []:
         if not isinstance(raw, dict):
             continue
@@ -203,8 +206,35 @@ def install_content_pack(
             "npcs": len(pack["npcs"]),
             "locations": len(pack["locations"]),
             "parties": len(pack["parties"]),
+            "has_tts": pack.get("tts") is not None,
         },
     }
+
+
+def _normalize_tts(raw: Any) -> dict[str, Any] | None:
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return None
+        parsed = yaml.safe_load(text) or {}
+        return parsed if isinstance(parsed, dict) else None
+    if isinstance(raw, dict):
+        return dict(raw)
+    return None
+
+
+def get_pack_tts(
+    owner_user_id: str | None = None,
+    campaign_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Return the owner's narrator TTS YAML from the installed content pack, if any."""
+    pack = get_pack(owner_user_id, campaign_id)
+    if not pack:
+        return None
+    tts = pack.get("tts")
+    return deepcopy(tts) if isinstance(tts, dict) else None
 
 
 def lookup_document(
