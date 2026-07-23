@@ -1,5 +1,8 @@
 """
 Server-wide settings loaded from YAML in ServerSettings/.
+
+Narrator TTS prefers the campaign owner's content-pack `tts` (per-user) when present;
+otherwise falls back to middleware-local ServerSettings/tts.yaml.
 """
 
 from __future__ import annotations
@@ -112,33 +115,52 @@ def _as_optional_int(value: Any) -> int | None:
         return None
 
 
+def _default_tts_settings() -> dict[str, Any]:
+    return {
+        "narrator": {
+            "voice_model": _DEFAULT_NARRATOR_VOICE_MODEL,
+            "fallback_voice_model": _DEFAULT_NARRATOR_FALLBACK_VOICE_MODEL,
+            "length_scale": _DEFAULT_NARRATOR_LENGTH_SCALE,
+            "noise_scale": _DEFAULT_NARRATOR_NOISE_SCALE,
+            "noise_w": _DEFAULT_NARRATOR_NOISE_W,
+            "sentence_silence": _DEFAULT_NARRATOR_SENTENCE_SILENCE,
+            "fx_preset": _DEFAULT_NARRATOR_FX,
+        }
+    }
+
+
 def load_tts_settings(path: Path | None = None) -> dict[str, Any]:
     """
-    Load TTS settings from ServerSettings/tts.yaml.
+    Load TTS settings from ServerSettings/tts.yaml (middleware-local fallback).
     Reloads automatically when the file changes on disk.
     """
     settings_path = path or DEFAULT_TTS_SETTINGS_FILE
     if not settings_path.exists():
-        return {
-            "narrator": {
-                "voice_model": _DEFAULT_NARRATOR_VOICE_MODEL,
-                "fallback_voice_model": _DEFAULT_NARRATOR_FALLBACK_VOICE_MODEL,
-                "length_scale": _DEFAULT_NARRATOR_LENGTH_SCALE,
-                "noise_scale": _DEFAULT_NARRATOR_NOISE_SCALE,
-                "noise_w": _DEFAULT_NARRATOR_NOISE_W,
-                "sentence_silence": _DEFAULT_NARRATOR_SENTENCE_SILENCE,
-                "fx_preset": _DEFAULT_NARRATOR_FX,
-            }
-        }
+        return _default_tts_settings()
 
     return _load_yaml_cached(settings_path, _TTS_SETTINGS_CACHE, str(settings_path))
+
+
+def _resolve_pack_tts() -> dict[str, Any] | None:
+    """Prefer per-owner TTS from the active content pack (request owner + campaign)."""
+    try:
+        from content_pack import get_pack_tts
+        from session_context import get_request_campaign, get_request_owner
+
+        return get_pack_tts(get_request_owner(), get_request_campaign())
+    except Exception:
+        return None
 
 
 def get_narrator_tts_settings(path: Path | None = None) -> dict[str, Any]:
     """
     Resolved narrator voice settings for stage-direction TTS.
+
+    Prefers the campaign owner's content-pack `tts` when installed; otherwise
+    middleware-local ServerSettings/tts.yaml (or built-in defaults).
     """
-    data = load_tts_settings(path)
+    pack_tts = _resolve_pack_tts()
+    data = pack_tts if isinstance(pack_tts, dict) else load_tts_settings(path)
     narrator = data.get("narrator") if isinstance(data.get("narrator"), dict) else {}
 
     voice_model = (narrator.get("voice_model") or _DEFAULT_NARRATOR_VOICE_MODEL).strip()
@@ -184,7 +206,8 @@ def init_server_settings() -> None:
     narrator = get_narrator_tts_settings()
     print(
         f"[SETTINGS] narrator voice={narrator['resolved_voice_model']} "
-        f"length_scale={narrator['length_scale']}",
+        f"length_scale={narrator['length_scale']} "
+        f"(pack TTS preferred when campaign content pack is installed)",
         flush=True,
     )
 
