@@ -1308,10 +1308,11 @@ def run_dm_ruling_auto_response(
 
 
 def ask_llm(messages):
+    # Let llm_router pick a higher budget for reasoning models (gpt-oss / qwen3).
     return generate_llm_response(
         messages,
         temperature=0.80,
-        max_tokens=180,
+        max_tokens=None,
         top_p=0.90,
         stream=False,
     )
