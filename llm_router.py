@@ -30,11 +30,18 @@ GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1/chat/
 GROQ_MODEL = os.getenv("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
 GROQ_TIMEOUT_SECONDS = int(os.getenv("GROQ_TIMEOUT_SECONDS", "10"))
 
+# Spoken NPC replies are short, but reasoning models spend completion tokens on
+# chain-of-thought first. max_tokens=180 with gpt-oss/qwen3 often yields empty
+# message.content (finish_reason=length) → "I have nothing more to say."
+DEFAULT_MAX_TOKENS = 180
+REASONING_MAX_TOKENS = int(os.getenv("LLM_REASONING_MAX_TOKENS", "768"))
+
 LLM_USAGE_FILE = BASE_DIR / "llm_usage.json"
 LLM_RUNTIME_CONFIG_FILE = BASE_DIR / "llm_runtime_config.json"
 LLM_SECRETS_FILE = BASE_DIR / "llm_secrets.env"
 
 VALID_PROVIDER_MODES = frozenset({"local", "groq", "groq_with_local_fallback"})
+REASONING_MODEL_MARKERS = ("gpt-oss", "qwen3")
 
 LLM_MODELS: dict[str, dict[str, Any]] = {
     "local": {
@@ -262,6 +269,57 @@ def _estimate_prompt_tokens(messages: list[dict[str, Any]]) -> int:
     return max(1, len(all_prompt_text) // 4)
 
 
+def _is_reasoning_model(model_id: str | None = None, model_name: str | None = None) -> bool:
+    blob = f"{model_id or ''} {model_name or ''}".casefold()
+    return any(marker in blob for marker in REASONING_MODEL_MARKERS)
+
+
+def _effective_max_tokens(
+    model_id: str | None,
+    max_tokens: int | None,
+    *,
+    model_name: str | None = None,
+) -> int:
+    if max_tokens is not None:
+        return max(1, int(max_tokens))
+    if _is_reasoning_model(model_id, model_name):
+        return REASONING_MAX_TOKENS
+    return DEFAULT_MAX_TOKENS
+
+
+def _extract_chat_content(message: dict[str, Any] | None) -> str:
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    if content is None:
+        return ""
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text")
+                if text:
+                    parts.append(str(text))
+        return "\n".join(parts).strip()
+    return str(content).strip()
+
+
+def _apply_groq_reasoning_options(payload: dict[str, Any], *, model_id: str, model_name: str) -> None:
+    """Keep reasoning cheap so spoken dialogue still fits in max_tokens."""
+    if not _is_reasoning_model(model_id, model_name):
+        return
+    name = (model_name or "").casefold()
+    mid = (model_id or "").casefold()
+    if "gpt-oss" in name or "gpt-oss" in mid:
+        # Groq gpt-oss supports low|medium|high (default medium).
+        payload.setdefault("reasoning_effort", "low")
+    elif "qwen3" in name or "qwen3" in mid:
+        # Groq qwen3 supports none|default|... — disable thinking for NPC turns.
+        payload.setdefault("reasoning_effort", "none")
+
+
 def _load_usage_records() -> list[dict[str, Any]]:
     if not LLM_USAGE_FILE.exists():
         return []
@@ -408,12 +466,13 @@ def call_local_chat_completions(
     max_tokens: int | None = None,
     **kwargs: Any,
 ) -> tuple[str, dict[str, int]]:
+    effective_max = _effective_max_tokens("local", max_tokens, model_name=LOCAL_LLM_MODEL)
     payload: dict[str, Any] = {
         "model": LOCAL_LLM_MODEL,
         "messages": messages,
         "temperature": 0.80 if temperature is None else temperature,
         "top_p": kwargs.pop("top_p", 0.90),
-        "max_tokens": 180 if max_tokens is None else max_tokens,
+        "max_tokens": effective_max,
         "stream": kwargs.pop("stream", False),
     }
     payload.update(kwargs)
@@ -421,12 +480,21 @@ def call_local_chat_completions(
     response = requests.post(LOCAL_LLM_URL, json=payload, timeout=180)
     response.raise_for_status()
     data = response.json()
-    content = data["choices"][0]["message"]["content"].strip()
+    message = (data.get("choices") or [{}])[0].get("message") or {}
+    content = _extract_chat_content(message)
 
     usage = data.get("usage") or {}
     prompt_tokens = int(usage.get("prompt_tokens") or _estimate_prompt_tokens(messages))
     completion_tokens = int(usage.get("completion_tokens") or max(1, len(content) // 4))
     total_tokens = int(usage.get("total_tokens") or prompt_tokens + completion_tokens)
+
+    if not content:
+        finish = (data.get("choices") or [{}])[0].get("finish_reason")
+        print(
+            f"[LLM] local empty content finish={finish!r} "
+            f"completion_tokens={completion_tokens} max_tokens={effective_max}",
+            flush=True,
+        )
 
     return content, {
         "prompt_tokens": prompt_tokens,
@@ -439,6 +507,7 @@ def call_groq_chat_completions(
     messages: list[dict[str, Any]],
     model_name: str,
     *,
+    model_id: str | None = None,
     temperature: float | None = None,
     max_tokens: int | None = None,
     timeout: int | None = None,
@@ -447,30 +516,47 @@ def call_groq_chat_completions(
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json",
     }
-    payload = {
+    effective_max = _effective_max_tokens(model_id, max_tokens, model_name=model_name)
+    payload: dict[str, Any] = {
         "model": model_name,
         "messages": messages,
         "temperature": 0.80 if temperature is None else temperature,
-        "max_tokens": 180 if max_tokens is None else max_tokens,
+        "max_tokens": effective_max,
     }
+    _apply_groq_reasoning_options(payload, model_id=model_id or "", model_name=model_name)
 
     response = requests.post(
         GROQ_BASE_URL,
         headers=headers,
         json=payload,
-        timeout=timeout or GROQ_TIMEOUT_SECONDS,
+        timeout=timeout
+        or (
+            max(GROQ_TIMEOUT_SECONDS, 30)
+            if _is_reasoning_model(model_id, model_name)
+            else GROQ_TIMEOUT_SECONDS
+        ),
     )
 
     if response.status_code >= 400:
         return "", {}, response
 
     data = response.json()
-    content = data["choices"][0]["message"]["content"].strip()
+    choice = (data.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    content = _extract_chat_content(message)
     usage = data.get("usage") or {}
 
     prompt_tokens = int(usage.get("prompt_tokens") or _estimate_prompt_tokens(messages))
     completion_tokens = int(usage.get("completion_tokens") or max(1, len(content) // 4))
     total_tokens = int(usage.get("total_tokens") or prompt_tokens + completion_tokens)
+
+    if not content:
+        print(
+            f"[LLM] groq empty content model={model_name} finish={choice.get('finish_reason')!r} "
+            f"completion_tokens={completion_tokens} max_tokens={effective_max} "
+            f"reasoning_effort={payload.get('reasoning_effort')!r}",
+            flush=True,
+        )
 
     return content, {
         "prompt_tokens": prompt_tokens,
@@ -546,7 +632,12 @@ def generate_llm_response(
         provider_mode = _effective_provider_mode(selected_model_id, LLM_PROVIDER_MODE)
 
     selected_model = LLM_MODELS.get(selected_model_id, LLM_MODELS["local"])
-    effective_max_tokens = 180 if max_tokens is None else max_tokens
+    model_name_hint = selected_model.get("model") if isinstance(selected_model, dict) else None
+    effective_max_tokens = _effective_max_tokens(
+        selected_model_id,
+        max_tokens,
+        model_name=str(model_name_hint or ""),
+    )
     estimated_prompt_tokens = _estimate_prompt_tokens(messages)
     estimated_total_tokens = estimated_prompt_tokens + effective_max_tokens
 
@@ -623,6 +714,7 @@ def generate_llm_response(
         content, usage, response = call_groq_chat_completions(
             messages,
             model_name,
+            model_id=selected_model_id,
             temperature=temperature,
             max_tokens=max_tokens,
         )
