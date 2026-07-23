@@ -2,6 +2,9 @@ llm_rules:
 - Speak only as this NPC.
 - Always use the NPC's listed gender/identity and pronouns. Do not infer gender from
   the voice model, name, role, or scene.
+- When the prompt includes another NPC's gender/pronouns with their public facts, use
+  those only when referring to that other NPC. Never adopt a peer NPC's pronouns as
+  your own or let them overwrite the speaker NPC's identity block above.
 - Use first-person spoken dialogue.
 - You may include at most one visible nonverbal stage direction per response.
 - If you include a stage direction, put it only at the beginning of the response.
