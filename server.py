@@ -814,9 +814,23 @@ def run_memory_extraction_background(
 @app.get("/npcs")
 def list_npcs():
     npcs = []
-    npc_ids = list_document_ids("npc") if has_pack() else [
-        path.stem for path in sorted(list(NPC_DIR.glob("*.yaml")) + list(NPC_DIR.glob("*.yml")))
-    ]
+    if has_pack():
+        npc_ids = list_document_ids("npc")
+    else:
+        from session_context import get_request_campaign, get_request_owner
+
+        owner = (get_request_owner() or "").strip()
+        campaign = (get_request_campaign() or "").strip()
+        # Tenant-scoped requests must never fall back to shared middleware NPC_DIR
+        # (that mixes other users' / local demo content into DM Console lists).
+        if owner or campaign:
+            return jsonify({
+                "npcs": [],
+                "warning": "No content pack installed for this owner/campaign.",
+            })
+        npc_ids = [
+            path.stem for path in sorted(list(NPC_DIR.glob("*.yaml")) + list(NPC_DIR.glob("*.yml")))
+        ]
 
     for npc_id in npc_ids:
         try:
@@ -2853,9 +2867,22 @@ def npc_voice_turn_debug():
 @app.get("/locations")
 def list_locations():
     locations = []
-    location_ids = list_document_ids("location") if has_pack() else [
-        path.stem for path in sorted(list(LOCATION_DIR.glob("*.yaml")) + list(LOCATION_DIR.glob("*.yml")))
-    ]
+    if has_pack():
+        location_ids = list_document_ids("location")
+    else:
+        from session_context import get_request_campaign, get_request_owner
+
+        owner = (get_request_owner() or "").strip()
+        campaign = (get_request_campaign() or "").strip()
+        if owner or campaign:
+            return jsonify({
+                "locations": [],
+                "warning": "No content pack installed for this owner/campaign.",
+            })
+        location_ids = [
+            path.stem
+            for path in sorted(list(LOCATION_DIR.glob("*.yaml")) + list(LOCATION_DIR.glob("*.yml")))
+        ]
 
     for location_id in location_ids:
         try:
