@@ -21,9 +21,9 @@ DEFAULT_PROMPT_CAPS: dict[str, int] = {
     # Co-located NPC directory (name + role only)
     "directory_max_npcs": 8,
     "directory_line_max_chars": 80,
-    # Peer public_facts when the player asks about another NPC
+    # Peer public_facts (+ gender/pronouns) when the player asks about another NPC
     "peer_max_targets": 1,
-    "peer_public_facts_max_chars": 500,
+    "peer_public_facts_max_chars": 650,
     # Location blob limits
     "location_summary_max_chars": 300,
     "location_events_max_items": 5,

@@ -1,7 +1,7 @@
 directory_max_npcs: 8
 directory_line_max_chars: 80
 peer_max_targets: 1
-peer_public_facts_max_chars: 500
+peer_public_facts_max_chars: 650
 location_summary_max_chars: 300
 location_events_max_items: 5
 location_places_max_items: 5

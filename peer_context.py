@@ -8,6 +8,7 @@ import re
 from typing import Any
 
 from content_pack import get_pack, lookup_document
+from npc_pronouns import get_npc_pronoun_context
 from prompt_caps import get_prompt_caps
 from session_context import get_request_campaign, get_request_owner
 
@@ -172,7 +173,7 @@ def format_peer_public_facts_block(
     caps: dict[str, int] | None = None,
 ) -> str:
     caps = caps or get_prompt_caps()
-    budget = caps.get("peer_public_facts_max_chars", 500)
+    budget = caps.get("peer_public_facts_max_chars", 650)
     if budget <= 0 or not peer_ids:
         return ""
 
@@ -183,6 +184,7 @@ def format_peer_public_facts_block(
         if not isinstance(doc, dict):
             continue
         name = str(doc.get("name") or peer_id).strip()
+        identity = get_npc_pronoun_context(doc)
         facts = doc.get("public_facts") or []
         if not isinstance(facts, list):
             facts = []
@@ -191,8 +193,16 @@ def format_peer_public_facts_block(
             fact_lines = ["- (no public facts listed)"]
 
         header = f"Public knowledge about {name} ({peer_id}):"
+        identity_lines = (
+            f"- Gender/identity: {identity['gender']}\n"
+            f"- Pronouns: {identity['display']}\n"
+            f"- Pronoun details: subject={identity['subject']}, object={identity['object']}, "
+            f"possessive adjective={identity['possessive_adjective']}, "
+            f"possessive pronoun={identity['possessive_pronoun']}, "
+            f"reflexive={identity['reflexive']}"
+        )
         body = "\n".join(fact_lines)
-        block = f"{header}\n{body}"
+        block = f"{header}\n{identity_lines}\nPublic facts:\n{body}"
         remaining = budget - used
         if remaining <= 0:
             break
@@ -205,9 +215,13 @@ def format_peer_public_facts_block(
         return ""
 
     rules = (
-        "Peer knowledge rules: You may share only these public facts about other NPCs. "
-        "Do not invent private knowledge. Other NPCs' secrets and known_facts are unavailable "
-        "unless listed here."
+        "Peer knowledge rules: You may share only these public facts and identity details "
+        "about other NPCs. Do not invent private knowledge. Other NPCs' secrets and "
+        "known_facts are unavailable unless listed here. "
+        "Peer gender/pronoun lines describe THAT other NPC only when you refer to them "
+        "in third person. They must NEVER replace, override, or blend into YOUR "
+        "gender/identity and pronouns listed under 'NPC name' at the top of this prompt. "
+        "Always speak as yourself using your own pronouns for first-person self-reference."
     )
     return "\n\n".join(sections) + "\n\n" + rules
 
