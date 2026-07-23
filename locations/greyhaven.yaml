@@ -20,16 +20,6 @@ important_locations:
 - name: Watch Barracks
   description: Headquarters of the city watch.
   public_knowledge: Captain Varra commands the night patrol from here.
-notable_npcs:
-- name: Mayor Halden
-  role: Mayor of Greyhaven
-  public_knowledge: Polished, ambitious, and very concerned with public order.
-- name: Marla Fenwick
-  role: Innkeeper of the Crooked Lantern
-  public_knowledge: Knows more rumors than she admits.
-- name: Torin Ashhand
-  role: Blacksmith
-  public_knowledge: Sells practical weapons and occasionally repairs unusual blades.
 rumors:
 - A black glass token was found near one of the disappearances.
 - Something has been heard moving beneath the old aqueduct.

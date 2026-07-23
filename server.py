@@ -98,6 +98,8 @@ from turn_progress import (
     set_turn_progress,
 )
 from server_settings import format_llm_rules, get_narrator_tts_settings, load_global_llm_rules
+from prompt_caps import get_prompt_caps, save_prompt_caps, DEFAULT_PROMPT_CAPS
+from peer_context import build_peer_location_prompt_sections
 from tts_processing import (
     DEFAULT_FX_PRESET,
     DEFAULT_LENGTH_SCALE,
@@ -659,12 +661,14 @@ def load_location(location_id: str | None) -> dict:
     return load_yaml_file_cached(path, LOCATION_CACHE, location_id)
 
 
-def format_list_items(items, formatter=None) -> str:
+def format_list_items(items, formatter=None, *, max_items: int | None = None) -> str:
     if not items:
         return ""
 
     lines = []
     for item in items:
+        if max_items is not None and len(lines) >= max_items:
+            break
         if formatter:
             rendered = formatter(item)
         elif isinstance(item, dict):
@@ -684,24 +688,52 @@ def format_list_items(items, formatter=None) -> str:
     return "\n".join(lines)
 
 
-def format_location_context(location: dict) -> str:
+def _truncate_text(text: str, max_chars: int) -> str:
+    text = (text or "").strip()
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    if max_chars <= 1:
+        return text[:max_chars]
+    return text[: max_chars - 1].rstrip() + "…"
+
+
+def format_location_context(location: dict, caps: dict | None = None) -> str:
     if not location:
         return "No specific local setting context is loaded."
 
     if location.get("error"):
         return f"Location context warning: {location['error']}"
 
+    caps = caps or get_prompt_caps()
     name = location.get("name", location.get("id", "Unknown location"))
     location_type = location.get("type", "")
-    summary = location.get("summary", "")
+    summary = _truncate_text(
+        str(location.get("summary") or ""),
+        caps.get("location_summary_max_chars", 300),
+    )
 
-    current_events = format_list_items(location.get("current_events", []))
-    important_locations = format_list_items(location.get("important_locations", []))
-    notable_npcs = format_list_items(location.get("notable_npcs", []))
-    rumors = format_list_items(location.get("rumors", []))
-    local_tone = format_list_items(location.get("local_tone", []))
-    knowledge_rules = format_list_items(location.get("knowledge_rules", []))
+    current_events = format_list_items(
+        location.get("current_events", []),
+        max_items=caps.get("location_events_max_items", 5),
+    )
+    important_locations = format_list_items(
+        location.get("important_locations", []),
+        max_items=caps.get("location_places_max_items", 5),
+    )
+    rumors = format_list_items(
+        location.get("rumors", []),
+        max_items=caps.get("location_rumors_max_items", 5),
+    )
+    local_tone = format_list_items(
+        location.get("local_tone", []),
+        max_items=caps.get("location_tone_max_items", 5),
+    )
+    knowledge_rules = format_list_items(
+        location.get("knowledge_rules", []),
+        max_items=caps.get("location_knowledge_rules_max_items", 5),
+    )
 
+    # notable_npcs removed: co-located NPCs come from peer directory + public_facts.
     return f"""
 Location name: {name}
 Location type: {location_type}
@@ -714,9 +746,6 @@ Current local events:
 
 Important local places:
 {important_locations}
-
-Notable local NPCs:
-{notable_npcs}
 
 Local rumors:
 {rumors}
@@ -952,12 +981,26 @@ def build_system_prompt(
     dm_context: dict | None = None,
     party_context: dict | None = None,
     scene_context: dict | None = None,
+    player_text: str | None = None,
+    about_npc_id: str | None = None,
 ) -> str:
+    caps = get_prompt_caps()
     public_facts = "\n".join(f"- {x}" for x in npc.get("public_facts", []))
     known_facts = "\n".join(f"- {x}" for x in npc.get("known_facts", []))
     secrets = "\n".join(f"- {x}" for x in npc.get("secrets", []))
     memories_text = "\n".join(f"- {x}" for x in (memories or []))
-    location_context = format_location_context(location or {})
+    location_context = format_location_context(location or {}, caps=caps)
+    directory_block, peer_facts_block = build_peer_location_prompt_sections(
+        npc,
+        player_text=player_text,
+        about_npc_id=about_npc_id,
+        caps=caps,
+    )
+    peer_sections = ""
+    if directory_block:
+        peer_sections += f"\n\n{directory_block}"
+    if peer_facts_block:
+        peer_sections += f"\n\n{peer_facts_block}"
     pronoun_context = get_npc_pronoun_context(npc)
     dm_context_text = format_dm_context_for_prompt(dm_context)
     party_context_text = format_party_context_for_prompt(party_context)
@@ -999,7 +1042,7 @@ Long-term memories about this party:
 {memories_text}
 
 Local setting context:
-{location_context}
+{location_context}{peer_sections}
 
 Authoritative scene context:
 {scene_context_text}
@@ -1030,6 +1073,7 @@ def build_npc_llm_messages(
     dm_context: dict | None = None,
     party_context: dict | None = None,
     scene_context: dict | None = None,
+    about_npc_id: str | None = None,
 ) -> list[dict]:
     messages = [
         {
@@ -1042,6 +1086,8 @@ def build_npc_llm_messages(
                 dm_context=dm_context,
                 party_context=party_context,
                 scene_context=scene_context,
+                player_text=player_text,
+                about_npc_id=about_npc_id,
             ),
         }
     ]
@@ -2164,6 +2210,7 @@ def npc_turn():
     player_text = body["text"]
     scene = body.get("scene", {})
     history = body.get("history", [])
+    about_npc_id = (body.get("about_npc_id") or body.get("asked_about_npc_id") or "").strip() or None
     session = resolve_request_session(body=body)
     player_id = session["player_id"]
     campaign_id = session["campaign_id"]
@@ -2215,6 +2262,7 @@ def npc_turn():
             dm_context=dm_context,
             party_context=party_context,
             scene_context=scene_context,
+            about_npc_id=about_npc_id,
         )
 
         prompt_chars = sum(len(m.get("content", "")) for m in messages)
@@ -2359,6 +2407,9 @@ def npc_turn():
 def npc_voice_turn():
     npc_id = request.form.get("npc_id", "captain_varra")
     scene_description = request.form.get("scene", "")
+    about_npc_id = (
+        request.form.get("about_npc_id") or request.form.get("asked_about_npc_id") or ""
+    ).strip() or None
     session = resolve_request_session(form=request.form)
     player_id = session["player_id"]
     campaign_id = session["campaign_id"]
@@ -2443,6 +2494,7 @@ def npc_voice_turn():
             dm_context=dm_context,
             party_context=party_context,
             scene_context=scene_context,
+            about_npc_id=about_npc_id,
         )
 
         prompt_chars = sum(len(m.get("content", "")) for m in messages)
@@ -2966,6 +3018,26 @@ def npc_preload():
 @app.get("/llm/models")
 def llm_models():
     return jsonify(get_llm_models_payload())
+
+
+@app.get("/settings/prompt-caps")
+def settings_prompt_caps_get():
+    return jsonify({
+        "ok": True,
+        "caps": get_prompt_caps(),
+        "defaults": dict(DEFAULT_PROMPT_CAPS),
+    })
+
+
+@app.put("/settings/prompt-caps")
+@app.post("/settings/prompt-caps")
+def settings_prompt_caps_put():
+    body = request.get_json(force=True, silent=True) or {}
+    raw = body.get("caps") if isinstance(body.get("caps"), dict) else body
+    if not isinstance(raw, dict):
+        return jsonify({"ok": False, "error": "Expected a caps object."}), 400
+    saved = save_prompt_caps(raw)
+    return jsonify({"ok": True, "caps": saved, "defaults": dict(DEFAULT_PROMPT_CAPS)})
 
 
 @app.get("/llm/status")
