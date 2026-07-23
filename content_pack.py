@@ -43,6 +43,10 @@ def _empty_pack(owner_user_id: str, campaign_id: str = "") -> dict[str, Any]:
         "locations": {},
         "parties": {},
         "tts": None,
+        "indexes": {
+            "npc_ids_by_location": {},
+            "npc_aliases": {},
+        },
         "installed_at": time.time(),
         "touched_at": time.time(),
     }
@@ -194,6 +198,8 @@ def install_content_pack(
                 pack["campaigns"][campaign_id] = doc
                 break
 
+    pack["indexes"] = _build_indexes(pack)
+
     with _PACK_LOCK:
         _PACKS[key] = pack
         _prune_locked()
@@ -207,7 +213,43 @@ def install_content_pack(
             "locations": len(pack["locations"]),
             "parties": len(pack["parties"]),
             "has_tts": pack.get("tts") is not None,
+            "locations_indexed": len(pack["indexes"].get("npc_ids_by_location") or {}),
         },
+    }
+
+
+def _build_indexes(pack: dict[str, Any]) -> dict[str, Any]:
+    """Derive location→npc and alias→npc maps once per pack install."""
+    npc_ids_by_location: dict[str, list[str]] = {}
+    npc_aliases: dict[str, str] = {}
+
+    for key, doc in (pack.get("npcs") or {}).items():
+        if not isinstance(doc, dict):
+            continue
+        npc_id = str(doc.get("npc_id") or doc.get("id") or key or "").strip()
+        if not npc_id:
+            continue
+        location_id = str(doc.get("location_id") or "").strip()
+        if location_id:
+            loc_key = location_id.casefold()
+            bucket = npc_ids_by_location.setdefault(loc_key, [])
+            # Preserve original location casing via first seen id list; keys are casefolded.
+            if npc_id not in bucket:
+                bucket.append(npc_id)
+
+        for alias in (npc_id, doc.get("name"), doc.get("role")):
+            text = str(alias or "").strip()
+            if len(text) < 3:
+                continue
+            npc_aliases.setdefault(text.casefold(), npc_id)
+
+    # Stable ordering for deterministic prompts
+    for loc_key, ids in npc_ids_by_location.items():
+        npc_ids_by_location[loc_key] = sorted(ids, key=str.casefold)
+
+    return {
+        "npc_ids_by_location": npc_ids_by_location,
+        "npc_aliases": npc_aliases,
     }
 
 
