@@ -16,12 +16,27 @@ MEMORY_DB = BASE_DIR / "npc_memory.db"
 # Existing unscoped rows are attributed to this campaign on first migration.
 LEGACY_CAMPAIGN_BACKFILL_ID = "greyhaven_intro"
 
+_ALLOWED_SQL_TABLES = frozenset({
+    "conversation_turns",
+    "npc_memories",
+    "dm_messages",
+    "dm_pending_checks",
+    "dm_rulings",
+})
+
 
 def normalize_campaign_id(campaign_id: str | None) -> str:
     return (campaign_id or "").strip()
 
 
+def _assert_safe_table(table: str) -> str:
+    if table not in _ALLOWED_SQL_TABLES:
+        raise ValueError(f"Refusing unsafe SQL table name: {table}")
+    return table
+
+
 def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    _assert_safe_table(table)
     return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
 
 
@@ -32,6 +47,7 @@ def ensure_campaign_id_column(
     backfill: str = LEGACY_CAMPAIGN_BACKFILL_ID,
 ) -> None:
     """Add campaign_id if missing and backfill legacy empty rows once."""
+    _assert_safe_table(table)
     columns = _table_columns(conn, table)
     if "campaign_id" not in columns:
         conn.execute(
