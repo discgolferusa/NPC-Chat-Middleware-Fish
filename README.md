@@ -179,7 +179,11 @@ Preview request body:
 Returns `audio/wav` (22050 Hz mono PCM16 after ffmpeg loudness/EQ normalization).
 
 NPC YAML TTS fields: `voice_model`, `tts_length_scale`, `tts_noise_scale`, `tts_noise_w`,
-`tts_sentence_silence`, `tts_speaker_id`, `tts_pitch_semitones`, `tts_fx`, `tts_pronunciation`.
+`tts_sentence_silence`, `tts_speaker_id`, `tts_pitch_semitones`, `tts_fx`.
+
+Narrator TTS (`ServerSettings/tts.yaml` → `narrator:`) uses the same knobs with unprefixed
+names: `voice_model`, `length_scale`, `noise_scale`, `noise_w`, `sentence_silence`,
+`speaker_id`, `pitch_semitones`, `fx_preset`. There is no `fallback_voice_model`.
 
 Env: `VOICES_DIR` overrides the scan root for `/voices`. By default the server scans **`../Voices`** (sibling of the middleware repo folder), then falls back to the `Voices` segment in the default Ryan model path (e.g. `C:\AI\Voices`).
 
