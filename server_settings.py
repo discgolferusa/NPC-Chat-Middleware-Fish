@@ -20,12 +20,13 @@ DEFAULT_LLM_RULES_FILE = SERVER_SETTINGS_DIR / "llm_rules.yaml"
 DEFAULT_TTS_SETTINGS_FILE = SERVER_SETTINGS_DIR / "tts.yaml"
 
 _DEFAULT_NARRATOR_VOICE_MODEL = r"C:\AI\Voices\en\en_US\amy\medium\en_US-amy-medium.onnx"
-_DEFAULT_NARRATOR_FALLBACK_VOICE_MODEL = r"C:\AI\Voices\en\en_US\ryan\medium\en_US-ryan-medium.onnx"
-_DEFAULT_NARRATOR_LENGTH_SCALE = 1.08
+_DEFAULT_NARRATOR_LENGTH_SCALE = 1.15
 _DEFAULT_NARRATOR_NOISE_SCALE = 0.667
 _DEFAULT_NARRATOR_NOISE_W = 0.8
 _DEFAULT_NARRATOR_SENTENCE_SILENCE = 0.2
-_DEFAULT_NARRATOR_FX = "clarity"
+_DEFAULT_NARRATOR_SPEAKER_ID = 0
+_DEFAULT_NARRATOR_PITCH_SEMITONES = 0.0
+_DEFAULT_NARRATOR_FX = "none"
 
 _CACHE_LOCK = threading.Lock()
 _LLM_RULES_CACHE: dict[str, Any] = {}
@@ -119,11 +120,12 @@ def _default_tts_settings() -> dict[str, Any]:
     return {
         "narrator": {
             "voice_model": _DEFAULT_NARRATOR_VOICE_MODEL,
-            "fallback_voice_model": _DEFAULT_NARRATOR_FALLBACK_VOICE_MODEL,
             "length_scale": _DEFAULT_NARRATOR_LENGTH_SCALE,
             "noise_scale": _DEFAULT_NARRATOR_NOISE_SCALE,
             "noise_w": _DEFAULT_NARRATOR_NOISE_W,
             "sentence_silence": _DEFAULT_NARRATOR_SENTENCE_SILENCE,
+            "speaker_id": _DEFAULT_NARRATOR_SPEAKER_ID,
+            "pitch_semitones": _DEFAULT_NARRATOR_PITCH_SEMITONES,
             "fx_preset": _DEFAULT_NARRATOR_FX,
         }
     }
@@ -158,32 +160,48 @@ def get_narrator_tts_settings(path: Path | None = None) -> dict[str, Any]:
 
     Prefers the campaign owner's content-pack `tts` when installed; otherwise
     middleware-local ServerSettings/tts.yaml (or built-in defaults).
+
+    Narrator knobs mirror NPC TTS fields (voice_model, length/noise scales,
+    sentence silence, speaker_id, pitch, fx). There is no fallback voice model.
     """
     pack_tts = _resolve_pack_tts()
     data = pack_tts if isinstance(pack_tts, dict) else load_tts_settings(path)
     narrator = data.get("narrator") if isinstance(data.get("narrator"), dict) else {}
 
-    voice_model = (narrator.get("voice_model") or _DEFAULT_NARRATOR_VOICE_MODEL).strip()
-    fallback_voice_model = (
-        narrator.get("fallback_voice_model") or _DEFAULT_NARRATOR_FALLBACK_VOICE_MODEL
+    voice_model = str(
+        narrator.get("voice_model") or _DEFAULT_NARRATOR_VOICE_MODEL
     ).strip()
-    length_scale = _as_float(narrator.get("length_scale"), _DEFAULT_NARRATOR_LENGTH_SCALE)
-    noise_scale = _as_float(narrator.get("noise_scale"), _DEFAULT_NARRATOR_NOISE_SCALE)
-    noise_w = _as_float(narrator.get("noise_w"), _DEFAULT_NARRATOR_NOISE_W)
-    sentence_silence = _as_float(
-        narrator.get("sentence_silence"), _DEFAULT_NARRATOR_SENTENCE_SILENCE
+    length_scale = _as_float(
+        narrator.get("length_scale", narrator.get("tts_length_scale")),
+        _DEFAULT_NARRATOR_LENGTH_SCALE,
     )
-    speaker_id = _as_optional_int(narrator.get("speaker_id"))
-    pitch_semitones = _as_float(narrator.get("pitch_semitones"), 0.0)
-    fx_preset = str(narrator.get("fx_preset") or narrator.get("tts_fx") or _DEFAULT_NARRATOR_FX).strip().lower()
-
-    resolved_model = Path(voice_model)
-    if not resolved_model.exists() and fallback_voice_model:
-        resolved_model = Path(fallback_voice_model)
+    noise_scale = _as_float(
+        narrator.get("noise_scale", narrator.get("tts_noise_scale")),
+        _DEFAULT_NARRATOR_NOISE_SCALE,
+    )
+    noise_w = _as_float(
+        narrator.get("noise_w", narrator.get("tts_noise_w")),
+        _DEFAULT_NARRATOR_NOISE_W,
+    )
+    sentence_silence = _as_float(
+        narrator.get("sentence_silence", narrator.get("tts_sentence_silence")),
+        _DEFAULT_NARRATOR_SENTENCE_SILENCE,
+    )
+    speaker_id = _as_optional_int(
+        narrator.get("speaker_id", narrator.get("tts_speaker_id"))
+    )
+    if speaker_id is None:
+        speaker_id = _DEFAULT_NARRATOR_SPEAKER_ID
+    pitch_semitones = _as_float(
+        narrator.get("pitch_semitones", narrator.get("tts_pitch_semitones")),
+        _DEFAULT_NARRATOR_PITCH_SEMITONES,
+    )
+    fx_preset = str(
+        narrator.get("fx_preset") or narrator.get("tts_fx") or _DEFAULT_NARRATOR_FX
+    ).strip().lower() or _DEFAULT_NARRATOR_FX
 
     return {
         "voice_model": voice_model,
-        "fallback_voice_model": fallback_voice_model,
         "length_scale": length_scale,
         "noise_scale": noise_scale,
         "noise_w": noise_w,
@@ -191,7 +209,7 @@ def get_narrator_tts_settings(path: Path | None = None) -> dict[str, Any]:
         "speaker_id": speaker_id,
         "pitch_semitones": pitch_semitones,
         "fx_preset": fx_preset,
-        "resolved_voice_model": str(resolved_model),
+        "resolved_voice_model": voice_model,
     }
 
 
