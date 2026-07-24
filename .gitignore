@@ -78,3 +78,11 @@ ehthumbs.db
 
 #Project unneeded files
 .uploads/
+uploads/
+outputs/
+npc_memory.db
+llm_usage.json
+llm_runtime_config.json
+scene_runtime_config.json
+session_runtime_config.json
+*_runtime_config.json

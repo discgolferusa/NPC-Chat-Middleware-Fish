@@ -173,6 +173,8 @@ PRELOADED_CONTEXTS = {}
 STT_MODEL = WhisperModel("base.en", device="cpu", compute_type="int8")
 
 app = Flask(__name__)
+# Cap uploads / JSON bodies (STT audio, content packs) to reduce DoS risk.
+app.config["MAX_CONTENT_LENGTH"] = int(os.environ.get("MAX_CONTENT_LENGTH_BYTES", str(16 * 1024 * 1024)))
 
 GAME_API_ENV_FILE = BASE_DIR / "game_api.env"
 
@@ -330,12 +332,34 @@ GAME_API_HOST = os.environ.get("GAME_API_HOST", "127.0.0.1").strip() or "127.0.0
 GAME_API_PORT = int(os.environ.get("GAME_API_PORT", "5000"))
 AUTH_EXEMPT_PATHS = frozenset({"/health"})
 
+if REQUIRE_GAME_API_KEY and not GAME_API_KEY:
+    raise SystemExit(
+        "REQUIRE_GAME_API_KEY is enabled but GAME_API_KEY is empty. "
+        "Set GAME_API_KEY or disable REQUIRE_GAME_API_KEY."
+    )
+
 
 def _extract_game_api_key():
     auth = request.headers.get("Authorization", "")
     if auth.startswith("Bearer "):
         return auth[7:].strip()
     return request.headers.get("X-Game-Api-Key", "").strip()
+
+
+def _api_keys_match(provided: str, expected: str) -> bool:
+    if not provided or not expected or len(provided) != len(expected):
+        return False
+    return secrets.compare_digest(provided, expected)
+
+
+def _client_error(ex: BaseException, status: int = 500, *, not_found: bool = False):
+    """Log exception details server-side; return a generic client message."""
+    print(f"[ERROR] {type(ex).__name__}: {ex!r}", flush=True)
+    if not_found or status == 404:
+        return jsonify({"error": "Not found"}), 404
+    if status == 400:
+        return jsonify({"error": "Bad request"}), 400
+    return jsonify({"error": "Internal server error"}), status
 
 
 @app.before_request
@@ -378,9 +402,10 @@ def require_game_api_key():
     if REQUIRE_GAME_API_KEY and request.path == "/llm/reset-usage":
         return jsonify({"error": "Not found"}), 404
 
-    if GAME_API_KEY and request.path not in AUTH_EXEMPT_PATHS:
+    # Fail closed when a key is configured, or when REQUIRE_GAME_API_KEY demands one.
+    if (GAME_API_KEY or REQUIRE_GAME_API_KEY) and request.path not in AUTH_EXEMPT_PATHS:
         provided = _extract_game_api_key()
-        if not provided or not secrets.compare_digest(provided, GAME_API_KEY):
+        if not GAME_API_KEY or not _api_keys_match(provided, GAME_API_KEY):
             print(
                 f"[AUTH] rejected request to {request.path} from {request.remote_addr}",
                 flush=True,
@@ -887,7 +912,7 @@ def list_npcs():
                 "name": npc_id,
                 "role": "",
                 "voice": "",
-                "error": str(ex)
+                "error": "load_failed"
             })
 
     return jsonify({
@@ -1242,7 +1267,7 @@ def run_dm_ruling_auto_response(
             "generated": False,
             "request_id": request_id,
             "reason": "generation_failed",
-            "error": str(ex),
+            "error": "generation_failed",
         }
 
 
@@ -1999,27 +2024,31 @@ def resolve_voice_model_path(voice_model: str | None) -> Path:
         return DEFAULT_VOICE_MODEL
 
     raw = str(voice_model).strip()
-    model_path = Path(raw)
-    if model_path.exists():
-        return model_path
+    # Only allow basenames / relative names under VOICES_DIR — never absolute or .. paths.
+    if Path(raw).is_absolute() or ".." in Path(raw).parts or raw.startswith(("\\\\", "//")):
+        raise FileNotFoundError(f"Piper voice model not found: {voice_model}")
 
-    normalized = raw.replace("\\", "/")
-    if normalized.startswith("//"):
-        unc = Path(raw)
-        if unc.exists():
-            return unc
+    normalized = raw.replace("\\", "/").lstrip("/")
+    candidate = (VOICES_DIR / normalized).resolve()
+    voices_root = VOICES_DIR.resolve()
+    try:
+        candidate.relative_to(voices_root)
+    except ValueError as ex:
+        raise FileNotFoundError(f"Piper voice model not found: {voice_model}") from ex
+    if not candidate.exists():
+        # Match by filename using the cached inventory (no per-request full-tree rglob).
+        target_name = Path(normalized).name.lower()
+        cached = lookup_cached_voice_by_name(target_name)
+        if cached is not None and cached.exists():
+            cached_resolved = cached.resolve()
+            try:
+                cached_resolved.relative_to(voices_root)
+                return cached_resolved
+            except ValueError:
+                pass
+        raise FileNotFoundError(f"Piper voice model not found: {voice_model}")
 
-    candidate = VOICES_DIR / normalized
-    if candidate.exists():
-        return candidate
-
-    # Match by filename using the cached inventory (no per-request full-tree rglob).
-    target_name = Path(normalized).name.lower()
-    cached = lookup_cached_voice_by_name(target_name)
-    if cached is not None and cached.exists():
-        return cached
-
-    raise FileNotFoundError(f"Piper voice model not found: {voice_model}")
+    return candidate
 
 
 def extract_memories_from_exchange(
@@ -2328,7 +2357,7 @@ def npc_turn():
         return jsonify(payload)
 
     except Exception as ex:
-        fail_turn_progress(request_id, str(ex))
+        fail_turn_progress(request_id, "turn_failed")
         log_dm_turn(
             request_id=request_id,
             route="/npc-turn",
@@ -2336,8 +2365,9 @@ def npc_turn():
             player_id=player_id,
             stage="error",
         )
+        print(f"[NPC-TURN] failed request_id={request_id}: {ex!r}", flush=True)
         return jsonify({
-            "error": str(ex),
+            "error": "Internal server error",
             "request_id": request_id,
             "npc_id": npc_id,
         }), 500
@@ -2638,9 +2668,9 @@ def npc_voice_turn():
             stage="error",
         )
         print(f"[DM] route=/npc-voice-turn stage=error request_id={request_id} error={ex!r}", flush=True)
-        fail_turn_progress(request_id, str(ex))
+        fail_turn_progress(request_id, "turn_failed")
         return jsonify({
-            "error": str(ex),
+            "error": "Internal server error",
             "request_id": request_id,
             "npc_id": npc_id
         }), 500
@@ -2851,7 +2881,7 @@ def npc_voice_turn_debug():
         total_elapsed = time.perf_counter() - total_start
         print(f"[TIMING] {request_id} DEBUG ERROR after {total_elapsed:.3f}s: {ex}", flush=True)
         return jsonify({
-            "error": str(ex),
+            "error": "Internal server error",
             "npc_id": npc_id
         }), 500
 
@@ -2892,7 +2922,7 @@ def list_locations():
                 "name": location_id,
                 "type": "",
                 "summary": "",
-                "error": str(ex)
+                "error": "load_failed"
             })
 
     return jsonify({
@@ -2947,11 +2977,12 @@ def npc_preload():
         })
 
     except Exception as ex:
+        print(f"[NPC-PRELOAD] failed npc={npc_id}: {ex!r}", flush=True)
         return jsonify({
             "status": "error",
             "npc_id": npc_id,
             "player_id": player_id,
-            "error": str(ex)
+            "error": "Internal server error"
         }), 500
 
 
@@ -3000,10 +3031,10 @@ def llm_select():
         result["status"] = get_llm_status()
         return jsonify(result)
     except ValueError as ex:
-        return jsonify({"error": str(ex)}), 400
+        return _client_error(ex, 400)
     except Exception as ex:
         print(f"[LLM] select failed: {ex}", flush=True)
-        return jsonify({"error": str(ex)}), 500
+        return _client_error(ex, 500)
 
 
 @app.post("/llm/reset-usage")
@@ -3037,7 +3068,7 @@ def scene_time_set():
     try:
         return jsonify(set_time_of_day(time_of_day))
     except ValueError as ex:
-        return jsonify({"error": str(ex)}), 400
+        return _client_error(ex, 400)
 
 
 @app.post("/scene/time/clear")
@@ -3054,7 +3085,7 @@ def scene_sub_locations():
     try:
         return jsonify(list_sub_location_options(location_id))
     except ValueError as ex:
-        return jsonify({"error": str(ex)}), 400
+        return _client_error(ex, 400)
 
 
 @app.post("/scene/sub-location")
@@ -3074,7 +3105,7 @@ def scene_sub_location_set():
             custom=custom or None,
         ))
     except ValueError as ex:
-        return jsonify({"error": str(ex)}), 400
+        return _client_error(ex, 400)
 
 
 @app.post("/scene/sub-location/clear")
@@ -3135,7 +3166,7 @@ def turn_audio_clip(request_id: str, clip: str):
     try:
         path = turn_audio_path(normalized, clip_key)
     except ValueError as ex:
-        return jsonify({"error": str(ex)}), 400
+        return _client_error(ex, 400)
 
     if not path.exists():
         return jsonify({"error": "Audio clip not ready.", "request_id": normalized, "clip": clip_key}), 404
@@ -3211,10 +3242,10 @@ def campaign_select():
             payload["content_pack"] = pack_info
         return jsonify(payload)
     except ValueError as ex:
-        return jsonify({"error": str(ex)}), 400
+        return _client_error(ex, 400)
     except Exception as ex:
         print(f"[SESSION] campaign select failed: {ex}", flush=True)
-        return jsonify({"error": str(ex)}), 500
+        return _client_error(ex, 500)
 
 
 @app.post("/content/pack")
@@ -3240,10 +3271,10 @@ def content_pack_install():
         )
         return jsonify({"status": "installed", **pack_info})
     except ValueError as ex:
-        return jsonify({"error": str(ex)}), 400
+        return _client_error(ex, 400)
     except Exception as ex:
         print(f"[CONTENT] pack install failed: {ex}", flush=True)
-        return jsonify({"error": str(ex)}), 500
+        return _client_error(ex, 500)
 
 
 @app.get("/parties")
@@ -3299,10 +3330,10 @@ def party_select():
         result = select_character(player_id, party_id=party_id)
         return jsonify({"status": "selected", **result})
     except ValueError as ex:
-        return jsonify({"error": str(ex)}), 400
+        return _client_error(ex, 400)
     except Exception as ex:
         print(f"[SESSION] party select failed: {ex}", flush=True)
-        return jsonify({"error": str(ex)}), 500
+        return _client_error(ex, 500)
 
 
 @app.get("/dm/status")
@@ -3328,7 +3359,10 @@ def dm_messages():
     session = resolve_request_session(args=request.args)
     player_id = session["player_id"]
     campaign_id = session["campaign_id"]
-    limit = int(request.args.get("limit", 50))
+    try:
+        limit = max(1, min(int(request.args.get("limit", 50)), 100))
+    except (TypeError, ValueError):
+        limit = 50
 
     return jsonify({
         "npc_id": npc_id,
@@ -3393,10 +3427,10 @@ def dm_message_post():
             "rulings": load_rulings(npc_id, player_id, limit=10, campaign_id=campaign_id),
         })
     except ValueError as ex:
-        return jsonify({"error": str(ex)}), 400
+        return _client_error(ex, 400)
     except Exception as ex:
         print(f"[DM] message post failed: {ex}", flush=True)
-        return jsonify({"error": str(ex)}), 500
+        return _client_error(ex, 500)
 
 
 @app.get("/dm/pending")
@@ -3422,7 +3456,10 @@ def dm_rulings():
     session = resolve_request_session(args=request.args)
     player_id = session["player_id"]
     campaign_id = session["campaign_id"]
-    limit = int(request.args.get("limit", 20))
+    try:
+        limit = max(1, min(int(request.args.get("limit", 20)), 100))
+    except (TypeError, ValueError):
+        limit = 20
 
     return jsonify({
         "npc_id": npc_id,
@@ -3492,10 +3529,10 @@ def dm_ruling_post():
             "rulings": load_rulings(npc_id, player_id, limit=10, campaign_id=campaign_id),
         })
     except ValueError as ex:
-        return jsonify({"error": str(ex)}), 400
+        return _client_error(ex, 400)
     except Exception as ex:
         print(f"[DM] ruling post failed: {ex}", flush=True)
-        return jsonify({"error": str(ex)}), 500
+        return _client_error(ex, 500)
 
 
 @app.post("/dm/detect")
@@ -3609,12 +3646,12 @@ def dm_speak():
             "saved_history": save_history,
         })
     except FileNotFoundError as ex:
-        return jsonify({"error": str(ex)}), 404
+        return _client_error(ex, 404, not_found=True)
     except ValueError as ex:
-        return jsonify({"error": str(ex)}), 400
+        return _client_error(ex, 400)
     except Exception as ex:
         print(f"[DM] speak failed: {ex!r}", flush=True)
-        return jsonify({"error": str(ex)}), 500
+        return _client_error(ex, 500)
 
 
 @app.get("/dm/followup-audio/<filename>")
@@ -3691,64 +3728,19 @@ def preview_voice():
             download_name="voice_preview.wav",
         )
     except FileNotFoundError as ex:
-        return jsonify({"error": str(ex)}), 404
+        return _client_error(ex, 404, not_found=True)
     except subprocess.CalledProcessError as ex:
         return jsonify({"error": f"Piper synthesis failed: {ex}"}), 500
     except Exception as ex:
         print(f"[VOICE] preview failed: {ex!r}", flush=True)
-        return jsonify({"error": str(ex)}), 500
+        return _client_error(ex, 500)
     finally:
         raw_path.unlink(missing_ok=True)
 
 
 @app.get("/health")
 def health():
-    return jsonify({
-        "status": "ok",
-        "routes": [
-            "/npc-turn",
-            "/npc-voice-turn",
-            "/npc-voice-turn-debug",
-            "/npc-memory",
-            "/npc-memory/clear",
-            "/npcs",
-            "/locations",
-            "/npc-preload",
-            "/llm/models",
-            "/llm/status",
-            "/llm/select",
-            "/llm/reset-usage",
-            "/session/status",
-            "/scene/status",
-            "/scene/time",
-            "/scene/time/clear",
-            "/scene/sub-location",
-            "/scene/sub-location/clear",
-            "/scene/sub-locations",
-            "/turn/progress/steps",
-            "/turn/progress/register",
-            "/turn/progress/<request_id>",
-            "/turn-audio/<request_id>/<clip>",
-            "/campaigns",
-            "/campaign/active",
-            "/campaign/select",
-            "/parties",
-            "/party/characters",
-            "/party/active",
-            "/party/select",
-            "/dm/status",
-            "/dm/messages",
-            "/dm/message",
-            "/dm/pending",
-            "/dm/rulings",
-            "/dm/ruling",
-            "/dm/detect",
-            "/dm/speak",
-            "/dm/followup-audio/<filename>",
-            "/voices",
-            "/voices/preview",
-        ]
-    })
+    return jsonify({"status": "ok"})
 
 
 @app.get("/npc-memory")
