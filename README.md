@@ -162,7 +162,7 @@ Preview request body:
 
 ```json
 {
-  "voice_path": "C:\\AI\\Voices\\en\\en_US\\ryan\\medium\\en_US-ryan-medium.onnx",
+  "voice_path": "en/en_US/ryan/medium/en_US-ryan-medium.onnx",
   "length_scale": 1.15,
   "noise_scale": 0.667,
   "noise_w": 0.8,
@@ -173,6 +173,8 @@ Preview request body:
   "text": "Optional sample text"
 }
 ```
+
+`voice_path` / YAML `voice_model` must be **relative to `VOICES_DIR`** (posix separators). Absolute/UNC paths are rejected; legacy absolutes may still resolve by basename via the voice inventory.
 
 `fx_preset` values: `none`, `clarity`, `cave`, `radio`, `grit`.
 
