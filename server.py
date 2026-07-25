@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify, send_file, make_response
 import os
+import hashlib
 import secrets
 import yaml
 import re
@@ -180,27 +181,154 @@ GAME_API_ENV_FILE = BASE_DIR / "game_api.env"
 
 
 def _load_game_api_env_file() -> None:
-    """Load GAME_API_* from game_api.env when not already set in the shell."""
+    """Load GAME_API_* from game_api.env.
+
+    File values win for GAME_API_* keys so a stale shell export cannot silently
+    override the secrets file ops edited and verified.
+    Non-GAME_API_* keys still only fill gaps (shell wins).
+    """
     if not GAME_API_ENV_FILE.exists():
         return
 
     try:
+        applied: list[str] = []
+        skipped: list[str] = []
         for line in GAME_API_ENV_FILE.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
+            line = line.strip().lstrip("\ufeff")
             if not line or line.startswith("#") or "=" not in line:
                 continue
             key, value = line.split("=", 1)
-            key = key.strip()
+            key = key.strip().lstrip("\ufeff")
             value = value.strip().strip('"').strip("'")
-            if key and key not in os.environ:
+            if not key:
+                continue
+            if key.startswith("GAME_API_"):
                 os.environ[key] = value
+                applied.append(key)
+                continue
+            if key not in os.environ:
+                os.environ[key] = value
+                applied.append(key)
+            else:
+                skipped.append(key)
+        if applied:
+            print(f"[GAME_API] applied from {GAME_API_ENV_FILE.name}: {', '.join(applied)}", flush=True)
+        if skipped:
+            print(
+                f"[GAME_API] left shell values for non-GAME_API keys: {', '.join(skipped)}",
+                flush=True,
+            )
     except OSError as ex:
         print(f"[GAME_API] failed to read env file: {ex}", flush=True)
 
 
 _load_game_api_env_file()
-if GAME_API_ENV_FILE.exists():
-    print(f"[GAME_API] loaded settings from {GAME_API_ENV_FILE.name}", flush=True)
+
+
+def _secret_fingerprint(value: str) -> str:
+    """Short non-reversible fingerprint for startup / auth diagnostics."""
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return f"len={len(value)} sha256_12={digest[:12]}"
+
+
+# Alpha / Funnel: bind localhost only; require Bearer token when GAME_API_KEY is set.
+GAME_API_KEY = os.environ.get("GAME_API_KEY", "").strip()
+REQUIRE_GAME_API_KEY = os.environ.get("REQUIRE_GAME_API_KEY", "").strip().lower() in ("1", "true", "yes")
+GAME_API_HOST = os.environ.get("GAME_API_HOST", "127.0.0.1").strip() or "127.0.0.1"
+GAME_API_PORT = int(os.environ.get("GAME_API_PORT", "5000"))
+AUTH_EXEMPT_PATHS = frozenset({"/health"})
+
+if GAME_API_KEY:
+    print(f"[GAME_API] GAME_API_KEY active ({_secret_fingerprint(GAME_API_KEY)})", flush=True)
+elif GAME_API_ENV_FILE.exists():
+    print(f"[GAME_API] {GAME_API_ENV_FILE.name} present but GAME_API_KEY is empty", flush=True)
+
+if REQUIRE_GAME_API_KEY and not GAME_API_KEY:
+    raise SystemExit(
+        "REQUIRE_GAME_API_KEY is enabled but GAME_API_KEY is empty. "
+        "Set GAME_API_KEY or disable REQUIRE_GAME_API_KEY."
+    )
+
+
+def _extract_game_api_key():
+    auth = request.headers.get("Authorization", "")
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    return request.headers.get("X-Game-Api-Key", "").strip()
+
+
+def _api_keys_match(provided: str, expected: str) -> bool:
+    if not provided or not expected or len(provided) != len(expected):
+        return False
+    return secrets.compare_digest(provided, expected)
+
+
+def _client_error(ex: BaseException, status: int = 500, *, not_found: bool = False):
+    """Log exception details server-side; return a generic client message."""
+    print(f"[ERROR] {type(ex).__name__}: {ex!r}", flush=True)
+    if not_found or status == 404:
+        return jsonify({"error": "Not found"}), 404
+    if status == 400:
+        return jsonify({"error": "Bad request"}), 400
+    return jsonify({"error": "Internal server error"}), status
+
+
+@app.before_request
+def require_game_api_key():
+    if request.method == "OPTIONS":
+        return None
+
+    owner = (
+        request.headers.get("X-Campaign-Owner-User-Id")
+        or request.headers.get("X-Owner-User-Id")
+        or ""
+    ).strip()
+    campaign = (
+        request.headers.get("X-Campaign-Id")
+        or request.headers.get("X-Active-Campaign-Id")
+        or ""
+    ).strip()
+
+    if request.method in ("POST", "PUT", "PATCH"):
+        # Best-effort: JSON/form may carry owner/campaign for session scoping.
+        body = None
+        if request.mimetype and "json" in (request.mimetype or ""):
+            body = request.get_json(silent=True) or {}
+            if isinstance(body, dict):
+                if not owner:
+                    owner = str(body.get("owner_user_id") or "").strip()
+                if not campaign:
+                    campaign = str(body.get("campaign_id") or body.get("id") or "").strip()
+        if request.form:
+            if not owner:
+                owner = str(request.form.get("owner_user_id") or "").strip()
+            if not campaign:
+                campaign = str(request.form.get("campaign_id") or "").strip()
+
+    if not campaign:
+        campaign = (request.args.get("campaign_id") or "").strip()
+
+    set_request_context(owner or None, campaign or None)
+
+    if REQUIRE_GAME_API_KEY and request.path == "/llm/reset-usage":
+        return jsonify({"error": "Not found"}), 404
+
+    # Fail closed when a key is configured, or when REQUIRE_GAME_API_KEY demands one.
+    if (GAME_API_KEY or REQUIRE_GAME_API_KEY) and request.path not in AUTH_EXEMPT_PATHS:
+        provided = _extract_game_api_key()
+        if not GAME_API_KEY or not _api_keys_match(provided, GAME_API_KEY):
+            auth_hdr = request.headers.get("Authorization", "")
+            print(
+                f"[AUTH] rejected {request.method} {request.path} from {request.remote_addr} "
+                f"(authorization={'yes' if auth_hdr else 'no'}, "
+                f"x_game_api_key={'yes' if request.headers.get('X-Game-Api-Key') else 'no'}, "
+                f"provided={_secret_fingerprint(provided) if provided else 'len=0'}, "
+                f"expected={_secret_fingerprint(GAME_API_KEY) if GAME_API_KEY else 'len=0'})",
+                flush=True,
+            )
+            return jsonify({"error": "Unauthorized"}), 401
+
+    return None
 
 
 def resolve_voices_dir() -> Path:
@@ -324,95 +452,6 @@ if VOICES_DIR.exists():
     )
 else:
     print(f"[VOICES] Piper scan root not found: {VOICES_DIR}", flush=True)
-
-# Alpha / Funnel: bind localhost only; require Bearer token when GAME_API_KEY is set.
-GAME_API_KEY = os.environ.get("GAME_API_KEY", "").strip()
-REQUIRE_GAME_API_KEY = os.environ.get("REQUIRE_GAME_API_KEY", "").strip().lower() in ("1", "true", "yes")
-GAME_API_HOST = os.environ.get("GAME_API_HOST", "127.0.0.1").strip() or "127.0.0.1"
-GAME_API_PORT = int(os.environ.get("GAME_API_PORT", "5000"))
-AUTH_EXEMPT_PATHS = frozenset({"/health"})
-
-if REQUIRE_GAME_API_KEY and not GAME_API_KEY:
-    raise SystemExit(
-        "REQUIRE_GAME_API_KEY is enabled but GAME_API_KEY is empty. "
-        "Set GAME_API_KEY or disable REQUIRE_GAME_API_KEY."
-    )
-
-
-def _extract_game_api_key():
-    auth = request.headers.get("Authorization", "")
-    if auth.startswith("Bearer "):
-        return auth[7:].strip()
-    return request.headers.get("X-Game-Api-Key", "").strip()
-
-
-def _api_keys_match(provided: str, expected: str) -> bool:
-    if not provided or not expected or len(provided) != len(expected):
-        return False
-    return secrets.compare_digest(provided, expected)
-
-
-def _client_error(ex: BaseException, status: int = 500, *, not_found: bool = False):
-    """Log exception details server-side; return a generic client message."""
-    print(f"[ERROR] {type(ex).__name__}: {ex!r}", flush=True)
-    if not_found or status == 404:
-        return jsonify({"error": "Not found"}), 404
-    if status == 400:
-        return jsonify({"error": "Bad request"}), 400
-    return jsonify({"error": "Internal server error"}), status
-
-
-@app.before_request
-def require_game_api_key():
-    if request.method == "OPTIONS":
-        return None
-
-    owner = (
-        request.headers.get("X-Campaign-Owner-User-Id")
-        or request.headers.get("X-Owner-User-Id")
-        or ""
-    ).strip()
-    campaign = (
-        request.headers.get("X-Campaign-Id")
-        or request.headers.get("X-Active-Campaign-Id")
-        or ""
-    ).strip()
-
-    if request.method in ("POST", "PUT", "PATCH"):
-        # Best-effort: JSON/form may carry owner/campaign for session scoping.
-        body = None
-        if request.mimetype and "json" in (request.mimetype or ""):
-            body = request.get_json(silent=True) or {}
-            if isinstance(body, dict):
-                if not owner:
-                    owner = str(body.get("owner_user_id") or "").strip()
-                if not campaign:
-                    campaign = str(body.get("campaign_id") or body.get("id") or "").strip()
-        if request.form:
-            if not owner:
-                owner = str(request.form.get("owner_user_id") or "").strip()
-            if not campaign:
-                campaign = str(request.form.get("campaign_id") or "").strip()
-
-    if not campaign:
-        campaign = (request.args.get("campaign_id") or "").strip()
-
-    set_request_context(owner or None, campaign or None)
-
-    if REQUIRE_GAME_API_KEY and request.path == "/llm/reset-usage":
-        return jsonify({"error": "Not found"}), 404
-
-    # Fail closed when a key is configured, or when REQUIRE_GAME_API_KEY demands one.
-    if (GAME_API_KEY or REQUIRE_GAME_API_KEY) and request.path not in AUTH_EXEMPT_PATHS:
-        provided = _extract_game_api_key()
-        if not GAME_API_KEY or not _api_keys_match(provided, GAME_API_KEY):
-            print(
-                f"[AUTH] rejected request to {request.path} from {request.remote_addr}",
-                flush=True,
-            )
-            return jsonify({"error": "Unauthorized"}), 401
-
-    return None
 
 
 @app.teardown_request
