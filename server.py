@@ -354,12 +354,23 @@ VOICES_DIR = resolve_voices_dir()
 # Cached Piper inventory — full-tree rglob on a large Voices share is slow enough
 # to 504 the Yaml Editor /api/voices proxy (30s) when scanned on every request.
 _VOICE_CACHE_LOCK = threading.Lock()
+_VOICE_BUILD_LOCK = threading.Lock()  # single-flight full-tree rebuilds
 _VOICE_CACHE: dict[str, Any] = {
     "built_at": 0.0,
     "voices": [],
     "by_name": {},
 }
 _VOICE_CACHE_TTL_SECONDS = float(os.environ.get("VOICES_CACHE_TTL_SECONDS", "300"))
+
+
+def _voice_cache_snapshot() -> list[dict[str, Any]] | None:
+    """Return a copy of cached voices when fresh, else None."""
+    now = time.perf_counter()
+    with _VOICE_CACHE_LOCK:
+        age = now - float(_VOICE_CACHE.get("built_at") or 0.0)
+        if _VOICE_CACHE["voices"] and age < _VOICE_CACHE_TTL_SECONDS:
+            return list(_VOICE_CACHE["voices"])
+    return None
 
 
 def _build_voice_inventory() -> tuple[list[dict[str, Any]], dict[str, Path]]:
@@ -417,18 +428,31 @@ def _build_voice_inventory() -> tuple[list[dict[str, Any]], dict[str, Path]]:
 
 
 def refresh_voice_inventory(*, force: bool = False) -> list[dict[str, Any]]:
-    now = time.perf_counter()
-    with _VOICE_CACHE_LOCK:
-        age = now - float(_VOICE_CACHE.get("built_at") or 0.0)
-        if not force and _VOICE_CACHE["voices"] and age < _VOICE_CACHE_TTL_SECONDS:
-            return list(_VOICE_CACHE["voices"])
+    if not force:
+        cached = _voice_cache_snapshot()
+        if cached is not None:
+            return cached
 
-    voices, by_name = _build_voice_inventory()
-    with _VOICE_CACHE_LOCK:
-        _VOICE_CACHE["built_at"] = time.perf_counter()
-        _VOICE_CACHE["voices"] = voices
-        _VOICE_CACHE["by_name"] = by_name
-        return list(voices)
+    # Single-flight: concurrent /voices + preview must not each rglob the tree.
+    with _VOICE_BUILD_LOCK:
+        if not force:
+            cached = _voice_cache_snapshot()
+            if cached is not None:
+                return cached
+
+        started = time.perf_counter()
+        voices, by_name = _build_voice_inventory()
+        elapsed = time.perf_counter() - started
+        print(
+            f"[VOICES] inventory rebuilt in {elapsed:.3f}s "
+            f"({len(voices)} model(s) under {VOICES_DIR})",
+            flush=True,
+        )
+        with _VOICE_CACHE_LOCK:
+            _VOICE_CACHE["built_at"] = time.perf_counter()
+            _VOICE_CACHE["voices"] = voices
+            _VOICE_CACHE["by_name"] = by_name
+            return list(voices)
 
 
 def list_piper_voices() -> list[dict[str, Any]]:
@@ -457,23 +481,22 @@ def resolve_voice_model_path(voice_model: str | None) -> Path:
     rejected for path-traversal hardening; legacy absolutes may still resolve
     via basename/relative-key inventory lookup only (never by opening the
     absolute path itself).
+
+    Important: do **not** call Path.resolve() on the Voices tree here. On mapped
+    drives / UNC shares resolve() can take many seconds per call and made
+    preview/select feel like 15–20s timeouts.
     """
     if not voice_model or not str(voice_model).strip():
         return DEFAULT_VOICE_MODEL
 
     raw = str(voice_model).strip()
-    voices_root = VOICES_DIR.resolve()
 
     def _from_cache(key: str) -> Path | None:
         cached = lookup_cached_voice_by_name(key)
-        if cached is None or not cached.exists():
+        if cached is None:
             return None
-        cached_resolved = cached.resolve()
-        try:
-            cached_resolved.relative_to(voices_root)
-            return cached_resolved
-        except ValueError:
-            return None
+        # Inventory paths are already under VOICES_DIR; trust them without resolve().
+        return cached
 
     # Harden: never open caller-supplied absolute/UNC paths.
     if Path(raw).is_absolute() or raw.startswith(("\\\\", "//")):
@@ -486,13 +509,14 @@ def resolve_voice_model_path(voice_model: str | None) -> Path:
         raise FileNotFoundError(f"Piper voice model not found: {voice_model}")
 
     normalized = raw.replace("\\", "/").lstrip("/")
-    candidate = (VOICES_DIR / normalized).resolve()
+    candidate = VOICES_DIR / Path(normalized)
+    # Syntactic containment (no filesystem resolve).
     try:
-        candidate.relative_to(voices_root)
+        candidate.relative_to(VOICES_DIR)
     except ValueError as ex:
         raise FileNotFoundError(f"Piper voice model not found: {voice_model}") from ex
 
-    if candidate.exists() and candidate.suffix.lower() == ".onnx":
+    if candidate.suffix.lower() == ".onnx" and candidate.is_file():
         return candidate
 
     matched = _from_cache(normalized)
@@ -3264,6 +3288,7 @@ def campaign_active():
 
 @app.post("/campaign/select")
 def campaign_select():
+    started = time.perf_counter()
     body = request.get_json(force=True, silent=True) or {}
     campaign_id = (body.get("campaign_id") or body.get("id") or "").strip()
 
@@ -3305,6 +3330,11 @@ def campaign_select():
         payload = {"status": "selected", **result}
         if pack_info:
             payload["content_pack"] = pack_info
+        print(
+            f"[SESSION] POST /campaign/select campaign={campaign_id} "
+            f"in {time.perf_counter() - started:.3f}s",
+            flush=True,
+        )
         return jsonify(payload)
     except ValueError as ex:
         return _client_error(ex, 400)
@@ -3739,8 +3769,14 @@ def dm_followup_audio(filename: str):
 
 @app.get("/voices")
 def list_voices():
+    started = time.perf_counter()
     force_refresh = (request.args.get("refresh") or "").strip().lower() in ("1", "true", "yes")
     voices = refresh_voice_inventory(force=force_refresh)
+    print(
+        f"[VOICES] GET /voices {len(voices)} model(s) in {time.perf_counter() - started:.3f}s "
+        f"(force_refresh={force_refresh})",
+        flush=True,
+    )
     return jsonify({
         "voices": voices,
         "voice_enabled": True,
@@ -3751,6 +3787,7 @@ def list_voices():
 
 @app.post("/voices/preview")
 def preview_voice():
+    started = time.perf_counter()
     body = request.get_json(force=True, silent=True) or {}
     voice_path = (body.get("voice_path") or body.get("voice_model") or "").strip()
     if not voice_path:
@@ -3769,7 +3806,10 @@ def preview_voice():
     raw_path = OUTPUT_DIR / f"{uuid.uuid4().hex}_voice_preview_raw.wav"
     output_path = OUTPUT_DIR / f"{uuid.uuid4().hex}_voice_preview.wav"
     try:
+        resolve_started = time.perf_counter()
         model_path = resolve_voice_model_path(voice_path)
+        resolve_elapsed = time.perf_counter() - resolve_started
+        synth_started = time.perf_counter()
         synthesize_speech(
             spoken,
             str(model_path),
@@ -3785,6 +3825,12 @@ def preview_voice():
             output_path,
             pitch_semitones=float(opts.get("pitch_semitones") or 0.0),
             fx_preset=str(opts.get("fx_preset") or DEFAULT_FX_PRESET),
+        )
+        print(
+            f"[VOICE] preview ok resolve={resolve_elapsed:.3f}s "
+            f"synth+fx={time.perf_counter() - synth_started:.3f}s "
+            f"total={time.perf_counter() - started:.3f}s path={voice_path}",
+            flush=True,
         )
         return send_file(
             output_path,
