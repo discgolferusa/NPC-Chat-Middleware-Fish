@@ -378,9 +378,9 @@ def _build_voice_inventory() -> tuple[list[dict[str, Any]], dict[str, Path]]:
         seen.add(key)
 
         try:
-            label = path.relative_to(VOICES_DIR).as_posix()
+            rel = path.relative_to(VOICES_DIR).as_posix()
         except ValueError:
-            label = path.name
+            rel = path.name
 
         meta = load_piper_model_meta(path)
         curated = curated_defaults_for_quality(meta["quality"])
@@ -392,8 +392,9 @@ def _build_voice_inventory() -> tuple[list[dict[str, Any]], dict[str, Path]]:
             quality_note += f" ({meta['num_speakers']} speakers)"
 
         voices.append({
-            "label": f"{label}{quality_note}",
-            "path": str(path),
+            "label": f"{rel}{quality_note}",
+            # Relative to VOICES_DIR (posix). Never expose host absolute/UNC paths.
+            "path": rel,
             "dataset": meta["dataset"],
             "quality": quality,
             "num_speakers": meta["num_speakers"],
@@ -407,6 +408,7 @@ def _build_voice_inventory() -> tuple[list[dict[str, Any]], dict[str, Path]]:
         })
         name_key = path.name.lower()
         by_name.setdefault(name_key, path)
+        by_name.setdefault(rel.lower(), path)
 
     # Alphabetical by display label (case-insensitive).
     voices.sort(key=lambda item: str(item.get("label", "")).lower())
@@ -434,14 +436,70 @@ def list_piper_voices() -> list[dict[str, Any]]:
 
 
 def lookup_cached_voice_by_name(filename: str) -> Path | None:
-    name = Path(filename).name.lower()
-    if not name:
+    """Look up a voice by basename or relative posix path (case-insensitive)."""
+    key = (filename or "").replace("\\", "/").strip().lower().lstrip("/")
+    if not key:
         return None
 
     refresh_voice_inventory(force=False)
     with _VOICE_CACHE_LOCK:
-        path = _VOICE_CACHE["by_name"].get(name)
+        path = _VOICE_CACHE["by_name"].get(key)
+        if path is None:
+            path = _VOICE_CACHE["by_name"].get(Path(key).name.lower())
         return path if isinstance(path, Path) else None
+
+
+def resolve_voice_model_path(voice_model: str | None) -> Path:
+    """Resolve voice_model to a real *.onnx under VOICES_DIR.
+
+    Contract: callers should pass a path relative to VOICES_DIR (posix), e.g.
+    ``en/en_US/ryan/medium/en_US-ryan-medium.onnx``. Absolute/UNC paths are
+    rejected for path-traversal hardening; legacy absolutes may still resolve
+    via basename/relative-key inventory lookup only (never by opening the
+    absolute path itself).
+    """
+    if not voice_model or not str(voice_model).strip():
+        return DEFAULT_VOICE_MODEL
+
+    raw = str(voice_model).strip()
+    voices_root = VOICES_DIR.resolve()
+
+    def _from_cache(key: str) -> Path | None:
+        cached = lookup_cached_voice_by_name(key)
+        if cached is None or not cached.exists():
+            return None
+        cached_resolved = cached.resolve()
+        try:
+            cached_resolved.relative_to(voices_root)
+            return cached_resolved
+        except ValueError:
+            return None
+
+    # Harden: never open caller-supplied absolute/UNC paths.
+    if Path(raw).is_absolute() or raw.startswith(("\\\\", "//")):
+        matched = _from_cache(raw)
+        if matched is not None:
+            return matched
+        raise FileNotFoundError(f"Piper voice model not found: {voice_model}")
+
+    if ".." in Path(raw).parts:
+        raise FileNotFoundError(f"Piper voice model not found: {voice_model}")
+
+    normalized = raw.replace("\\", "/").lstrip("/")
+    candidate = (VOICES_DIR / normalized).resolve()
+    try:
+        candidate.relative_to(voices_root)
+    except ValueError as ex:
+        raise FileNotFoundError(f"Piper voice model not found: {voice_model}") from ex
+
+    if candidate.exists() and candidate.suffix.lower() == ".onnx":
+        return candidate
+
+    matched = _from_cache(normalized)
+    if matched is not None:
+        return matched
+
+    raise FileNotFoundError(f"Piper voice model not found: {voice_model}")
 
 
 if VOICES_DIR.exists():
@@ -2056,38 +2114,6 @@ def synthesize_speech(
         encoding="utf-8",
         check=True,
     )
-
-
-def resolve_voice_model_path(voice_model: str | None) -> Path:
-    if not voice_model or not str(voice_model).strip():
-        return DEFAULT_VOICE_MODEL
-
-    raw = str(voice_model).strip()
-    # Only allow basenames / relative names under VOICES_DIR — never absolute or .. paths.
-    if Path(raw).is_absolute() or ".." in Path(raw).parts or raw.startswith(("\\\\", "//")):
-        raise FileNotFoundError(f"Piper voice model not found: {voice_model}")
-
-    normalized = raw.replace("\\", "/").lstrip("/")
-    candidate = (VOICES_DIR / normalized).resolve()
-    voices_root = VOICES_DIR.resolve()
-    try:
-        candidate.relative_to(voices_root)
-    except ValueError as ex:
-        raise FileNotFoundError(f"Piper voice model not found: {voice_model}") from ex
-    if not candidate.exists():
-        # Match by filename using the cached inventory (no per-request full-tree rglob).
-        target_name = Path(normalized).name.lower()
-        cached = lookup_cached_voice_by_name(target_name)
-        if cached is not None and cached.exists():
-            cached_resolved = cached.resolve()
-            try:
-                cached_resolved.relative_to(voices_root)
-                return cached_resolved
-            except ValueError:
-                pass
-        raise FileNotFoundError(f"Piper voice model not found: {voice_model}")
-
-    return candidate
 
 
 def extract_memories_from_exchange(
