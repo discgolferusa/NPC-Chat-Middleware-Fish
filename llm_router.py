@@ -552,24 +552,60 @@ def _would_exceed_groq_limits(model_id: str, estimated_total_tokens: int) -> str
         return None
 
     limits = model_entry.get("limits") or {}
+    label = model_entry.get("label") or model_id
 
     rpm = limits.get("rpm")
     if rpm is not None and usage_requests_last_60s(model_id=model_id) + 1 > rpm:
-        return "groq_estimated_rpm_limit"
+        return (
+            f"Groq requests-per-minute limit reached for {label} "
+            f"({rpm}/min). Wait about a minute, then retry."
+        )
 
     rpd = limits.get("rpd")
     if rpd is not None and usage_requests_last_24h(model_id=model_id) + 1 > rpd:
-        return "groq_estimated_rpd_limit"
+        return (
+            f"Groq requests-per-day limit reached for {label} "
+            f"({rpd}/day). Try again tomorrow or switch models in Admin → LLM."
+        )
 
     tpm = limits.get("tpm")
-    if tpm is not None and usage_tokens_last_60s(model_id=model_id) + estimated_total_tokens > tpm:
-        return "groq_estimated_tpm_limit"
+    if tpm is not None:
+        used = usage_tokens_last_60s(model_id=model_id)
+        if used + estimated_total_tokens > tpm:
+            return (
+                f"Groq tokens-per-minute budget too small for this request on {label} "
+                f"(need ~{estimated_total_tokens} tokens, limit {tpm}/min, "
+                f"~{used} used in the last minute). "
+                "Wait about a minute, shorten the document, or switch content creation "
+                "to a higher-TPM model such as groq-llama-4-scout (Admin → LLM)."
+            )
 
     tpd = limits.get("tpd")
     if tpd is not None and usage_tokens_last_24h(model_id=model_id) + estimated_total_tokens > tpd:
-        return "groq_estimated_tpd_limit"
+        return (
+            f"Groq tokens-per-day limit reached for {label} "
+            f"({tpd}/day). Try again tomorrow or switch models in Admin → LLM."
+        )
 
     return None
+
+
+def content_creation_max_input_chars() -> int:
+    """Cap document import size so the outline prompt fits the selected model's TPM."""
+    model_id = CONTENT_CREATION_MODEL_ID
+    model_entry = LLM_MODELS.get(model_id) or {}
+    limits = model_entry.get("limits") or {}
+    tpm = limits.get("tpm")
+    if tpm is None:
+        return 120_000
+
+    # Reserve completion budget + system/prompt overhead + recent usage cushion.
+    completion = CONTENT_CREATION_DEFAULT_MAX_TOKENS
+    used = usage_tokens_last_60s(model_id=model_id)
+    # Use at most ~55% of TPM for the document body so outline still fits.
+    budget_tokens = max(2_000, int(tpm * 0.55) - completion - min(used, tpm // 4))
+    # Rough chars≈tokens*4 heuristic used elsewhere in this module.
+    return max(8_000, min(120_000, budget_tokens * 4))
 
 
 def call_local_chat_completions(

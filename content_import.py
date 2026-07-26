@@ -24,7 +24,7 @@ import json
 import re
 from typing import Any
 
-from llm_router import generate_llm_response
+from llm_router import content_creation_max_input_chars, generate_llm_response
 
 MAX_INPUT_CHARS = 120_000
 MAX_LOCATIONS_PER_BATCH = 8
@@ -617,12 +617,15 @@ def _merge_npc_detail(stub: dict[str, Any], detail: dict[str, Any], campaign_id:
 
 def _truncate_input(text: str, warnings: list[str]) -> str:
     text = text or ""
-    if len(text) > MAX_INPUT_CHARS:
+    # Fit the selected content_creation model's Groq TPM when configured.
+    max_chars = min(MAX_INPUT_CHARS, content_creation_max_input_chars())
+    if len(text) > max_chars:
         warnings.append(
             f"Input document was {len(text)} characters; truncated to the first "
-            f"{MAX_INPUT_CHARS} characters for analysis."
+            f"{max_chars} characters so the outline pass fits the current "
+            "content_creation model's Groq token-per-minute budget."
         )
-        return text[:MAX_INPUT_CHARS]
+        return text[:max_chars]
     return text
 
 
