@@ -3166,7 +3166,10 @@ def content_import_analyze():
         )
         return jsonify(result)
     except ContentImportError as ex:
-        return _client_error(ex, 400)
+        # User-facing analysis failures (empty model output, bad JSON, etc.) —
+        # return the message so the editor can show it instead of generic "Bad request".
+        print(f"[CONTENT-IMPORT] analyze rejected: {ex}", flush=True)
+        return jsonify({"error": str(ex)}), 400
     except Exception as ex:
         print(f"[CONTENT-IMPORT] analyze failed: {ex!r}", flush=True)
         return _client_error(ex, 500)
