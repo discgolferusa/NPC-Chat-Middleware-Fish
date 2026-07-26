@@ -1211,6 +1211,20 @@ def get_llm_models_payload() -> dict[str, Any]:
     return {
         "current_model_id": CURRENT_LLM_MODEL_ID,
         "provider_mode": LLM_PROVIDER_MODE,
+        "provider_modes": [
+            {
+                "id": "local",
+                "label": "local — llama.cpp only (must be running on LOCAL_LLM_URL)",
+            },
+            {
+                "id": "groq",
+                "label": "groq — Groq only (fails if Groq is unavailable)",
+            },
+            {
+                "id": "groq_with_local_fallback",
+                "label": "groq_with_local_fallback — try Groq, fall back to local",
+            },
+        ],
         "models": _public_model_list(),
         "purposes": {
             PURPOSE_CHAT: {
