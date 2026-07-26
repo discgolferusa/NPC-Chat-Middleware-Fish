@@ -24,7 +24,7 @@ import json
 import re
 from typing import Any
 
-from llm_router import generate_llm_response
+from llm_router import content_creation_max_input_chars, generate_llm_response
 
 MAX_INPUT_CHARS = 120_000
 MAX_LOCATIONS_PER_BATCH = 8
@@ -617,12 +617,24 @@ def _merge_npc_detail(stub: dict[str, Any], detail: dict[str, Any], campaign_id:
 
 def _truncate_input(text: str, warnings: list[str]) -> str:
     text = text or ""
-    if len(text) > MAX_INPUT_CHARS:
+    # Fit the selected content_creation model's Groq TPM when configured.
+    # 0 means this model cannot host an import request at all right now.
+    max_chars = content_creation_max_input_chars()
+    if max_chars <= 0:
+        raise ContentImportError(
+            "The content creation model's Groq tokens-per-minute budget is too small "
+            "for document import (completion reserve fills the limit). Switch content "
+            "creation to a higher-TPM model such as groq-llama-4-scout in Admin → LLM, "
+            "or wait a minute if recent usage exhausted the budget."
+        )
+    max_chars = min(MAX_INPUT_CHARS, max_chars)
+    if len(text) > max_chars:
         warnings.append(
             f"Input document was {len(text)} characters; truncated to the first "
-            f"{MAX_INPUT_CHARS} characters for analysis."
+            f"{max_chars} characters so the outline pass fits the current "
+            "content_creation model's Groq token-per-minute budget."
         )
-        return text[:MAX_INPUT_CHARS]
+        return text[:max_chars]
     return text
 
 
