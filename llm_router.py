@@ -35,6 +35,11 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1/chat/completions")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
 GROQ_TIMEOUT_SECONDS = int(os.getenv("GROQ_TIMEOUT_SECONDS", "10"))
+# content_creation sends large prompts and asks for long JSON completions;
+# the chat default (10s) is far too short and causes cascading timeouts.
+CONTENT_CREATION_GROQ_TIMEOUT_SECONDS = int(
+    os.getenv("CONTENT_CREATION_GROQ_TIMEOUT_SECONDS", "120")
+)
 
 # Spoken NPC replies are short, but reasoning models spend completion tokens on
 # chain-of-thought first. max_tokens=180 with gpt-oss/qwen3 often yields empty
@@ -611,6 +616,22 @@ def call_local_chat_completions(
     }
 
 
+def _groq_timeout_seconds(
+    *,
+    purpose: str = DEFAULT_PURPOSE,
+    model_id: str | None = None,
+    model_name: str | None = None,
+    timeout: int | None = None,
+) -> int:
+    if timeout is not None:
+        return max(1, int(timeout))
+    if purpose == PURPOSE_CONTENT_CREATION:
+        return max(CONTENT_CREATION_GROQ_TIMEOUT_SECONDS, GROQ_TIMEOUT_SECONDS)
+    if _is_reasoning_model(model_id, model_name):
+        return max(GROQ_TIMEOUT_SECONDS, 30)
+    return GROQ_TIMEOUT_SECONDS
+
+
 def call_groq_chat_completions(
     messages: list[dict[str, Any]],
     model_name: str,
@@ -619,12 +640,13 @@ def call_groq_chat_completions(
     temperature: float | None = None,
     max_tokens: int | None = None,
     timeout: int | None = None,
+    purpose: str = DEFAULT_PURPOSE,
 ) -> tuple[str, dict[str, int], requests.Response]:
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json",
     }
-    effective_max = _effective_max_tokens(model_id, max_tokens, model_name=model_name)
+    effective_max = _effective_max_tokens(model_id, max_tokens, model_name=model_name, purpose=purpose)
     payload: dict[str, Any] = {
         "model": model_name,
         "messages": messages,
@@ -637,11 +659,11 @@ def call_groq_chat_completions(
         GROQ_BASE_URL,
         headers=headers,
         json=payload,
-        timeout=timeout
-        or (
-            max(GROQ_TIMEOUT_SECONDS, 30)
-            if _is_reasoning_model(model_id, model_name)
-            else GROQ_TIMEOUT_SECONDS
+        timeout=_groq_timeout_seconds(
+            purpose=purpose,
+            model_id=model_id,
+            model_name=model_name,
+            timeout=timeout,
         ),
     )
 
@@ -821,6 +843,11 @@ def generate_llm_response(
         )
 
     model_name = selected_model["model"]
+    groq_timeout = _groq_timeout_seconds(
+        purpose=purpose,
+        model_id=selected_model_id,
+        model_name=model_name,
+    )
 
     try:
         content, usage, response = call_groq_chat_completions(
@@ -829,9 +856,13 @@ def generate_llm_response(
             model_id=selected_model_id,
             temperature=temperature,
             max_tokens=effective_max_tokens,
+            timeout=groq_timeout,
+            purpose=purpose,
         )
     except requests.Timeout as ex:
-        _set_online_disabled(300, "groq_timeout")
+        # Creation timeouts are expected for large docs; do not disable Groq for chat.
+        if purpose == PURPOSE_CHAT:
+            _set_online_disabled(300, "groq_timeout")
         if provider_mode == "groq":
             LAST_LLM_ERROR[purpose] = str(ex)
             record_llm_usage(
@@ -858,7 +889,8 @@ def generate_llm_response(
             **kwargs,
         )
     except requests.RequestException as ex:
-        _set_online_disabled(300, "groq_exception")
+        if purpose == PURPOSE_CHAT:
+            _set_online_disabled(300, "groq_exception")
         if provider_mode == "groq":
             LAST_LLM_ERROR[purpose] = str(ex)
             record_llm_usage(
@@ -916,7 +948,10 @@ def generate_llm_response(
         )
 
     if response.status_code in (500, 502, 503, 504):
-        _set_online_disabled(300, "groq_http_error")
+        # Transient server errors: disable globally for chat only. Creation
+        # retries should not take chat offline for five minutes.
+        if purpose == PURPOSE_CHAT:
+            _set_online_disabled(300, "groq_http_error")
         error_text = response.text[:500]
         record_llm_usage(
             provider="groq",

@@ -155,10 +155,30 @@ def _coerce_container(data: Any, key: str) -> list[dict[str, Any]]:
         value = data.get(key)
         if isinstance(value, list):
             return [item for item in value if isinstance(item, dict)]
-        # Some models collapse a single-item batch into the bare object.
-        if "id" in data:
+        # One-item batch often collapses to {"locations": {...}} / {"npcs": {...}}.
+        if isinstance(value, dict):
+            return [value]
+        # Bare object at the top level (single entity without the wrapper key).
+        if "id" in data or "name" in data:
             return [data]
     return []
+
+
+def _index_details_by_stub_id(
+    detail_items: list[dict[str, Any]],
+    stubs: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Map detail objects onto stub ids, including one-item bare-object batches."""
+    details_by_id: dict[str, dict[str, Any]] = {}
+    for item in detail_items:
+        item_id = str(item.get("id") or "").strip()
+        if item_id:
+            details_by_id[item_id] = item
+
+    if len(stubs) == 1 and len(detail_items) == 1 and stubs[0]["id"] not in details_by_id:
+        details_by_id[stubs[0]["id"]] = detail_items[0]
+
+    return details_by_id
 
 
 def _call_llm_json(
@@ -278,7 +298,13 @@ def _normalize_outline(
         "description": str(campaign_raw.get("description") or "").strip(),
     }
 
-    taken_location_ids: set[str] = {loc_id.strip() for loc_id in existing_location_ids if loc_id and loc_id.strip()}
+    existing_location_set: set[str] = {
+        loc_id.strip() for loc_id in existing_location_ids if loc_id and loc_id.strip()
+    }
+    # Tracks ids already claimed by locations we will emit (write). Existing
+    # campaign ids are intentionally NOT pre-seeded here so merge mode can reuse
+    # them for NPC location refs without inventing greyhaven_2.
+    taken_location_ids: set[str] = set()
     id_remap: dict[str, str] = {}
     locations: list[dict[str, Any]] = []
 
@@ -288,16 +314,40 @@ def _normalize_outline(
         name = str(raw_loc.get("name") or "").strip()
         raw_id = str(raw_loc.get("id") or name or "location").strip()
         base_id = snake_case(raw_id)
+        if not base_id:
+            continue
+
+        # Merge: model reused an existing campaign location — keep the id for
+        # NPC refs, but do not re-emit it for writing (editor won't overwrite).
+        if mode == "merge" and base_id in existing_location_set:
+            id_remap[raw_id] = base_id
+            if base_id not in id_remap:
+                id_remap[base_id] = base_id
+            warnings.append(
+                f"Location id '{base_id}' already exists in the campaign; "
+                "reusing it for references and skipping regeneration."
+            )
+            continue
+
         final_id = base_id
         if final_id in taken_location_ids:
+            # Within-document collision (two outline rows share a snake_case id).
+            # Keep id_remap[base_id] pointing at the FIRST location; only the
+            # later raw_id maps to the renamed final_id.
             final_id = _unique_id(base_id, taken_location_ids)
             warnings.append(
-                f"Location id '{base_id}' collided with an existing location; renamed to '{final_id}'."
+                f"Location id '{base_id}' collided with another outline location; "
+                f"renamed later entry to '{final_id}'."
             )
         else:
             taken_location_ids.add(final_id)
+
         id_remap[raw_id] = final_id
-        id_remap[base_id] = final_id
+        # Prefer the first claimant of the snake_case key so NPC refs that use
+        # the base id keep pointing at the original location.
+        if base_id not in id_remap:
+            id_remap[base_id] = final_id
+
         locations.append(
             {
                 "id": final_id,
@@ -306,7 +356,8 @@ def _normalize_outline(
             }
         )
 
-    known_location_ids = {loc["id"] for loc in locations}
+    # Existing locations remain valid NPC targets even when not re-emitted.
+    known_location_ids = {loc["id"] for loc in locations} | existing_location_set
 
     def _resolve_location_ref(ref: str) -> str | None:
         ref = str(ref or "").strip()
@@ -321,7 +372,13 @@ def _normalize_outline(
             return candidate
         return None
 
-    taken_npc_ids: set[str] = {snake_case(n) for n in existing_npc_names if n and n.strip()}
+    existing_npc_name_keys: set[str] = {
+        n.strip().casefold() for n in existing_npc_names if n and n.strip()
+    }
+    existing_npc_id_set: set[str] = {
+        snake_case(n) for n in existing_npc_names if n and n.strip()
+    }
+    taken_npc_ids: set[str] = set()
     npcs: list[dict[str, Any]] = []
 
     for raw_npc in _as_list(outline.get("npcs")):
@@ -331,11 +388,25 @@ def _normalize_outline(
         if not name:
             continue
         base_id = snake_case(name)
+        if not base_id:
+            continue
+
+        # Merge: reuse existing NPC identity — skip regeneration/write.
+        if mode == "merge" and (
+            name.casefold() in existing_npc_name_keys or base_id in existing_npc_id_set
+        ):
+            warnings.append(
+                f"NPC '{name}' already exists in the campaign; "
+                "reusing existing character and skipping regeneration."
+            )
+            continue
+
         final_id = base_id
         if final_id in taken_npc_ids:
             final_id = _unique_id(base_id, taken_npc_ids)
             warnings.append(
-                f"NPC id '{base_id}' collided with an existing NPC name; renamed to '{final_id}'."
+                f"NPC id '{base_id}' collided with another outline NPC; "
+                f"renamed later entry to '{final_id}'."
             )
         else:
             taken_npc_ids.add(final_id)
@@ -598,7 +669,7 @@ def analyze_campaign_document(
         try:
             detail_raw = _call_llm_json(_SYSTEM_PROMPT, prompt, warnings=warnings, step="location detail")
             detail_items = _coerce_container(detail_raw, "locations")
-            details_by_id = {str(item.get("id") or "").strip(): item for item in detail_items}
+            details_by_id = _index_details_by_stub_id(detail_items, batch)
         except Exception as ex:
             warnings.append(f"Location detail batch failed ({[loc['id'] for loc in batch]}): {ex}")
             details_by_id = {}
@@ -615,7 +686,7 @@ def analyze_campaign_document(
         try:
             detail_raw = _call_llm_json(_SYSTEM_PROMPT, prompt, warnings=warnings, step="npc detail")
             detail_items = _coerce_container(detail_raw, "npcs")
-            details_by_id = {str(item.get("id") or "").strip(): item for item in detail_items}
+            details_by_id = _index_details_by_stub_id(detail_items, batch)
         except Exception as ex:
             warnings.append(f"NPC detail batch failed ({[npc['id'] for npc in batch]}): {ex}")
             details_by_id = {}
