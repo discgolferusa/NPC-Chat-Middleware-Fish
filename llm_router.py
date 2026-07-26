@@ -590,8 +590,20 @@ def call_local_chat_completions(
     }
     payload.update(kwargs)
 
-    response = requests.post(LOCAL_LLM_URL, json=payload, timeout=180)
-    response.raise_for_status()
+    try:
+        response = requests.post(LOCAL_LLM_URL, json=payload, timeout=180)
+        response.raise_for_status()
+    except requests.ConnectionError as ex:
+        raise LLMProviderError(
+            f"Local LLM is not reachable at {LOCAL_LLM_URL}. "
+            "Start llama.cpp on that port, or set the content_creation / chat model to Groq "
+            "in Admin → LLM (provider mode 'groq' or 'groq_with_local_fallback')."
+        ) from ex
+    except requests.Timeout as ex:
+        raise LLMProviderError(
+            f"Local LLM timed out at {LOCAL_LLM_URL}."
+        ) from ex
+
     data = response.json()
     message = (data.get("choices") or [{}])[0].get("message") or {}
     content = _extract_chat_content(message)
