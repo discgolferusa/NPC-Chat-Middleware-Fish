@@ -1,11 +1,17 @@
 """
 Multi-provider LLM routing: local llama.cpp (default/fallback) and Groq.
 
+Requests are scoped by "purpose":
+  - chat: spoken NPC dialogue turns (default, short completions).
+  - content_creation: campaign document import / generation tooling
+    (longer completions, its own selected model + provider mode).
+
 Manual test (PowerShell):
   curl http://127.0.0.1:5000/llm/models
   curl http://127.0.0.1:5000/llm/status
   curl -X POST http://127.0.0.1:5000/llm/select -H "Content-Type: application/json" -d "{\"model_id\":\"local\",\"provider_mode\":\"local\"}"
   curl -X POST http://127.0.0.1:5000/llm/select -H "Content-Type: application/json" -d "{\"model_id\":\"groq-llama-4-scout\",\"provider_mode\":\"groq_with_local_fallback\"}"
+  curl -X POST http://127.0.0.1:5000/llm/select -H "Content-Type: application/json" -d "{\"model_id\":\"groq-llama-3.3-70b\",\"provider_mode\":\"groq_with_local_fallback\",\"purpose\":\"content_creation\"}"
 """
 
 from __future__ import annotations
@@ -32,9 +38,13 @@ GROQ_TIMEOUT_SECONDS = int(os.getenv("GROQ_TIMEOUT_SECONDS", "10"))
 
 # Spoken NPC replies are short, but reasoning models spend completion tokens on
 # chain-of-thought first. max_tokens=180 with gpt-oss/qwen3 often yields empty
-# message.content (finish_reason=length) → "I have nothing more to say."
+# message.content (finish_reason=length) -> "I have nothing more to say."
 DEFAULT_MAX_TOKENS = 180
 REASONING_MAX_TOKENS = int(os.getenv("LLM_REASONING_MAX_TOKENS", "768"))
+
+# content_creation purpose (campaign document import, generation tooling) needs
+# much larger completions than spoken NPC dialogue, so it gets its own default.
+CONTENT_CREATION_DEFAULT_MAX_TOKENS = int(os.getenv("LLM_CONTENT_CREATION_MAX_TOKENS", "4096"))
 
 LLM_USAGE_FILE = BASE_DIR / "llm_usage.json"
 LLM_RUNTIME_CONFIG_FILE = BASE_DIR / "llm_runtime_config.json"
@@ -42,6 +52,11 @@ LLM_SECRETS_FILE = BASE_DIR / "llm_secrets.env"
 
 VALID_PROVIDER_MODES = frozenset({"local", "groq", "groq_with_local_fallback"})
 REASONING_MODEL_MARKERS = ("gpt-oss", "qwen3")
+
+PURPOSE_CHAT = "chat"
+PURPOSE_CONTENT_CREATION = "content_creation"
+VALID_PURPOSES = frozenset({PURPOSE_CHAT, PURPOSE_CONTENT_CREATION})
+DEFAULT_PURPOSE = PURPOSE_CHAT
 
 LLM_MODELS: dict[str, dict[str, Any]] = {
     "local": {
@@ -103,12 +118,21 @@ LLM_MODELS: dict[str, dict[str, Any]] = {
     },
 }
 
+# --- chat purpose (default / backward-compatible globals) ---
 CURRENT_LLM_MODEL_ID = os.getenv("CURRENT_LLM_MODEL_ID", "local")
 LLM_PROVIDER_MODE = os.getenv("LLM_PROVIDER_MODE", "groq_with_local_fallback")
-LAST_ACTIVE_PROVIDER = "local"
-LAST_ACTIVE_MODEL_ID = "local"
-LAST_FALLBACK_REASON: str | None = None
-LAST_LLM_ERROR: str | None = None
+
+# --- content_creation purpose (campaign/document generation tooling) ---
+CONTENT_CREATION_MODEL_ID = os.getenv("CONTENT_CREATION_LLM_MODEL_ID", CURRENT_LLM_MODEL_ID)
+CONTENT_CREATION_PROVIDER_MODE = os.getenv("CONTENT_CREATION_LLM_PROVIDER_MODE", LLM_PROVIDER_MODE)
+
+# Per-purpose runtime status. Mutated in place (never rebound) so callers never
+# need `global` to update them.
+LAST_ACTIVE_PROVIDER: dict[str, str] = {PURPOSE_CHAT: "local", PURPOSE_CONTENT_CREATION: "local"}
+LAST_ACTIVE_MODEL_ID: dict[str, str] = {PURPOSE_CHAT: "local", PURPOSE_CONTENT_CREATION: "local"}
+LAST_FALLBACK_REASON: dict[str, str | None] = {PURPOSE_CHAT: None, PURPOSE_CONTENT_CREATION: None}
+LAST_LLM_ERROR: dict[str, str | None] = {PURPOSE_CHAT: None, PURPOSE_CONTENT_CREATION: None}
+
 ONLINE_DISABLED_UNTIL: datetime | None = None
 
 _STATE_LOCK = threading.Lock()
@@ -142,6 +166,20 @@ def _parse_utc_iso(value: str | None) -> datetime | None:
         return None
 
 
+def _normalize_purpose(purpose: str | None) -> str:
+    if purpose in VALID_PURPOSES:
+        return purpose
+    return DEFAULT_PURPOSE
+
+
+def _get_purpose_model_id(purpose: str) -> str:
+    return CONTENT_CREATION_MODEL_ID if purpose == PURPOSE_CONTENT_CREATION else CURRENT_LLM_MODEL_ID
+
+
+def _get_purpose_provider_mode(purpose: str) -> str:
+    return CONTENT_CREATION_PROVIDER_MODE if purpose == PURPOSE_CONTENT_CREATION else LLM_PROVIDER_MODE
+
+
 def _load_secrets_file() -> None:
     global GROQ_API_KEY
 
@@ -168,6 +206,7 @@ def _load_secrets_file() -> None:
 
 def _load_runtime_config() -> None:
     global CURRENT_LLM_MODEL_ID, LLM_PROVIDER_MODE
+    global CONTENT_CREATION_MODEL_ID, CONTENT_CREATION_PROVIDER_MODE
 
     if not LLM_RUNTIME_CONFIG_FILE.exists():
         CURRENT_LLM_MODEL_ID = "local"
@@ -176,34 +215,78 @@ def _load_runtime_config() -> None:
                 LLM_PROVIDER_MODE = "local"
         else:
             LLM_PROVIDER_MODE = "local"
+
+        CONTENT_CREATION_MODEL_ID = os.getenv("CONTENT_CREATION_LLM_MODEL_ID", CURRENT_LLM_MODEL_ID)
+        if CONTENT_CREATION_MODEL_ID not in LLM_MODELS:
+            CONTENT_CREATION_MODEL_ID = "local"
+        CONTENT_CREATION_PROVIDER_MODE = os.getenv("CONTENT_CREATION_LLM_PROVIDER_MODE", LLM_PROVIDER_MODE)
+        if CONTENT_CREATION_PROVIDER_MODE not in VALID_PROVIDER_MODES:
+            CONTENT_CREATION_PROVIDER_MODE = "local"
         return
 
     try:
-        data = json.loads(LLM_RUNTIME_CONFIG_FILE.read_text(encoding="utf-8"))
+        raw = json.loads(LLM_RUNTIME_CONFIG_FILE.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as ex:
         print(f"[LLM] invalid runtime config, using defaults: {ex}", flush=True)
         CURRENT_LLM_MODEL_ID = "local"
         LLM_PROVIDER_MODE = "local"
+        CONTENT_CREATION_MODEL_ID = "local"
+        CONTENT_CREATION_PROVIDER_MODE = "local"
         return
 
-    model_id = data.get("model_id", CURRENT_LLM_MODEL_ID)
-    provider_mode = data.get("provider_mode", LLM_PROVIDER_MODE)
+    data = raw if isinstance(raw, dict) else {}
+    purposes = data.get("purposes") if isinstance(data.get("purposes"), dict) else {}
 
-    if model_id in LLM_MODELS:
-        CURRENT_LLM_MODEL_ID = model_id
+    # Backward compat: pre-purpose runtime config files only had top-level
+    # model_id/provider_mode. Treat those as the "chat" purpose.
+    chat_cfg = purposes.get(PURPOSE_CHAT) if isinstance(purposes.get(PURPOSE_CHAT), dict) else {}
+    chat_model_id = chat_cfg.get("model_id", data.get("model_id", CURRENT_LLM_MODEL_ID))
+    chat_provider_mode = chat_cfg.get("provider_mode", data.get("provider_mode", LLM_PROVIDER_MODE))
+
+    if chat_model_id in LLM_MODELS:
+        CURRENT_LLM_MODEL_ID = chat_model_id
     elif CURRENT_LLM_MODEL_ID not in LLM_MODELS:
         CURRENT_LLM_MODEL_ID = "local"
 
-    if provider_mode in VALID_PROVIDER_MODES:
-        LLM_PROVIDER_MODE = provider_mode
+    if chat_provider_mode in VALID_PROVIDER_MODES:
+        LLM_PROVIDER_MODE = chat_provider_mode
     elif LLM_PROVIDER_MODE not in VALID_PROVIDER_MODES:
         LLM_PROVIDER_MODE = "local"
+
+    creation_cfg = (
+        purposes.get(PURPOSE_CONTENT_CREATION)
+        if isinstance(purposes.get(PURPOSE_CONTENT_CREATION), dict)
+        else {}
+    )
+    creation_model_id = creation_cfg.get("model_id", CONTENT_CREATION_MODEL_ID)
+    creation_provider_mode = creation_cfg.get("provider_mode", CONTENT_CREATION_PROVIDER_MODE)
+
+    if creation_model_id in LLM_MODELS:
+        CONTENT_CREATION_MODEL_ID = creation_model_id
+    elif CONTENT_CREATION_MODEL_ID not in LLM_MODELS:
+        CONTENT_CREATION_MODEL_ID = "local"
+
+    if creation_provider_mode in VALID_PROVIDER_MODES:
+        CONTENT_CREATION_PROVIDER_MODE = creation_provider_mode
+    elif CONTENT_CREATION_PROVIDER_MODE not in VALID_PROVIDER_MODES:
+        CONTENT_CREATION_PROVIDER_MODE = "local"
 
 
 def _save_runtime_config() -> None:
     payload = {
+        # Legacy top-level keys kept for backward compatibility; mirror "chat".
         "model_id": CURRENT_LLM_MODEL_ID,
         "provider_mode": LLM_PROVIDER_MODE,
+        "purposes": {
+            PURPOSE_CHAT: {
+                "model_id": CURRENT_LLM_MODEL_ID,
+                "provider_mode": LLM_PROVIDER_MODE,
+            },
+            PURPOSE_CONTENT_CREATION: {
+                "model_id": CONTENT_CREATION_MODEL_ID,
+                "provider_mode": CONTENT_CREATION_PROVIDER_MODE,
+            },
+        },
         "updated_at": _utc_iso(_utc_now()),
     }
     try:
@@ -240,10 +323,9 @@ def groq_is_available() -> bool:
 
 
 def _set_online_disabled(seconds: int, reason: str) -> None:
-    global ONLINE_DISABLED_UNTIL, LAST_FALLBACK_REASON
+    global ONLINE_DISABLED_UNTIL
 
     ONLINE_DISABLED_UNTIL = _utc_now() + timedelta(seconds=max(1, seconds))
-    LAST_FALLBACK_REASON = reason
     print(
         f"[LLM] Groq disabled until {_utc_iso(ONLINE_DISABLED_UNTIL)} ({reason})",
         flush=True,
@@ -279,9 +361,12 @@ def _effective_max_tokens(
     max_tokens: int | None,
     *,
     model_name: str | None = None,
+    purpose: str = DEFAULT_PURPOSE,
 ) -> int:
     if max_tokens is not None:
         return max(1, int(max_tokens))
+    if purpose == PURPOSE_CONTENT_CREATION:
+        return CONTENT_CREATION_DEFAULT_MAX_TOKENS
     if _is_reasoning_model(model_id, model_name):
         return REASONING_MAX_TOKENS
     return DEFAULT_MAX_TOKENS
@@ -359,12 +444,14 @@ def record_llm_usage(
     success: bool,
     fallback: bool = False,
     error: str | None = None,
+    purpose: str = DEFAULT_PURPOSE,
 ) -> None:
     record = {
         "timestamp": _utc_iso(_utc_now()),
         "provider": provider,
         "model_id": model_id,
         "model": model,
+        "purpose": _normalize_purpose(purpose),
         "prompt_tokens": int(prompt_tokens),
         "completion_tokens": int(completion_tokens),
         "total_tokens": int(total_tokens),
@@ -385,6 +472,7 @@ def _filter_usage_records(
     model_id: str | None = None,
     provider: str | None = None,
     online_only: bool = False,
+    purpose: str | None = None,
 ) -> list[dict[str, Any]]:
     cutoff = _utc_now() - since
     filtered = []
@@ -399,41 +487,61 @@ def _filter_usage_records(
             continue
         if online_only and record.get("provider") != "groq":
             continue
+        if purpose is not None and record.get("purpose", DEFAULT_PURPOSE) != purpose:
+            continue
         filtered.append(record)
 
     return filtered
 
 
-def usage_requests_last_60s(model_id: str | None = None, provider: str | None = None) -> int:
-    records = _filter_usage_records(since=timedelta(seconds=60), model_id=model_id, provider=provider, online_only=True)
+def usage_requests_last_60s(
+    model_id: str | None = None, provider: str | None = None, purpose: str | None = None
+) -> int:
+    records = _filter_usage_records(
+        since=timedelta(seconds=60), model_id=model_id, provider=provider, online_only=True, purpose=purpose
+    )
     return len(records)
 
 
-def usage_tokens_last_60s(model_id: str | None = None, provider: str | None = None) -> int:
-    records = _filter_usage_records(since=timedelta(seconds=60), model_id=model_id, provider=provider, online_only=True)
+def usage_tokens_last_60s(
+    model_id: str | None = None, provider: str | None = None, purpose: str | None = None
+) -> int:
+    records = _filter_usage_records(
+        since=timedelta(seconds=60), model_id=model_id, provider=provider, online_only=True, purpose=purpose
+    )
     return sum(int(r.get("total_tokens", 0)) for r in records)
 
 
-def usage_requests_last_24h(model_id: str | None = None, provider: str | None = None) -> int:
-    records = _filter_usage_records(since=timedelta(hours=24), model_id=model_id, provider=provider, online_only=True)
+def usage_requests_last_24h(
+    model_id: str | None = None, provider: str | None = None, purpose: str | None = None
+) -> int:
+    records = _filter_usage_records(
+        since=timedelta(hours=24), model_id=model_id, provider=provider, online_only=True, purpose=purpose
+    )
     return len(records)
 
 
-def usage_tokens_last_24h(model_id: str | None = None, provider: str | None = None) -> int:
-    records = _filter_usage_records(since=timedelta(hours=24), model_id=model_id, provider=provider, online_only=True)
+def usage_tokens_last_24h(
+    model_id: str | None = None, provider: str | None = None, purpose: str | None = None
+) -> int:
+    records = _filter_usage_records(
+        since=timedelta(hours=24), model_id=model_id, provider=provider, online_only=True, purpose=purpose
+    )
     return sum(int(r.get("total_tokens", 0)) for r in records)
 
 
-def get_usage_summary(model_id: str) -> dict[str, int]:
+def get_usage_summary(model_id: str, purpose: str | None = None) -> dict[str, int]:
     return {
-        "requests_last_minute": usage_requests_last_60s(model_id=model_id),
-        "tokens_last_minute": usage_tokens_last_60s(model_id=model_id),
-        "requests_last_24h": usage_requests_last_24h(model_id=model_id),
-        "tokens_last_24h": usage_tokens_last_24h(model_id=model_id),
+        "requests_last_minute": usage_requests_last_60s(model_id=model_id, purpose=purpose),
+        "tokens_last_minute": usage_tokens_last_60s(model_id=model_id, purpose=purpose),
+        "requests_last_24h": usage_requests_last_24h(model_id=model_id, purpose=purpose),
+        "tokens_last_24h": usage_tokens_last_24h(model_id=model_id, purpose=purpose),
     }
 
 
 def _would_exceed_groq_limits(model_id: str, estimated_total_tokens: int) -> str | None:
+    # Rate limits are enforced per model_id on the Groq account, shared across
+    # purposes — do not filter by purpose here.
     model_entry = LLM_MODELS.get(model_id)
     if not model_entry or model_entry.get("provider") != "groq":
         return None
@@ -571,11 +679,9 @@ def _effective_provider_mode(model_id: str, provider_mode: str) -> str:
     return provider_mode
 
 
-def _set_active(provider: str, model_id: str) -> None:
-    global LAST_ACTIVE_PROVIDER, LAST_ACTIVE_MODEL_ID
-
-    LAST_ACTIVE_PROVIDER = provider
-    LAST_ACTIVE_MODEL_ID = model_id
+def _set_active(provider: str, model_id: str, purpose: str = DEFAULT_PURPOSE) -> None:
+    LAST_ACTIVE_PROVIDER[purpose] = provider
+    LAST_ACTIVE_MODEL_ID[purpose] = model_id
 
 
 def _fallback_to_local(
@@ -586,14 +692,13 @@ def _fallback_to_local(
     temperature: float | None,
     max_tokens: int | None,
     error: str | None = None,
+    purpose: str = DEFAULT_PURPOSE,
     **kwargs: Any,
 ) -> str:
-    global LAST_FALLBACK_REASON, LAST_LLM_ERROR
+    LAST_FALLBACK_REASON[purpose] = reason
+    LAST_LLM_ERROR[purpose] = error
 
-    LAST_FALLBACK_REASON = reason
-    LAST_LLM_ERROR = error
-
-    print(f"[LLM] falling back to local ({reason})", flush=True)
+    print(f"[LLM] falling back to local ({reason}) purpose={purpose}", flush=True)
 
     content, usage = call_local_chat_completions(
         messages,
@@ -601,7 +706,7 @@ def _fallback_to_local(
         max_tokens=max_tokens,
         **kwargs,
     )
-    _set_active("local", "local")
+    _set_active("local", "local", purpose)
 
     record_llm_usage(
         provider="local",
@@ -613,6 +718,7 @@ def _fallback_to_local(
         success=True,
         fallback=True,
         error=error,
+        purpose=purpose,
     )
 
     return content
@@ -623,13 +729,14 @@ def generate_llm_response(
     *,
     temperature: float | None = None,
     max_tokens: int | None = None,
+    purpose: str = DEFAULT_PURPOSE,
     **kwargs: Any,
 ) -> str:
-    global LAST_FALLBACK_REASON, LAST_LLM_ERROR
+    purpose = _normalize_purpose(purpose)
 
     with _STATE_LOCK:
-        selected_model_id = CURRENT_LLM_MODEL_ID
-        provider_mode = _effective_provider_mode(selected_model_id, LLM_PROVIDER_MODE)
+        selected_model_id = _get_purpose_model_id(purpose)
+        provider_mode = _effective_provider_mode(selected_model_id, _get_purpose_provider_mode(purpose))
 
     selected_model = LLM_MODELS.get(selected_model_id, LLM_MODELS["local"])
     model_name_hint = selected_model.get("model") if isinstance(selected_model, dict) else None
@@ -637,6 +744,7 @@ def generate_llm_response(
         selected_model_id,
         max_tokens,
         model_name=str(model_name_hint or ""),
+        purpose=purpose,
     )
     estimated_prompt_tokens = _estimate_prompt_tokens(messages)
     estimated_total_tokens = estimated_prompt_tokens + effective_max_tokens
@@ -645,12 +753,12 @@ def generate_llm_response(
         content, usage = call_local_chat_completions(
             messages,
             temperature=temperature,
-            max_tokens=max_tokens,
+            max_tokens=effective_max_tokens,
             **kwargs,
         )
-        _set_active("local", "local")
-        LAST_FALLBACK_REASON = None
-        LAST_LLM_ERROR = None
+        _set_active("local", "local", purpose)
+        LAST_FALLBACK_REASON[purpose] = None
+        LAST_LLM_ERROR[purpose] = None
 
         record_llm_usage(
             provider="local",
@@ -661,50 +769,54 @@ def generate_llm_response(
             total_tokens=usage["total_tokens"],
             success=True,
             fallback=False,
+            purpose=purpose,
         )
         return content
 
     if not groq_is_configured():
         if provider_mode == "groq":
-            LAST_LLM_ERROR = "Groq API key is not configured"
-            raise LLMProviderError(LAST_LLM_ERROR)
+            LAST_LLM_ERROR[purpose] = "Groq API key is not configured"
+            raise LLMProviderError(LAST_LLM_ERROR[purpose])
         return _fallback_to_local(
             messages,
             reason="groq_missing_api_key",
             selected_model_id=selected_model_id,
             temperature=temperature,
-            max_tokens=max_tokens,
+            max_tokens=effective_max_tokens,
             error="Groq API key is not configured",
+            purpose=purpose,
             **kwargs,
         )
 
     if ONLINE_DISABLED_UNTIL is not None and _utc_now() < ONLINE_DISABLED_UNTIL:
         disabled_msg = f"Groq temporarily disabled until {_utc_iso(ONLINE_DISABLED_UNTIL)}"
         if provider_mode == "groq":
-            LAST_LLM_ERROR = disabled_msg
-            raise LLMProviderError(LAST_LLM_ERROR)
+            LAST_LLM_ERROR[purpose] = disabled_msg
+            raise LLMProviderError(LAST_LLM_ERROR[purpose])
         return _fallback_to_local(
             messages,
             reason="groq_disabled_until",
             selected_model_id=selected_model_id,
             temperature=temperature,
-            max_tokens=max_tokens,
+            max_tokens=effective_max_tokens,
             error=disabled_msg,
+            purpose=purpose,
             **kwargs,
         )
 
     limit_reason = _would_exceed_groq_limits(selected_model_id, estimated_total_tokens)
     if limit_reason:
         if provider_mode == "groq":
-            LAST_LLM_ERROR = limit_reason
+            LAST_LLM_ERROR[purpose] = limit_reason
             raise LLMProviderError(limit_reason)
         return _fallback_to_local(
             messages,
             reason=limit_reason,
             selected_model_id=selected_model_id,
             temperature=temperature,
-            max_tokens=max_tokens,
+            max_tokens=effective_max_tokens,
             error=limit_reason,
+            purpose=purpose,
             **kwargs,
         )
 
@@ -716,12 +828,12 @@ def generate_llm_response(
             model_name,
             model_id=selected_model_id,
             temperature=temperature,
-            max_tokens=max_tokens,
+            max_tokens=effective_max_tokens,
         )
     except requests.Timeout as ex:
         _set_online_disabled(300, "groq_timeout")
         if provider_mode == "groq":
-            LAST_LLM_ERROR = str(ex)
+            LAST_LLM_ERROR[purpose] = str(ex)
             record_llm_usage(
                 provider="groq",
                 model_id=selected_model_id,
@@ -732,6 +844,7 @@ def generate_llm_response(
                 success=False,
                 fallback=False,
                 error=str(ex),
+                purpose=purpose,
             )
             raise LLMProviderError(f"Groq request timed out: {ex}") from ex
         return _fallback_to_local(
@@ -739,14 +852,15 @@ def generate_llm_response(
             reason="groq_timeout",
             selected_model_id=selected_model_id,
             temperature=temperature,
-            max_tokens=max_tokens,
+            max_tokens=effective_max_tokens,
             error=str(ex),
+            purpose=purpose,
             **kwargs,
         )
     except requests.RequestException as ex:
         _set_online_disabled(300, "groq_exception")
         if provider_mode == "groq":
-            LAST_LLM_ERROR = str(ex)
+            LAST_LLM_ERROR[purpose] = str(ex)
             record_llm_usage(
                 provider="groq",
                 model_id=selected_model_id,
@@ -757,6 +871,7 @@ def generate_llm_response(
                 success=False,
                 fallback=False,
                 error=str(ex),
+                purpose=purpose,
             )
             raise LLMProviderError(f"Groq request failed: {ex}") from ex
         return _fallback_to_local(
@@ -764,8 +879,9 @@ def generate_llm_response(
             reason="groq_exception",
             selected_model_id=selected_model_id,
             temperature=temperature,
-            max_tokens=max_tokens,
+            max_tokens=effective_max_tokens,
             error=str(ex),
+            purpose=purpose,
             **kwargs,
         )
 
@@ -783,17 +899,19 @@ def generate_llm_response(
             success=False,
             fallback=provider_mode != "groq",
             error=error_text,
+            purpose=purpose,
         )
         if provider_mode == "groq":
-            LAST_LLM_ERROR = "Groq rate limited"
+            LAST_LLM_ERROR[purpose] = "Groq rate limited"
             raise LLMProviderError("Groq rate limited")
         return _fallback_to_local(
             messages,
             reason="groq_rate_limited",
             selected_model_id=selected_model_id,
             temperature=temperature,
-            max_tokens=max_tokens,
+            max_tokens=effective_max_tokens,
             error=error_text,
+            purpose=purpose,
             **kwargs,
         )
 
@@ -810,17 +928,19 @@ def generate_llm_response(
             success=False,
             fallback=provider_mode != "groq",
             error=f"HTTP {response.status_code}: {error_text}",
+            purpose=purpose,
         )
         if provider_mode == "groq":
-            LAST_LLM_ERROR = f"Groq HTTP {response.status_code}"
-            raise LLMProviderError(LAST_LLM_ERROR)
+            LAST_LLM_ERROR[purpose] = f"Groq HTTP {response.status_code}"
+            raise LLMProviderError(LAST_LLM_ERROR[purpose])
         return _fallback_to_local(
             messages,
             reason="groq_http_error",
             selected_model_id=selected_model_id,
             temperature=temperature,
-            max_tokens=max_tokens,
+            max_tokens=effective_max_tokens,
             error=error_text,
+            purpose=purpose,
             **kwargs,
         )
 
@@ -836,23 +956,25 @@ def generate_llm_response(
             success=False,
             fallback=provider_mode != "groq",
             error=f"HTTP {response.status_code}: {error_text}",
+            purpose=purpose,
         )
         if provider_mode == "groq":
-            LAST_LLM_ERROR = f"Groq HTTP {response.status_code}"
-            raise LLMProviderError(LAST_LLM_ERROR)
+            LAST_LLM_ERROR[purpose] = f"Groq HTTP {response.status_code}"
+            raise LLMProviderError(LAST_LLM_ERROR[purpose])
         return _fallback_to_local(
             messages,
             reason="groq_http_error",
             selected_model_id=selected_model_id,
             temperature=temperature,
-            max_tokens=max_tokens,
+            max_tokens=effective_max_tokens,
             error=error_text,
+            purpose=purpose,
             **kwargs,
         )
 
-    _set_active("groq", selected_model_id)
-    LAST_FALLBACK_REASON = None
-    LAST_LLM_ERROR = None
+    _set_active("groq", selected_model_id, purpose)
+    LAST_FALLBACK_REASON[purpose] = None
+    LAST_LLM_ERROR[purpose] = None
 
     record_llm_usage(
         provider="groq",
@@ -863,37 +985,56 @@ def generate_llm_response(
         total_tokens=usage["total_tokens"],
         success=True,
         fallback=False,
+        purpose=purpose,
     )
 
     return content
 
 
-def select_llm_model(model_id: str, provider_mode: str | None = None) -> dict[str, Any]:
-    global CURRENT_LLM_MODEL_ID, LLM_PROVIDER_MODE, LAST_FALLBACK_REASON, LAST_LLM_ERROR
+def select_llm_model(
+    model_id: str,
+    provider_mode: str | None = None,
+    purpose: str = DEFAULT_PURPOSE,
+) -> dict[str, Any]:
+    global CURRENT_LLM_MODEL_ID, LLM_PROVIDER_MODE
+    global CONTENT_CREATION_MODEL_ID, CONTENT_CREATION_PROVIDER_MODE
+
+    purpose = _normalize_purpose(purpose)
 
     if model_id not in LLM_MODELS:
         raise ValueError(f"Unknown model_id: {model_id}")
 
+    if provider_mode is not None and provider_mode not in VALID_PROVIDER_MODES:
+        raise ValueError(f"Invalid provider_mode: {provider_mode}")
+
     with _STATE_LOCK:
-        CURRENT_LLM_MODEL_ID = model_id
+        if purpose == PURPOSE_CONTENT_CREATION:
+            CONTENT_CREATION_MODEL_ID = model_id
+            if provider_mode is not None:
+                CONTENT_CREATION_PROVIDER_MODE = provider_mode
+            if model_id == "local":
+                CONTENT_CREATION_PROVIDER_MODE = "local"
+            result_model_id = CONTENT_CREATION_MODEL_ID
+            result_provider_mode = CONTENT_CREATION_PROVIDER_MODE
+        else:
+            CURRENT_LLM_MODEL_ID = model_id
+            if provider_mode is not None:
+                LLM_PROVIDER_MODE = provider_mode
+            if model_id == "local":
+                LLM_PROVIDER_MODE = "local"
+            result_model_id = CURRENT_LLM_MODEL_ID
+            result_provider_mode = LLM_PROVIDER_MODE
 
-        if provider_mode is not None:
-            if provider_mode not in VALID_PROVIDER_MODES:
-                raise ValueError(f"Invalid provider_mode: {provider_mode}")
-            LLM_PROVIDER_MODE = provider_mode
-
-        if model_id == "local":
-            LLM_PROVIDER_MODE = "local"
-
-        LAST_FALLBACK_REASON = None
-        LAST_LLM_ERROR = None
+        LAST_FALLBACK_REASON[purpose] = None
+        LAST_LLM_ERROR[purpose] = None
 
         _save_runtime_config()
 
         return {
-            "model_id": CURRENT_LLM_MODEL_ID,
-            "provider_mode": LLM_PROVIDER_MODE,
-            "selected_model": _public_model_entry(CURRENT_LLM_MODEL_ID),
+            "purpose": purpose,
+            "model_id": result_model_id,
+            "provider_mode": result_provider_mode,
+            "selected_model": _public_model_entry(result_model_id),
         }
 
 
@@ -911,6 +1052,8 @@ def _remaining_estimate(model_id: str) -> dict[str, int | None]:
     tpm = limits.get("tpm")
     tpd = limits.get("tpd")
 
+    # Remaining quota reflects actual account usage across all purposes,
+    # since Groq enforces limits per model regardless of caller purpose.
     usage = get_usage_summary(model_id)
 
     return {
@@ -921,23 +1064,26 @@ def _remaining_estimate(model_id: str) -> dict[str, int | None]:
     }
 
 
-def get_llm_status() -> dict[str, Any]:
-    selected_model_id = CURRENT_LLM_MODEL_ID
+def _purpose_status(purpose: str) -> dict[str, Any]:
+    selected_model_id = _get_purpose_model_id(purpose)
     if selected_model_id not in LLM_MODELS:
         selected_model_id = "local"
 
+    provider_mode = _get_purpose_provider_mode(purpose)
     selected_model = _public_model_entry(selected_model_id)
     usage_model_id = selected_model_id if selected_model.get("provider") == "groq" else None
 
     if usage_model_id:
-        usage = get_usage_summary(usage_model_id)
+        # "usage" is purpose-specific (how much this purpose consumed);
+        # "remaining_estimate" is the real shared-quota remaining for the model.
+        usage = get_usage_summary(usage_model_id, purpose=purpose)
         remaining = _remaining_estimate(usage_model_id)
     else:
         usage = {
-            "requests_last_minute": usage_requests_last_60s(provider="groq"),
-            "tokens_last_minute": usage_tokens_last_60s(provider="groq"),
-            "requests_last_24h": usage_requests_last_24h(provider="groq"),
-            "tokens_last_24h": usage_tokens_last_24h(provider="groq"),
+            "requests_last_minute": usage_requests_last_60s(provider="groq", purpose=purpose),
+            "tokens_last_minute": usage_tokens_last_60s(provider="groq", purpose=purpose),
+            "requests_last_24h": usage_requests_last_24h(provider="groq", purpose=purpose),
+            "tokens_last_24h": usage_tokens_last_24h(provider="groq", purpose=purpose),
         }
         remaining = {
             "requests_this_minute": None,
@@ -947,34 +1093,82 @@ def get_llm_status() -> dict[str, Any]:
         }
 
     local_usage = {
-        "requests_last_minute": len(_filter_usage_records(since=timedelta(seconds=60), provider="local")),
+        "requests_last_minute": len(
+            _filter_usage_records(since=timedelta(seconds=60), provider="local", purpose=purpose)
+        ),
         "tokens_last_minute": sum(
             int(r.get("total_tokens", 0))
-            for r in _filter_usage_records(since=timedelta(seconds=60), provider="local")
+            for r in _filter_usage_records(since=timedelta(seconds=60), provider="local", purpose=purpose)
         ),
-        "requests_last_24h": len(_filter_usage_records(since=timedelta(hours=24), provider="local")),
+        "requests_last_24h": len(
+            _filter_usage_records(since=timedelta(hours=24), provider="local", purpose=purpose)
+        ),
         "tokens_last_24h": sum(
             int(r.get("total_tokens", 0))
-            for r in _filter_usage_records(since=timedelta(hours=24), provider="local")
+            for r in _filter_usage_records(since=timedelta(hours=24), provider="local", purpose=purpose)
         ),
     }
 
     return {
-        "provider_mode": LLM_PROVIDER_MODE,
-        "selected_model_id": selected_model_id,
+        "model_id": selected_model_id,
+        "provider_mode": provider_mode,
         "selected_model": selected_model,
-        "active_provider": LAST_ACTIVE_PROVIDER,
-        "active_model_id": LAST_ACTIVE_MODEL_ID,
+        "active_provider": LAST_ACTIVE_PROVIDER.get(purpose, "local"),
+        "active_model_id": LAST_ACTIVE_MODEL_ID.get(purpose, "local"),
         "online_available": groq_is_available(),
         "online_configured": groq_is_configured(),
         "online_disabled_until": _utc_iso(ONLINE_DISABLED_UNTIL),
-        "last_fallback_reason": LAST_FALLBACK_REASON,
-        "last_error": LAST_LLM_ERROR,
+        "last_fallback_reason": LAST_FALLBACK_REASON.get(purpose),
+        "last_error": LAST_LLM_ERROR.get(purpose),
         "usage": usage,
         "local_usage": local_usage,
         "remaining_estimate": remaining,
+    }
+
+
+def _usage_by_purpose_summary(purpose: str) -> dict[str, Any]:
+    # Unlike usage_requests_last_60s/etc (which are online/Groq-only for rate
+    # limiting), this reports ALL provider usage (local + groq) for a purpose.
+    last_minute = _filter_usage_records(since=timedelta(seconds=60), purpose=purpose)
+    last_24h = _filter_usage_records(since=timedelta(hours=24), purpose=purpose)
+    return {
+        "requests_last_minute": len(last_minute),
+        "tokens_last_minute": sum(int(r.get("total_tokens", 0)) for r in last_minute),
+        "requests_last_24h": len(last_24h),
+        "tokens_last_24h": sum(int(r.get("total_tokens", 0)) for r in last_24h),
+    }
+
+
+def get_llm_status() -> dict[str, Any]:
+    chat_status = _purpose_status(PURPOSE_CHAT)
+    creation_status = _purpose_status(PURPOSE_CONTENT_CREATION)
+
+    return {
+        # --- existing top-level fields kept for backward compatibility (== chat purpose) ---
+        "provider_mode": chat_status["provider_mode"],
+        "selected_model_id": chat_status["model_id"],
+        "selected_model": chat_status["selected_model"],
+        "active_provider": chat_status["active_provider"],
+        "active_model_id": chat_status["active_model_id"],
+        "online_available": chat_status["online_available"],
+        "online_configured": chat_status["online_configured"],
+        "online_disabled_until": chat_status["online_disabled_until"],
+        "last_fallback_reason": chat_status["last_fallback_reason"],
+        "last_error": chat_status["last_error"],
+        "usage": chat_status["usage"],
+        "local_usage": chat_status["local_usage"],
+        "remaining_estimate": chat_status["remaining_estimate"],
         "models_endpoint": "/llm/models",
         "select_endpoint": "/llm/select",
+        # --- purpose-scoped detail ---
+        "purposes": {
+            PURPOSE_CHAT: chat_status,
+            PURPOSE_CONTENT_CREATION: creation_status,
+        },
+        "usage_by_purpose": {
+            PURPOSE_CHAT: _usage_by_purpose_summary(PURPOSE_CHAT),
+            PURPOSE_CONTENT_CREATION: _usage_by_purpose_summary(PURPOSE_CONTENT_CREATION),
+        },
     }
 
 
@@ -983,6 +1177,16 @@ def get_llm_models_payload() -> dict[str, Any]:
         "current_model_id": CURRENT_LLM_MODEL_ID,
         "provider_mode": LLM_PROVIDER_MODE,
         "models": _public_model_list(),
+        "purposes": {
+            PURPOSE_CHAT: {
+                "current_model_id": CURRENT_LLM_MODEL_ID,
+                "provider_mode": LLM_PROVIDER_MODE,
+            },
+            PURPOSE_CONTENT_CREATION: {
+                "current_model_id": CONTENT_CREATION_MODEL_ID,
+                "provider_mode": CONTENT_CREATION_PROVIDER_MODE,
+            },
+        },
     }
 
 
@@ -995,7 +1199,8 @@ def init_llm_router() -> None:
     LLM_MODELS["local"]["url"] = LOCAL_LLM_URL
 
     print(
-        f"[LLM] router ready model={CURRENT_LLM_MODEL_ID} mode={LLM_PROVIDER_MODE} "
+        f"[LLM] router ready chat_model={CURRENT_LLM_MODEL_ID} chat_mode={LLM_PROVIDER_MODE} "
+        f"content_creation_model={CONTENT_CREATION_MODEL_ID} content_creation_mode={CONTENT_CREATION_PROVIDER_MODE} "
         f"groq_configured={groq_is_configured()}",
         flush=True,
     )

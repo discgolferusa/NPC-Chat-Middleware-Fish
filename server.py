@@ -27,6 +27,10 @@ from llm_router import (
     reset_usage_tracking,
     select_llm_model,
 )
+from content_import import (
+    ContentImportError,
+    analyze_campaign_document,
+)
 from dm_channel import (
     build_dm_injection_messages,
     clear_dm_data,
@@ -3111,12 +3115,13 @@ def llm_select():
 
     model_id = body.get("model_id") or body.get("model")
     provider_mode = body.get("provider_mode")
+    purpose = (body.get("purpose") or "chat").strip() or "chat"
 
     if not model_id:
         return jsonify({"error": "Missing model_id"}), 400
 
     try:
-        result = select_llm_model(model_id, provider_mode=provider_mode)
+        result = select_llm_model(model_id, provider_mode=provider_mode, purpose=purpose)
         result["status"] = get_llm_status()
         return jsonify(result)
     except ValueError as ex:
@@ -3131,6 +3136,40 @@ def llm_reset_usage():
     # LAN-only convenience endpoint; do not expose this middleware publicly.
     reset_usage_tracking()
     return jsonify({"status": "reset", "usage": get_llm_status().get("usage", {})})
+
+
+@app.post("/content/import/analyze")
+def content_import_analyze():
+    body = request.get_json(force=True, silent=True) or {}
+
+    text = body.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return jsonify({"error": "Missing text"}), 400
+
+    mode = str(body.get("mode") or "create_new").strip().lower()
+    existing_campaign_id = body.get("existing_campaign_id")
+    existing_location_ids = body.get("existing_location_ids") or []
+    existing_npc_names = body.get("existing_npc_names") or []
+
+    if not isinstance(existing_location_ids, list):
+        return jsonify({"error": "existing_location_ids must be a list"}), 400
+    if not isinstance(existing_npc_names, list):
+        return jsonify({"error": "existing_npc_names must be a list"}), 400
+
+    try:
+        result = analyze_campaign_document(
+            text,
+            mode,
+            existing_campaign_id=existing_campaign_id,
+            existing_location_ids=existing_location_ids,
+            existing_npc_names=existing_npc_names,
+        )
+        return jsonify(result)
+    except ContentImportError as ex:
+        return _client_error(ex, 400)
+    except Exception as ex:
+        print(f"[CONTENT-IMPORT] analyze failed: {ex!r}", flush=True)
+        return _client_error(ex, 500)
 
 
 @app.get("/session/status")
