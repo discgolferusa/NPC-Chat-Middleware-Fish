@@ -168,15 +168,33 @@ def _index_details_by_stub_id(
     detail_items: list[dict[str, Any]],
     stubs: list[dict[str, Any]],
 ) -> dict[str, dict[str, Any]]:
-    """Map detail objects onto stub ids, including one-item bare-object batches."""
+    """Map detail objects onto stub ids, including one-item bare-object batches.
+
+    Detail passes often echo ids with different casing/spacing than the outline
+    stubs (which are always snake_case). Normalize before indexing so lookups
+    do not fall through to empty defaults.
+    """
     details_by_id: dict[str, dict[str, Any]] = {}
     for item in detail_items:
-        item_id = str(item.get("id") or "").strip()
-        if item_id:
-            details_by_id[item_id] = item
+        raw_id = str(item.get("id") or "").strip()
+        if raw_id:
+            details_by_id[snake_case(raw_id)] = item
+        # NPCs frequently return the display name as id; index by name too.
+        raw_name = str(item.get("name") or "").strip()
+        if raw_name:
+            details_by_id.setdefault(snake_case(raw_name), item)
 
     if len(stubs) == 1 and len(detail_items) == 1 and stubs[0]["id"] not in details_by_id:
         details_by_id[stubs[0]["id"]] = detail_items[0]
+        return details_by_id
+
+    # Positional fallback when counts match and some stubs still unresolved
+    # (model returned fields but mismatched/missing ids).
+    if len(detail_items) == len(stubs) and len(stubs) > 1:
+        for stub, item in zip(stubs, detail_items):
+            stub_id = str(stub.get("id") or "")
+            if stub_id and stub_id not in details_by_id:
+                details_by_id[stub_id] = item
 
     return details_by_id
 
