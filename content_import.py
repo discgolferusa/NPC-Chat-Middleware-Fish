@@ -8,14 +8,16 @@ structured dicts (shaped like the campaign/location/npc YAML schemas used
 elsewhere in this repo) for the caller to review and persist.
 
 Pipeline:
-  1. Outline pass — one LLM call (or ALIEN FULL NAME stub seeding when recoverable
-     published stat blocks are present). Exposed as ``outline_campaign_document``.
+  1. Outline pass — one LLM call, or deterministic stub seeding when recoverable
+     published callouts are present (ALIEN FULL NAME blocks, or Cubicle 7-style
+     name + Awareness/Presence + TRAITS character boxes). Exposed as
+     ``outline_campaign_document``.
   2. Location detail — format-agnostic LLM extraction from name-focused excerpts.
      One call per Funnel hop; editor retries sparse results as a separate hop, then
      may request ``allow_seed_fallback``.
   3. NPC detail — same pattern. Layout examples (labeled writeups, FULL NAME blocks,
-     trait grids + bios) are described generically so new RPG lines do not need
-     dedicated parsers. Deterministic excerpt seeding is last-resort only.
+     trait grids + bios / callout boxes) are described generically so new RPG lines
+     do not need dedicated parsers. Deterministic excerpt seeding is last-resort only.
 
 ``analyze_campaign_document`` orchestrates outline + detail (+ local retry/seed)
 for local/dev. Production Yaml Editor drives chunked Funnel hops.
@@ -1062,6 +1064,183 @@ def _seed_npc_detail_from_document(
     return detail
 
 
+_CALLOUT_AWARENESS_PRESENCE = re.compile(
+    r"(?i)^\s*awareness\s+\d+\s+presence\s+\d+\s*$"
+)
+_CALLOUT_STORY_OR_TECH = re.compile(r"(?i)\b(?:story\s*points|tech\s*level)\b")
+_CALLOUT_MONSTER_CONTEXT = re.compile(
+    r"(?i)\b(?:creature\s*statistics?|monster(?:s)?|enemy\s*stat|adversary\s*stat|"
+    r"alien\s*creature|beast(?:s)?\s*stat)\b"
+)
+_CREDIT_ROLE_LINE = re.compile(
+    r"(?i)^\s*(?:writing|writer|line\s*developer|editing|editors?|cover|"
+    r"graphic\s*design(?:\s*&\s*layout)?|layout|creative\s*director|"
+    r"art\s*director|publisher|proofreading|playtesters?|thanks)\s*$"
+)
+
+
+def _token_looks_pdf_split_fragment(tok: str) -> bool:
+    """True when a token looks like a PdfPig mid-word shard, not a real name word."""
+    t = str(tok or "").strip()
+    if not t:
+        return False
+    # Single-letter leftovers: "Peterse N"
+    if len(t) == 1 and t.isalpha():
+        return True
+    # Mixed mid-word caps typical of PdfPig: "HiNs", "eddiNGs" shards
+    if any(c.islower() for c in t) and any(c.isupper() for c in t[1:]):
+        return True
+    # Short consonant-only shards: "Sm" in "Sm Ith"
+    letters = [c for c in t if c.isalpha()]
+    if 2 <= len(letters) <= 4:
+        if not any(c.casefold() in "aeiou" for c in letters):
+            return True
+    return False
+
+
+def _normalize_pdf_person_name(raw: str) -> str:
+    """Repair PdfPig mid-word spaces: 'Peter Hutc HiNs' → 'Peter Hutchins'.
+
+    Only joins trailing tokens when at least one looks like a split fragment.
+    Legitimate multi-word names (Mary Ann Lee, Jean Luc Picard) are left alone.
+    """
+    s = str(raw or "").strip().strip("\"“”'‘’")
+    if not s:
+        return ""
+    tokens = re.sub(r"\s+", " ", s).split()
+    if len(tokens) >= 3:
+        left, right = tokens[-2], tokens[-1]
+        if right.casefold() not in {"vs", "the", "of", "and", "or", "jr", "sr", "ii", "iii", "iv"}:
+            if _token_looks_pdf_split_fragment(left) or _token_looks_pdf_split_fragment(right):
+                tokens = tokens[:-2] + [left + right]
+    return " ".join((t[0].upper() + t[1:].lower()) if t else t for t in tokens)
+
+
+def _guess_callout_role(preceding: str) -> str:
+    window = (preceding or "")[-900:].casefold()
+    if "squatter" in window:
+        return "squatter"
+    if "villain" in window or "antagonist" in window:
+        return "antagonist"
+    if "guest" in window or "reception" in window:
+        return "hotel guest"
+    return ""
+
+
+def _extract_cubicle7_callout_npcs(document_text: str) -> list[dict[str, str]]:
+    """Find Cubicle 7-style character callout boxes (name + attributes + TRAITS).
+
+    These appear mid-scene (like ALIEN sidebar/stat callouts), not only under an
+    NPC appendix. Credits/TOC names lack Awareness/Presence + TRAITS + Story Points
+    and are ignored. Creature-only blocks under monster headings are skipped when
+    that context is adjacent.
+    """
+    text = document_text or ""
+    if not text.strip():
+        return []
+
+    lines = text.splitlines()
+    found: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    for i, line in enumerate(lines):
+        if not _CALLOUT_AWARENESS_PRESENCE.match(line.strip()):
+            continue
+
+        # Name header is the nearest prior non-empty line.
+        header_idx = -1
+        for j in range(i - 1, max(-1, i - 6), -1):
+            candidate = lines[j].strip()
+            if not candidate:
+                continue
+            if _CREDIT_ROLE_LINE.match(candidate) or _STAT_OR_SECTION_LINE.match(candidate):
+                header_idx = -1
+                break
+            header_idx = j
+            break
+        if header_idx < 0:
+            continue
+
+        header_raw = lines[header_idx].strip()
+        if not _looks_like_npc_name_header(header_raw):
+            continue
+
+        # Look ahead for character-sheet signals (TRAITS + Story Points / Tech Level).
+        window = "\n".join(lines[i : min(len(lines), i + 22)])
+        if not _TRAIT_SECTION_HEADER.search(window):
+            continue
+        if not _CALLOUT_STORY_OR_TECH.search(window):
+            continue
+
+        preceding = "\n".join(lines[max(0, header_idx - 12) : header_idx])
+        if _CALLOUT_MONSTER_CONTEXT.search(preceding):
+            continue
+
+        name = _normalize_pdf_person_name(header_raw)
+        if not name or len(name) < 3:
+            continue
+        key = name.casefold()
+        if key in seen:
+            continue
+        if key in _KNOWN_IMPORT_FALSE_POSITIVE_NAMES:
+            continue
+
+        seen.add(key)
+        role = _guess_callout_role(preceding + "\n" + window)
+        found.append({"name": name, "role": role, "location_hint": ""})
+
+    return found
+
+
+def _npc_stubs_from_cubicle7_callouts(
+    document_text: str,
+    *,
+    location_ids: set[str],
+    warnings: list[str],
+) -> list[dict[str, Any]]:
+    """Build outline NPC stubs from Cubicle 7 character callout boxes."""
+    parsed = _extract_cubicle7_callout_npcs(document_text)
+    if not parsed:
+        return []
+
+    loc = ""
+    for candidate in ("majestic_hotel", "the_majestic", "majestic"):
+        if candidate in location_ids:
+            loc = candidate
+            break
+    if not loc and location_ids:
+        # Prefer a hotel/building-looking id when present.
+        for loc_id in location_ids:
+            if "majestic" in loc_id or "hotel" in loc_id:
+                loc = loc_id
+                break
+
+    stubs: list[dict[str, Any]] = []
+    for row in parsed:
+        stubs.append(
+            {
+                "id": snake_case(row["name"]),
+                "name": row["name"],
+                "role": row.get("role") or "",
+                "first_location_id": loc,
+                "other_location_ids": [],
+                "seeded_from_stat_blocks": True,
+                "seed_personality": "",
+                "seed_personal_agenda": "",
+            }
+        )
+
+    warnings.append(
+        f"Parsed {len(stubs)} NPC(s) from Cubicle 7-style character callout boxes "
+        "(name + Awareness/Presence + TRAITS)."
+    )
+    return stubs
+
+
+def _document_has_recoverable_callouts(text: str) -> bool:
+    return len(_extract_cubicle7_callout_npcs(text or "")) >= 2
+
+
 def _location_detail_from_seed(stub: dict[str, Any]) -> dict[str, Any]:
     name = str(stub.get("name") or stub.get("id") or "Location").strip()
     return {
@@ -1156,6 +1335,71 @@ def _merge_outline_npcs_with_stat_blocks(
         )
 
     return kept_llm + stat_stubs
+
+
+def _merge_outline_npcs_with_callouts(
+    llm_npcs: list[dict[str, Any]],
+    document_text: str,
+    *,
+    mode: str,
+    existing_npc_names: list[str],
+    location_ids: set[str],
+    warnings: list[str],
+) -> list[dict[str, Any]]:
+    """Prefer Cubicle 7 character callouts over LLM/credits when confidently detected.
+
+    When enough callout boxes are present, they are authoritative — credits-page
+    and TOC names from the outline LLM are dropped.
+    """
+    # ALIEN FULL NAME stubs already carry PERSONALITY seeds; leave them alone.
+    alien_seeded = sum(
+        1
+        for n in llm_npcs
+        if n.get("seeded_from_stat_blocks")
+        and str(n.get("seed_personality") or "").strip()
+    )
+    if alien_seeded >= 3:
+        return llm_npcs
+
+    callout_stubs = _npc_stubs_from_cubicle7_callouts(
+        document_text,
+        location_ids=location_ids,
+        warnings=warnings,
+    )
+    if len(callout_stubs) < 2:
+        return llm_npcs
+
+    filtered: list[dict[str, Any]] = []
+    for stub in callout_stubs:
+        name = str(stub.get("name") or "").strip()
+        if not name:
+            continue
+        if _npc_already_exists_in_campaign(
+            name, mode=mode, existing_npc_names=existing_npc_names
+        ):
+            warnings.append(
+                f"NPC '{name}' already exists in the campaign; "
+                "reusing existing character and skipping callout regeneration."
+            )
+            continue
+        filtered.append(stub)
+    if len(filtered) < 2:
+        return llm_npcs
+
+    callout_keys = {stub["name"].casefold() for stub in filtered}
+    dropped = [
+        str(npc.get("name") or "").strip()
+        for npc in llm_npcs
+        if str(npc.get("name") or "").strip()
+        and str(npc.get("name") or "").strip().casefold() not in callout_keys
+    ]
+    if dropped:
+        warnings.append(
+            "Ignored outline NPC(s) not found in character callout boxes "
+            "(often credits/TOC): " + ", ".join(dropped)
+        )
+
+    return filtered
 
 
 _PRONOUN_OBJECTS: dict[str, dict[str, str]] = {
@@ -1503,11 +1747,21 @@ def _build_outline_prompt(
         "that section is the authoritative NPC list. List every stat-block NPC there and do "
         "NOT list names only mentioned in intro text, movie quotes, sidebars, or player "
         "(PC) material.\n"
+        "- Character callout boxes are also authoritative NPCs even mid-scene: a short name "
+        "header followed by attributes (Awareness/Presence/...), Skills, TRAITS "
+        "(Trait: description), Tech Level / Story Points, and a prose biography that is more "
+        "than physical appearance. List each such callout NPC.\n"
+        "- Do NOT list credits / staff / acknowledgements (Writing, Editing, Cover, Art "
+        "Director, etc.), table-of-contents page references, publisher names, or trademark "
+        "boilerplate as NPCs.\n"
         "- Do NOT list player characters, the PC party, or the PC ship crew as NPCs.\n"
+        "- Prefer named supporting characters with dialogue, motives, or callout boxes over "
+        "generic monsters/enemies unless the text clearly presents them as individual "
+        "named characters with personality.\n"
         "- Published RPG stat blocks (e.g. lines like 'JOHNS, OFFICER' with FULL NAME, "
         "PERSONALITY, PERSONAL AGENDA) are always NPCs when inside the NPC section.\n"
-        "- Include every named location and every named NPC from the authoritative NPC section; "
-        "minor NPCs in that section still count.\n"
+        "- Include every named location and every named NPC from the authoritative NPC section "
+        "or character callout boxes; minor NPCs in those places still count.\n"
         "- other_location_ids should only be non-empty for NPCs who travel or appear in more "
         "than one place in the text.\n"
         f"{mode_guidance}"
@@ -1807,6 +2061,9 @@ def _build_npc_detail_prompt(
         "- Labeled writeups (Appearance, Voice, Personality, Goals, What they know/hide, "
         "Attitude, Memory triggers, sample dialogue).\n"
         "- Compact stat blocks with FULL NAME / role lines and PERSONALITY or agenda lines.\n"
+        "- Character callout boxes: short name header, attribute grid (Awareness/Presence/...), "
+        "Skills, TRAITS (Trait: description), Tech Level / Story Points, then a biography that "
+        "covers motives, relationships, and behavior — not just appearance.\n"
         "- Attribute/skill grids followed by TRAITS (Name: description) and a prose biography.\n"
         "- Free prose paragraphs that open with the character's name.\n\n"
         "Field mapping (layout-agnostic):\n"
@@ -2049,6 +2306,14 @@ def outline_campaign_document(
     existing_location_set = {snake_case(loc_id) for loc_id in existing_location_ids}
     location_ids = {loc["id"] for loc in location_stubs} | existing_location_set
     npc_stubs = _merge_outline_npcs_with_stat_blocks(
+        npc_stubs,
+        full_document_text,
+        mode=mode,
+        existing_npc_names=existing_npc_names,
+        location_ids=location_ids,
+        warnings=warnings,
+    )
+    npc_stubs = _merge_outline_npcs_with_callouts(
         npc_stubs,
         full_document_text,
         mode=mode,
