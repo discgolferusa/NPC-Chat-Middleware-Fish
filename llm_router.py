@@ -649,15 +649,39 @@ _CONTENT_CREATION_PROMPT_OVERHEAD_TOKENS = 1_000
 _CONTENT_CREATION_IMPORT_MAX_TOKENS = 6144
 
 
+def _local_import_completion_reserve_tokens() -> int:
+    """Completion share reserved when sizing local import prompts.
+
+    Import callers often request up to 6144 max_tokens, but that much must not be
+    locked aside before shrinking the document — otherwise the prompt is starved
+    and end-biased NPC sections get dropped. Match the same share used by
+    ``_local_content_creation_max_input_chars``.
+    """
+    completion = min(_CONTENT_CREATION_IMPORT_MAX_TOKENS, CONTENT_CREATION_DEFAULT_MAX_TOKENS)
+    return min(completion, max(512, LOCAL_LLM_CONTEXT_TOKENS // 3))
+
+
 def _local_content_creation_max_input_chars() -> int:
     """Document chars that fit local llama.cpp context for content_creation import."""
-    completion = min(_CONTENT_CREATION_IMPORT_MAX_TOKENS, CONTENT_CREATION_DEFAULT_MAX_TOKENS)
-    completion = min(completion, max(512, LOCAL_LLM_CONTEXT_TOKENS // 3))
+    completion = _local_import_completion_reserve_tokens()
     overhead = _CONTENT_CREATION_PROMPT_OVERHEAD_TOKENS + 128
     budget_tokens = LOCAL_LLM_CONTEXT_TOKENS - completion - overhead
     if budget_tokens <= 256:
         return 0
     return min(120_000, budget_tokens * 4)
+
+
+def _trim_message_content_keep_tail(content: str, keep_ratio: float = 0.85) -> str:
+    """Drop content from the start so end-biased import excerpts survive.
+
+    Outline and detail prompts place NON-PLAYER CHARACTERS / name-focused windows
+    toward the end of the largest message. Chopping the tail would undo
+    ``_truncate_preserving_npc_section`` and forward-biased excerpts.
+    """
+    keep = max(1, int(len(content) * keep_ratio))
+    if keep >= len(content):
+        return content
+    return "[... truncated to fit local model context ...]\n\n" + content[-keep:]
 
 
 def _fit_messages_to_local_context(
@@ -667,15 +691,18 @@ def _fit_messages_to_local_context(
     """Shrink the largest message so prompt + completion fits LOCAL_LLM_CONTEXT_TOKENS.
 
     Preserves the caller's requested ``max_completion_tokens`` as a ceiling (so chat
-    stays at 180, import can keep thousands). While shrinking an oversized prompt,
-    reserves room for that completion; after the prompt fits, recomputes completion
-    from remaining context so it is not stuck at a temporary floor.
+    stays at 180). While shrinking an oversized prompt, reserves only the shared
+    local import completion share (not the full 6144 request). Shrinks from the
+    start of the largest message so NPC sections / forward-biased excerpts at the
+    end remain. After the prompt fits, recomputes completion from remaining context.
     """
     slack = 128
     fitted = [dict(m) for m in messages]
     requested = max(1, int(max_completion_tokens))
-    # Leave some prompt room even when the caller asks for a huge completion.
-    reserve = min(requested, max(1, LOCAL_LLM_CONTEXT_TOKENS - slack - 256))
+    # Cap shrink-time reserve to the import share so a 6144 request does not
+    # collapse the prompt; chat (180) still reserves only what it asked for.
+    reserve = min(requested, _local_import_completion_reserve_tokens())
+    reserve = min(reserve, max(1, LOCAL_LLM_CONTEXT_TOKENS - slack - 256))
     max_prompt_tokens = LOCAL_LLM_CONTEXT_TOKENS - reserve - slack
 
     longest_idx = max(
@@ -688,10 +715,9 @@ def _fit_messages_to_local_context(
         content = str(fitted[longest_idx].get("content") or "")
         if len(content) < 400:
             break
-        trimmed = content[: int(len(content) * 0.85)]
         fitted[longest_idx] = {
             **fitted[longest_idx],
-            "content": trimmed + "\n\n[... truncated to fit local model context ...]",
+            "content": _trim_message_content_keep_tail(content),
         }
         prompt_tokens = _estimate_prompt_tokens(fitted)
 
