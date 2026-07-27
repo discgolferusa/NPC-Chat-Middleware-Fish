@@ -56,6 +56,18 @@ def _load_chariot_pdfpig_fixture() -> str:
     return PDFPIG_FIXTURE_PATH.read_text(encoding="utf-8")
 
 
+DOCTOR_WHO_CATSEYE_FIXTURE_PATH = (
+    Path(__file__).resolve().parent
+    / "tests"
+    / "fixtures"
+    / "doctor_who_catseye_npcs_excerpt.txt"
+)
+
+
+def _load_doctor_who_catseye_fixture() -> str:
+    return DOCTOR_WHO_CATSEYE_FIXTURE_PATH.read_text(encoding="utf-8")
+
+
 def test_npc_section_header_end_pattern_is_whole_line_only():
     assert content_import._NPC_SECTION_HEADER_END_PATTERN.match("APPENDIX I")
     assert content_import._NPC_SECTION_HEADER_END_PATTERN.match("INDEX")
@@ -566,10 +578,18 @@ def test_chunked_outline_then_detail_batches(monkeypatch):
     assert "location detail" in steps
 
     johns = next(npc for npc in outline["npcs"] if npc["name"] == "Albert Johns")
-    npc_result = content_import.detail_npc_batch(text, campaign, [johns])
+    # First hop is LLM-only (editor may retry separately when sparse).
+    sparse = content_import.detail_npc_batch(text, campaign, [johns])
+    assert sparse["npcs"][0]["name"] == "Albert Johns"
+    assert content_import._npc_detail_is_sparse(sparse["npcs"][0])
+    assert "npc detail" in steps
+
+    # Last Funnel hop may request excerpt/stat seed fallback after retries.
+    npc_result = content_import.detail_npc_batch(
+        text, campaign, [johns], allow_seed_fallback=True
+    )
     assert npc_result["npcs"][0]["name"] == "Albert Johns"
     assert npc_result["npcs"][0]["personality"] or npc_result["npcs"][0]["secrets"]
-    assert "npc detail" in steps
 
 
 def test_detail_location_batch_rejects_oversized_batch():
@@ -585,7 +605,7 @@ def test_detail_location_batch_rejects_oversized_batch():
 
 
 def test_detail_location_batch_does_not_sparse_retry(monkeypatch):
-    """Funnel hops must be one LLM call; sparse results fall back without a second call."""
+    """Funnel hops must be one LLM call; seed fallback is opt-in after editor retries."""
     calls: list[str] = []
 
     def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step):
@@ -593,12 +613,21 @@ def test_detail_location_batch_does_not_sparse_retry(monkeypatch):
         return {"locations": []}
 
     monkeypatch.setattr(content_import, "_call_llm_json", fake_call_llm_json)
-    result = content_import.detail_location_batch(
+    sparse = content_import.detail_location_batch(
         "USCSS Cronus drifts in deep space with failing life support.",
         {"campaign_id": "c", "name": "C"},
         [{"id": "uscss_cronus", "name": "USCSS Cronus", "type": "building", "seeded_from_stat_blocks": True}],
     )
     assert calls == ["location detail"]
+    assert content_import._location_detail_is_sparse(sparse["locations"][0])
+
+    result = content_import.detail_location_batch(
+        "USCSS Cronus drifts in deep space with failing life support.",
+        {"campaign_id": "c", "name": "C"},
+        [{"id": "uscss_cronus", "name": "USCSS Cronus", "type": "building", "seeded_from_stat_blocks": True}],
+        allow_seed_fallback=True,
+    )
+    assert len(calls) == 2
     assert result["locations"][0]["id"] == "uscss_cronus"
     assert any("fell back" in w.lower() for w in result["warnings"])
 
@@ -654,20 +683,12 @@ def test_detail_npc_batch_preserves_campaign_id_and_empty_location(monkeypatch):
                 "seeded_from_stat_blocks": True,
             }
         ],
+        allow_seed_fallback=True,
     )
     npc = result["npcs"][0]
     assert npc["campaign_id"] == "MultiTest"
     assert npc["location_id"] == ""
-
-
-def _load_doctor_who_catseye_fixture() -> str:
-    path = (
-        Path(__file__).resolve().parent
-        / "tests"
-        / "fixtures"
-        / "doctor_who_catseye_npcs_excerpt.txt"
-    )
-    return path.read_text(encoding="utf-8")
+    assert npc["personality"]
 
 
 def test_seed_npc_detail_from_doctor_who_traits_and_bio():
@@ -679,6 +700,53 @@ def test_seed_npc_detail_from_doctor_who_traits_and_bio():
         assert not content_import._npc_detail_is_sparse(seeded), f"sparse seed for {name}"
 
 
+def test_seed_max_does_not_absorb_neighbor_traits():
+    """Packed Cubicle 7 pages must not attach Peter's/Chad's TRAITS to Max."""
+    text = _load_doctor_who_catseye_fixture()
+    seeded = content_import._seed_npc_detail_from_document("Max Eddings", "squatter", text)
+    assert seeded is not None
+    joined = " ".join(seeded["personality"] + seeded["llm_rules"])
+    assert "Selfish" in joined
+    assert "Argumentative" in joined
+    assert "Friends:" not in joined and "Friends:" not in " ".join(seeded["personality"])
+    assert "Brave:" not in joined
+    assert not any("Hutchins has the majority" in p for p in seeded["personality"])
+
+
+def test_bio_paragraphs_handle_pdf_single_newlines_and_split_names():
+    """PdfPig extracts often lack blank lines; headers may split surnames."""
+    text = (
+        "MAx eddiNGs\n"
+        "AWAreNess 3 PreseNce 2\n"
+        "trAits\n"
+        "Selfish: Eddings thinks of nobody other than himself.\n"
+        "tecH LeVeL: 4 stOry POiNts: 8\n"
+        "Max Eddings suffers from some unknown psychological complaint that makes him angry.\n"
+        "Peter Hutc HiNs\n"
+        "AWAreNess 4 PreseNce 4\n"
+        "trAits\n"
+        "Friends: Hutchins has the majority of the squatters on his side.\n"
+        "tecH LeVeL: 4 stOry POiNts: 6\n"
+        "Peter Hutchins is something of an enigma – people are drawn to Hutchins.\n"
+    )
+    max_bios = content_import._bio_paragraphs_for_name(text, "Max Eddings")
+    assert max_bios
+    assert all("Hutchins is something" not in b for b in max_bios)
+    assert all(len(b) <= content_import._BIO_CHUNK_MAX_CHARS for b in max_bios)
+
+    clipped = content_import._clip_npc_writeup(text, "Peter Hutchins")
+    assert "Peter Hutc HiNs" in clipped or "Peter Hutchins" in clipped
+    assert "Selfish:" not in clipped
+    peter_traits = content_import._parse_trait_blocks(clipped, first_section_only=True)
+    assert any(name == "Friends" for name, _ in peter_traits)
+    assert not any(name == "Selfish" for name, _ in peter_traits)
+
+    peter_seed = content_import._seed_npc_detail_from_document("Peter Hutchins", "leader", text)
+    assert peter_seed is not None
+    assert any("Friends" in p for p in peter_seed["personality"])
+    assert not any("Selfish" in p for p in peter_seed["personality"])
+
+
 def test_detail_npc_batch_seeds_doctor_who_when_llm_empty(monkeypatch):
     text = _load_doctor_who_catseye_fixture()
 
@@ -686,16 +754,25 @@ def test_detail_npc_batch_seeds_doctor_who_when_llm_empty(monkeypatch):
         return {"npcs": []}
 
     monkeypatch.setattr(content_import, "_call_llm_json", fake_call_llm_json)
+    # Without seed fallback the hop stays sparse so the editor can retry.
+    sparse = content_import.detail_npc_batch(
+        text,
+        {"campaign_id": "cats_eye", "name": "Cat's Eye"},
+        [{"id": "max_eddings", "name": "Max Eddings", "role": "squatter", "first_location_id": "majestic"}],
+    )
+    assert content_import._npc_detail_is_sparse(sparse["npcs"][0])
+
     result = content_import.detail_npc_batch(
         text,
         {"campaign_id": "cats_eye", "name": "Cat's Eye"},
         [{"id": "max_eddings", "name": "Max Eddings", "role": "squatter", "first_location_id": "majestic"}],
+        allow_seed_fallback=True,
     )
     npc = result["npcs"][0]
     assert any("Selfish" in p for p in npc["personality"])
     assert any("Argumentative" in p for p in npc["personality"])
     assert npc["public_facts"] or npc["known_facts"]
-    assert any("seeded from traits/bio" in w.lower() for w in result["warnings"])
+    assert any("last resort" in w.lower() for w in result["warnings"])
 
 
 def test_mention_indexes_tolerates_pdf_split_hutchins():
