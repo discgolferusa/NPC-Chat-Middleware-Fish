@@ -228,3 +228,15 @@ def test_location_hints_resolve_existing_campaign_locations(monkeypatch):
     )
     by_name = {npc["name"]: npc for npc in result["npcs"]}
     assert by_name["Albert Johns"]["location_id"] == "uscss_cronus"
+
+
+def test_truncate_preserving_npc_section_keeps_stat_blocks():
+    intro = "X" * 20_000
+    section = _load_chariot_fixture()
+    text = f"{intro}\n\n{section}"
+    max_chars = 12_000
+    trimmed = content_import._truncate_preserving_npc_section(text, max_chars)
+    assert len(trimmed) <= max_chars
+    assert "JOHNS, OFFICER" in trimmed
+    assert "FULL NAME: Albert Johns" in trimmed
+    assert "Captain Miller" not in trimmed

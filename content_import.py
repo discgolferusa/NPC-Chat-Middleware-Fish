@@ -28,6 +28,7 @@ import re
 from typing import Any
 
 from llm_router import content_creation_max_input_chars, generate_llm_response
+from llm_router import LLMProviderError
 
 MAX_INPUT_CHARS = 120_000
 # Small batches: local 8B models (and Groq fallbacks) often return empty/partial JSON
@@ -295,6 +296,32 @@ def _prepare_outline_document_text(text: str, warnings: list[str]) -> str:
     if intro:
         return f"{intro}\n\n--- NON-PLAYER CHARACTERS (authoritative NPC list) ---\n\n{npc_section}"
     return npc_section
+
+
+def _truncate_preserving_npc_section(text: str, max_chars: int) -> str:
+    """Shrink long documents but keep the NON-PLAYER CHARACTERS section when present."""
+    if len(text) <= max_chars:
+        return text
+
+    collapsed = _collapse_spaced_caps(text)
+    span = _find_npc_section_span(collapsed)
+    if span is None:
+        return text[:max_chars]
+
+    start, end = span
+    section = collapsed[start:end].strip()
+    separator = "\n\n--- NON-PLAYER CHARACTERS (priority excerpt) ---\n\n"
+    if len(section) >= max_chars:
+        return section[:max_chars]
+
+    intro_budget = max_chars - len(section) - len(separator)
+    if intro_budget > 0:
+        intro_source = collapsed[:start].strip()
+        intro = intro_source[:intro_budget]
+        combined = f"{intro}{separator}{section}" if intro else section
+        return combined[:max_chars]
+
+    return section[:max_chars]
 
 
 def _npc_stubs_from_stat_blocks(
@@ -1125,12 +1152,13 @@ def _truncate_input(text: str, warnings: list[str]) -> str:
     max_chars = min(MAX_INPUT_CHARS, max_chars)
     if len(text) > max_chars:
         warnings.append(
-            f"Input document was {len(text)} characters; truncated to the first "
-            f"{max_chars} characters so the outline pass fits the current "
-            "content_creation token budget. Later sections may be missing — "
-            "prefer content_creation=local or a higher-TPM Groq model for long docs."
+            f"Input document was {len(text)} characters; truncated to fit the current "
+            f"content_creation context budget ({max_chars} characters). "
+            "When a NON-PLAYER CHARACTERS section exists it is kept in priority. "
+            "For long PDFs use Groq for content_creation or raise LOCAL_LLM_CONTEXT_TOKENS "
+            "to match llama.cpp n_ctx."
         )
-        return text[:max_chars]
+        return _truncate_preserving_npc_section(text, max_chars)
     return text
 
 
@@ -1215,6 +1243,8 @@ def analyze_campaign_document(
 
     try:
         outline_raw = _call_llm_json(_SYSTEM_PROMPT, outline_prompt, warnings=warnings, step="outline")
+    except LLMProviderError as ex:
+        raise ContentImportError(str(ex)) from ex
     except Exception as ex:
         raise ContentImportError(f"Outline pass failed: {ex}") from ex
 

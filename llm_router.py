@@ -31,6 +31,8 @@ BASE_DIR = Path(__file__).resolve().parent
 
 LOCAL_LLM_URL = os.getenv("LOCAL_LLM_URL", "http://127.0.0.1:8080/v1/chat/completions")
 LOCAL_LLM_MODEL = os.getenv("LOCAL_LLM_MODEL", "npc")
+# llama.cpp rejects requests when prompt_tokens + max_tokens exceeds n_ctx (HTTP 400).
+LOCAL_LLM_CONTEXT_TOKENS = int(os.getenv("LOCAL_LLM_CONTEXT_TOKENS", "8192"))
 LOCAL_LLM_TIMEOUT_SECONDS = int(os.getenv("LOCAL_LLM_TIMEOUT_SECONDS", "180"))
 CONTENT_CREATION_LOCAL_TIMEOUT_SECONDS = int(
     os.getenv("CONTENT_CREATION_LOCAL_TIMEOUT_SECONDS", "600")
@@ -643,6 +645,57 @@ def _would_exceed_groq_limits(
 
 # Rough tokens reserved for system prompt + outline instructions outside the document body.
 _CONTENT_CREATION_PROMPT_OVERHEAD_TOKENS = 1_000
+# Import outline/detail passes may request up to 6144 completion tokens.
+_CONTENT_CREATION_IMPORT_MAX_TOKENS = 6144
+
+
+def _local_content_creation_max_input_chars() -> int:
+    """Document chars that fit local llama.cpp context for content_creation import."""
+    completion = min(_CONTENT_CREATION_IMPORT_MAX_TOKENS, CONTENT_CREATION_DEFAULT_MAX_TOKENS)
+    completion = min(completion, max(512, LOCAL_LLM_CONTEXT_TOKENS // 3))
+    overhead = _CONTENT_CREATION_PROMPT_OVERHEAD_TOKENS + 128
+    budget_tokens = LOCAL_LLM_CONTEXT_TOKENS - completion - overhead
+    if budget_tokens <= 256:
+        return 0
+    return min(120_000, budget_tokens * 4)
+
+
+def _fit_messages_to_local_context(
+    messages: list[dict[str, Any]],
+    max_completion_tokens: int,
+) -> tuple[list[dict[str, Any]], int]:
+    """Shrink the largest message so prompt + completion fits LOCAL_LLM_CONTEXT_TOKENS."""
+    slack = 128
+    fitted = [dict(m) for m in messages]
+    prompt_tokens = _estimate_prompt_tokens(fitted)
+    max_completion = min(
+        max(256, max_completion_tokens),
+        max(256, LOCAL_LLM_CONTEXT_TOKENS - prompt_tokens - slack),
+    )
+
+    max_prompt_tokens = LOCAL_LLM_CONTEXT_TOKENS - max_completion - slack
+    longest_idx = max(
+        range(len(fitted)),
+        key=lambda i: len(str(fitted[i].get("content") or "")),
+        default=0,
+    )
+    while prompt_tokens > max_prompt_tokens and len(fitted) > 0:
+        content = str(fitted[longest_idx].get("content") or "")
+        if len(content) < 400:
+            break
+        trimmed = content[: int(len(content) * 0.85)]
+        fitted[longest_idx] = {
+            **fitted[longest_idx],
+            "content": trimmed + "\n\n[... truncated to fit local model context ...]",
+        }
+        prompt_tokens = _estimate_prompt_tokens(fitted)
+        max_completion = min(
+            max_completion,
+            max(256, LOCAL_LLM_CONTEXT_TOKENS - prompt_tokens - slack),
+        )
+        max_prompt_tokens = LOCAL_LLM_CONTEXT_TOKENS - max_completion - slack
+
+    return fitted, max_completion
 
 
 def content_creation_max_input_chars() -> int:
@@ -656,10 +709,9 @@ def content_creation_max_input_chars() -> int:
     model_id = CONTENT_CREATION_MODEL_ID
     provider_mode = CONTENT_CREATION_PROVIDER_MODE
     if provider_mode == "local" or model_id == "local":
-        return 120_000
+        return _local_content_creation_max_input_chars()
     if provider_mode == "groq_with_local_fallback":
-        # Keep the full document available for local fallback; Groq still has its
-        # own preflight in generate_llm_response and will fall back when needed.
+        # Groq may take the full doc; local fallback truncates in call_local_chat_completions.
         return 120_000
 
     model_entry = LLM_MODELS.get(model_id) or {}
@@ -687,9 +739,10 @@ def call_local_chat_completions(
     **kwargs: Any,
 ) -> tuple[str, dict[str, int]]:
     effective_max = _effective_max_tokens("local", max_tokens, model_name=LOCAL_LLM_MODEL)
+    fitted_messages, effective_max = _fit_messages_to_local_context(messages, effective_max)
     payload: dict[str, Any] = {
         "model": LOCAL_LLM_MODEL,
-        "messages": messages,
+        "messages": fitted_messages,
         "temperature": 0.80 if temperature is None else temperature,
         "top_p": kwargs.pop("top_p", 0.90),
         "max_tokens": effective_max,
@@ -711,6 +764,21 @@ def call_local_chat_completions(
         raise LLMProviderError(
             f"Local LLM timed out at {LOCAL_LLM_URL} after {timeout}s."
         ) from ex
+    except requests.HTTPError as ex:
+        detail = ""
+        if ex.response is not None:
+            detail = (ex.response.text or "").strip()[:500]
+        prompt_tokens = _estimate_prompt_tokens(fitted_messages)
+        hint = (
+            f"Local LLM rejected the request (HTTP {ex.response.status_code if ex.response else '?'}). "
+            f"Estimated prompt ~{prompt_tokens} tokens + max_tokens={effective_max} "
+            f"exceeds LOCAL_LLM_CONTEXT_TOKENS={LOCAL_LLM_CONTEXT_TOKENS}. "
+            "Raise n_ctx when starting llama.cpp, set LOCAL_LLM_CONTEXT_TOKENS to match, "
+            "or use Groq for content_creation in Admin → LLM."
+        )
+        if detail:
+            hint = f"{hint} Server said: {detail}"
+        raise LLMProviderError(hint) from ex
 
     data = response.json()
     message = (data.get("choices") or [{}])[0].get("message") or {}
