@@ -10,7 +10,7 @@ Manual test (PowerShell):
   curl http://127.0.0.1:5000/llm/models
   curl http://127.0.0.1:5000/llm/status
   curl -X POST http://127.0.0.1:5000/llm/select -H "Content-Type: application/json" -d "{\"model_id\":\"local\",\"provider_mode\":\"local\"}"
-  curl -X POST http://127.0.0.1:5000/llm/select -H "Content-Type: application/json" -d "{\"model_id\":\"groq-llama-4-scout\",\"provider_mode\":\"groq_with_local_fallback\"}"
+  curl -X POST http://127.0.0.1:5000/llm/select -H "Content-Type: application/json" -d "{\"model_id\":\"groq-llama-3.3-70b\",\"provider_mode\":\"groq_with_local_fallback\"}"
   curl -X POST http://127.0.0.1:5000/llm/select -H "Content-Type: application/json" -d "{\"model_id\":\"groq-llama-3.3-70b\",\"provider_mode\":\"groq_with_local_fallback\",\"purpose\":\"content_creation\"}"
 """
 
@@ -37,7 +37,7 @@ CONTENT_CREATION_LOCAL_TIMEOUT_SECONDS = int(
 )
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1/chat/completions")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 GROQ_TIMEOUT_SECONDS = int(os.getenv("GROQ_TIMEOUT_SECONDS", "10"))
 # content_creation sends large prompts and asks for long JSON completions;
 # the chat default (10s) is far too short and causes cascading timeouts.
@@ -77,29 +77,14 @@ LLM_MODELS: dict[str, dict[str, Any]] = {
         "online": False,
         "limits": None,
     },
-    "groq-llama-4-scout": {
-        "id": "groq-llama-4-scout",
-        "label": "Groq Llama 4 Scout 17B",
-        "provider": "groq",
-        "model": "meta-llama/llama-4-scout-17b-16e-instruct",
-        "online": True,
-        "limits": {"rpm": 30, "rpd": 1000, "tpm": 30000, "tpd": 500000},
-    },
     "groq-llama-3.1-8b-instant": {
         "id": "groq-llama-3.1-8b-instant",
         "label": "Groq Llama 3.1 8B Instant",
         "provider": "groq",
         "model": "llama-3.1-8b-instant",
         "online": True,
+        # Free-tier-ish defaults; paid plans are higher — these stay conservative for preflight.
         "limits": {"rpm": 30, "rpd": 14400, "tpm": 6000, "tpd": 500000},
-    },
-    "groq-qwen3-32b": {
-        "id": "groq-qwen3-32b",
-        "label": "Groq Qwen3 32B",
-        "provider": "groq",
-        "model": "qwen/qwen3-32b",
-        "online": True,
-        "limits": {"rpm": 60, "rpd": 1000, "tpm": 6000, "tpd": 500000},
     },
     "groq-llama-3.3-70b": {
         "id": "groq-llama-3.3-70b",
@@ -108,6 +93,14 @@ LLM_MODELS: dict[str, dict[str, Any]] = {
         "model": "llama-3.3-70b-versatile",
         "online": True,
         "limits": {"rpm": 30, "rpd": 1000, "tpm": 12000, "tpd": 100000},
+    },
+    "groq-qwen3.6-27b": {
+        "id": "groq-qwen3.6-27b",
+        "label": "Groq Qwen3.6 27B",
+        "provider": "groq",
+        "model": "qwen/qwen3.6-27b",
+        "online": True,
+        "limits": {"rpm": 30, "rpd": 1000, "tpm": 6000, "tpd": 500000},
     },
     "groq-gpt-oss-120b": {
         "id": "groq-gpt-oss-120b",
@@ -125,6 +118,12 @@ LLM_MODELS: dict[str, dict[str, Any]] = {
         "online": True,
         "limits": {"rpm": 30, "rpd": 1000, "tpm": 8000, "tpd": 200000},
     },
+}
+
+# Retired Groq model ids still present in older llm_runtime_config.json files.
+DEPRECATED_MODEL_ALIASES: dict[str, str] = {
+    "groq-llama-4-scout": "groq-llama-3.3-70b",
+    "groq-qwen3-32b": "groq-qwen3.6-27b",
 }
 
 # --- chat purpose (default / backward-compatible globals) ---
@@ -213,6 +212,30 @@ def _load_secrets_file() -> None:
         print(f"[LLM] failed to read secrets file: {ex}", flush=True)
 
 
+def _alias_model_id(model_id: str | None) -> str:
+    """Follow retired-model aliases only. Does not invent a fallback catalog id."""
+    candidate = str(model_id or "").strip()
+    if not candidate:
+        return ""
+    seen: set[str] = set()
+    while candidate in DEPRECATED_MODEL_ALIASES and candidate not in seen:
+        seen.add(candidate)
+        candidate = DEPRECATED_MODEL_ALIASES[candidate]
+    return candidate
+
+
+def _resolve_model_id(model_id: str | None, *, default: str = "local") -> str:
+    """Map retired catalog ids onto current models, else fall back to default."""
+    candidate = _alias_model_id(model_id)
+    if not candidate:
+        candidate = default
+    if candidate in LLM_MODELS:
+        return candidate
+    if default in LLM_MODELS:
+        return default
+    return "local"
+
+
 def _load_runtime_config() -> None:
     global CURRENT_LLM_MODEL_ID, LLM_PROVIDER_MODE
     global CONTENT_CREATION_MODEL_ID, CONTENT_CREATION_PROVIDER_MODE
@@ -249,13 +272,11 @@ def _load_runtime_config() -> None:
     # Backward compat: pre-purpose runtime config files only had top-level
     # model_id/provider_mode. Treat those as the "chat" purpose.
     chat_cfg = purposes.get(PURPOSE_CHAT) if isinstance(purposes.get(PURPOSE_CHAT), dict) else {}
-    chat_model_id = chat_cfg.get("model_id", data.get("model_id", CURRENT_LLM_MODEL_ID))
+    raw_chat_model_id = str(chat_cfg.get("model_id", data.get("model_id", CURRENT_LLM_MODEL_ID)) or "")
+    chat_model_id = _resolve_model_id(raw_chat_model_id, default="local")
     chat_provider_mode = chat_cfg.get("provider_mode", data.get("provider_mode", LLM_PROVIDER_MODE))
 
-    if chat_model_id in LLM_MODELS:
-        CURRENT_LLM_MODEL_ID = chat_model_id
-    elif CURRENT_LLM_MODEL_ID not in LLM_MODELS:
-        CURRENT_LLM_MODEL_ID = "local"
+    CURRENT_LLM_MODEL_ID = chat_model_id
 
     if chat_provider_mode in VALID_PROVIDER_MODES:
         LLM_PROVIDER_MODE = chat_provider_mode
@@ -267,18 +288,24 @@ def _load_runtime_config() -> None:
         if isinstance(purposes.get(PURPOSE_CONTENT_CREATION), dict)
         else {}
     )
-    creation_model_id = creation_cfg.get("model_id", CONTENT_CREATION_MODEL_ID)
+    raw_creation_model_id = str(creation_cfg.get("model_id", CONTENT_CREATION_MODEL_ID) or "")
+    creation_model_id = _resolve_model_id(raw_creation_model_id, default=CURRENT_LLM_MODEL_ID)
     creation_provider_mode = creation_cfg.get("provider_mode", CONTENT_CREATION_PROVIDER_MODE)
 
-    if creation_model_id in LLM_MODELS:
-        CONTENT_CREATION_MODEL_ID = creation_model_id
-    elif CONTENT_CREATION_MODEL_ID not in LLM_MODELS:
-        CONTENT_CREATION_MODEL_ID = "local"
+    CONTENT_CREATION_MODEL_ID = creation_model_id
 
     if creation_provider_mode in VALID_PROVIDER_MODES:
         CONTENT_CREATION_PROVIDER_MODE = creation_provider_mode
     elif CONTENT_CREATION_PROVIDER_MODE not in VALID_PROVIDER_MODES:
         CONTENT_CREATION_PROVIDER_MODE = "local"
+
+    if raw_chat_model_id != CURRENT_LLM_MODEL_ID or raw_creation_model_id != CONTENT_CREATION_MODEL_ID:
+        print(
+            f"[LLM] remapped retired model ids: chat {raw_chat_model_id!r}->{CURRENT_LLM_MODEL_ID!r}, "
+            f"content_creation {raw_creation_model_id!r}->{CONTENT_CREATION_MODEL_ID!r}",
+            flush=True,
+        )
+        _save_runtime_config()
 
 
 def _save_runtime_config() -> None:
@@ -591,7 +618,7 @@ def _would_exceed_groq_limits(
             if purpose == PURPOSE_CONTENT_CREATION:
                 action = (
                     "Wait about a minute, shorten the document, or switch content creation "
-                    "to a higher-TPM model such as groq-llama-4-scout (Admin → LLM)."
+                    "to a higher-TPM model such as groq-llama-3.3-70b (Admin → LLM)."
                 )
             else:
                 action = (
@@ -1086,6 +1113,19 @@ def generate_llm_response(
 
     if response.status_code >= 400:
         error_text = response.text[:500]
+        model_missing = (
+            "model_not_found" in error_text
+            or "does not exist" in error_text
+            or "do not have access" in error_text
+        )
+        reason = "groq_model_not_found" if model_missing else "groq_http_error"
+        friendly = (
+            f"Groq model '{model_name}' is unavailable on this API key/plan "
+            f"(retired or not entitled). Pick another model in Admin → LLM "
+            f"(e.g. groq-llama-3.3-70b)."
+            if model_missing
+            else f"HTTP {response.status_code}: {error_text}"
+        )
         record_llm_usage(
             provider="groq",
             model_id=selected_model_id,
@@ -1095,19 +1135,19 @@ def generate_llm_response(
             total_tokens=estimated_prompt_tokens,
             success=False,
             fallback=provider_mode != "groq",
-            error=f"HTTP {response.status_code}: {error_text}",
+            error=friendly,
             purpose=purpose,
         )
         if provider_mode == "groq":
-            LAST_LLM_ERROR[purpose] = f"Groq HTTP {response.status_code}"
-            raise LLMProviderError(LAST_LLM_ERROR[purpose])
+            LAST_LLM_ERROR[purpose] = friendly
+            raise LLMProviderError(friendly)
         return _fallback_to_local(
             messages,
-            reason="groq_http_error",
+            reason=reason,
             selected_model_id=selected_model_id,
             temperature=temperature,
             max_tokens=effective_max_tokens,
-            error=error_text,
+            error=friendly,
             purpose=purpose,
             **kwargs,
         )
@@ -1142,7 +1182,12 @@ def select_llm_model(
     purpose = _normalize_purpose(purpose)
 
     if model_id not in LLM_MODELS:
-        raise ValueError(f"Unknown model_id: {model_id}")
+        remapped = _alias_model_id(model_id)
+        if remapped in LLM_MODELS:
+            print(f"[LLM] select remapped retired model {model_id!r} -> {remapped!r}", flush=True)
+            model_id = remapped
+        else:
+            raise ValueError(f"Unknown model_id: {model_id}")
 
     if provider_mode is not None and provider_mode not in VALID_PROVIDER_MODES:
         raise ValueError(f"Invalid provider_mode: {provider_mode}")
