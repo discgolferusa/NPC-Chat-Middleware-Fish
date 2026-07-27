@@ -582,3 +582,48 @@ def test_detail_npc_batch_rejects_oversized_batch():
                 {"id": "b", "name": "B", "role": "y", "first_location_id": "loc"},
             ],
         )
+
+
+def test_normalize_campaign_meta_preserves_merge_campaign_id():
+    meta = content_import._normalize_campaign_meta(
+        {"campaign_id": "MultiTest", "name": "Multi Test", "description": ""}
+    )
+    assert meta["campaign_id"] == "MultiTest"
+
+
+def test_normalize_campaign_meta_snake_cases_when_id_missing():
+    meta = content_import._normalize_campaign_meta({"name": "Multi Test"})
+    assert meta["campaign_id"] == "multi_test"
+
+
+def test_normalize_npc_stubs_empty_location_stays_empty():
+    stubs = content_import._normalize_npc_stubs(
+        [{"id": "albert_johns", "name": "Albert Johns", "role": "Officer", "first_location_id": ""}]
+    )
+    assert stubs[0]["first_location_id"] == ""
+    assert content_import.snake_case("") == "unnamed"
+
+
+def test_detail_npc_batch_preserves_campaign_id_and_empty_location(monkeypatch):
+    def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step):
+        return {"npcs": []}
+
+    monkeypatch.setattr(content_import, "_call_llm_json", fake_call_llm_json)
+    result = content_import.detail_npc_batch(
+        "Albert Johns is an officer with PERSONALITY: Cautious.",
+        {"campaign_id": "MultiTest", "name": "Multi Test"},
+        [
+            {
+                "id": "albert_johns",
+                "name": "Albert Johns",
+                "role": "Officer",
+                "first_location_id": "",
+                "seed_personality": "Cautious",
+                "seed_personal_agenda": "Survive",
+                "seeded_from_stat_blocks": True,
+            }
+        ],
+    )
+    npc = result["npcs"][0]
+    assert npc["campaign_id"] == "MultiTest"
+    assert npc["location_id"] == ""

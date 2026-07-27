@@ -1756,13 +1756,34 @@ def outline_campaign_document(
 
 
 def _normalize_campaign_meta(campaign: dict[str, Any] | None) -> dict[str, Any]:
+    """Normalize campaign fields for detail hops without rewriting assigned ids.
+
+    Merge mode and the editor pass a concrete ``campaign_id`` that must be stamped
+    onto locations/NPCs unchanged (e.g. ``MultiTest``). Only invent via snake_case
+    when no id was provided.
+    """
     raw = campaign if isinstance(campaign, dict) else {}
-    campaign_id = snake_case(raw.get("campaign_id") or raw.get("name") or "campaign") or "campaign"
+    raw_id = str(raw.get("campaign_id") or "").strip()
+    if raw_id:
+        campaign_id = raw_id
+    else:
+        campaign_id = snake_case(raw.get("name") or "campaign")
     return {
         "campaign_id": campaign_id,
         "name": str(raw.get("name") or campaign_id.replace("_", " ").title()).strip(),
         "description": str(raw.get("description") or "").strip(),
     }
+
+
+def _optional_location_id(value: Any) -> str:
+    """Snake-case a location id, or return empty when the source had none.
+
+    ``snake_case("")`` yields ``\"unnamed\"``, which must not become a fake location.
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    return snake_case(raw)
 
 
 def _normalize_location_stubs(raw_locations: Any) -> list[dict[str, Any]]:
@@ -1795,7 +1816,7 @@ def _normalize_npc_stubs(raw_npcs: Any) -> list[dict[str, Any]]:
         if not npc_id or not name:
             continue
         other = [
-            snake_case(x)
+            _optional_location_id(x)
             for x in _as_list(raw.get("other_location_ids"))
             if str(x).strip()
         ]
@@ -1804,7 +1825,7 @@ def _normalize_npc_stubs(raw_npcs: Any) -> list[dict[str, Any]]:
                 "id": npc_id,
                 "name": name,
                 "role": str(raw.get("role") or "").strip(),
-                "first_location_id": snake_case(raw.get("first_location_id") or "") or "",
+                "first_location_id": _optional_location_id(raw.get("first_location_id")),
                 "other_location_ids": [x for x in other if x],
                 "seeded_from_stat_blocks": bool(raw.get("seeded_from_stat_blocks")),
                 "seed_personality": str(raw.get("seed_personality") or "").strip(),
