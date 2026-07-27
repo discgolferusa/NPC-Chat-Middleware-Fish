@@ -572,16 +572,35 @@ def test_chunked_outline_then_detail_batches(monkeypatch):
     assert "npc detail" in steps
 
 
-def test_detail_npc_batch_rejects_oversized_batch():
+def test_detail_location_batch_rejects_oversized_batch():
     with pytest.raises(content_import.ContentImportError, match="at most"):
-        content_import.detail_npc_batch(
-            "NON-PLAYER CHARACTERS\nFULL NAME: A",
+        content_import.detail_location_batch(
+            "A location appears here.",
             {"campaign_id": "c", "name": "C"},
             [
-                {"id": "a", "name": "A", "role": "x", "first_location_id": "loc"},
-                {"id": "b", "name": "B", "role": "y", "first_location_id": "loc"},
+                {"id": "a", "name": "A", "type": "building"},
+                {"id": "b", "name": "B", "type": "building"},
             ],
         )
+
+
+def test_detail_location_batch_does_not_sparse_retry(monkeypatch):
+    """Funnel hops must be one LLM call; sparse results fall back without a second call."""
+    calls: list[str] = []
+
+    def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step):
+        calls.append(step)
+        return {"locations": []}
+
+    monkeypatch.setattr(content_import, "_call_llm_json", fake_call_llm_json)
+    result = content_import.detail_location_batch(
+        "USCSS Cronus drifts in deep space with failing life support.",
+        {"campaign_id": "c", "name": "C"},
+        [{"id": "uscss_cronus", "name": "USCSS Cronus", "type": "building", "seeded_from_stat_blocks": True}],
+    )
+    assert calls == ["location detail"]
+    assert result["locations"][0]["id"] == "uscss_cronus"
+    assert any("fell back" in w.lower() for w in result["warnings"])
 
 
 def test_normalize_campaign_meta_preserves_merge_campaign_id():

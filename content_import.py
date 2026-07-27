@@ -45,9 +45,9 @@ from llm_router import (
 )
 
 MAX_INPUT_CHARS = 120_000
-# Small batches: local 8B models (and Groq fallbacks) often return empty/partial JSON
-# when asked for many rich NPCs at once. One NPC per call preserves source detail.
-MAX_LOCATIONS_PER_BATCH = 2
+# One entity per Funnel hop. Location batching + sparse retries stacked past the
+# editor's per-hop HTTP timeout (CONTENT_CREATION_LOCAL_TIMEOUT_SECONDS each).
+MAX_LOCATIONS_PER_BATCH = 1
 MAX_NPCS_PER_BATCH = 1
 IMPORT_TEMPERATURE = 0.15
 IMPORT_MAX_TOKENS = 6144
@@ -1855,15 +1855,12 @@ def detail_location_batch(
 
     details_by_id: dict[str, dict[str, Any]] = {}
     details_by_id.update(_fetch_location_details(batch, text, campaign, warnings))
+    # One LLM call per Funnel hop — do not sparse-retry here. Retries stacked with
+    # CONTENT_CREATION_LOCAL_TIMEOUT_SECONDS and blew past the editor hop budget.
     for stub in batch:
         detail = details_by_id.get(stub["id"], {})
         if _location_detail_is_sparse(detail):
-            retry = _fetch_location_details([stub], text, campaign, warnings)
-            retry_detail = retry.get(stub["id"], {})
-            if not _location_detail_is_sparse(retry_detail):
-                details_by_id[stub["id"]] = retry_detail
-                warnings.append(f"Location '{stub['id']}': recovered details on retry.")
-            elif stub.get("seeded_from_stat_blocks"):
+            if stub.get("seeded_from_stat_blocks"):
                 details_by_id[stub["id"]] = _location_detail_from_seed(stub)
                 warnings.append(
                     f"Location '{stub['id']}': detail sparse; fell back to "
@@ -1901,15 +1898,11 @@ def detail_npc_batch(
 
     details_by_id: dict[str, dict[str, Any]] = {}
     details_by_id.update(_fetch_npc_details(batch, text, campaign, warnings))
+    # One LLM call per Funnel hop — sparse seed fallback only, no second LLM retry.
     for stub in batch:
         detail = details_by_id.get(stub["id"], {})
         if _npc_detail_is_sparse(detail):
-            retry = _fetch_npc_details([stub], text, campaign, warnings)
-            retry_detail = retry.get(stub["id"], {})
-            if not _npc_detail_is_sparse(retry_detail):
-                details_by_id[stub["id"]] = retry_detail
-                warnings.append(f"NPC '{stub['id']}': recovered details on retry.")
-            elif _npc_stub_has_stat_seed(stub):
+            if _npc_stub_has_stat_seed(stub):
                 details_by_id[stub["id"]] = _npc_detail_from_stat_seed(stub)
                 warnings.append(
                     f"NPC '{stub['id']}': detail sparse; fell back to "
