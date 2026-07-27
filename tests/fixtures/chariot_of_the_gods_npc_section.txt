@@ -1,0 +1,63 @@
+﻿CHARIOT OF THE GODS - scenario excerpt for import regression.
+
+Sidebar quote (NOT scenario NPCs):
+Captain Miller warned David 8 that Miss Vickers would never approve of the expedition.
+
+During this scenario, the crew from the USCSS Montero can encounter NPCs from three different groups, all detailed below.
+N O N - P L A Y E R
+C H A R A C T E R S
+JOHNS, OFFICER
+Second Officer on the USCSS Cronus
+FULL NAME: Albert Johns
+AGE: 47
+PERSONALITY: Submissive
+PERSONAL AGENDA: Find a leader to follow and help them to save human lives.
+REID, COLONIAL MARINE
+Security Officer on the USCSS Cronus
+FULL NAME: Valerie Reid
+AGE: 34
+PERSONALITY: On Edge
+PERSONAL AGENDA: Terminate all threats to the Cronus crew with extreme prejudice.
+FLYNN, MEDIC
+Ship Medic on the USCSS Cronus
+FULL NAME: Liam Flynn
+AGE: 27
+PERSONALITY: Fearful
+PERSONAL AGENDA: Get out of this mess alive.
+COOPER, SCIENTIST
+Chief Scientist on the USCSS Cronus
+FULL NAME: Daniel Cooper
+AGE: 53
+PERSONALITY: Rational
+PERSONAL AGENDA: To make sure the 26 Draconis Strain does not become a threat to human civilization.
+CLAYTON, COMPANY AGENT
+Corporate Liaison on the USCSS Cronus
+FULL NAME: Lori Clayton
+AGE: 42
+PERSONALITY: Ruthless
+PERSONAL AGENDA: Bring both Flynn and a sample of the 26 Draconis Strain back to Weyland-Yutani.
+BOLAJI, OFFICER
+Captain of the Sotillo
+FULL NAME: Adisa Bolaji
+AGE: 30
+PERSONALITY: Resolute
+PERSONAL AGENDA: Turn this tricky situation into a profit without risking your ship and crew.
+PIN, MERCENARY
+Hired muscle on the Sotillo
+FULL NAME: Pinion
+AGE: 31
+PERSONALITY: Steadfast
+PERSONAL AGENDA: Follow and protect Bolaji, no matter what the cost or risk.
+BEIN, PILOT
+Pilot on the Sotillo
+FULL NAME: Helen Bein
+AGE: 53
+PERSONALITY: Cynical
+PERSONAL AGENDA: Find a drink on this goddamn ship.
+HORTON, MECHANIC
+Mechanic on the Sotillo
+FULL NAME: Micky Horton
+AGE: 12
+PERSONALITY: Friendly
+PERSONAL AGENDA: Help your crewmates from the Sotillo to get out alive.
+AUXILIARY VEHICLES: The Cronus has only two ATVs.
