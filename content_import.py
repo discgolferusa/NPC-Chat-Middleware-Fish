@@ -59,8 +59,13 @@ _NPC_SECTION_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _NPC_SECTION_END_PATTERN = re.compile(
-    r"(?:^|\n)\s*(?:auxiliary\s+vehicles|the\s+deck\s+plans|appendix\b|index\b|maps?\b)",
+    r"(?:^|\n)\s*(?:auxiliary\s+vehicles|(?:the\s+)?deck\s+plans)\b",
     re.IGNORECASE,
+)
+# Whole-line headers only. Group the alternation so ^ and $ apply to every option;
+# mid-prose "Appendix I on page 38." must not match.
+_NPC_SECTION_HEADER_END_PATTERN = re.compile(
+    r"(?im)^\s*(?:APPENDIX(?:\s+[A-Z0-9]+)?|INDEX|MAPS?)\s*$",
 )
 _STAT_BLOCK_HEADING = re.compile(
     r"^([A-Z][A-Z0-9][A-Z0-9 '\-]*?)\s*,\s*([A-Z][A-Z0-9][A-Z0-9 '\-/]*)$",
@@ -86,6 +91,18 @@ _STAT_BLOCK_FALSE_HEADING_NAMES = frozenset(
     }
 )
 _FULL_NAME_LINE = re.compile(r"^FULL NAME:\s*(.+)$", re.IGNORECASE)
+# PdfPig two-column lines often contain multiple FULL NAME markers on one line.
+# Restrict to Title-Case name tokens; stop before the next FULL NAME or lowercase prose.
+_FULL_NAME_ANY = re.compile(
+    r"(?:FULL|Full|full)\s+(?:NAME|Name|name):\s*"
+    r"([A-Z][a-zA-Z0-9'\-]+(?:\s+[A-Z][a-zA-Z0-9'\-]+){0,4})"
+    r"(?=\s*(?:FULL|Full|full)\s+(?:NAME|Name|name)\s*:|\s+[a-z]|\s*$|[,;\n])",
+)
+_STAT_BLOCK_FIELD_STOP = re.compile(
+    r"^(?:AGE|PERSONALITY|PERSONAL\s+AGENDA|STRENGTH|HEALTH|SKILLS|GEAR|TALENT|"
+    r"BUDDY|RIVAL|FULL\s+NAME)\b",
+    re.IGNORECASE,
+)
 # Movie/sidebar names that are not scenario NPCs (Chariot of the Gods regression).
 _KNOWN_IMPORT_FALSE_POSITIVE_NAMES = frozenset(
     {
@@ -238,8 +255,49 @@ def _find_npc_section_span(collapsed_text: str) -> tuple[int, int] | None:
         return None
     start = match.start()
     remainder = collapsed_text[match.end() :]
+    end = len(collapsed_text)
+    hard_end: int | None = None
+
     end_match = _NPC_SECTION_END_PATTERN.search(remainder)
-    end = match.end() + end_match.start() if end_match else len(collapsed_text)
+    if end_match:
+        hard_end = match.end() + end_match.start()
+        end = hard_end
+
+    # Only treat APPENDIX/INDEX/MAPS as section ends when the entire line is that
+    # header — not mid-sentence references like "Appendix I on page 38".
+    for header_match in _NPC_SECTION_HEADER_END_PATTERN.finditer(remainder):
+        abs_pos = match.end() + header_match.start()
+        if abs_pos >= end:
+            break
+        line_start = collapsed_text.rfind("\n", start, abs_pos) + 1
+        line_end = collapsed_text.find("\n", abs_pos)
+        if line_end < 0:
+            line_end = len(collapsed_text)
+        line = collapsed_text[line_start:line_end].strip()
+        # Regex already requires a whole-line header; keep the length guard as a
+        # belt-and-suspenders check against odd whitespace collapses.
+        if line and len(line) <= 40 and _NPC_SECTION_HEADER_END_PATTERN.match(line):
+            end = min(end, line_start)
+            break
+
+    section = collapsed_text[start:end]
+    # PdfPig two-column glue can trip an early false end after the first NPC.
+    # If we see too few FULL NAME markers, extend only to the next *hard* end
+    # (deck plans / auxiliary vehicles). Never blow past a known hard boundary
+    # with a blind start+20_000 window — that swallows following chapters when
+    # a legitimate module simply has fewer than three FULL NAME rows.
+    if len(_FULL_NAME_ANY.findall(section)) < 3:
+        hard = _NPC_SECTION_END_PATTERN.search(collapsed_text, start)
+        if hard is not None:
+            hard_pos = hard.start()
+            if hard_pos > end:
+                end = hard_pos
+            # else: already at/before the hard end — keep it
+        elif hard_end is None:
+            # No hard boundary in the document; allow a bounded look-ahead only
+            # when we have not already locked onto deck-plans / auxiliary vehicles.
+            end = min(len(collapsed_text), max(end, start + 20_000))
+
     return start, end
 
 
@@ -328,16 +386,58 @@ def _block_has_own_full_name(lines: list[str], heading_index: int) -> bool:
 
 
 def _labeled_field_from_window(window: str, label: str) -> str:
-    """Read a ``LABEL:`` value that may wrap across following lines until the next LABEL."""
-    pattern = re.compile(
-        rf"(?im)^\s*{re.escape(label)}\s*:\s*(.*?)(?=^\s*[A-Z][A-Z0-9 /]{{1,24}}:\s*|\Z)",
-        re.DOTALL,
-    )
-    match = pattern.search(window)
+    """Read a ``LABEL:`` value; PdfPig often places labels mid-line between columns."""
+    match = re.search(rf"(?i)\b{re.escape(label)}\s*:\s*(.+)", window)
     if not match:
         return ""
-    value = re.sub(r"\s+", " ", match.group(1)).strip(" -\t")
+    rest = match.group(1)
+    first_line = rest.split("\n", 1)[0].strip(" -\t")
+    if label.casefold() == "personality":
+        # Published trait is short (Submissive, On Edge); drop glued column prose.
+        cleaned = re.split(
+            r"\b(?:PERSONALITY|PERSONAL\s+AGENDA|STRENGTH|HEALTH|SKILLS|AGE|FULL\s+NAME)\b",
+            first_line,
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[0].strip(" -\t")
+        trait = re.match(
+            r"([A-Za-z][A-Za-z\-]*(?:\s+[A-Za-z][A-Za-z\-]*){0,3})",
+            cleaned,
+        )
+        return trait.group(1).strip() if trait else (cleaned.split()[0] if cleaned else "")
+
+    # PERSONAL AGENDA (and similar) may wrap; stop at next known field marker.
+    chunk = first_line
+    more = rest.split("\n", 1)
+    if len(more) > 1:
+        for line in more[1].splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if _STAT_BLOCK_FIELD_STOP.match(stripped) or re.search(
+                r"\b(?:STRENGTH|HEALTH|SKILLS|GEAR|TALENT|BUDDY|RIVAL|FULL\s+NAME|PERSONALITY|AGE)\b",
+                stripped,
+                re.IGNORECASE,
+            ):
+                break
+            if re.search(r"\bPERSONAL\s+AGENDA\s*:", stripped, re.IGNORECASE):
+                break
+            chunk += " " + stripped
+            if len(chunk) > 240:
+                break
+    value = re.sub(r"\s+", " ", chunk).strip(" -\t")
+    value = re.split(
+        r"\b(?:STRENGTH|HEALTH|SKILLS|GEAR|TALENT|BUDDY|RIVAL|PERSONAL\s+AGENDA|PERSONALITY)\b",
+        value,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0].strip(" -\t")
     return value
+
+
+def _iter_full_names_on_line(line: str) -> list[str]:
+    """Return every FULL NAME value on a line (PdfPig often glues two columns)."""
+    return [match.group(1).strip() for match in _FULL_NAME_ANY.finditer(line.strip())]
 
 
 def _enrich_row_from_window(row: dict[str, str], window: str) -> dict[str, str]:
@@ -414,45 +514,38 @@ def _extract_alien_rpg_stat_block_npcs(section_text: str) -> list[dict[str, str]
 
     for index, raw_line in enumerate(lines):
         line = raw_line.strip()
-        if not line:
-            continue
-        full_name_match = _FULL_NAME_LINE.match(line)
-        if not full_name_match:
+        if not line or "FULL NAME:" not in line.upper():
             continue
 
-        display_name = full_name_match.group(1).strip()
-        name_key = display_name.casefold()
-        if not display_name or name_key in seen_names:
-            continue
+        for display_name in _iter_full_names_on_line(line):
+            name_key = display_name.casefold()
+            if not display_name or name_key in seen_names:
+                continue
 
-        short_name, role = _role_near_full_name(index, display_name)
-        if short_name:
-            claimed_heading_keys.add(short_name.casefold())
+            short_name, role = _role_near_full_name(index, display_name)
+            if short_name:
+                claimed_heading_keys.add(short_name.casefold())
 
-        window = "\n".join(lines[max(0, index - 8) : index + 25])
-        if not role:
-            for look_ahead in lines[index + 1 : index + 4]:
-                candidate = look_ahead.strip()
-                if not candidate or candidate.upper().startswith("FULL NAME:"):
-                    continue
-                if _iter_stat_block_headings(candidate):
-                    break
-                if not re.match(
-                    r"^(AGE|PERSONALITY|STRENGTH|HEALTH|SKILLS|GEAR|TALENT)\b",
-                    candidate,
-                    re.IGNORECASE,
-                ):
-                    role = candidate
-                    break
+            window = "\n".join(lines[max(0, index - 8) : index + 25])
+            if not role:
+                for look_ahead in lines[index + 1 : index + 4]:
+                    candidate = look_ahead.strip()
+                    if not candidate or "FULL NAME:" in candidate.upper():
+                        continue
+                    if _iter_stat_block_headings(candidate):
+                        break
+                    if not _STAT_BLOCK_FIELD_STOP.match(candidate):
+                        role = candidate
+                        break
 
-        seen_names.add(name_key)
-        row = {
-            "name": display_name,
-            "role": role or (short_name.title() if short_name else ""),
-            "short_name": short_name or display_name.split()[-1].upper(),
-            "location_hint": _location_hint_from(window),
-        }
-        results.append(_enrich_row_from_window(row, window))
+            seen_names.add(name_key)
+            row = {
+                "name": display_name,
+                "role": role or (short_name.title() if short_name else ""),
+                "short_name": short_name or display_name.split()[-1].upper(),
+                "location_hint": _location_hint_from(window),
+            }
+            results.append(_enrich_row_from_window(row, window))
 
     # Androids / entries with PERSONAL AGENDA but no FULL NAME (e.g. AVA 6).
     for index, raw_line in enumerate(lines):
@@ -480,15 +573,11 @@ def _extract_alien_rpg_stat_block_npcs(section_text: str) -> list[dict[str, str]
             role_text = role.replace("/", " ").title()
             for look_ahead in lines[index + 1 : index + 4]:
                 candidate = look_ahead.strip()
-                if not candidate or candidate.upper().startswith("FULL NAME:"):
+                if not candidate or "FULL NAME:" in candidate.upper():
                     continue
                 if _iter_stat_block_headings(candidate):
                     break
-                if not re.match(
-                    r"^(AGE|PERSONALITY|STRENGTH|HEALTH|SKILLS|GEAR|TALENT)\b",
-                    candidate,
-                    re.IGNORECASE,
-                ):
+                if not _STAT_BLOCK_FIELD_STOP.match(candidate):
                     role_text = candidate
                     break
             row = {
