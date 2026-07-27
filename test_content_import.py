@@ -68,6 +68,18 @@ def _load_doctor_who_catseye_fixture() -> str:
     return DOCTOR_WHO_CATSEYE_FIXTURE_PATH.read_text(encoding="utf-8")
 
 
+DOCTOR_WHO_CALLOUT_PDF_FIXTURE_PATH = (
+    Path(__file__).resolve().parent
+    / "tests"
+    / "fixtures"
+    / "doctor_who_catseye_pdf_extract_callouts.txt"
+)
+
+
+def _load_doctor_who_callout_pdf_fixture() -> str:
+    return DOCTOR_WHO_CALLOUT_PDF_FIXTURE_PATH.read_text(encoding="utf-8")
+
+
 def test_npc_section_header_end_pattern_is_whole_line_only():
     assert content_import._NPC_SECTION_HEADER_END_PATTERN.match("APPENDIX I")
     assert content_import._NPC_SECTION_HEADER_END_PATTERN.match("INDEX")
@@ -698,6 +710,62 @@ def test_seed_npc_detail_from_doctor_who_traits_and_bio():
         assert seeded is not None, f"expected seed for {name}"
         assert seeded["personality"] or seeded["public_facts"], f"empty seed for {name}"
         assert not content_import._npc_detail_is_sparse(seeded), f"sparse seed for {name}"
+
+
+def test_extract_cubicle7_callouts_from_catseye_pdf_fixture():
+    text = _load_doctor_who_callout_pdf_fixture()
+    parsed = content_import._extract_cubicle7_callout_npcs(text)
+    names = {row["name"] for row in parsed}
+    assert names >= {"Kate Petersen", "Max Eddings", "Peter Hutchins", "Chad"}
+    # Credits / TOC staff must not become callout NPCs.
+    assert "Nick Huggins" not in names
+    assert "Paul Bourne" not in names
+    assert "Gareth Ryder-Hanrahan" not in names
+
+
+def test_outline_prefers_callouts_over_credit_hallucinations(monkeypatch):
+    text = _load_doctor_who_callout_pdf_fixture()
+
+    def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step):
+        return {
+            "campaign": {
+                "campaign_id": "cats_eye",
+                "name": "Cat's Eye",
+                "description": "A hotel adventure.",
+            },
+            "locations": [
+                {"id": "majestic_hotel", "name": "Majestic Hotel", "type": "building"}
+            ],
+            "npcs": [
+                {
+                    "name": "Nick Huggins",
+                    "role": "writer",
+                    "first_location_id": "majestic_hotel",
+                    "other_location_ids": [],
+                },
+                {
+                    "name": "Paul Bourne",
+                    "role": "cover artist",
+                    "first_location_id": "majestic_hotel",
+                    "other_location_ids": [],
+                },
+            ],
+        }
+
+    monkeypatch.setattr(content_import, "_call_llm_json", fake_call_llm_json)
+    result = content_import.outline_campaign_document(text, "create_new")
+    names = {npc["name"] for npc in result["npcs"]}
+    assert names >= {"Kate Petersen", "Max Eddings", "Peter Hutchins", "Chad"}
+    assert "Nick Huggins" not in names
+    assert "Paul Bourne" not in names
+    assert any("callout" in w.lower() for w in result["warnings"])
+    assert any("credits/toc" in w.lower() for w in result["warnings"])
+
+
+def test_normalize_pdf_person_name_repairs_split_tokens():
+    assert content_import._normalize_pdf_person_name("Peter Hutc HiNs") == "Peter Hutchins"
+    assert content_import._normalize_pdf_person_name("KAte Peterse N") == "Kate Petersen"
+    assert content_import._normalize_pdf_person_name('"cHAd"') == "Chad"
 
 
 def test_seed_max_does_not_absorb_neighbor_traits():
