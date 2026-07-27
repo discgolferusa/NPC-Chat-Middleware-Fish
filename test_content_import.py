@@ -141,13 +141,25 @@ def test_chariot_pdfpig_extract_finds_all_stat_block_npcs():
 
 
 def test_chariot_pdfpig_analyze_imports_all_npcs(monkeypatch):
+    """PdfPig extract skips outline but still runs location/NPC detail sweeps."""
     text = _load_chariot_pdfpig_fixture()
+    calls: list[str] = []
 
-    def fake_call_llm_json(*args, **kwargs):
-        raise AssertionError("stat-block fast path should not call the LLM")
+    def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step):
+        calls.append(step)
+        if step == "outline":
+            raise AssertionError("stat-block fast path should not call the outline LLM")
+        if step == "location detail":
+            return {"locations": []}
+        if step == "npc detail":
+            return {"npcs": []}
+        return {}
 
     monkeypatch.setattr(content_import, "_call_llm_json", fake_call_llm_json)
     result = content_import.analyze_campaign_document(text, "create_new")
+    assert "outline" not in calls
+    assert "location detail" in calls
+    assert "npc detail" in calls
     names = {npc["name"] for npc in result["npcs"]}
     for expected in CHARIOT_EXPECTED_NPCS:
         assert expected in names
