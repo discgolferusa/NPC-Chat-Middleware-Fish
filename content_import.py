@@ -1079,18 +1079,40 @@ _CREDIT_ROLE_LINE = re.compile(
 )
 
 
+def _token_looks_pdf_split_fragment(tok: str) -> bool:
+    """True when a token looks like a PdfPig mid-word shard, not a real name word."""
+    t = str(tok or "").strip()
+    if not t:
+        return False
+    # Single-letter leftovers: "Peterse N"
+    if len(t) == 1 and t.isalpha():
+        return True
+    # Mixed mid-word caps typical of PdfPig: "HiNs", "eddiNGs" shards
+    if any(c.islower() for c in t) and any(c.isupper() for c in t[1:]):
+        return True
+    # Short consonant-only shards: "Sm" in "Sm Ith"
+    letters = [c for c in t if c.isalpha()]
+    if 2 <= len(letters) <= 4:
+        if not any(c.casefold() in "aeiou" for c in letters):
+            return True
+    return False
+
+
 def _normalize_pdf_person_name(raw: str) -> str:
-    """Repair PdfPig mid-word spaces: 'Peter Hutc HiNs' → 'Peter Hutchins'."""
+    """Repair PdfPig mid-word spaces: 'Peter Hutc HiNs' → 'Peter Hutchins'.
+
+    Only joins trailing tokens when at least one looks like a split fragment.
+    Legitimate multi-word names (Mary Ann Lee, Jean Luc Picard) are left alone.
+    """
     s = str(raw or "").strip().strip("\"“”'‘’")
     if not s:
         return ""
     tokens = re.sub(r"\s+", " ", s).split()
-    # Merge trailing syllable splits (Peterse N, Hutc HiNs).
-    if len(tokens) >= 3 and (
-        len(tokens[-1]) <= 3 or (len(tokens[-2]) <= 4 and len(tokens[-1]) <= 4)
-    ):
-        if tokens[-1].casefold() not in {"vs", "the", "of", "and", "or"}:
-            tokens = tokens[:-2] + [tokens[-2] + tokens[-1]]
+    if len(tokens) >= 3:
+        left, right = tokens[-2], tokens[-1]
+        if right.casefold() not in {"vs", "the", "of", "and", "or", "jr", "sr", "ii", "iii", "iv"}:
+            if _token_looks_pdf_split_fragment(left) or _token_looks_pdf_split_fragment(right):
+                tokens = tokens[:-2] + [left + right]
     return " ".join((t[0].upper() + t[1:].lower()) if t else t for t in tokens)
 
 

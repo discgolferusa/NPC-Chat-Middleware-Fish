@@ -766,6 +766,10 @@ def test_normalize_pdf_person_name_repairs_split_tokens():
     assert content_import._normalize_pdf_person_name("Peter Hutc HiNs") == "Peter Hutchins"
     assert content_import._normalize_pdf_person_name("KAte Peterse N") == "Kate Petersen"
     assert content_import._normalize_pdf_person_name('"cHAd"') == "Chad"
+    # Legitimate multi-word names must not be smashed into one surname.
+    assert content_import._normalize_pdf_person_name("Mary Ann Lee") == "Mary Ann Lee"
+    assert content_import._normalize_pdf_person_name("Jean Luc Picard") == "Jean Luc Picard"
+    assert content_import._normalize_pdf_person_name("Mary Ann Smith") == "Mary Ann Smith"
 
 
 def test_seed_max_does_not_absorb_neighbor_traits():
