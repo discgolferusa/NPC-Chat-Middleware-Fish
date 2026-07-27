@@ -42,6 +42,49 @@ def _load_chariot_pdf_extract_fixture() -> str:
     return PDF_EXTRACT_FIXTURE_PATH.read_text(encoding="utf-8")
 
 
+PDFPIG_FIXTURE_PATH = (
+    Path(__file__).resolve().parent
+    / "tests"
+    / "fixtures"
+    / "chariot_of_the_gods_pdfpig_npc_section.txt"
+)
+
+
+def _load_chariot_pdfpig_fixture() -> str:
+    return PDFPIG_FIXTURE_PATH.read_text(encoding="utf-8")
+
+
+def test_chariot_pdfpig_extract_finds_all_stat_block_npcs():
+    """PdfPig Y-grouped lines glue columns and mid-prose Appendix refs."""
+    text = _load_chariot_pdfpig_fixture()
+    collapsed = content_import._collapse_spaced_caps(text)
+    span = content_import._find_npc_section_span(collapsed)
+    assert span is not None
+    section = collapsed[span[0] : span[1]]
+    # Must not end at mid-prose "Appendix I on page 38".
+    assert "Valerie Reid" in section or "FULL NAME: Valerie Reid" in section
+    parsed = content_import._extract_alien_rpg_stat_block_npcs(section)
+    names = {row["name"] for row in parsed}
+    for expected in CHARIOT_EXPECTED_NPCS:
+        assert expected in names, f"missing {expected} in {sorted(names)}"
+    assert "Valerie Reid FULL NAME" not in names
+    assert "Micky Horton take the ship" not in names
+
+
+def test_chariot_pdfpig_analyze_imports_all_npcs(monkeypatch):
+    text = _load_chariot_pdfpig_fixture()
+
+    def fake_call_llm_json(*args, **kwargs):
+        raise AssertionError("stat-block fast path should not call the LLM")
+
+    monkeypatch.setattr(content_import, "_call_llm_json", fake_call_llm_json)
+    result = content_import.analyze_campaign_document(text, "create_new")
+    names = {npc["name"] for npc in result["npcs"]}
+    for expected in CHARIOT_EXPECTED_NPCS:
+        assert expected in names
+    assert "Ava 6" in names
+
+
 def test_chariot_fixture_finds_spaced_non_player_characters_header():
     text = _load_chariot_fixture()
     collapsed = content_import._collapse_spaced_caps(text)
