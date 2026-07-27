@@ -33,8 +33,17 @@ MAX_LOCATIONS_PER_BATCH = 2
 MAX_NPCS_PER_BATCH = 1
 IMPORT_TEMPERATURE = 0.15
 IMPORT_MAX_TOKENS = 6144
-EXCERPT_WINDOW_CHARS = 1_800
+# NPCNarrator writeups put the name in a header, then many blocks after it.
+# Bias the window forward so Knows/Hides/Memory/Finale are kept.
+EXCERPT_WINDOW_BEFORE = 400
+EXCERPT_WINDOW_AFTER = 7_000
 EXCERPT_MAX_CHARS = 28_000
+_EXCERPT_STOPWORDS = frozenset(
+    {
+        "a", "an", "and", "at", "by", "de", "for", "from", "in", "into", "la", "le",
+        "npc", "of", "on", "or", "the", "to", "van", "von", "with",
+    }
+)
 
 VALID_MODES = frozenset({"create_new", "merge"})
 
@@ -178,7 +187,11 @@ _PRONOUN_OBJECTS: dict[str, dict[str, str]] = {
 
 
 def _normalize_pronouns(value: Any, gender: str) -> dict[str, str]:
-    """Return structured pronouns the Yaml Editor can persist."""
+    """Return structured pronouns the Yaml Editor can persist.
+
+    Avoid substring checks like ``\"he\" in text`` — that matches inside ``the``.
+    Prefer slash-forms and whole-word pronoun tokens only.
+    """
     if isinstance(value, dict):
         subject = str(value.get("subject") or "").strip().lower()
         obj = str(value.get("object") or "").strip().lower()
@@ -194,13 +207,19 @@ def _normalize_pronouns(value: Any, gender: str) -> dict[str, str]:
                 or ("herself" if subject == "she" else "himself" if subject == "he" else "themselves"),
             }
 
-    text = str(value or "").strip().lower().replace(" ", "")
+    text = str(value or "").strip().lower()
+    compact = re.sub(r"\s+", "", text)
     for key, obj in _PRONOUN_OBJECTS.items():
-        if text == key or text.startswith(key.split("/")[0] + "/"):
+        head = key.split("/")[0]
+        if compact == key or compact.startswith(head + "/"):
             return dict(obj)
-    if "she" in text or "her" in text:
+
+    tokens = set(re.findall(r"[a-z]+", text))
+    if tokens & {"she", "her", "hers", "herself"}:
         return dict(_PRONOUN_OBJECTS["she/her"])
-    if "he" in text or "him" in text:
+    if tokens & {"they", "them", "their", "theirs", "themselves"}:
+        return dict(_PRONOUN_OBJECTS["they/them"])
+    if tokens & {"he", "him", "his", "himself"}:
         return dict(_PRONOUN_OBJECTS["he/him"])
 
     gender_l = (gender or "").strip().lower()
@@ -211,41 +230,85 @@ def _normalize_pronouns(value: Any, gender: str) -> dict[str, str]:
     return dict(_PRONOUN_OBJECTS["they/them"])
 
 
-def _relevant_excerpts(text: str, needles: list[str], *, window: int = EXCERPT_WINDOW_CHARS) -> str:
+def _distinctive_name_needles(name: str, entity_id: str = "") -> list[str]:
+    """Needles safe for excerpt search — full name/id plus distinctive tokens only."""
+    needles: list[str] = []
+    for raw in (name, entity_id):
+        value = str(raw or "").strip()
+        if value:
+            needles.append(value)
+
+    for part in re.split(r"[\s_/]+", str(name or "").strip()):
+        cleaned = part.strip("-").strip()
+        if len(cleaned) < 4:
+            continue
+        if cleaned.casefold() in _EXCERPT_STOPWORDS:
+            continue
+        # Skip pure numeric fragments.
+        if cleaned.isdigit():
+            continue
+        needles.append(cleaned)
+
+    # Prefer longer / more specific needles first when budget is tight.
+    unique: list[str] = []
+    seen: set[str] = set()
+    for needle in sorted(needles, key=lambda n: len(n), reverse=True):
+        key = needle.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(needle)
+    return unique
+
+
+def _mention_indexes(haystack_cf: str, needle: str) -> list[int]:
+    """Casefolded bounded substring matches (not bare 'he' inside 'the')."""
+    v = str(needle or "").strip().casefold()
+    if len(v) < 3:
+        return []
+    pattern = re.compile(rf"(?<![a-z0-9]){re.escape(v)}(?![a-z0-9])")
+    return [match.start() for match in pattern.finditer(haystack_cf)]
+
+
+def _relevant_excerpts(
+    text: str,
+    needles: list[str],
+    *,
+    window_before: int = EXCERPT_WINDOW_BEFORE,
+    window_after: int = EXCERPT_WINDOW_AFTER,
+) -> str:
     """Pull document windows around name/id mentions so detail passes stay focused."""
     if not text or not needles:
         return text
 
-    spans: list[tuple[int, int]] = []
     lower = text.casefold()
-    for raw in needles:
-        needle = str(raw or "").strip()
-        if len(needle) < 2:
-            continue
-        variants = {needle, snake_case(needle).replace("_", " ")}
-        # Also try last token of multi-word names ("Archdeacon Verity-9" → "Verity-9").
-        parts = re.split(r"[\s_/]+", needle)
-        if parts:
-            variants.add(parts[-1])
-        for variant in variants:
-            v = variant.casefold()
-            if len(v) < 2:
-                continue
-            start = 0
-            while True:
-                idx = lower.find(v, start)
-                if idx < 0:
-                    break
-                spans.append((max(0, idx - window), min(len(text), idx + len(v) + window)))
-                start = idx + len(v)
+    # Prefer long/specific needles so short tokens cannot flood the budget.
+    ranked = sorted(
+        {str(n).strip() for n in needles if str(n).strip()},
+        key=lambda n: len(n),
+        reverse=True,
+    )
+    primary = [n for n in ranked if len(n) >= 6 or any(ch in n for ch in (" ", "-", "_"))]
+    search_needles = primary or [n for n in ranked if len(n) >= 4]
+
+    spans: list[tuple[int, int, int]] = []  # start, end, needle_len
+    for needle in search_needles:
+        for idx in _mention_indexes(lower, needle):
+            start = max(0, idx - window_before)
+            end = min(len(text), idx + len(needle) + window_after)
+            spans.append((start, end, len(needle)))
 
     if not spans:
-        # Fall back to the head of the document so we still send something useful.
         return text[: min(len(text), EXCERPT_MAX_CHARS)]
 
-    spans.sort()
+    # Keep matches from the longest needles when they exist.
+    best_len = max(span[2] for span in spans)
+    if best_len >= 6:
+        spans = [span for span in spans if span[2] >= max(6, best_len - 4)]
+
+    spans.sort(key=lambda s: s[0])
     merged: list[list[int]] = []
-    for start, end in spans:
+    for start, end, _needle_len in spans:
         if not merged or start > merged[-1][1] + 80:
             merged.append([start, end])
         else:
@@ -807,7 +870,9 @@ def _fetch_location_details(
     campaign: dict[str, Any],
     warnings: list[str],
 ) -> dict[str, dict[str, Any]]:
-    needles = [loc["name"] for loc in batch] + [loc["id"] for loc in batch]
+    needles: list[str] = []
+    for loc in batch:
+        needles.extend(_distinctive_name_needles(loc["name"], loc["id"]))
     excerpt = _relevant_excerpts(document_text, needles)
     prompt = _build_location_detail_prompt(batch, excerpt, campaign)
     try:
@@ -827,7 +892,7 @@ def _fetch_npc_details(
 ) -> dict[str, dict[str, Any]]:
     needles: list[str] = []
     for npc in batch:
-        needles.extend([npc["name"], npc["id"], *(npc["name"].split())])
+        needles.extend(_distinctive_name_needles(npc["name"], npc["id"]))
     excerpt = _relevant_excerpts(document_text, needles)
     prompt = _build_npc_detail_prompt(batch, excerpt, campaign)
     try:
