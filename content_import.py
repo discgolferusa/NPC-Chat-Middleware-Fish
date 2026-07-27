@@ -327,6 +327,29 @@ def _block_has_own_full_name(lines: list[str], heading_index: int) -> bool:
     return False
 
 
+def _labeled_field_from_window(window: str, label: str) -> str:
+    """Read a ``LABEL:`` value that may wrap across following lines until the next LABEL."""
+    pattern = re.compile(
+        rf"(?im)^\s*{re.escape(label)}\s*:\s*(.*?)(?=^\s*[A-Z][A-Z0-9 /]{{1,24}}:\s*|\Z)",
+        re.DOTALL,
+    )
+    match = pattern.search(window)
+    if not match:
+        return ""
+    value = re.sub(r"\s+", " ", match.group(1)).strip(" -\t")
+    return value
+
+
+def _enrich_row_from_window(row: dict[str, str], window: str) -> dict[str, str]:
+    personality = _labeled_field_from_window(window, "PERSONALITY")
+    agenda = _labeled_field_from_window(window, "PERSONAL AGENDA")
+    if personality:
+        row["personality"] = personality
+    if agenda:
+        row["personal_agenda"] = agenda
+    return row
+
+
 def _extract_alien_rpg_stat_block_npcs(section_text: str) -> list[dict[str, str]]:
     """Parse ALIEN RPG module stat blocks.
 
@@ -423,14 +446,13 @@ def _extract_alien_rpg_stat_block_npcs(section_text: str) -> list[dict[str, str]
                     break
 
         seen_names.add(name_key)
-        results.append(
-            {
-                "name": display_name,
-                "role": role or (short_name.title() if short_name else ""),
-                "short_name": short_name or display_name.split()[-1].upper(),
-                "location_hint": _location_hint_from(window),
-            }
-        )
+        row = {
+            "name": display_name,
+            "role": role or (short_name.title() if short_name else ""),
+            "short_name": short_name or display_name.split()[-1].upper(),
+            "location_hint": _location_hint_from(window),
+        }
+        results.append(_enrich_row_from_window(row, window))
 
     # Androids / entries with PERSONAL AGENDA but no FULL NAME (e.g. AVA 6).
     for index, raw_line in enumerate(lines):
@@ -469,14 +491,13 @@ def _extract_alien_rpg_stat_block_npcs(section_text: str) -> list[dict[str, str]
                 ):
                     role_text = candidate
                     break
-            results.append(
-                {
-                    "name": display_name,
-                    "role": role_text,
-                    "short_name": short_name,
-                    "location_hint": _location_hint_from(window),
-                }
-            )
+            row = {
+                "name": display_name,
+                "role": role_text,
+                "short_name": short_name,
+                "location_hint": _location_hint_from(window),
+            }
+            results.append(_enrich_row_from_window(row, window))
 
     return results
 
@@ -584,7 +605,14 @@ def _ensure_locations_for_npc_hints(
         if not loc_id or loc_id in known:
             continue
         name, loc_type = defaults.get(loc_id, (loc_id.replace("_", " ").title(), "other"))
-        location_stubs.append({"id": loc_id, "name": name, "type": loc_type})
+        location_stubs.append(
+            {
+                "id": loc_id,
+                "name": name,
+                "type": loc_type,
+                "seeded_from_stat_blocks": True,
+            }
+        )
         known.add(loc_id)
         added.append(loc_id)
     if added:
@@ -622,6 +650,8 @@ def _npc_stubs_from_stat_blocks(
     stubs: list[dict[str, Any]] = []
     for row in parsed:
         loc = _resolve_hint(row.get("location_hint") or "")
+        personality = str(row.get("personality") or "").strip()
+        agenda = str(row.get("personal_agenda") or "").strip()
         stubs.append(
             {
                 "id": snake_case(row["name"]),
@@ -629,6 +659,9 @@ def _npc_stubs_from_stat_blocks(
                 "role": row.get("role") or "",
                 "first_location_id": loc,
                 "other_location_ids": [],
+                "seeded_from_stat_blocks": True,
+                "seed_personality": personality,
+                "seed_personal_agenda": agenda,
             }
         )
 
@@ -636,6 +669,49 @@ def _npc_stubs_from_stat_blocks(
         f"Parsed {len(stubs)} NPC(s) from published stat blocks in NON-PLAYER CHARACTERS."
     )
     return stubs
+
+
+def _npc_stub_has_stat_seed(stub: dict[str, Any]) -> bool:
+    return bool(stub.get("seeded_from_stat_blocks")) and bool(
+        stub.get("seed_personality") or stub.get("seed_personal_agenda")
+    )
+
+
+def _npc_detail_from_stat_seed(stub: dict[str, Any]) -> dict[str, Any]:
+    """Build usable NPC detail fields from published ALIEN block text (no LLM)."""
+    personality = str(stub.get("seed_personality") or "").strip()
+    agenda = str(stub.get("seed_personal_agenda") or "").strip()
+    role = str(stub.get("role") or "").strip()
+    detail: dict[str, Any] = {
+        "gender": "unspecified",
+        "race": "unknown",
+        "voice": [],
+        "personality": [personality] if personality else [],
+        "public_facts": [f"Role: {role}"] if role else [],
+        "known_facts": [f"Personal agenda: {agenda}"] if agenda else [],
+        "secrets": [agenda] if agenda else [],
+        "llm_rules": [],
+    }
+    if agenda:
+        detail["llm_rules"] = [
+            f"Pursue this personal agenda when it fits the scene: {agenda}",
+            "If asked directly about information you are keeping secret, do not reveal it. "
+            "Respond in character, then end your reply with [DM CHECK: the player is probing "
+            "one of this NPC's secrets] so the DM can decide if it comes out.",
+        ]
+    return detail
+
+
+def _location_detail_from_seed(stub: dict[str, Any]) -> dict[str, Any]:
+    name = str(stub.get("name") or stub.get("id") or "Location").strip()
+    return {
+        "summary": f"{name} appears in the imported module.",
+        "current_events": [],
+        "important_locations": [],
+        "rumors": [],
+        "local_tone": [],
+        "knowledge_rules": [],
+    }
 
 
 def _npc_already_exists_in_campaign(
@@ -1504,35 +1580,31 @@ def analyze_campaign_document(
     # Keep the full extract for deterministic stat-block parsing and detail excerpts.
     # Only the outline LLM prompt is truncated to the provider budget.
     full_document_text = text
-    outline_document_text = _truncate_input(text, warnings)
-    outline_source = _prepare_outline_document_text(outline_document_text, warnings)
+    use_stat_block_fast_path = _document_has_recoverable_stat_blocks(full_document_text)
 
-    outline_prompt = _build_outline_prompt(
-        outline_source, mode, existing_campaign_id, existing_location_ids, existing_npc_names
-    )
-
-    try:
-        outline_raw = _call_llm_json(_SYSTEM_PROMPT, outline_prompt, warnings=warnings, step="outline")
-    except Exception as ex:
-        if _document_has_recoverable_stat_blocks(full_document_text):
-            warnings.append(
-                f"Outline pass failed ({ex}); continuing from published NON-PLAYER "
-                "CHARACTERS stat blocks."
+    if use_stat_block_fast_path:
+        # Avoid a long/fragile outline LLM call — merge already prefers stat blocks.
+        warnings.append(
+            "Published NON-PLAYER CHARACTERS stat blocks detected; skipping LLM outline "
+            "and seeding NPC details from PERSONALITY / PERSONAL AGENDA."
+        )
+        outline_raw = {"campaign": {}, "locations": [], "npcs": []}
+    else:
+        outline_document_text = _truncate_input(text, warnings)
+        outline_source = _prepare_outline_document_text(outline_document_text, warnings)
+        outline_prompt = _build_outline_prompt(
+            outline_source, mode, existing_campaign_id, existing_location_ids, existing_npc_names
+        )
+        try:
+            outline_raw = _call_llm_json(
+                _SYSTEM_PROMPT, outline_prompt, warnings=warnings, step="outline"
             )
-            outline_raw = {"campaign": {}, "locations": [], "npcs": []}
-        elif isinstance(ex, LLMProviderError):
-            raise ContentImportError(str(ex)) from ex
-        else:
+        except Exception as ex:
+            if isinstance(ex, LLMProviderError):
+                raise ContentImportError(str(ex)) from ex
             raise ContentImportError(f"Outline pass failed: {ex}") from ex
 
-    if not isinstance(outline_raw, dict):
-        if _document_has_recoverable_stat_blocks(full_document_text):
-            warnings.append(
-                "Outline pass did not return a JSON object; continuing from published "
-                "NON-PLAYER CHARACTERS stat blocks."
-            )
-            outline_raw = {"campaign": {}, "locations": [], "npcs": []}
-        else:
+        if not isinstance(outline_raw, dict):
             raise ContentImportError("Outline pass did not return a JSON object")
 
     campaign, location_stubs, npc_stubs = _normalize_outline(
@@ -1568,55 +1640,68 @@ def analyze_campaign_document(
     location_stubs = _ensure_locations_for_npc_hints(
         location_stubs, npc_stubs, warnings=warnings
     )
-    # Recompute after seeded locations so detail passes resolve hints.
-    location_ids = {loc["id"] for loc in location_stubs} | existing_location_set
     for stub in npc_stubs:
         hint = str(stub.get("first_location_id") or "").strip()
-        if hint and hint not in location_ids:
-            # Remap via resolve if ensure added under a different id — already covered.
-            pass
-        elif not hint and location_stubs:
+        if not hint and location_stubs:
             stub["first_location_id"] = location_stubs[0]["id"]
 
     locations_by_id: dict[str, dict[str, Any]] = {}
     for batch in _batches(location_stubs, MAX_LOCATIONS_PER_BATCH):
-        details_by_id = _fetch_location_details(batch, full_document_text, campaign, warnings)
+        seeded_batch = [stub for stub in batch if stub.get("seeded_from_stat_blocks")]
+        llm_batch = [stub for stub in batch if not stub.get("seeded_from_stat_blocks")]
+        details_by_id: dict[str, dict[str, Any]] = {
+            stub["id"]: _location_detail_from_seed(stub) for stub in seeded_batch
+        }
+        if llm_batch:
+            details_by_id.update(_fetch_location_details(llm_batch, full_document_text, campaign, warnings))
+            for stub in llm_batch:
+                detail = details_by_id.get(stub["id"], {})
+                if _location_detail_is_sparse(detail):
+                    retry = _fetch_location_details([stub], full_document_text, campaign, warnings)
+                    retry_detail = retry.get(stub["id"], {})
+                    if not _location_detail_is_sparse(retry_detail):
+                        details_by_id[stub["id"]] = retry_detail
+                        warnings.append(f"Location '{stub['id']}': recovered details on retry.")
+                    elif not detail:
+                        warnings.append(
+                            f"Location '{stub['id']}': no detail returned; using minimal defaults."
+                        )
 
-        # Retry sparse singles once with a tighter excerpt focus.
         for stub in batch:
-            detail = details_by_id.get(stub["id"], {})
-            if _location_detail_is_sparse(detail):
-                retry = _fetch_location_details([stub], full_document_text, campaign, warnings)
-                retry_detail = retry.get(stub["id"], {})
-                if not _location_detail_is_sparse(retry_detail):
-                    details_by_id[stub["id"]] = retry_detail
-                    warnings.append(f"Location '{stub['id']}': recovered details on retry.")
-                elif not detail:
-                    warnings.append(f"Location '{stub['id']}': no detail returned; using minimal defaults.")
-
             locations_by_id[stub["id"]] = _merge_location_detail(
                 stub, details_by_id.get(stub["id"], {}), campaign["campaign_id"]
             )
 
     npcs_by_id: dict[str, dict[str, Any]] = {}
     for batch in _batches(npc_stubs, MAX_NPCS_PER_BATCH):
-        details_by_id = _fetch_npc_details(batch, full_document_text, campaign, warnings)
+        seeded_batch = [stub for stub in batch if _npc_stub_has_stat_seed(stub)]
+        llm_batch = [stub for stub in batch if not _npc_stub_has_stat_seed(stub)]
+        details_by_id: dict[str, dict[str, Any]] = {
+            stub["id"]: _npc_detail_from_stat_seed(stub) for stub in seeded_batch
+        }
+        if seeded_batch:
+            warnings.append(
+                f"Seeded roleplay fields for {len(seeded_batch)} NPC(s) from published "
+                "stat blocks (skipped slow per-NPC LLM detail)."
+            )
+        if llm_batch:
+            details_by_id.update(_fetch_npc_details(llm_batch, full_document_text, campaign, warnings))
+            for stub in llm_batch:
+                detail = details_by_id.get(stub["id"], {})
+                if _npc_detail_is_sparse(detail):
+                    retry = _fetch_npc_details([stub], full_document_text, campaign, warnings)
+                    retry_detail = retry.get(stub["id"], {})
+                    if not _npc_detail_is_sparse(retry_detail):
+                        details_by_id[stub["id"]] = retry_detail
+                        warnings.append(f"NPC '{stub['id']}': recovered details on retry.")
+                    elif not detail:
+                        warnings.append(
+                            f"NPC '{stub['id']}': no detail returned; using minimal defaults. "
+                            "Local small models often need content_creation set to Groq or a "
+                            "stronger local model for dense NPC writeups."
+                        )
 
         for stub in batch:
-            detail = details_by_id.get(stub["id"], {})
-            if _npc_detail_is_sparse(detail):
-                retry = _fetch_npc_details([stub], full_document_text, campaign, warnings)
-                retry_detail = retry.get(stub["id"], {})
-                if not _npc_detail_is_sparse(retry_detail):
-                    details_by_id[stub["id"]] = retry_detail
-                    warnings.append(f"NPC '{stub['id']}': recovered details on retry.")
-                elif not detail:
-                    warnings.append(
-                        f"NPC '{stub['id']}': no detail returned; using minimal defaults. "
-                        "Local small models often need content_creation set to Groq or a "
-                        "stronger local model for dense NPC writeups."
-                    )
-
             npcs_by_id[stub["id"]] = _merge_npc_detail(
                 stub, details_by_id.get(stub["id"], {}), campaign["campaign_id"], warnings
             )

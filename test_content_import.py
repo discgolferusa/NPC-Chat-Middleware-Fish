@@ -94,22 +94,18 @@ def test_chariot_pdf_extract_parses_two_column_stat_blocks():
 
 
 def test_chariot_pdf_extract_recovers_from_empty_llm_outline(monkeypatch):
-    """Tight Groq budgets often yield empty outline JSON; stat blocks must still populate."""
+    """Stat-block modules skip the outline LLM and still populate NPCs/locations."""
     text = _load_chariot_pdf_extract_fixture()
+    calls: list[str] = []
 
     def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step):
-        if step == "outline":
-            return {"campaign": {}, "locations": [], "npcs": []}
-        if step == "location detail":
-            return {"locations": []}
-        if step == "npc detail":
-            return {"npcs": []}
-        return {}
+        calls.append(step)
+        raise AssertionError(f"unexpected LLM call for step={step}")
 
     monkeypatch.setattr(content_import, "_call_llm_json", fake_call_llm_json)
-    monkeypatch.setattr(content_import, "content_creation_max_input_chars", lambda: 6016)
 
     result = content_import.analyze_campaign_document(text, "create_new")
+    assert calls == []
     assert "chariot" in result["campaign"]["campaign_id"].casefold() or "gods" in result[
         "campaign"
     ]["name"].casefold()
@@ -117,25 +113,28 @@ def test_chariot_pdf_extract_recovers_from_empty_llm_outline(monkeypatch):
     for expected in CHARIOT_EXPECTED_NPCS:
         assert expected in names
     assert "Ava 6" in names
+    johns = next(npc for npc in result["npcs"] if npc["name"] == "Albert Johns")
+    assert johns["personality"]
+    assert johns["secrets"] or johns["known_facts"]
     loc_ids = {loc["id"] for loc in result["locations"]}
     assert "uscss_cronus" in loc_ids or "sotillo" in loc_ids
     assert "Captain Miller" not in names
+    warning_blob = " ".join(result.get("warnings") or []).lower()
+    assert "skipping llm outline" in warning_blob
 
 
 def test_outline_failure_recovers_from_stat_blocks(monkeypatch):
+    """Non-ALIEN docs still fail hard on outline errors; ALIEN PDF uses fast path."""
     text = _load_chariot_pdf_extract_fixture()
 
     def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step):
-        if step == "outline":
-            raise RuntimeError("simulated outline TPM failure")
-        return {"locations": []} if step == "location detail" else {"npcs": []}
+        raise RuntimeError("should not be called on stat-block fast path")
 
     monkeypatch.setattr(content_import, "_call_llm_json", fake_call_llm_json)
     result = content_import.analyze_campaign_document(text, "create_new")
     names = {npc["name"] for npc in result["npcs"]}
     assert "Albert Johns" in names
     assert "Ava 6" in names
-    assert any("outline pass failed" in w.casefold() for w in result["warnings"])
 
 
 def test_truncate_preserving_npc_section_respects_max_chars():
