@@ -30,6 +30,9 @@ from llm_router import (
 from content_import import (
     ContentImportError,
     analyze_campaign_document,
+    detail_location_batch,
+    detail_npc_batch,
+    outline_campaign_document,
 )
 from dm_channel import (
     build_dm_injection_messages,
@@ -3172,6 +3175,98 @@ def content_import_analyze():
         return jsonify({"error": str(ex)}), 400
     except Exception as ex:
         print(f"[CONTENT-IMPORT] analyze failed: {ex!r}", flush=True)
+        return _client_error(ex, 500)
+
+
+@app.post("/content/import/outline")
+def content_import_outline():
+    """Short Funnel hop: campaign + location/NPC stubs only."""
+    body = request.get_json(force=True, silent=True) or {}
+
+    text = body.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return jsonify({"error": "Missing text"}), 400
+
+    mode = str(body.get("mode") or "create_new").strip().lower()
+    existing_campaign_id = body.get("existing_campaign_id")
+    existing_location_ids = body.get("existing_location_ids") or []
+    existing_npc_names = body.get("existing_npc_names") or []
+
+    if not isinstance(existing_location_ids, list):
+        return jsonify({"error": "existing_location_ids must be a list"}), 400
+    if not isinstance(existing_npc_names, list):
+        return jsonify({"error": "existing_npc_names must be a list"}), 400
+
+    try:
+        result = outline_campaign_document(
+            text,
+            mode,
+            existing_campaign_id=existing_campaign_id,
+            existing_location_ids=existing_location_ids,
+            existing_npc_names=existing_npc_names,
+        )
+        return jsonify(result)
+    except ContentImportError as ex:
+        print(f"[CONTENT-IMPORT] outline rejected: {ex}", flush=True)
+        return jsonify({"error": str(ex)}), 400
+    except Exception as ex:
+        print(f"[CONTENT-IMPORT] outline failed: {ex!r}", flush=True)
+        return _client_error(ex, 500)
+
+
+@app.post("/content/import/location-details")
+def content_import_location_details():
+    """Short Funnel hop: detail one location batch."""
+    body = request.get_json(force=True, silent=True) or {}
+
+    text = body.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return jsonify({"error": "Missing text"}), 400
+
+    campaign = body.get("campaign")
+    if not isinstance(campaign, dict):
+        return jsonify({"error": "campaign object is required"}), 400
+
+    locations = body.get("locations")
+    if not isinstance(locations, list) or not locations:
+        return jsonify({"error": "locations must be a non-empty list"}), 400
+
+    try:
+        result = detail_location_batch(text, campaign, locations)
+        return jsonify(result)
+    except ContentImportError as ex:
+        print(f"[CONTENT-IMPORT] location-details rejected: {ex}", flush=True)
+        return jsonify({"error": str(ex)}), 400
+    except Exception as ex:
+        print(f"[CONTENT-IMPORT] location-details failed: {ex!r}", flush=True)
+        return _client_error(ex, 500)
+
+
+@app.post("/content/import/npc-details")
+def content_import_npc_details():
+    """Short Funnel hop: detail one NPC batch."""
+    body = request.get_json(force=True, silent=True) or {}
+
+    text = body.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return jsonify({"error": "Missing text"}), 400
+
+    campaign = body.get("campaign")
+    if not isinstance(campaign, dict):
+        return jsonify({"error": "campaign object is required"}), 400
+
+    npcs = body.get("npcs")
+    if not isinstance(npcs, list) or not npcs:
+        return jsonify({"error": "npcs must be a non-empty list"}), 400
+
+    try:
+        result = detail_npc_batch(text, campaign, npcs)
+        return jsonify(result)
+    except ContentImportError as ex:
+        print(f"[CONTENT-IMPORT] npc-details rejected: {ex}", flush=True)
+        return jsonify({"error": str(ex)}), 400
+    except Exception as ex:
+        print(f"[CONTENT-IMPORT] npc-details failed: {ex!r}", flush=True)
         return _client_error(ex, 500)
 
 

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 import content_import
 
 
@@ -522,3 +524,106 @@ def test_location_hints_resolve_existing_campaign_locations(monkeypatch):
     )
     by_name = {npc["name"]: npc for npc in result["npcs"]}
     assert by_name["Albert Johns"]["location_id"] == "uscss_cronus"
+
+
+def test_chunked_outline_then_detail_batches(monkeypatch):
+    """Editor-style chunked path: outline stubs, then per-batch detail hops."""
+    text = _load_chariot_pdf_extract_fixture()
+    steps: list[str] = []
+
+    def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step):
+        steps.append(step)
+        if step == "outline":
+            raise AssertionError("stat-block outline must be skipped")
+        if step == "location detail":
+            return {"locations": []}
+        if step == "npc detail":
+            return {"npcs": []}
+        return {}
+
+    monkeypatch.setattr(content_import, "_call_llm_json", fake_call_llm_json)
+
+    outline = content_import.outline_campaign_document(text, "create_new")
+    assert "outline" not in steps
+    assert outline["npcs"]
+    assert outline["locations"] or any(
+        npc.get("first_location_id") for npc in outline["npcs"]
+    )
+    names = {npc["name"] for npc in outline["npcs"]}
+    assert "Albert Johns" in names
+
+    campaign = outline["campaign"]
+    loc_batch = outline["locations"][: content_import.MAX_LOCATIONS_PER_BATCH] or [
+        {
+            "id": "uscss_cronus",
+            "name": "USCSS Cronus",
+            "type": "building",
+            "seeded_from_stat_blocks": True,
+        }
+    ]
+    loc_result = content_import.detail_location_batch(text, campaign, loc_batch)
+    assert loc_result["locations"]
+    assert "location detail" in steps
+
+    johns = next(npc for npc in outline["npcs"] if npc["name"] == "Albert Johns")
+    npc_result = content_import.detail_npc_batch(text, campaign, [johns])
+    assert npc_result["npcs"][0]["name"] == "Albert Johns"
+    assert npc_result["npcs"][0]["personality"] or npc_result["npcs"][0]["secrets"]
+    assert "npc detail" in steps
+
+
+def test_detail_npc_batch_rejects_oversized_batch():
+    with pytest.raises(content_import.ContentImportError, match="at most"):
+        content_import.detail_npc_batch(
+            "NON-PLAYER CHARACTERS\nFULL NAME: A",
+            {"campaign_id": "c", "name": "C"},
+            [
+                {"id": "a", "name": "A", "role": "x", "first_location_id": "loc"},
+                {"id": "b", "name": "B", "role": "y", "first_location_id": "loc"},
+            ],
+        )
+
+
+def test_normalize_campaign_meta_preserves_merge_campaign_id():
+    meta = content_import._normalize_campaign_meta(
+        {"campaign_id": "MultiTest", "name": "Multi Test", "description": ""}
+    )
+    assert meta["campaign_id"] == "MultiTest"
+
+
+def test_normalize_campaign_meta_snake_cases_when_id_missing():
+    meta = content_import._normalize_campaign_meta({"name": "Multi Test"})
+    assert meta["campaign_id"] == "multi_test"
+
+
+def test_normalize_npc_stubs_empty_location_stays_empty():
+    stubs = content_import._normalize_npc_stubs(
+        [{"id": "albert_johns", "name": "Albert Johns", "role": "Officer", "first_location_id": ""}]
+    )
+    assert stubs[0]["first_location_id"] == ""
+    assert content_import.snake_case("") == "unnamed"
+
+
+def test_detail_npc_batch_preserves_campaign_id_and_empty_location(monkeypatch):
+    def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step):
+        return {"npcs": []}
+
+    monkeypatch.setattr(content_import, "_call_llm_json", fake_call_llm_json)
+    result = content_import.detail_npc_batch(
+        "Albert Johns is an officer with PERSONALITY: Cautious.",
+        {"campaign_id": "MultiTest", "name": "Multi Test"},
+        [
+            {
+                "id": "albert_johns",
+                "name": "Albert Johns",
+                "role": "Officer",
+                "first_location_id": "",
+                "seed_personality": "Cautious",
+                "seed_personal_agenda": "Survive",
+                "seeded_from_stat_blocks": True,
+            }
+        ],
+    )
+    npc = result["npcs"][0]
+    assert npc["campaign_id"] == "MultiTest"
+    assert npc["location_id"] == ""
