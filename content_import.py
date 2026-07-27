@@ -65,6 +65,27 @@ _NPC_SECTION_END_PATTERN = re.compile(
 _STAT_BLOCK_HEADING = re.compile(
     r"^([A-Z][A-Z0-9][A-Z0-9 '\-]*?)\s*,\s*([A-Z][A-Z0-9][A-Z0-9 '\-/]*)$",
 )
+# Short name before a comma in a heading (AVA 6 allowed; not multi-word titles).
+_STAT_BLOCK_SHORT_NAME = re.compile(
+    r"([A-Z][A-Z0-9'\-]*(?:\s+\d+)?)\s*,\s*"
+)
+_STAT_BLOCK_FALSE_HEADING_NAMES = frozenset(
+    {
+        "STRENGTH",
+        "AGILITY",
+        "WITS",
+        "EMPATHY",
+        "HEALTH",
+        "SKILLS",
+        "GEAR",
+        "TALENT",
+        "BUDDY",
+        "RIVAL",
+        "AGE",
+        "SCENARIO",
+    }
+)
+_FULL_NAME_LINE = re.compile(r"^FULL NAME:\s*(.+)$", re.IGNORECASE)
 # Movie/sidebar names that are not scenario NPCs (Chariot of the Gods regression).
 _KNOWN_IMPORT_FALSE_POSITIVE_NAMES = frozenset(
     {
@@ -222,61 +243,238 @@ def _find_npc_section_span(collapsed_text: str) -> tuple[int, int] | None:
     return start, end
 
 
+def _iter_stat_block_headings(line: str) -> list[tuple[str, str]]:
+    """Return (short_name, role) pairs from a line; supports PDF two-column glue.
+
+    Split on short-name commas rather than a role lookahead that can swallow the
+    next heading (``REID, COLONIAL MARINE FLYNN, MEDIC`` → Reid/Colonial Marine +
+    Flynn/Medic, not Marine Flynn as a short name).
+    """
+    stripped = line.strip()
+    if not stripped:
+        return []
+
+    starts = list(_STAT_BLOCK_SHORT_NAME.finditer(stripped))
+    if not starts:
+        return []
+
+    results: list[tuple[str, str]] = []
+    for index, match in enumerate(starts):
+        short_name = match.group(1).strip()
+        short_key = short_name.upper()
+        if short_key in _STAT_BLOCK_FALSE_HEADING_NAMES:
+            continue
+        if short_key.split()[0] in _STAT_BLOCK_FALSE_HEADING_NAMES:
+            continue
+        # Allow ``AVA 6`` but reject codes like ``LV-1113``.
+        if re.search(r"\d", short_name) and not re.fullmatch(
+            r"[A-Z][A-Z'\-]*\s+\d+", short_name
+        ):
+            continue
+
+        role_start = match.end()
+        role_end = starts[index + 1].start() if index + 1 < len(starts) else len(stripped)
+        role = stripped[role_start:role_end].strip(" ,\t")
+        if not role:
+            continue
+        # Prose after a comma (``LV-1113, and suffers...``) is not a role.
+        if not role[0].isupper():
+            continue
+        role_key = role.upper()
+        if role_key in _STAT_BLOCK_FALSE_HEADING_NAMES:
+            continue
+        # Attribute rows like ``STRENGTH 4, AGILITY 3``.
+        if re.fullmatch(r"\d+(?:\s*,\s*[A-Z]+ \d+)*", role):
+            continue
+        # Roles are short labels (COLONIAL MARINE), not sentences.
+        if len(role.split()) > 6 or "," in role:
+            continue
+        results.append((short_name, role))
+    return results
+
+
+def _heading_matches_display_name(short_name: str, display_name: str) -> bool:
+    short_key = short_name.casefold().strip()
+    display_key = display_name.casefold().strip()
+    if not short_key or not display_key:
+        return False
+    if short_key in display_key:
+        return True
+    # PIN -> Pinion, AVA 6 -> Ava 6
+    short_token = re.sub(r"[^a-z0-9]+", "", short_key)
+    display_compact = re.sub(r"[^a-z0-9]+", "", display_key)
+    return bool(short_token) and short_token in display_compact
+
+
+def _block_has_own_full_name(lines: list[str], heading_index: int) -> bool:
+    """True when a FULL NAME appears before this heading's PERSONAL AGENDA.
+
+    Used to distinguish humans (FULL NAME then agenda) from androids like Ava 6
+    whose agenda window may later include a column partner's FULL NAME.
+    """
+    for raw in lines[heading_index + 1 : heading_index + 35]:
+        candidate = raw.strip()
+        if not candidate:
+            continue
+        if _FULL_NAME_LINE.match(candidate):
+            return True
+        if re.match(r"^PERSONAL AGENDA:", candidate, re.IGNORECASE):
+            return False
+        # A later heading line usually starts the next block / column partner body.
+        if _iter_stat_block_headings(candidate) and not candidate.upper().startswith("FULL NAME:"):
+            # Same-line partners are on heading_index itself; a new heading line ends the block.
+            return False
+    return False
+
+
 def _extract_alien_rpg_stat_block_npcs(section_text: str) -> list[dict[str, str]]:
-    """Parse ALIEN RPG module stat blocks (JOHNS, OFFICER + FULL NAME lines)."""
+    """Parse ALIEN RPG module stat blocks.
+
+    Prefer ``FULL NAME:`` rows (authoritative). PDF two-column extraction often glues
+    headings like ``REID, COLONIAL MARINE FLYNN, MEDIC`` onto one line, so whole-line
+    heading matches alone miss most NPCs.
+    """
     if not section_text.strip():
         return []
 
     lines = section_text.splitlines()
     results: list[dict[str, str]] = []
     seen_names: set[str] = set()
+    claimed_heading_keys: set[str] = set()
+
+    def _location_hint_from(window: str) -> str:
+        if re.search(r"\bSotillo\b", window, re.IGNORECASE):
+            return "sotillo"
+        if re.search(r"\bCronus\b", window, re.IGNORECASE):
+            return "uscss_cronus"
+        return ""
+
+    def _role_near_full_name(index: int, display_name: str) -> tuple[str, str]:
+        """Return (short_name, role) from nearby headings matching this full name."""
+        before = lines[max(0, index - 40) : index]
+        # Prefer a heading whose short name appears in the full name.
+        for raw in reversed(before):
+            for short_name, role in _iter_stat_block_headings(raw):
+                key = short_name.casefold()
+                if key in claimed_heading_keys:
+                    continue
+                if _heading_matches_display_name(short_name, display_name):
+                    return short_name, role.replace("/", " ").title()
+        # Fallback: nearest unclaimed heading, then subtitle line under it.
+        for raw_index in range(len(before) - 1, -1, -1):
+            headings = _iter_stat_block_headings(before[raw_index])
+            if not headings:
+                continue
+            for short_name, role in reversed(headings):
+                key = short_name.casefold()
+                if key in claimed_heading_keys:
+                    continue
+                role_text = role.replace("/", " ").title()
+                # Prefer a short subtitle under the heading; skip prose sentences.
+                if raw_index + 1 < len(before):
+                    candidate = before[raw_index + 1].strip()
+                    if (
+                        candidate
+                        and not candidate.upper().startswith("FULL NAME:")
+                        and not _iter_stat_block_headings(candidate)
+                        and len(candidate.split()) <= 8
+                        and not candidate.endswith(("-", ","))
+                        and not re.match(
+                            r"^(AGE|PERSONALITY|STRENGTH|HEALTH|SKILLS|GEAR|TALENT)\b",
+                            candidate,
+                            re.IGNORECASE,
+                        )
+                    ):
+                        role_text = candidate
+                return short_name, role_text
+        return "", ""
 
     for index, raw_line in enumerate(lines):
         line = raw_line.strip()
         if not line:
             continue
-        segments = re.split(r"\t+", line) if "\t" in line else [line]
-        for segment in segments:
-            segment = segment.strip()
-            if not _STAT_BLOCK_HEADING.match(segment):
-                continue
+        full_name_match = _FULL_NAME_LINE.match(line)
+        if not full_name_match:
+            continue
 
-            short_name = segment.split(",", 1)[0].strip()
-            descriptor = segment.split(",", 1)[1].strip() if "," in segment else ""
-            window = "\n".join(lines[index : index + 30])
-            full_name_match = re.search(r"FULL NAME:\s*(.+)", window)
-            if not full_name_match:
-                # ALIEN RPG stat blocks always publish FULL NAME; skip generic headings.
-                continue
-            display_name = full_name_match.group(1).strip()
-            name_key = display_name.casefold()
-            if name_key in seen_names:
-                continue
+        display_name = full_name_match.group(1).strip()
+        name_key = display_name.casefold()
+        if not display_name or name_key in seen_names:
+            continue
 
-            role = descriptor.replace("/", " ").title()
+        short_name, role = _role_near_full_name(index, display_name)
+        if short_name:
+            claimed_heading_keys.add(short_name.casefold())
+
+        window = "\n".join(lines[max(0, index - 8) : index + 25])
+        if not role:
             for look_ahead in lines[index + 1 : index + 4]:
                 candidate = look_ahead.strip()
-                if not candidate or candidate.startswith("FULL NAME:"):
+                if not candidate or candidate.upper().startswith("FULL NAME:"):
                     continue
-                if _STAT_BLOCK_HEADING.match(candidate):
+                if _iter_stat_block_headings(candidate):
                     break
-                if not re.match(r"^(AGE|PERSONALITY|STRENGTH|HEALTH|SKILLS)\b", candidate):
+                if not re.match(
+                    r"^(AGE|PERSONALITY|STRENGTH|HEALTH|SKILLS|GEAR|TALENT)\b",
+                    candidate,
+                    re.IGNORECASE,
+                ):
                     role = candidate
                     break
 
-            location_hint = ""
-            if re.search(r"\bSotillo\b", window, re.IGNORECASE):
-                location_hint = "sotillo"
-            elif re.search(r"\bCronus\b", window, re.IGNORECASE):
-                location_hint = "uscss_cronus"
+        seen_names.add(name_key)
+        results.append(
+            {
+                "name": display_name,
+                "role": role or (short_name.title() if short_name else ""),
+                "short_name": short_name or display_name.split()[-1].upper(),
+                "location_hint": _location_hint_from(window),
+            }
+        )
 
+    # Androids / entries with PERSONAL AGENDA but no FULL NAME (e.g. AVA 6).
+    for index, raw_line in enumerate(lines):
+        for short_name, role in _iter_stat_block_headings(raw_line):
+            key = short_name.casefold()
+            if key in claimed_heading_keys:
+                continue
+            # Already imported under a FULL NAME that matches this heading.
+            if any(_heading_matches_display_name(short_name, row["name"]) for row in results):
+                claimed_heading_keys.add(key)
+                continue
+            window = "\n".join(lines[index : index + 30])
+            if not re.search(r"PERSONAL AGENDA:", window, re.IGNORECASE):
+                continue
+            # Only skip when THIS block has its own FULL NAME before its agenda.
+            # A column partner's FULL NAME after Ava's agenda must not suppress Ava.
+            if _block_has_own_full_name(lines, index):
+                continue
+            display_name = short_name.title()
+            name_key = display_name.casefold()
+            if name_key in seen_names:
+                continue
+            claimed_heading_keys.add(key)
             seen_names.add(name_key)
+            role_text = role.replace("/", " ").title()
+            for look_ahead in lines[index + 1 : index + 4]:
+                candidate = look_ahead.strip()
+                if not candidate or candidate.upper().startswith("FULL NAME:"):
+                    continue
+                if _iter_stat_block_headings(candidate):
+                    break
+                if not re.match(
+                    r"^(AGE|PERSONALITY|STRENGTH|HEALTH|SKILLS|GEAR|TALENT)\b",
+                    candidate,
+                    re.IGNORECASE,
+                ):
+                    role_text = candidate
+                    break
             results.append(
                 {
                     "name": display_name,
-                    "role": role,
+                    "role": role_text,
                     "short_name": short_name,
-                    "location_hint": location_hint,
+                    "location_hint": _location_hint_from(window),
                 }
             )
 
@@ -303,7 +501,11 @@ def _prepare_outline_document_text(text: str, warnings: list[str]) -> str:
 
 
 def _truncate_preserving_npc_section(text: str, max_chars: int) -> str:
-    """Shrink long documents but keep the NON-PLAYER CHARACTERS section when present."""
+    """Shrink long documents but keep the NON-PLAYER CHARACTERS section when present.
+
+    Must not exceed ``max_chars`` — that budget is the Groq/local outline limit.
+    Deterministic stat-block merge uses the full document separately.
+    """
     if len(text) <= max_chars:
         return text
 
@@ -328,6 +530,70 @@ def _truncate_preserving_npc_section(text: str, max_chars: int) -> str:
     return section[:max_chars]
 
 
+def _document_has_recoverable_stat_blocks(text: str) -> bool:
+    collapsed = _collapse_spaced_caps(text or "")
+    span = _find_npc_section_span(collapsed)
+    if span is None:
+        return False
+    parsed = _extract_alien_rpg_stat_block_npcs(collapsed[span[0] : span[1]])
+    return len(parsed) >= 3
+
+
+def _guess_campaign_title(text: str) -> str | None:
+    """Best-effort title from the document head when the LLM returns an empty campaign."""
+    head = (text or "")[:2500]
+    collapsed_head = _collapse_spaced_caps(head)
+    # Prefer an explicit scenario title near the top of the extract.
+    for pattern in (
+        r"(?is)\b(CHARIOT\s+OF\s+THE\s+GODS)\b",
+        r"(?m)^\s*([A-Z0-9][A-Z0-9' \-]{2,48})\s*$",
+    ):
+        match = re.search(pattern, collapsed_head)
+        if not match:
+            continue
+        title = re.sub(r"\s+", " ", match.group(1)).strip(" :-")
+        if not title:
+            continue
+        words = title.split()
+        if len(words) > 8:
+            continue
+        if title.casefold() in {"scenario", "contents", "introduction", "non-player characters"}:
+            continue
+        if title.isupper() and len(words) >= 2:
+            return title.title()
+        if title.isupper() and len(words) == 1 and len(title) >= 4:
+            return title.title()
+    return None
+
+
+def _ensure_locations_for_npc_hints(
+    location_stubs: list[dict[str, Any]],
+    npc_stubs: list[dict[str, Any]],
+    *,
+    warnings: list[str],
+) -> list[dict[str, Any]]:
+    """Add minimal location stubs referenced by NPC first_location_id hints."""
+    known = {loc["id"] for loc in location_stubs}
+    defaults = {
+        "uscss_cronus": ("USCSS Cronus", "building"),
+        "sotillo": ("Sotillo", "building"),
+    }
+    added: list[str] = []
+    for npc in npc_stubs:
+        loc_id = str(npc.get("first_location_id") or "").strip()
+        if not loc_id or loc_id in known:
+            continue
+        name, loc_type = defaults.get(loc_id, (loc_id.replace("_", " ").title(), "other"))
+        location_stubs.append({"id": loc_id, "name": name, "type": loc_type})
+        known.add(loc_id)
+        added.append(loc_id)
+    if added:
+        warnings.append(
+            "Added location stub(s) referenced by stat-block NPCs: " + ", ".join(added)
+        )
+    return location_stubs
+
+
 def _npc_stubs_from_stat_blocks(
     section_text: str,
     *,
@@ -340,14 +606,18 @@ def _npc_stubs_from_stat_blocks(
         return []
 
     def _resolve_hint(hint: str) -> str:
-        if not location_ids:
+        hint = (hint or "").strip()
+        if not hint:
             return ""
         if hint in location_ids:
             return hint
         for loc_id in location_ids:
             if hint in loc_id or loc_id in hint:
                 return loc_id
-        return next(iter(location_ids), "")
+        if location_ids:
+            return next(iter(location_ids), "")
+        # Keep the hint so callers can seed a location stub later.
+        return hint
 
     stubs: list[dict[str, Any]] = []
     for row in parsed:
@@ -1231,8 +1501,11 @@ def analyze_campaign_document(
     if not text or not text.strip():
         raise ContentImportError("No document text provided")
 
-    document_text = _truncate_input(text, warnings)
-    outline_source = _prepare_outline_document_text(document_text, warnings)
+    # Keep the full extract for deterministic stat-block parsing and detail excerpts.
+    # Only the outline LLM prompt is truncated to the provider budget.
+    full_document_text = text
+    outline_document_text = _truncate_input(text, warnings)
+    outline_source = _prepare_outline_document_text(outline_document_text, warnings)
 
     outline_prompt = _build_outline_prompt(
         outline_source, mode, existing_campaign_id, existing_location_ids, existing_npc_names
@@ -1240,13 +1513,27 @@ def analyze_campaign_document(
 
     try:
         outline_raw = _call_llm_json(_SYSTEM_PROMPT, outline_prompt, warnings=warnings, step="outline")
-    except LLMProviderError as ex:
-        raise ContentImportError(str(ex)) from ex
     except Exception as ex:
-        raise ContentImportError(f"Outline pass failed: {ex}") from ex
+        if _document_has_recoverable_stat_blocks(full_document_text):
+            warnings.append(
+                f"Outline pass failed ({ex}); continuing from published NON-PLAYER "
+                "CHARACTERS stat blocks."
+            )
+            outline_raw = {"campaign": {}, "locations": [], "npcs": []}
+        elif isinstance(ex, LLMProviderError):
+            raise ContentImportError(str(ex)) from ex
+        else:
+            raise ContentImportError(f"Outline pass failed: {ex}") from ex
 
     if not isinstance(outline_raw, dict):
-        raise ContentImportError("Outline pass did not return a JSON object")
+        if _document_has_recoverable_stat_blocks(full_document_text):
+            warnings.append(
+                "Outline pass did not return a JSON object; continuing from published "
+                "NON-PLAYER CHARACTERS stat blocks."
+            )
+            outline_raw = {"campaign": {}, "locations": [], "npcs": []}
+        else:
+            raise ContentImportError("Outline pass did not return a JSON object")
 
     campaign, location_stubs, npc_stubs = _normalize_outline(
         outline_raw,
@@ -1257,26 +1544,49 @@ def analyze_campaign_document(
         warnings=warnings,
     )
 
+    if (
+        mode == "create_new"
+        and campaign.get("campaign_id") in {"campaign", ""}
+        and (not campaign.get("name") or str(campaign.get("name")).strip().casefold() in {"campaign", ""})
+    ):
+        guessed = _guess_campaign_title(full_document_text)
+        if guessed:
+            campaign["name"] = guessed
+            campaign["campaign_id"] = snake_case(guessed)
+            warnings.append(f"Outline omitted campaign title; inferred '{guessed}' from the document head.")
+
     existing_location_set = {snake_case(loc_id) for loc_id in existing_location_ids}
     location_ids = {loc["id"] for loc in location_stubs} | existing_location_set
     npc_stubs = _merge_outline_npcs_with_stat_blocks(
         npc_stubs,
-        document_text,
+        full_document_text,
         mode=mode,
         existing_npc_names=existing_npc_names,
         location_ids=location_ids,
         warnings=warnings,
     )
+    location_stubs = _ensure_locations_for_npc_hints(
+        location_stubs, npc_stubs, warnings=warnings
+    )
+    # Recompute after seeded locations so detail passes resolve hints.
+    location_ids = {loc["id"] for loc in location_stubs} | existing_location_set
+    for stub in npc_stubs:
+        hint = str(stub.get("first_location_id") or "").strip()
+        if hint and hint not in location_ids:
+            # Remap via resolve if ensure added under a different id — already covered.
+            pass
+        elif not hint and location_stubs:
+            stub["first_location_id"] = location_stubs[0]["id"]
 
     locations_by_id: dict[str, dict[str, Any]] = {}
     for batch in _batches(location_stubs, MAX_LOCATIONS_PER_BATCH):
-        details_by_id = _fetch_location_details(batch, document_text, campaign, warnings)
+        details_by_id = _fetch_location_details(batch, full_document_text, campaign, warnings)
 
         # Retry sparse singles once with a tighter excerpt focus.
         for stub in batch:
             detail = details_by_id.get(stub["id"], {})
             if _location_detail_is_sparse(detail):
-                retry = _fetch_location_details([stub], document_text, campaign, warnings)
+                retry = _fetch_location_details([stub], full_document_text, campaign, warnings)
                 retry_detail = retry.get(stub["id"], {})
                 if not _location_detail_is_sparse(retry_detail):
                     details_by_id[stub["id"]] = retry_detail
@@ -1290,12 +1600,12 @@ def analyze_campaign_document(
 
     npcs_by_id: dict[str, dict[str, Any]] = {}
     for batch in _batches(npc_stubs, MAX_NPCS_PER_BATCH):
-        details_by_id = _fetch_npc_details(batch, document_text, campaign, warnings)
+        details_by_id = _fetch_npc_details(batch, full_document_text, campaign, warnings)
 
         for stub in batch:
             detail = details_by_id.get(stub["id"], {})
             if _npc_detail_is_sparse(detail):
-                retry = _fetch_npc_details([stub], document_text, campaign, warnings)
+                retry = _fetch_npc_details([stub], full_document_text, campaign, warnings)
                 retry_detail = retry.get(stub["id"], {})
                 if not _npc_detail_is_sparse(retry_detail):
                     details_by_id[stub["id"]] = retry_detail
