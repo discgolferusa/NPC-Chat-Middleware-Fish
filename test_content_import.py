@@ -700,6 +700,53 @@ def test_seed_npc_detail_from_doctor_who_traits_and_bio():
         assert not content_import._npc_detail_is_sparse(seeded), f"sparse seed for {name}"
 
 
+def test_seed_max_does_not_absorb_neighbor_traits():
+    """Packed Cubicle 7 pages must not attach Peter's/Chad's TRAITS to Max."""
+    text = _load_doctor_who_catseye_fixture()
+    seeded = content_import._seed_npc_detail_from_document("Max Eddings", "squatter", text)
+    assert seeded is not None
+    joined = " ".join(seeded["personality"] + seeded["llm_rules"])
+    assert "Selfish" in joined
+    assert "Argumentative" in joined
+    assert "Friends:" not in joined and "Friends:" not in " ".join(seeded["personality"])
+    assert "Brave:" not in joined
+    assert not any("Hutchins has the majority" in p for p in seeded["personality"])
+
+
+def test_bio_paragraphs_handle_pdf_single_newlines_and_split_names():
+    """PdfPig extracts often lack blank lines; headers may split surnames."""
+    text = (
+        "MAx eddiNGs\n"
+        "AWAreNess 3 PreseNce 2\n"
+        "trAits\n"
+        "Selfish: Eddings thinks of nobody other than himself.\n"
+        "tecH LeVeL: 4 stOry POiNts: 8\n"
+        "Max Eddings suffers from some unknown psychological complaint that makes him angry.\n"
+        "Peter Hutc HiNs\n"
+        "AWAreNess 4 PreseNce 4\n"
+        "trAits\n"
+        "Friends: Hutchins has the majority of the squatters on his side.\n"
+        "tecH LeVeL: 4 stOry POiNts: 6\n"
+        "Peter Hutchins is something of an enigma – people are drawn to Hutchins.\n"
+    )
+    max_bios = content_import._bio_paragraphs_for_name(text, "Max Eddings")
+    assert max_bios
+    assert all("Hutchins is something" not in b for b in max_bios)
+    assert all(len(b) <= content_import._BIO_CHUNK_MAX_CHARS for b in max_bios)
+
+    clipped = content_import._clip_npc_writeup(text, "Peter Hutchins")
+    assert "Peter Hutc HiNs" in clipped or "Peter Hutchins" in clipped
+    assert "Selfish:" not in clipped
+    peter_traits = content_import._parse_trait_blocks(clipped, first_section_only=True)
+    assert any(name == "Friends" for name, _ in peter_traits)
+    assert not any(name == "Selfish" for name, _ in peter_traits)
+
+    peter_seed = content_import._seed_npc_detail_from_document("Peter Hutchins", "leader", text)
+    assert peter_seed is not None
+    assert any("Friends" in p for p in peter_seed["personality"])
+    assert not any("Selfish" in p for p in peter_seed["personality"])
+
+
 def test_detail_npc_batch_seeds_doctor_who_when_llm_empty(monkeypatch):
     text = _load_doctor_who_catseye_fixture()
 
