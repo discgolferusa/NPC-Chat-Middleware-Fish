@@ -73,11 +73,24 @@ def test_chariot_pdf_extract_parses_two_column_stat_blocks():
     assert span is not None
     section = collapsed[span[0] : span[1]]
     assert "REID, COLONIAL MARINE FLYNN, MEDIC" in section
+
+    headings = content_import._iter_stat_block_headings("REID, COLONIAL MARINE FLYNN, MEDIC")
+    assert headings == [("REID", "COLONIAL MARINE"), ("FLYNN", "MEDIC")]
+    headings = content_import._iter_stat_block_headings("COOPER, SCIENTIST CLAYTON, COMPANY AGENT")
+    assert headings == [("COOPER", "SCIENTIST"), ("CLAYTON", "COMPANY AGENT")]
+    headings = content_import._iter_stat_block_headings("AVA 6, SYNTHETIC BOLAJI, OFFICER")
+    assert headings == [("AVA 6", "SYNTHETIC"), ("BOLAJI", "OFFICER")]
+
     parsed = content_import._extract_alien_rpg_stat_block_npcs(section)
     names = {row["name"] for row in parsed}
     for expected in CHARIOT_EXPECTED_NPCS:
         assert expected in names, f"missing {expected} in {sorted(names)}"
-    assert len(parsed) >= 9
+    assert "Ava 6" in names
+    by_name = {row["name"]: row for row in parsed}
+    assert by_name["Valerie Reid"]["short_name"].upper() == "REID"
+    assert "marine flynn" not in by_name["Valerie Reid"]["role"].casefold()
+    assert "Colonial Marine" in by_name["Valerie Reid"]["role"]
+    assert len(parsed) >= 10
 
 
 def test_chariot_pdf_extract_recovers_from_empty_llm_outline(monkeypatch):
@@ -103,10 +116,50 @@ def test_chariot_pdf_extract_recovers_from_empty_llm_outline(monkeypatch):
     names = {npc["name"] for npc in result["npcs"]}
     for expected in CHARIOT_EXPECTED_NPCS:
         assert expected in names
+    assert "Ava 6" in names
     loc_ids = {loc["id"] for loc in result["locations"]}
     assert "uscss_cronus" in loc_ids or "sotillo" in loc_ids
     assert "Captain Miller" not in names
 
+
+def test_outline_failure_recovers_from_stat_blocks(monkeypatch):
+    text = _load_chariot_pdf_extract_fixture()
+
+    def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step):
+        if step == "outline":
+            raise RuntimeError("simulated outline TPM failure")
+        return {"locations": []} if step == "location detail" else {"npcs": []}
+
+    monkeypatch.setattr(content_import, "_call_llm_json", fake_call_llm_json)
+    result = content_import.analyze_campaign_document(text, "create_new")
+    names = {npc["name"] for npc in result["npcs"]}
+    assert "Albert Johns" in names
+    assert "Ava 6" in names
+    assert any("outline pass failed" in w.casefold() for w in result["warnings"])
+
+
+def test_truncate_preserving_npc_section_respects_max_chars():
+    intro = "X" * 20_000
+    section = _load_chariot_fixture()
+    text = f"{intro}\n\n{section}"
+    max_chars = 6016
+    trimmed = content_import._truncate_preserving_npc_section(text, max_chars)
+    assert len(trimmed) <= max_chars
+    assert "JOHNS, OFFICER" in trimmed
+    assert "FULL NAME: Albert Johns" in trimmed
+
+
+def test_truncate_preserving_npc_section_keeps_stat_blocks():
+    intro = "X" * 20_000
+    section = _load_chariot_fixture()
+    text = f"{intro}\n\n{section}"
+    max_chars = 12_000
+    trimmed = content_import._truncate_preserving_npc_section(text, max_chars)
+    assert len(trimmed) <= max_chars
+    assert "JOHNS, OFFICER" in trimmed
+    assert "FULL NAME: Albert Johns" in trimmed
+    assert "FULL NAME: Micky Horton" in trimmed
+    assert "Captain Miller" not in trimmed
 
 def test_chariot_regression_replaces_movie_quote_outline_npcs(monkeypatch):
     """LLM outline picked Miller / David 8 / Vickers; stat blocks should win."""
@@ -281,18 +334,3 @@ def test_location_hints_resolve_existing_campaign_locations(monkeypatch):
     )
     by_name = {npc["name"]: npc for npc in result["npcs"]}
     assert by_name["Albert Johns"]["location_id"] == "uscss_cronus"
-
-
-def test_truncate_preserving_npc_section_keeps_stat_blocks():
-    intro = "X" * 20_000
-    section = _load_chariot_fixture()
-    text = f"{intro}\n\n{section}"
-    max_chars = 12_000
-    trimmed = content_import._truncate_preserving_npc_section(text, max_chars)
-    # Soft budget may be raised so the whole NPC section survives.
-    assert "JOHNS, OFFICER" in trimmed
-    assert "FULL NAME: Albert Johns" in trimmed
-    assert "FULL NAME: Micky Horton" in trimmed
-    assert "Captain Miller" not in trimmed or trimmed.index("JOHNS, OFFICER") < trimmed.index(
-        "Captain Miller"
-    )

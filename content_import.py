@@ -65,11 +65,9 @@ _NPC_SECTION_END_PATTERN = re.compile(
 _STAT_BLOCK_HEADING = re.compile(
     r"^([A-Z][A-Z0-9][A-Z0-9 '\-]*?)\s*,\s*([A-Z][A-Z0-9][A-Z0-9 '\-/]*)$",
 )
-# PDF two-column layouts glue two headings on one line (e.g. REID, COLONIAL MARINE FLYNN, MEDIC).
-_STAT_BLOCK_HEADING_INLINE = re.compile(
-    r"([A-Z][A-Z0-9][A-Z0-9'\-]*(?:\s+[A-Z0-9]+)?)\s*,\s*"
-    r"([A-Z][A-Z0-9'\-]*(?:\s+[A-Z][A-Z0-9'\-]*)*?)\s*"
-    r"(?=(?:[A-Z][A-Z0-9'\-]*(?:\s+[A-Z0-9]+)?\s*,)|$)"
+# Short name before a comma in a heading (AVA 6 allowed; not multi-word titles).
+_STAT_BLOCK_SHORT_NAME = re.compile(
+    r"([A-Z][A-Z0-9'\-]*(?:\s+\d+)?)\s*,\s*"
 )
 _STAT_BLOCK_FALSE_HEADING_NAMES = frozenset(
     {
@@ -246,17 +244,50 @@ def _find_npc_section_span(collapsed_text: str) -> tuple[int, int] | None:
 
 
 def _iter_stat_block_headings(line: str) -> list[tuple[str, str]]:
-    """Return (short_name, role) pairs from a line; supports PDF two-column glue."""
+    """Return (short_name, role) pairs from a line; supports PDF two-column glue.
+
+    Split on short-name commas rather than a role lookahead that can swallow the
+    next heading (``REID, COLONIAL MARINE FLYNN, MEDIC`` → Reid/Colonial Marine +
+    Flynn/Medic, not Marine Flynn as a short name).
+    """
+    stripped = line.strip()
+    if not stripped:
+        return []
+
+    starts = list(_STAT_BLOCK_SHORT_NAME.finditer(stripped))
+    if not starts:
+        return []
+
     results: list[tuple[str, str]] = []
-    for match in _STAT_BLOCK_HEADING_INLINE.finditer(line.strip()):
+    for index, match in enumerate(starts):
         short_name = match.group(1).strip()
-        role = match.group(2).strip()
-        if short_name.upper() in _STAT_BLOCK_FALSE_HEADING_NAMES:
+        short_key = short_name.upper()
+        if short_key in _STAT_BLOCK_FALSE_HEADING_NAMES:
             continue
-        if role.upper() in _STAT_BLOCK_FALSE_HEADING_NAMES:
+        if short_key.split()[0] in _STAT_BLOCK_FALSE_HEADING_NAMES:
             continue
-        # STRENGTH 4, AGILITY 3 style attribute rows.
-        if re.search(r"\d", short_name) and short_name.upper().split()[0] in _STAT_BLOCK_FALSE_HEADING_NAMES:
+        # Allow ``AVA 6`` but reject codes like ``LV-1113``.
+        if re.search(r"\d", short_name) and not re.fullmatch(
+            r"[A-Z][A-Z'\-]*\s+\d+", short_name
+        ):
+            continue
+
+        role_start = match.end()
+        role_end = starts[index + 1].start() if index + 1 < len(starts) else len(stripped)
+        role = stripped[role_start:role_end].strip(" ,\t")
+        if not role:
+            continue
+        # Prose after a comma (``LV-1113, and suffers...``) is not a role.
+        if not role[0].isupper():
+            continue
+        role_key = role.upper()
+        if role_key in _STAT_BLOCK_FALSE_HEADING_NAMES:
+            continue
+        # Attribute rows like ``STRENGTH 4, AGILITY 3``.
+        if re.fullmatch(r"\d+(?:\s*,\s*[A-Z]+ \d+)*", role):
+            continue
+        # Roles are short labels (COLONIAL MARINE), not sentences.
+        if len(role.split()) > 6 or "," in role:
             continue
         results.append((short_name, role))
     return results
@@ -273,6 +304,27 @@ def _heading_matches_display_name(short_name: str, display_name: str) -> bool:
     short_token = re.sub(r"[^a-z0-9]+", "", short_key)
     display_compact = re.sub(r"[^a-z0-9]+", "", display_key)
     return bool(short_token) and short_token in display_compact
+
+
+def _block_has_own_full_name(lines: list[str], heading_index: int) -> bool:
+    """True when a FULL NAME appears before this heading's PERSONAL AGENDA.
+
+    Used to distinguish humans (FULL NAME then agenda) from androids like Ava 6
+    whose agenda window may later include a column partner's FULL NAME.
+    """
+    for raw in lines[heading_index + 1 : heading_index + 35]:
+        candidate = raw.strip()
+        if not candidate:
+            continue
+        if _FULL_NAME_LINE.match(candidate):
+            return True
+        if re.match(r"^PERSONAL AGENDA:", candidate, re.IGNORECASE):
+            return False
+        # A later heading line usually starts the next block / column partner body.
+        if _iter_stat_block_headings(candidate) and not candidate.upper().startswith("FULL NAME:"):
+            # Same-line partners are on heading_index itself; a new heading line ends the block.
+            return False
+    return False
 
 
 def _extract_alien_rpg_stat_block_npcs(section_text: str) -> list[dict[str, str]]:
@@ -299,7 +351,7 @@ def _extract_alien_rpg_stat_block_npcs(section_text: str) -> list[dict[str, str]
 
     def _role_near_full_name(index: int, display_name: str) -> tuple[str, str]:
         """Return (short_name, role) from nearby headings matching this full name."""
-        before = lines[max(0, index - 20) : index]
+        before = lines[max(0, index - 40) : index]
         # Prefer a heading whose short name appears in the full name.
         for raw in reversed(before):
             for short_name, role in _iter_stat_block_headings(raw):
@@ -318,13 +370,15 @@ def _extract_alien_rpg_stat_block_npcs(section_text: str) -> list[dict[str, str]
                 if key in claimed_heading_keys:
                     continue
                 role_text = role.replace("/", " ").title()
-                # Subtitle on the next line often has the better title.
+                # Prefer a short subtitle under the heading; skip prose sentences.
                 if raw_index + 1 < len(before):
                     candidate = before[raw_index + 1].strip()
                     if (
                         candidate
                         and not candidate.upper().startswith("FULL NAME:")
                         and not _iter_stat_block_headings(candidate)
+                        and len(candidate.split()) <= 8
+                        and not candidate.endswith(("-", ","))
                         and not re.match(
                             r"^(AGE|PERSONALITY|STRENGTH|HEALTH|SKILLS|GEAR|TALENT)\b",
                             candidate,
@@ -384,11 +438,16 @@ def _extract_alien_rpg_stat_block_npcs(section_text: str) -> list[dict[str, str]
             key = short_name.casefold()
             if key in claimed_heading_keys:
                 continue
+            # Already imported under a FULL NAME that matches this heading.
+            if any(_heading_matches_display_name(short_name, row["name"]) for row in results):
+                claimed_heading_keys.add(key)
+                continue
             window = "\n".join(lines[index : index + 30])
             if not re.search(r"PERSONAL AGENDA:", window, re.IGNORECASE):
                 continue
-            if re.search(r"FULL NAME:", window, re.IGNORECASE):
-                # Belongs to a FULL NAME block already handled (or column partner).
+            # Only skip when THIS block has its own FULL NAME before its agenda.
+            # A column partner's FULL NAME after Ava's agenda must not suppress Ava.
+            if _block_has_own_full_name(lines, index):
                 continue
             display_name = short_name.title()
             name_key = display_name.casefold()
@@ -442,7 +501,11 @@ def _prepare_outline_document_text(text: str, warnings: list[str]) -> str:
 
 
 def _truncate_preserving_npc_section(text: str, max_chars: int) -> str:
-    """Shrink long documents but keep the NON-PLAYER CHARACTERS section when present."""
+    """Shrink long documents but keep the NON-PLAYER CHARACTERS section when present.
+
+    Must not exceed ``max_chars`` — that budget is the Groq/local outline limit.
+    Deterministic stat-block merge uses the full document separately.
+    """
     if len(text) <= max_chars:
         return text
 
@@ -454,29 +517,26 @@ def _truncate_preserving_npc_section(text: str, max_chars: int) -> str:
     start, end = span
     section = collapsed[start:end].strip()
     separator = "\n\n--- NON-PLAYER CHARACTERS (priority excerpt) ---\n\n"
-    # Never chop the middle of a published NPC section when the soft budget is
-    # smaller than the section — keep the whole section (plus a small intro) up
-    # to a hard ceiling so ALL FULL NAME rows remain available.
-    hard_ceiling = max(max_chars, min(48_000, len(section) + 3_000))
-    if len(section) + len(separator) <= hard_ceiling:
-        intro_budget = hard_ceiling - len(section) - len(separator)
-        intro_source = collapsed[:start].strip()
-        intro = intro_source[:intro_budget] if intro_budget > 0 else ""
-        if intro:
-            return f"{intro}{separator}{section}"
-        return section
+    if len(section) >= max_chars:
+        return section[:max_chars]
 
-    if len(section) >= hard_ceiling:
-        return section[:hard_ceiling]
-
-    intro_budget = hard_ceiling - len(section) - len(separator)
+    intro_budget = max_chars - len(section) - len(separator)
     if intro_budget > 0:
         intro_source = collapsed[:start].strip()
         intro = intro_source[:intro_budget]
         combined = f"{intro}{separator}{section}" if intro else section
-        return combined[:hard_ceiling]
+        return combined[:max_chars]
 
-    return section[:hard_ceiling]
+    return section[:max_chars]
+
+
+def _document_has_recoverable_stat_blocks(text: str) -> bool:
+    collapsed = _collapse_spaced_caps(text or "")
+    span = _find_npc_section_span(collapsed)
+    if span is None:
+        return False
+    parsed = _extract_alien_rpg_stat_block_npcs(collapsed[span[0] : span[1]])
+    return len(parsed) >= 3
 
 
 def _guess_campaign_title(text: str) -> str | None:
@@ -1453,13 +1513,27 @@ def analyze_campaign_document(
 
     try:
         outline_raw = _call_llm_json(_SYSTEM_PROMPT, outline_prompt, warnings=warnings, step="outline")
-    except LLMProviderError as ex:
-        raise ContentImportError(str(ex)) from ex
     except Exception as ex:
-        raise ContentImportError(f"Outline pass failed: {ex}") from ex
+        if _document_has_recoverable_stat_blocks(full_document_text):
+            warnings.append(
+                f"Outline pass failed ({ex}); continuing from published NON-PLAYER "
+                "CHARACTERS stat blocks."
+            )
+            outline_raw = {"campaign": {}, "locations": [], "npcs": []}
+        elif isinstance(ex, LLMProviderError):
+            raise ContentImportError(str(ex)) from ex
+        else:
+            raise ContentImportError(f"Outline pass failed: {ex}") from ex
 
     if not isinstance(outline_raw, dict):
-        raise ContentImportError("Outline pass did not return a JSON object")
+        if _document_has_recoverable_stat_blocks(full_document_text):
+            warnings.append(
+                "Outline pass did not return a JSON object; continuing from published "
+                "NON-PLAYER CHARACTERS stat blocks."
+            )
+            outline_raw = {"campaign": {}, "locations": [], "npcs": []}
+        else:
+            raise ContentImportError("Outline pass did not return a JSON object")
 
     campaign, location_stubs, npc_stubs = _normalize_outline(
         outline_raw,
