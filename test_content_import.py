@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 import content_import
 
 
@@ -522,3 +524,61 @@ def test_location_hints_resolve_existing_campaign_locations(monkeypatch):
     )
     by_name = {npc["name"]: npc for npc in result["npcs"]}
     assert by_name["Albert Johns"]["location_id"] == "uscss_cronus"
+
+
+def test_chunked_outline_then_detail_batches(monkeypatch):
+    """Editor-style chunked path: outline stubs, then per-batch detail hops."""
+    text = _load_chariot_pdf_extract_fixture()
+    steps: list[str] = []
+
+    def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step):
+        steps.append(step)
+        if step == "outline":
+            raise AssertionError("stat-block outline must be skipped")
+        if step == "location detail":
+            return {"locations": []}
+        if step == "npc detail":
+            return {"npcs": []}
+        return {}
+
+    monkeypatch.setattr(content_import, "_call_llm_json", fake_call_llm_json)
+
+    outline = content_import.outline_campaign_document(text, "create_new")
+    assert "outline" not in steps
+    assert outline["npcs"]
+    assert outline["locations"] or any(
+        npc.get("first_location_id") for npc in outline["npcs"]
+    )
+    names = {npc["name"] for npc in outline["npcs"]}
+    assert "Albert Johns" in names
+
+    campaign = outline["campaign"]
+    loc_batch = outline["locations"][: content_import.MAX_LOCATIONS_PER_BATCH] or [
+        {
+            "id": "uscss_cronus",
+            "name": "USCSS Cronus",
+            "type": "building",
+            "seeded_from_stat_blocks": True,
+        }
+    ]
+    loc_result = content_import.detail_location_batch(text, campaign, loc_batch)
+    assert loc_result["locations"]
+    assert "location detail" in steps
+
+    johns = next(npc for npc in outline["npcs"] if npc["name"] == "Albert Johns")
+    npc_result = content_import.detail_npc_batch(text, campaign, [johns])
+    assert npc_result["npcs"][0]["name"] == "Albert Johns"
+    assert npc_result["npcs"][0]["personality"] or npc_result["npcs"][0]["secrets"]
+    assert "npc detail" in steps
+
+
+def test_detail_npc_batch_rejects_oversized_batch():
+    with pytest.raises(content_import.ContentImportError, match="at most"):
+        content_import.detail_npc_batch(
+            "NON-PLAYER CHARACTERS\nFULL NAME: A",
+            {"campaign_id": "c", "name": "C"},
+            [
+                {"id": "a", "name": "A", "role": "x", "first_location_id": "loc"},
+                {"id": "b", "name": "B", "role": "y", "first_location_id": "loc"},
+            ],
+        )

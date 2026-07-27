@@ -12,12 +12,20 @@ Pipeline:
      the campaign, a location list, and an NPC list (name/role/locations).
      Skipped when recoverable published RPG stat blocks are present (names are
      seeded deterministically); location/NPC detail sweeps still run.
+     Exposed as ``outline_campaign_document`` / ``POST /content/import/outline``.
   2. Location detail pass — small batches (<= MAX_LOCATIONS_PER_BATCH) using
      name-focused source excerpts; extract-over-invent; retry if sparse.
+     Exposed as ``detail_location_batch`` / ``POST /content/import/location-details``.
   3. NPC detail pass — one NPC per call with name-focused excerpts; maps
      NPCNarrator section headers and published RPG stat blocks (e.g. ALIEN RPG
      FULL NAME / PERSONAL AGENDA) into voice/personality/facts/secrets/llm_rules;
      retry if sparse. PERSONALITY / PERSONAL AGENDA seeds are a fallback only.
+     Exposed as ``detail_npc_batch`` / ``POST /content/import/npc-details``.
+
+``analyze_campaign_document`` / ``POST /content/import/analyze`` still orchestrates
+all three passes for local/dev callers. Production Yaml Editor should call the
+chunked endpoints so Tailscale Funnel is not holding one HTTP request across
+every LLM pass.
 
 When a NON-PLAYER CHARACTERS section is detected, stat-block names override
 bad LLM outline guesses (see test_content_import.py / Chariot of the Gods).
@@ -1636,47 +1644,48 @@ def _fetch_npc_details(
         return {}
 
 
-def analyze_campaign_document(
+def _resolve_import_mode(
+    mode: str | None,
+    *,
+    existing_campaign_id: str | None,
+    warnings: list[str],
+) -> tuple[str, str | None]:
+    mode = (mode or "create_new").strip().lower()
+    if mode not in VALID_MODES:
+        warnings.append(f"Unknown mode '{mode}'; defaulting to 'create_new'.")
+        mode = "create_new"
+    existing_campaign_id = (existing_campaign_id or "").strip() or None
+    if mode == "merge" and not existing_campaign_id:
+        warnings.append("mode='merge' but no existing_campaign_id was provided; treating as create_new.")
+        mode = "create_new"
+    return mode, existing_campaign_id
+
+
+def outline_campaign_document(
     text: str,
     mode: str,
     existing_campaign_id: str | None = None,
     existing_location_ids: list[str] | None = None,
     existing_npc_names: list[str] | None = None,
 ) -> dict[str, Any]:
-    """
-    Analyze a campaign document (module notes, session prep, wiki export) and
-    return structured campaign/location/NPC data via multi-pass LLM calls.
+    """Pass 1: campaign + location/NPC stubs (no detail LLM sweeps).
 
-    Returns: {"campaign": {...}, "locations": [...], "npcs": [...], "warnings": [...]}
-    Raises ContentImportError if the document cannot be analyzed at all.
+    Used by the editor as a short Funnel hop before per-batch detail calls.
     """
     warnings: list[str] = []
-
-    mode = (mode or "create_new").strip().lower()
-    if mode not in VALID_MODES:
-        warnings.append(f"Unknown mode '{mode}'; defaulting to 'create_new'.")
-        mode = "create_new"
-
+    mode, existing_campaign_id = _resolve_import_mode(
+        mode, existing_campaign_id=existing_campaign_id, warnings=warnings
+    )
     existing_location_ids = [str(x).strip() for x in (existing_location_ids or []) if str(x).strip()]
     existing_npc_names = [str(x).strip() for x in (existing_npc_names or []) if str(x).strip()]
-    existing_campaign_id = (existing_campaign_id or "").strip() or None
-
-    if mode == "merge" and not existing_campaign_id:
-        warnings.append("mode='merge' but no existing_campaign_id was provided; treating as create_new.")
-        mode = "create_new"
 
     if not text or not text.strip():
         raise ContentImportError("No document text provided")
 
-    # Keep the full extract for deterministic stat-block parsing and detail excerpts.
-    # Only the outline LLM prompt is truncated to the provider budget.
     full_document_text = text
     use_stat_block_fast_path = _document_has_recoverable_stat_blocks(full_document_text)
 
     if use_stat_block_fast_path:
-        # Avoid a long/fragile outline LLM call — merge already prefers stat blocks.
-        # Location and NPC detail sweeps still run so roleplay fields are filled
-        # from the document; PERSONALITY / AGENDA seeds are fallback only.
         warnings.append(
             "Published NON-PLAYER CHARACTERS stat blocks detected; skipping LLM outline "
             "and seeding NPC stubs from FULL NAME blocks (detail sweep still runs)."
@@ -1738,77 +1747,214 @@ def analyze_campaign_document(
         if not hint and location_stubs:
             stub["first_location_id"] = location_stubs[0]["id"]
 
-    locations_by_id: dict[str, dict[str, Any]] = {}
+    return {
+        "campaign": campaign,
+        "locations": location_stubs,
+        "npcs": npc_stubs,
+        "warnings": warnings,
+    }
+
+
+def _normalize_campaign_meta(campaign: dict[str, Any] | None) -> dict[str, Any]:
+    raw = campaign if isinstance(campaign, dict) else {}
+    campaign_id = snake_case(raw.get("campaign_id") or raw.get("name") or "campaign") or "campaign"
+    return {
+        "campaign_id": campaign_id,
+        "name": str(raw.get("name") or campaign_id.replace("_", " ").title()).strip(),
+        "description": str(raw.get("description") or "").strip(),
+    }
+
+
+def _normalize_location_stubs(raw_locations: Any) -> list[dict[str, Any]]:
+    stubs: list[dict[str, Any]] = []
+    for raw in _as_list(raw_locations):
+        if not isinstance(raw, dict):
+            continue
+        name = str(raw.get("name") or "").strip()
+        loc_id = snake_case(raw.get("id") or name or "location")
+        if not loc_id:
+            continue
+        stubs.append(
+            {
+                "id": loc_id,
+                "name": name or loc_id.replace("_", " ").title(),
+                "type": str(raw.get("type") or "other").strip() or "other",
+                "seeded_from_stat_blocks": bool(raw.get("seeded_from_stat_blocks")),
+            }
+        )
+    return stubs
+
+
+def _normalize_npc_stubs(raw_npcs: Any) -> list[dict[str, Any]]:
+    stubs: list[dict[str, Any]] = []
+    for raw in _as_list(raw_npcs):
+        if not isinstance(raw, dict):
+            continue
+        name = str(raw.get("name") or "").strip()
+        npc_id = snake_case(raw.get("id") or name or "npc")
+        if not npc_id or not name:
+            continue
+        other = [
+            snake_case(x)
+            for x in _as_list(raw.get("other_location_ids"))
+            if str(x).strip()
+        ]
+        stubs.append(
+            {
+                "id": npc_id,
+                "name": name,
+                "role": str(raw.get("role") or "").strip(),
+                "first_location_id": snake_case(raw.get("first_location_id") or "") or "",
+                "other_location_ids": [x for x in other if x],
+                "seeded_from_stat_blocks": bool(raw.get("seeded_from_stat_blocks")),
+                "seed_personality": str(raw.get("seed_personality") or "").strip(),
+                "seed_personal_agenda": str(raw.get("seed_personal_agenda") or "").strip(),
+            }
+        )
+    return stubs
+
+
+def detail_location_batch(
+    text: str,
+    campaign: dict[str, Any],
+    location_stubs: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Pass 2: fill one location batch from document excerpts."""
+    warnings: list[str] = []
+    if not text or not text.strip():
+        raise ContentImportError("No document text provided")
+    campaign = _normalize_campaign_meta(campaign)
+    batch = _normalize_location_stubs(location_stubs)
+    if not batch:
+        raise ContentImportError("location-details requires at least one location stub")
+    if len(batch) > MAX_LOCATIONS_PER_BATCH:
+        raise ContentImportError(
+            f"location-details accepts at most {MAX_LOCATIONS_PER_BATCH} locations per call"
+        )
+
+    details_by_id: dict[str, dict[str, Any]] = {}
+    details_by_id.update(_fetch_location_details(batch, text, campaign, warnings))
+    for stub in batch:
+        detail = details_by_id.get(stub["id"], {})
+        if _location_detail_is_sparse(detail):
+            retry = _fetch_location_details([stub], text, campaign, warnings)
+            retry_detail = retry.get(stub["id"], {})
+            if not _location_detail_is_sparse(retry_detail):
+                details_by_id[stub["id"]] = retry_detail
+                warnings.append(f"Location '{stub['id']}': recovered details on retry.")
+            elif stub.get("seeded_from_stat_blocks"):
+                details_by_id[stub["id"]] = _location_detail_from_seed(stub)
+                warnings.append(
+                    f"Location '{stub['id']}': detail sparse; fell back to "
+                    "stat-block location stub defaults."
+                )
+            elif not detail:
+                warnings.append(
+                    f"Location '{stub['id']}': no detail returned; using minimal defaults."
+                )
+
+    locations = [
+        _merge_location_detail(stub, details_by_id.get(stub["id"], {}), campaign["campaign_id"])
+        for stub in batch
+    ]
+    return {"locations": locations, "warnings": warnings}
+
+
+def detail_npc_batch(
+    text: str,
+    campaign: dict[str, Any],
+    npc_stubs: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Pass 3: fill one NPC batch from document excerpts."""
+    warnings: list[str] = []
+    if not text or not text.strip():
+        raise ContentImportError("No document text provided")
+    campaign = _normalize_campaign_meta(campaign)
+    batch = _normalize_npc_stubs(npc_stubs)
+    if not batch:
+        raise ContentImportError("npc-details requires at least one NPC stub")
+    if len(batch) > MAX_NPCS_PER_BATCH:
+        raise ContentImportError(
+            f"npc-details accepts at most {MAX_NPCS_PER_BATCH} NPC(s) per call"
+        )
+
+    details_by_id: dict[str, dict[str, Any]] = {}
+    details_by_id.update(_fetch_npc_details(batch, text, campaign, warnings))
+    for stub in batch:
+        detail = details_by_id.get(stub["id"], {})
+        if _npc_detail_is_sparse(detail):
+            retry = _fetch_npc_details([stub], text, campaign, warnings)
+            retry_detail = retry.get(stub["id"], {})
+            if not _npc_detail_is_sparse(retry_detail):
+                details_by_id[stub["id"]] = retry_detail
+                warnings.append(f"NPC '{stub['id']}': recovered details on retry.")
+            elif _npc_stub_has_stat_seed(stub):
+                details_by_id[stub["id"]] = _npc_detail_from_stat_seed(stub)
+                warnings.append(
+                    f"NPC '{stub['id']}': detail sparse; fell back to "
+                    "PERSONALITY / PERSONAL AGENDA from the stat block."
+                )
+            elif not detail:
+                warnings.append(
+                    f"NPC '{stub['id']}': no detail returned; using minimal defaults. "
+                    "Local small models often need content_creation set to Groq or a "
+                    "stronger local model for dense NPC writeups."
+                )
+
+    npcs = [
+        _merge_npc_detail(
+            stub, details_by_id.get(stub["id"], {}), campaign["campaign_id"], warnings
+        )
+        for stub in batch
+    ]
+    return {"npcs": npcs, "warnings": warnings}
+
+
+def analyze_campaign_document(
+    text: str,
+    mode: str,
+    existing_campaign_id: str | None = None,
+    existing_location_ids: list[str] | None = None,
+    existing_npc_names: list[str] | None = None,
+) -> dict[str, Any]:
+    """
+    Analyze a campaign document (module notes, session prep, wiki export) and
+    return structured campaign/location/NPC data via multi-pass LLM calls.
+
+    Orchestrates outline + detail batches for local/dev callers. Production
+    Yaml Editor should call the chunked endpoints instead so Tailscale Funnel
+    is not holding one HTTP request across every LLM pass.
+
+    Returns: {"campaign": {...}, "locations": [...], "npcs": [...], "warnings": [...]}
+    Raises ContentImportError if the document cannot be analyzed at all.
+    """
+    outline = outline_campaign_document(
+        text,
+        mode,
+        existing_campaign_id=existing_campaign_id,
+        existing_location_ids=existing_location_ids,
+        existing_npc_names=existing_npc_names,
+    )
+    warnings = list(outline.get("warnings") or [])
+    campaign = outline["campaign"]
+    location_stubs = list(outline.get("locations") or [])
+    npc_stubs = list(outline.get("npcs") or [])
+
+    locations: list[dict[str, Any]] = []
     for batch in _batches(location_stubs, MAX_LOCATIONS_PER_BATCH):
-        details_by_id: dict[str, dict[str, Any]] = {}
-        if batch:
-            details_by_id.update(
-                _fetch_location_details(batch, full_document_text, campaign, warnings)
-            )
-            for stub in batch:
-                detail = details_by_id.get(stub["id"], {})
-                if _location_detail_is_sparse(detail):
-                    retry = _fetch_location_details(
-                        [stub], full_document_text, campaign, warnings
-                    )
-                    retry_detail = retry.get(stub["id"], {})
-                    if not _location_detail_is_sparse(retry_detail):
-                        details_by_id[stub["id"]] = retry_detail
-                        warnings.append(f"Location '{stub['id']}': recovered details on retry.")
-                    elif stub.get("seeded_from_stat_blocks"):
-                        details_by_id[stub["id"]] = _location_detail_from_seed(stub)
-                        warnings.append(
-                            f"Location '{stub['id']}': detail sparse; fell back to "
-                            "stat-block location stub defaults."
-                        )
-                    elif not detail:
-                        warnings.append(
-                            f"Location '{stub['id']}': no detail returned; using minimal defaults."
-                        )
+        result = detail_location_batch(text, campaign, batch)
+        warnings.extend(result.get("warnings") or [])
+        locations.extend(result.get("locations") or [])
 
-        for stub in batch:
-            locations_by_id[stub["id"]] = _merge_location_detail(
-                stub, details_by_id.get(stub["id"], {}), campaign["campaign_id"]
-            )
-
-    npcs_by_id: dict[str, dict[str, Any]] = {}
+    npcs: list[dict[str, Any]] = []
     for batch in _batches(npc_stubs, MAX_NPCS_PER_BATCH):
-        details_by_id: dict[str, dict[str, Any]] = {}
-        if batch:
-            details_by_id.update(
-                _fetch_npc_details(batch, full_document_text, campaign, warnings)
-            )
-            for stub in batch:
-                detail = details_by_id.get(stub["id"], {})
-                if _npc_detail_is_sparse(detail):
-                    retry = _fetch_npc_details(
-                        [stub], full_document_text, campaign, warnings
-                    )
-                    retry_detail = retry.get(stub["id"], {})
-                    if not _npc_detail_is_sparse(retry_detail):
-                        details_by_id[stub["id"]] = retry_detail
-                        warnings.append(f"NPC '{stub['id']}': recovered details on retry.")
-                    elif _npc_stub_has_stat_seed(stub):
-                        details_by_id[stub["id"]] = _npc_detail_from_stat_seed(stub)
-                        warnings.append(
-                            f"NPC '{stub['id']}': detail sparse; fell back to "
-                            "PERSONALITY / PERSONAL AGENDA from the stat block."
-                        )
-                    elif not detail:
-                        warnings.append(
-                            f"NPC '{stub['id']}': no detail returned; using minimal defaults. "
-                            "Local small models often need content_creation set to Groq or a "
-                            "stronger local model for dense NPC writeups."
-                        )
-
-        for stub in batch:
-            npcs_by_id[stub["id"]] = _merge_npc_detail(
-                stub, details_by_id.get(stub["id"], {}), campaign["campaign_id"], warnings
-            )
+        result = detail_npc_batch(text, campaign, batch)
+        warnings.extend(result.get("warnings") or [])
+        npcs.extend(result.get("npcs") or [])
 
     return {
         "campaign": campaign,
-        "locations": [locations_by_id[stub["id"]] for stub in location_stubs],
-        "npcs": [npcs_by_id[stub["id"]] for stub in npc_stubs],
+        "locations": locations,
+        "npcs": npcs,
         "warnings": warnings,
     }
