@@ -110,3 +110,121 @@ def test_chariot_regression_replaces_movie_quote_outline_npcs(monkeypatch):
     warning_blob = " ".join(result.get("warnings") or []).lower()
     assert "non-player characters" in warning_blob
     assert "stat block" in warning_blob
+
+
+def test_generic_npc_section_without_full_name_keeps_llm_outline(monkeypatch):
+    """Caps NAME, ROLE lines without FULL NAME must not replace the LLM outline."""
+    text = """NON-PLAYER CHARACTERS
+
+JOHN SMITH, GUARD
+A town guard on patrol.
+
+JANE DOE, MERCHANT
+Runs the general store.
+
+BOB JONES, INNKEEPER
+Owns the tavern.
+"""
+    outline = {
+        "campaign": {
+            "campaign_id": "test_campaign",
+            "name": "Test Campaign",
+            "description": "A generic module",
+        },
+        "locations": [{"id": "tavern", "name": "Tavern", "type": "building"}],
+        "npcs": [
+            {
+                "name": "Archdeacon Verity-9",
+                "role": "priest",
+                "first_location_id": "tavern",
+            },
+        ],
+    }
+
+    def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step):
+        if step == "outline":
+            return outline
+        if step == "location detail":
+            return {"locations": []}
+        if step == "npc detail":
+            return {"npcs": []}
+        return {}
+
+    monkeypatch.setattr(content_import, "_call_llm_json", fake_call_llm_json)
+
+    result = content_import.analyze_campaign_document(text, "create_new")
+    names = {npc["name"] for npc in result["npcs"]}
+    assert "Archdeacon Verity-9" in names
+    assert result["npcs"][0]["id"] == "archdeacon_verity_9"
+
+
+def test_merge_mode_skips_existing_npcs_from_stat_blocks(monkeypatch):
+    """Merge must not re-import NPCs already present in the campaign."""
+    text = _load_chariot_fixture()
+    outline = {
+        "campaign": {
+            "campaign_id": "chariot_of_the_gods",
+            "name": "Chariot of the Gods",
+            "description": "ALIEN RPG scenario",
+        },
+        "locations": [{"id": "uscss_cronus", "name": "USCSS Cronus", "type": "building"}],
+        "npcs": [],
+    }
+
+    def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step):
+        if step == "outline":
+            return outline
+        if step == "location detail":
+            return {"locations": []}
+        if step == "npc detail":
+            return {"npcs": []}
+        return {}
+
+    monkeypatch.setattr(content_import, "_call_llm_json", fake_call_llm_json)
+
+    result = content_import.analyze_campaign_document(
+        text,
+        "merge",
+        existing_campaign_id="chariot_of_the_gods",
+        existing_location_ids=["uscss_cronus"],
+        existing_npc_names=["Albert Johns", "Valerie Reid"],
+    )
+    names = {npc["name"] for npc in result["npcs"]}
+    assert "Albert Johns" not in names
+    assert "Valerie Reid" not in names
+    assert "Liam Flynn" in names
+
+
+def test_location_hints_resolve_existing_campaign_locations(monkeypatch):
+    """Stat-block location hints should match ids from existing_location_ids."""
+    text = _load_chariot_fixture()
+    outline = {
+        "campaign": {
+            "campaign_id": "chariot_of_the_gods",
+            "name": "Chariot of the Gods",
+            "description": "ALIEN RPG scenario",
+        },
+        "locations": [],
+        "npcs": [],
+    }
+
+    def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step):
+        if step == "outline":
+            return outline
+        if step == "location detail":
+            return {"locations": []}
+        if step == "npc detail":
+            return {"npcs": []}
+        return {}
+
+    monkeypatch.setattr(content_import, "_call_llm_json", fake_call_llm_json)
+
+    result = content_import.analyze_campaign_document(
+        text,
+        "merge",
+        existing_campaign_id="chariot_of_the_gods",
+        existing_location_ids=["uscss_cronus", "sotillo"],
+        existing_npc_names=[],
+    )
+    by_name = {npc["name"]: npc for npc in result["npcs"]}
+    assert by_name["Albert Johns"]["location_id"] == "uscss_cronus"

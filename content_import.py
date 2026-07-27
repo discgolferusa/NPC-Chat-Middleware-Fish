@@ -240,11 +240,10 @@ def _extract_alien_rpg_stat_block_npcs(section_text: str) -> list[dict[str, str]
             descriptor = segment.split(",", 1)[1].strip() if "," in segment else ""
             window = "\n".join(lines[index : index + 30])
             full_name_match = re.search(r"FULL NAME:\s*(.+)", window)
-            display_name = (
-                full_name_match.group(1).strip()
-                if full_name_match
-                else short_name.title()
-            )
+            if not full_name_match:
+                # ALIEN RPG stat blocks always publish FULL NAME; skip generic headings.
+                continue
+            display_name = full_name_match.group(1).strip()
             name_key = display_name.casefold()
             if name_key in seen_names:
                 continue
@@ -260,7 +259,7 @@ def _extract_alien_rpg_stat_block_npcs(section_text: str) -> list[dict[str, str]
                     role = candidate
                     break
 
-            location_hint = "uscss_cronus"
+            location_hint = ""
             if re.search(r"\bSotillo\b", window, re.IGNORECASE):
                 location_hint = "sotillo"
             elif re.search(r"\bCronus\b", window, re.IGNORECASE):
@@ -338,14 +337,31 @@ def _npc_stubs_from_stat_blocks(
     return stubs
 
 
+def _npc_already_exists_in_campaign(
+    name: str,
+    *,
+    mode: str,
+    existing_npc_names: list[str],
+) -> bool:
+    if mode != "merge":
+        return False
+    key = name.casefold()
+    existing_name_keys = {n.casefold() for n in existing_npc_names if n}
+    existing_id_keys = {snake_case(n) for n in existing_npc_names if n}
+    base_id = snake_case(name)
+    return key in existing_name_keys or base_id in existing_id_keys
+
+
 def _merge_outline_npcs_with_stat_blocks(
     llm_npcs: list[dict[str, Any]],
     document_text: str,
     *,
+    mode: str,
+    existing_npc_names: list[str],
     location_ids: set[str],
     warnings: list[str],
 ) -> list[dict[str, Any]]:
-    """Prefer stat-block NPCs from NON-PLAYER CHARACTERS over LLM outline guesses."""
+    """Merge ALIEN RPG stat-block NPCs with outline stubs when confidently detected."""
     collapsed = _collapse_spaced_caps(document_text)
     span = _find_npc_section_span(collapsed)
     if span is None:
@@ -361,8 +377,27 @@ def _merge_outline_npcs_with_stat_blocks(
     if len(stat_stubs) < 3:
         return llm_npcs
 
+    filtered_stat_stubs: list[dict[str, Any]] = []
+    for stub in stat_stubs:
+        name = str(stub.get("name") or "").strip()
+        if not name:
+            continue
+        if _npc_already_exists_in_campaign(
+            name, mode=mode, existing_npc_names=existing_npc_names
+        ):
+            warnings.append(
+                f"NPC '{name}' already exists in the campaign; "
+                "reusing existing character and skipping stat-block regeneration."
+            )
+            continue
+        filtered_stat_stubs.append(stub)
+    stat_stubs = filtered_stat_stubs
+    if len(stat_stubs) < 3:
+        return llm_npcs
+
     stat_names = {stub["name"].casefold() for stub in stat_stubs}
     dropped: list[str] = []
+    kept_llm: list[dict[str, Any]] = []
     for npc in llm_npcs:
         name = str(npc.get("name") or "").strip()
         if not name:
@@ -375,6 +410,7 @@ def _merge_outline_npcs_with_stat_blocks(
         ):
             dropped.append(name)
             continue
+        kept_llm.append(npc)
 
     if dropped:
         warnings.append(
@@ -382,7 +418,7 @@ def _merge_outline_npcs_with_stat_blocks(
             + ", ".join(dropped)
         )
 
-    return stat_stubs
+    return kept_llm + stat_stubs
 
 
 _PRONOUN_OBJECTS: dict[str, dict[str, str]] = {
@@ -1194,23 +1230,16 @@ def analyze_campaign_document(
         warnings=warnings,
     )
 
-    location_ids = {loc["id"] for loc in location_stubs}
-    llm_npc_rows = [
-        {
-            "name": stub["name"],
-            "role": stub.get("role") or "",
-            "first_location_id": stub.get("first_location_id") or "",
-            "other_location_ids": stub.get("other_location_ids") or [],
-        }
-        for stub in npc_stubs
-    ]
-    merged_npc_rows = _merge_outline_npcs_with_stat_blocks(
-        llm_npc_rows,
+    existing_location_set = {snake_case(loc_id) for loc_id in existing_location_ids}
+    location_ids = {loc["id"] for loc in location_stubs} | existing_location_set
+    npc_stubs = _merge_outline_npcs_with_stat_blocks(
+        npc_stubs,
         document_text,
+        mode=mode,
+        existing_npc_names=existing_npc_names,
         location_ids=location_ids,
         warnings=warnings,
     )
-    npc_stubs = merged_npc_rows
 
     locations_by_id: dict[str, dict[str, Any]] = {}
     for batch in _batches(location_stubs, MAX_LOCATIONS_PER_BATCH):
