@@ -212,16 +212,28 @@ def _load_secrets_file() -> None:
         print(f"[LLM] failed to read secrets file: {ex}", flush=True)
 
 
-def _resolve_model_id(model_id: str | None, *, default: str = "local") -> str:
-    """Map retired catalog ids onto current Groq production models."""
-    candidate = str(model_id or "").strip() or default
+def _alias_model_id(model_id: str | None) -> str:
+    """Follow retired-model aliases only. Does not invent a fallback catalog id."""
+    candidate = str(model_id or "").strip()
+    if not candidate:
+        return ""
     seen: set[str] = set()
     while candidate in DEPRECATED_MODEL_ALIASES and candidate not in seen:
         seen.add(candidate)
         candidate = DEPRECATED_MODEL_ALIASES[candidate]
+    return candidate
+
+
+def _resolve_model_id(model_id: str | None, *, default: str = "local") -> str:
+    """Map retired catalog ids onto current models, else fall back to default."""
+    candidate = _alias_model_id(model_id)
+    if not candidate:
+        candidate = default
     if candidate in LLM_MODELS:
         return candidate
-    return default if default in LLM_MODELS else "local"
+    if default in LLM_MODELS:
+        return default
+    return "local"
 
 
 def _load_runtime_config() -> None:
@@ -1170,8 +1182,8 @@ def select_llm_model(
     purpose = _normalize_purpose(purpose)
 
     if model_id not in LLM_MODELS:
-        remapped = _resolve_model_id(model_id, default="")
-        if remapped and remapped in LLM_MODELS:
+        remapped = _alias_model_id(model_id)
+        if remapped in LLM_MODELS:
             print(f"[LLM] select remapped retired model {model_id!r} -> {remapped!r}", flush=True)
             model_id = remapped
         else:
