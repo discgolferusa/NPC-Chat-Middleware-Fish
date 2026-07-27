@@ -847,7 +847,7 @@ def _truncate_input(text: str, warnings: list[str]) -> str:
         raise ContentImportError(
             "The content creation model's Groq tokens-per-minute budget is too small "
             "for document import (completion reserve fills the limit). Switch content "
-            "creation to a higher-TPM model such as groq-llama-4-scout in Admin → LLM, "
+            "creation to a higher-TPM Groq model such as groq-llama-3.3-70b in Admin → LLM, "
             "or wait a minute if recent usage exhausted the budget. "
             "If you use local llama.cpp, set content_creation provider mode to 'local' "
             "so import is not pre-truncated for Groq TPM."
