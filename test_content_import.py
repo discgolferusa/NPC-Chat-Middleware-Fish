@@ -603,6 +603,18 @@ def test_detail_location_batch_does_not_sparse_retry(monkeypatch):
     assert any("fell back" in w.lower() for w in result["warnings"])
 
 
+def test_detail_npc_batch_rejects_oversized_batch():
+    with pytest.raises(content_import.ContentImportError, match="at most"):
+        content_import.detail_npc_batch(
+            "NON-PLAYER CHARACTERS\nFULL NAME: A",
+            {"campaign_id": "c", "name": "C"},
+            [
+                {"id": "a", "name": "A", "role": "x", "first_location_id": "loc"},
+                {"id": "b", "name": "B", "role": "y", "first_location_id": "loc"},
+            ],
+        )
+
+
 def test_normalize_campaign_meta_preserves_merge_campaign_id():
     meta = content_import._normalize_campaign_meta(
         {"campaign_id": "MultiTest", "name": "Multi Test", "description": ""}
