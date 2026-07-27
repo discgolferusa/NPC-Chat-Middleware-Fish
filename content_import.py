@@ -8,27 +8,17 @@ structured dicts (shaped like the campaign/location/npc YAML schemas used
 elsewhere in this repo) for the caller to review and persist.
 
 Pipeline:
-  1. Outline pass — one LLM call that reads the whole document and proposes
-     the campaign, a location list, and an NPC list (name/role/locations).
-     Skipped when recoverable published RPG stat blocks are present (names are
-     seeded deterministically); location/NPC detail sweeps still run.
-     Exposed as ``outline_campaign_document`` / ``POST /content/import/outline``.
-  2. Location detail pass — small batches (<= MAX_LOCATIONS_PER_BATCH) using
-     name-focused source excerpts; extract-over-invent; retry if sparse.
-     Exposed as ``detail_location_batch`` / ``POST /content/import/location-details``.
-  3. NPC detail pass — one NPC per call with name-focused excerpts; maps
-     NPCNarrator section headers and published RPG stat blocks (e.g. ALIEN RPG
-     FULL NAME / PERSONAL AGENDA) into voice/personality/facts/secrets/llm_rules;
-     retry if sparse. PERSONALITY / PERSONAL AGENDA seeds are a fallback only.
-     Exposed as ``detail_npc_batch`` / ``POST /content/import/npc-details``.
+  1. Outline pass — one LLM call (or ALIEN FULL NAME stub seeding when recoverable
+     published stat blocks are present). Exposed as ``outline_campaign_document``.
+  2. Location detail — format-agnostic LLM extraction from name-focused excerpts.
+     One call per Funnel hop; editor retries sparse results as a separate hop, then
+     may request ``allow_seed_fallback``.
+  3. NPC detail — same pattern. Layout examples (labeled writeups, FULL NAME blocks,
+     trait grids + bios) are described generically so new RPG lines do not need
+     dedicated parsers. Deterministic excerpt seeding is last-resort only.
 
-``analyze_campaign_document`` / ``POST /content/import/analyze`` still orchestrates
-all three passes for local/dev callers. Production Yaml Editor should call the
-chunked endpoints so Tailscale Funnel is not holding one HTTP request across
-every LLM pass.
-
-When a NON-PLAYER CHARACTERS section is detected, stat-block names override
-bad LLM outline guesses (see test_content_import.py / Chariot of the Gods).
+``analyze_campaign_document`` orchestrates outline + detail (+ local retry/seed)
+for local/dev. Production Yaml Editor drives chunked Funnel hops.
 """
 
 from __future__ import annotations
@@ -1547,11 +1537,34 @@ def _normalize_outline(
 # --------------------------------------------------------------------------
 
 
-def _build_location_detail_prompt(batch: list[dict[str, Any]], text: str, campaign: dict[str, Any]) -> str:
+def _build_location_detail_prompt(
+    batch: list[dict[str, Any]],
+    text: str,
+    campaign: dict[str, Any],
+    *,
+    is_retry: bool = False,
+) -> str:
     location_list = "\n".join(f"- id: {loc['id']} | name: {loc['name']} | type: {loc['type']}" for loc in batch)
+    retry_note = ""
+    if is_retry:
+        retry_note = (
+            "RETRY: A previous pass returned little or nothing useful for this location. "
+            "Read the excerpts again carefully and fill every field you can support from the text.\n\n"
+        )
     return (
         f'Campaign: "{campaign["name"]}" ({campaign["campaign_id"]}).\n\n'
-        "Fill in details for EACH location below from the SOURCE EXCERPTS. "
+        f"{retry_note}"
+        "Fill in details for EACH location below from the SOURCE EXCERPTS only.\n"
+        "Modules use many layouts — room-by-room keys, ship deck notes, scene boxed text, "
+        "faction writeups, maps with captions, or free prose. Do not assume one game's headings.\n\n"
+        "How to read unfamiliar layouts:\n"
+        "- Treat nearby headings, bullets, boxed text, and captions as belonging to this place "
+        "when they clearly describe it.\n"
+        "- Sensory description, hazards, who is present, and what is going on → summary / "
+        "current_events / local_tone.\n"
+        "- Named sub-areas, rooms, decks, or landmarks → important_locations.\n"
+        "- Gossip, hearsay, or uncertain talk → rumors.\n"
+        "- What locals or visitors typically know or must not know → knowledge_rules.\n\n"
         'Respond with exactly {"locations": [ ... ]} where each item has this shape:\n\n'
         "{\n"
         '  "id": "<exact id from the list below>",\n'
@@ -1567,7 +1580,6 @@ def _build_location_detail_prompt(batch: list[dict[str, Any]], text: str, campai
         "CRITICAL EXTRACTION RULES:\n"
         "- Prefer copying concrete names, objects, factions, and plot facts from the source.\n"
         "- Do NOT invent major plot facts. If a field has no source support, use [] or \"\".\n"
-        "- If the source uses section headers (Appearance, Green Line, etc.), mine them for this location.\n"
         "- Keep fidelity high: longer accurate lists beat short generic ones.\n\n"
         "Locations to fill in:\n"
         f"{location_list}\n\n"
@@ -1612,7 +1624,13 @@ def _merge_location_detail(stub: dict[str, Any], detail: dict[str, Any], campaig
 # --------------------------------------------------------------------------
 
 
-def _build_npc_detail_prompt(batch: list[dict[str, Any]], text: str, campaign: dict[str, Any]) -> str:
+def _build_npc_detail_prompt(
+    batch: list[dict[str, Any]],
+    text: str,
+    campaign: dict[str, Any],
+    *,
+    is_retry: bool = False,
+) -> str:
     npc_lines = []
     for npc in batch:
         locations_note = npc["first_location_id"]
@@ -1624,27 +1642,34 @@ def _build_npc_detail_prompt(batch: list[dict[str, Any]], text: str, campaign: d
         )
     npc_list = "\n".join(npc_lines)
 
+    retry_note = ""
+    if is_retry:
+        retry_note = (
+            "RETRY: A previous pass returned little or nothing useful for this NPC. "
+            "The excerpts below almost certainly contain usable personality, traits, or biography. "
+            "Extract every concrete beat you can; do not return empty lists if the text has substance.\n\n"
+        )
+
     return (
         f'Campaign: "{campaign["name"]}" ({campaign["campaign_id"]}).\n\n'
-        "Fill in roleplay details for EACH NPC below from the SOURCE EXCERPTS. "
-        "These excerpts often come from NPCNarrator-ready writeups or published RPG "
-        "stat blocks. Map section headers into fields when present:\n"
-        "- Role → keep/refine role (already provided on the stub; do not blank it)\n"
-        "- Appearance → public_facts and/or personality cues\n"
-        "- Voice Direction → voice (short delivery traits) AND llm_rules about speech style\n"
-        "- Personality and Motivation / Goals → personality + known_facts + llm_rules\n"
-        "- PERSONALITY / PERSONAL AGENDA (ALIEN RPG modules) → personality + known_facts + llm_rules\n"
-        "- TRAITS (Doctor Who / Cubicle 7 modules: Selfish, Brave, Friends, Tough, etc.) → "
-        "each trait name+description becomes personality and an llm_rule\n"
-        "- SKILLS / attributes near a named NPC → optional known_facts (do not invent scores)\n"
-        "- Prose biography after TECH LEVEL / STORY POINTS → public_facts + known_facts + "
-        "personality; copy concrete wording\n"
-        "- BUDDY / RIVAL (ALIEN RPG) → llm_rules about relationships\n"
-        "- What the NPC Knows → known_facts (one bullet per distinct fact)\n"
-        "- What the NPC Hides → secrets\n"
-        "- Initial Attitude and Development / Breaking Point → llm_rules\n"
-        "- NPCNarrator Memory Triggers → llm_rules (remember X when players do Y)\n"
-        "- Sample Dialogue → optional llm_rules quoting tone; do not dump every line\n\n"
+        f"{retry_note}"
+        "Fill in roleplay details for EACH NPC below from the SOURCE EXCERPTS only.\n"
+        "Published modules and GM notes use many layouts. Do not require a particular game's "
+        "section titles. Recognize these common shapes when they appear (examples, not a checklist):\n"
+        "- Labeled writeups (Appearance, Voice, Personality, Goals, What they know/hide, "
+        "Attitude, Memory triggers, sample dialogue).\n"
+        "- Compact stat blocks with FULL NAME / role lines and PERSONALITY or agenda lines.\n"
+        "- Attribute/skill grids followed by TRAITS (Name: description) and a prose biography.\n"
+        "- Free prose paragraphs that open with the character's name.\n\n"
+        "Field mapping (layout-agnostic):\n"
+        "- Keep/refine role from the stub; do not blank it.\n"
+        "- Motives, temperament, labeled traits, agendas → personality and llm_rules.\n"
+        "- Appearance, public reputation, social role → public_facts.\n"
+        "- What this NPC knows, plans, or can share → known_facts.\n"
+        "- What they conceal → secrets.\n"
+        "- How they speak or behave in play → voice and llm_rules.\n"
+        "- Relationship hooks (allies, rivals, who they protect) → llm_rules.\n"
+        "- Attribute/skill numbers are optional; prefer roleplay substance over statting.\n\n"
         'Respond with exactly {"npcs": [ ... ]} where each array item has this shape:\n\n'
         "{\n"
         '  "id": "<exact id from the list below>",\n'
@@ -1652,19 +1677,18 @@ def _build_npc_detail_prompt(batch: list[dict[str, Any]], text: str, campaign: d
         '"possessive_pronoun":"hers","reflexive":"herself"},\n'
         '  "race": "species/ancestry if stated, else \\"unknown\\"",\n'
         '  "gender": "male|female|nonbinary|unspecified",\n'
-        '  "voice": ["short spoken-delivery traits from Voice Direction, e.g. quiet, compassionate, controlled"],\n'
-        '  "personality": ["traits and motives from Personality/Motivation; include all distinct ones"],\n'
+        '  "voice": ["short spoken-delivery traits"],\n'
+        '  "personality": ["distinct traits and motives from the source"],\n'
         '  "public_facts": ["appearance and reputation others can observe or commonly know"],\n'
-        '  "known_facts": ["EVERY distinct item from What the NPC Knows / Goals the NPC is pursuing"],\n'
-        '  "secrets": ["EVERY distinct item from What the NPC Hides"],\n'
-        '  "llm_rules": ["behavioral rules from Attitude, Development, Memory Triggers, Breaking Point, '
-        'and Voice Direction; include all actionable guidance"]\n'
+        '  "known_facts": ["what THIS NPC knows / is pursuing"],\n'
+        '  "secrets": ["what THIS NPC will not willingly reveal"],\n'
+        '  "llm_rules": ["actionable play guidance from the source"]\n'
         "}\n\n"
         "CRITICAL EXTRACTION RULES:\n"
         "- EXTRACT over invent. Copy concrete facts from the source; do not replace them with generics.\n"
         "- Empty lists only when the source truly has nothing for that field.\n"
         "- If the source says she/her (or uses she/her language), pronouns and gender must match.\n"
-        "- public_facts = what OTHER characters already know or can see (appearance, public role).\n"
+        "- public_facts = what OTHER characters already know or can see.\n"
         "- known_facts = what THIS NPC knows and may share.\n"
         "- secrets = what THIS NPC will not willingly reveal.\n"
         "- If secrets is non-empty, include at least one llm_rule of this exact form: "
@@ -1750,12 +1774,14 @@ def _fetch_location_details(
     document_text: str,
     campaign: dict[str, Any],
     warnings: list[str],
+    *,
+    is_retry: bool = False,
 ) -> dict[str, dict[str, Any]]:
     needles: list[str] = []
     for loc in batch:
         needles.extend(_distinctive_name_needles(loc["name"], loc["id"]))
     excerpt = _relevant_excerpts(document_text, needles)
-    prompt = _build_location_detail_prompt(batch, excerpt, campaign)
+    prompt = _build_location_detail_prompt(batch, excerpt, campaign, is_retry=is_retry)
     try:
         detail_raw = _call_llm_json(_SYSTEM_PROMPT, prompt, warnings=warnings, step="location detail")
         detail_items = _coerce_container(detail_raw, "locations")
@@ -1770,12 +1796,14 @@ def _fetch_npc_details(
     document_text: str,
     campaign: dict[str, Any],
     warnings: list[str],
+    *,
+    is_retry: bool = False,
 ) -> dict[str, dict[str, Any]]:
     needles: list[str] = []
     for npc in batch:
         needles.extend(_distinctive_name_needles(npc["name"], npc["id"]))
     excerpt = _relevant_excerpts(document_text, needles)
-    prompt = _build_npc_detail_prompt(batch, excerpt, campaign)
+    prompt = _build_npc_detail_prompt(batch, excerpt, campaign, is_retry=is_retry)
     try:
         detail_raw = _call_llm_json(_SYSTEM_PROMPT, prompt, warnings=warnings, step="npc detail")
         detail_items = _coerce_container(detail_raw, "npcs")
@@ -1980,8 +2008,15 @@ def detail_location_batch(
     text: str,
     campaign: dict[str, Any],
     location_stubs: list[dict[str, Any]],
+    *,
+    is_retry: bool = False,
+    allow_seed_fallback: bool = False,
 ) -> dict[str, Any]:
-    """Pass 2: fill one location batch from document excerpts."""
+    """Pass 2: fill one location batch from document excerpts.
+
+    One LLM call per Funnel hop. Editor should retry with ``is_retry=True`` when
+    sparse; only pass ``allow_seed_fallback=True`` after LLM retries are exhausted.
+    """
     warnings: list[str] = []
     if not text or not text.strip():
         raise ContentImportError("No document text provided")
@@ -1995,22 +2030,26 @@ def detail_location_batch(
         )
 
     details_by_id: dict[str, dict[str, Any]] = {}
-    details_by_id.update(_fetch_location_details(batch, text, campaign, warnings))
-    # One LLM call per Funnel hop — do not sparse-retry here. Retries stacked with
-    # CONTENT_CREATION_LOCAL_TIMEOUT_SECONDS and blew past the editor hop budget.
+    details_by_id.update(
+        _fetch_location_details(batch, text, campaign, warnings, is_retry=is_retry)
+    )
     for stub in batch:
         detail = details_by_id.get(stub["id"], {})
-        if _location_detail_is_sparse(detail):
+        if _location_detail_is_sparse(detail) and allow_seed_fallback:
             if stub.get("seeded_from_stat_blocks"):
                 details_by_id[stub["id"]] = _location_detail_from_seed(stub)
                 warnings.append(
-                    f"Location '{stub['id']}': detail sparse; fell back to "
-                    "stat-block location stub defaults."
+                    f"Location '{stub['id']}': detail sparse after LLM; fell back to "
+                    "minimal location stub defaults."
                 )
             elif not detail:
                 warnings.append(
                     f"Location '{stub['id']}': no detail returned; using minimal defaults."
                 )
+        elif _location_detail_is_sparse(detail) and not detail:
+            warnings.append(
+                f"Location '{stub['id']}': LLM detail sparse (editor may retry this hop)."
+            )
 
     locations = [
         _merge_location_detail(stub, details_by_id.get(stub["id"], {}), campaign["campaign_id"])
@@ -2023,8 +2062,16 @@ def detail_npc_batch(
     text: str,
     campaign: dict[str, Any],
     npc_stubs: list[dict[str, Any]],
+    *,
+    is_retry: bool = False,
+    allow_seed_fallback: bool = False,
 ) -> dict[str, Any]:
-    """Pass 3: fill one NPC batch from document excerpts."""
+    """Pass 3: fill one NPC batch from document excerpts.
+
+    One LLM call per Funnel hop. Prefer editor-driven retries over in-hop seeds.
+    ``allow_seed_fallback`` enables last-resort ALIEN stub seeds or generic
+    excerpt seeding only after LLM hops have failed.
+    """
     warnings: list[str] = []
     if not text or not text.strip():
         raise ContentImportError("No document text provided")
@@ -2038,35 +2085,43 @@ def detail_npc_batch(
         )
 
     details_by_id: dict[str, dict[str, Any]] = {}
-    details_by_id.update(_fetch_npc_details(batch, text, campaign, warnings))
-    # One LLM call per Funnel hop — sparse seed fallback only, no second LLM retry.
+    details_by_id.update(
+        _fetch_npc_details(batch, text, campaign, warnings, is_retry=is_retry)
+    )
     for stub in batch:
         detail = details_by_id.get(stub["id"], {})
-        if _npc_detail_is_sparse(detail):
+        if not _npc_detail_is_sparse(detail):
+            continue
+        if allow_seed_fallback:
             if _npc_stub_has_stat_seed(stub):
                 details_by_id[stub["id"]] = _npc_detail_from_stat_seed(stub)
                 warnings.append(
-                    f"NPC '{stub['id']}': detail sparse; fell back to "
+                    f"NPC '{stub['id']}': detail sparse after LLM; fell back to "
                     "PERSONALITY / PERSONAL AGENDA from the stat block."
                 )
-            else:
-                seeded = _seed_npc_detail_from_document(
-                    str(stub.get("name") or ""),
-                    str(stub.get("role") or ""),
-                    text,
+                continue
+            seeded = _seed_npc_detail_from_document(
+                str(stub.get("name") or ""),
+                str(stub.get("role") or ""),
+                text,
+            )
+            if seeded is not None:
+                details_by_id[stub["id"]] = seeded
+                warnings.append(
+                    f"NPC '{stub['id']}': detail sparse after LLM; seeded from "
+                    "document excerpts as a last resort."
                 )
-                if seeded is not None:
-                    details_by_id[stub["id"]] = seeded
-                    warnings.append(
-                        f"NPC '{stub['id']}': detail sparse; seeded from TRAITS/bio "
-                        "excerpts in the source document."
-                    )
-                elif not detail:
-                    warnings.append(
-                        f"NPC '{stub['id']}': no detail returned; using minimal defaults. "
-                        "Local small models often need content_creation set to Groq or a "
-                        "stronger local model for dense NPC writeups."
-                    )
+                continue
+            if not detail:
+                warnings.append(
+                    f"NPC '{stub['id']}': no detail returned; using minimal defaults. "
+                    "Local small models often need content_creation set to Groq or a "
+                    "stronger local model for dense NPC writeups."
+                )
+        elif not detail:
+            warnings.append(
+                f"NPC '{stub['id']}': LLM detail sparse (editor may retry this hop)."
+            )
 
     npcs = [
         _merge_npc_detail(
@@ -2110,12 +2165,24 @@ def analyze_campaign_document(
     locations: list[dict[str, Any]] = []
     for batch in _batches(location_stubs, MAX_LOCATIONS_PER_BATCH):
         result = detail_location_batch(text, campaign, batch)
+        if any(_location_detail_is_sparse(loc) for loc in (result.get("locations") or [])):
+            result = detail_location_batch(text, campaign, batch, is_retry=True)
+        if any(_location_detail_is_sparse(loc) for loc in (result.get("locations") or [])):
+            result = detail_location_batch(
+                text, campaign, batch, is_retry=True, allow_seed_fallback=True
+            )
         warnings.extend(result.get("warnings") or [])
         locations.extend(result.get("locations") or [])
 
     npcs: list[dict[str, Any]] = []
     for batch in _batches(npc_stubs, MAX_NPCS_PER_BATCH):
         result = detail_npc_batch(text, campaign, batch)
+        if any(_npc_detail_is_sparse(npc) for npc in (result.get("npcs") or [])):
+            result = detail_npc_batch(text, campaign, batch, is_retry=True)
+        if any(_npc_detail_is_sparse(npc) for npc in (result.get("npcs") or [])):
+            result = detail_npc_batch(
+                text, campaign, batch, is_retry=True, allow_seed_fallback=True
+            )
         warnings.extend(result.get("warnings") or [])
         npcs.extend(result.get("npcs") or [])
 

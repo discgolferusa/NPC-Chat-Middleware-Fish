@@ -3232,7 +3232,13 @@ def content_import_location_details():
         return jsonify({"error": "locations must be a non-empty list"}), 400
 
     try:
-        result = detail_location_batch(text, campaign, locations)
+        result = detail_location_batch(
+            text,
+            campaign,
+            locations,
+            is_retry=bool(body.get("retry") or body.get("is_retry")),
+            allow_seed_fallback=bool(body.get("allow_seed_fallback")),
+        )
         return jsonify(result)
     except ContentImportError as ex:
         print(f"[CONTENT-IMPORT] location-details rejected: {ex}", flush=True)
@@ -3260,7 +3266,13 @@ def content_import_npc_details():
         return jsonify({"error": "npcs must be a non-empty list"}), 400
 
     try:
-        result = detail_npc_batch(text, campaign, npcs)
+        result = detail_npc_batch(
+            text,
+            campaign,
+            npcs,
+            is_retry=bool(body.get("retry") or body.get("is_retry")),
+            allow_seed_fallback=bool(body.get("allow_seed_fallback")),
+        )
         return jsonify(result)
     except ContentImportError as ex:
         print(f"[CONTENT-IMPORT] npc-details rejected: {ex}", flush=True)
