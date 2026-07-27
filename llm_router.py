@@ -664,21 +664,26 @@ def _fit_messages_to_local_context(
     messages: list[dict[str, Any]],
     max_completion_tokens: int,
 ) -> tuple[list[dict[str, Any]], int]:
-    """Shrink the largest message so prompt + completion fits LOCAL_LLM_CONTEXT_TOKENS."""
+    """Shrink the largest message so prompt + completion fits LOCAL_LLM_CONTEXT_TOKENS.
+
+    Preserves the caller's requested ``max_completion_tokens`` as a ceiling (so chat
+    stays at 180, import can keep thousands). While shrinking an oversized prompt,
+    reserves room for that completion; after the prompt fits, recomputes completion
+    from remaining context so it is not stuck at a temporary floor.
+    """
     slack = 128
     fitted = [dict(m) for m in messages]
-    prompt_tokens = _estimate_prompt_tokens(fitted)
-    max_completion = min(
-        max(256, max_completion_tokens),
-        max(256, LOCAL_LLM_CONTEXT_TOKENS - prompt_tokens - slack),
-    )
+    requested = max(1, int(max_completion_tokens))
+    # Leave some prompt room even when the caller asks for a huge completion.
+    reserve = min(requested, max(1, LOCAL_LLM_CONTEXT_TOKENS - slack - 256))
+    max_prompt_tokens = LOCAL_LLM_CONTEXT_TOKENS - reserve - slack
 
-    max_prompt_tokens = LOCAL_LLM_CONTEXT_TOKENS - max_completion - slack
     longest_idx = max(
         range(len(fitted)),
         key=lambda i: len(str(fitted[i].get("content") or "")),
         default=0,
     )
+    prompt_tokens = _estimate_prompt_tokens(fitted)
     while prompt_tokens > max_prompt_tokens and len(fitted) > 0:
         content = str(fitted[longest_idx].get("content") or "")
         if len(content) < 400:
@@ -689,20 +694,37 @@ def _fit_messages_to_local_context(
             "content": trimmed + "\n\n[... truncated to fit local model context ...]",
         }
         prompt_tokens = _estimate_prompt_tokens(fitted)
-        max_completion = min(
-            max_completion,
-            max(256, LOCAL_LLM_CONTEXT_TOKENS - prompt_tokens - slack),
-        )
-        max_prompt_tokens = LOCAL_LLM_CONTEXT_TOKENS - max_completion - slack
 
+    available = LOCAL_LLM_CONTEXT_TOKENS - prompt_tokens - slack
+    max_completion = max(1, min(requested, available))
     return fitted, max_completion
+
+
+def content_creation_zero_budget_error_message() -> str:
+    """User-facing reason when ``content_creation_max_input_chars`` returns 0."""
+    model_id = CONTENT_CREATION_MODEL_ID
+    provider_mode = CONTENT_CREATION_PROVIDER_MODE
+    if provider_mode == "local" or model_id == "local":
+        return (
+            f"Local llama.cpp context is too small for document import "
+            f"(LOCAL_LLM_CONTEXT_TOKENS={LOCAL_LLM_CONTEXT_TOKENS}). "
+            "Raise llama-server -c / --ctx-size and set LOCAL_LLM_CONTEXT_TOKENS to match, "
+            "or switch content_creation to Groq in Admin → LLM."
+        )
+    return (
+        "The content creation model's Groq tokens-per-minute budget is too small "
+        "for document import (completion reserve fills the limit). Switch content "
+        "creation to a higher-TPM Groq model such as groq-llama-3.3-70b in Admin → LLM, "
+        "or wait a minute if recent usage exhausted the budget."
+    )
 
 
 def content_creation_max_input_chars() -> int:
     """Chars of document body that fit the content_creation model's current budget.
 
-    Returns 0 when a strict-Groq setup cannot fit a minimal import request.
-    For local / groq_with_local_fallback, do NOT pre-truncate using Groq TPM —
+    Returns 0 when a strict-Groq setup cannot fit a minimal import request, or when
+    local n_ctx / LOCAL_LLM_CONTEXT_TOKENS is too tight for import.
+    For groq_with_local_fallback, do NOT pre-truncate using Groq TPM —
     otherwise Groq limit failures fall back to local with a head-chopped document
     and NPC/location sections later in the file are invisible to the local model.
     """

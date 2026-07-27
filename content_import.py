@@ -27,8 +27,12 @@ import json
 import re
 from typing import Any
 
-from llm_router import content_creation_max_input_chars, generate_llm_response
-from llm_router import LLMProviderError
+from llm_router import (
+    LLMProviderError,
+    content_creation_max_input_chars,
+    content_creation_zero_budget_error_message,
+    generate_llm_response,
+)
 
 MAX_INPUT_CHARS = 120_000
 # Small batches: local 8B models (and Groq fallbacks) often return empty/partial JSON
@@ -1141,14 +1145,7 @@ def _truncate_input(text: str, warnings: list[str]) -> str:
     # 0 means this model cannot host an import request at all right now.
     max_chars = content_creation_max_input_chars()
     if max_chars <= 0:
-        raise ContentImportError(
-            "The content creation model's Groq tokens-per-minute budget is too small "
-            "for document import (completion reserve fills the limit). Switch content "
-            "creation to a higher-TPM Groq model such as groq-llama-3.3-70b in Admin → LLM, "
-            "or wait a minute if recent usage exhausted the budget. "
-            "If you use local llama.cpp, set content_creation provider mode to 'local' "
-            "so import is not pre-truncated for Groq TPM."
-        )
+        raise ContentImportError(content_creation_zero_budget_error_message())
     max_chars = min(MAX_INPUT_CHARS, max_chars)
     if len(text) > max_chars:
         warnings.append(
