@@ -62,9 +62,10 @@ _NPC_SECTION_END_PATTERN = re.compile(
     r"(?:^|\n)\s*(?:auxiliary\s+vehicles|(?:the\s+)?deck\s+plans)\b",
     re.IGNORECASE,
 )
-# Mid-prose "Appendix I on page 38" must NOT end the NPC section (PdfPig two-column glue).
+# Whole-line headers only. Group the alternation so ^ and $ apply to every option;
+# mid-prose "Appendix I on page 38." must not match.
 _NPC_SECTION_HEADER_END_PATTERN = re.compile(
-    r"(?im)^\s*(APPENDIX(?:\s+[A-Z0-9]+)?)|(INDEX)|(MAPS?)\s*$",
+    r"(?im)^\s*(?:APPENDIX(?:\s+[A-Z0-9]+)?|INDEX|MAPS?)\s*$",
 )
 _STAT_BLOCK_HEADING = re.compile(
     r"^([A-Z][A-Z0-9][A-Z0-9 '\-]*?)\s*,\s*([A-Z][A-Z0-9][A-Z0-9 '\-/]*)$",
@@ -255,13 +256,15 @@ def _find_npc_section_span(collapsed_text: str) -> tuple[int, int] | None:
     start = match.start()
     remainder = collapsed_text[match.end() :]
     end = len(collapsed_text)
+    hard_end: int | None = None
 
     end_match = _NPC_SECTION_END_PATTERN.search(remainder)
     if end_match:
-        end = match.end() + end_match.start()
+        hard_end = match.end() + end_match.start()
+        end = hard_end
 
-    # Only treat APPENDIX/INDEX/MAPS as section ends when they look like headers,
-    # not mid-sentence references like "Appendix I on page 38" glued by PdfPig.
+    # Only treat APPENDIX/INDEX/MAPS as section ends when the entire line is that
+    # header — not mid-sentence references like "Appendix I on page 38".
     for header_match in _NPC_SECTION_HEADER_END_PATTERN.finditer(remainder):
         abs_pos = match.end() + header_match.start()
         if abs_pos >= end:
@@ -271,22 +274,29 @@ def _find_npc_section_span(collapsed_text: str) -> tuple[int, int] | None:
         if line_end < 0:
             line_end = len(collapsed_text)
         line = collapsed_text[line_start:line_end].strip()
-        if len(line) <= 40:
+        # Regex already requires a whole-line header; keep the length guard as a
+        # belt-and-suspenders check against odd whitespace collapses.
+        if line and len(line) <= 40 and _NPC_SECTION_HEADER_END_PATTERN.match(line):
             end = min(end, line_start)
             break
 
     section = collapsed_text[start:end]
     # PdfPig two-column glue can trip an early false end after the first NPC.
-    # If we see too few FULL NAME markers, extend to the next hard end / cap.
+    # If we see too few FULL NAME markers, extend only to the next *hard* end
+    # (deck plans / auxiliary vehicles). Never blow past a known hard boundary
+    # with a blind start+20_000 window — that swallows following chapters when
+    # a legitimate module simply has fewer than three FULL NAME rows.
     if len(_FULL_NAME_ANY.findall(section)) < 3:
         hard = _NPC_SECTION_END_PATTERN.search(collapsed_text, start)
-        extended_end = hard.start() if hard else min(len(collapsed_text), start + 20_000)
-        if extended_end > end:
-            end = extended_end
-        # Still short? Keep a bounded window so we don't ingest the whole book.
-        section = collapsed_text[start:end]
-        if len(_FULL_NAME_ANY.findall(section)) < 3:
-            end = min(len(collapsed_text), start + 20_000)
+        if hard is not None:
+            hard_pos = hard.start()
+            if hard_pos > end:
+                end = hard_pos
+            # else: already at/before the hard end — keep it
+        elif hard_end is None:
+            # No hard boundary in the document; allow a bounded look-ahead only
+            # when we have not already locked onto deck-plans / auxiliary vehicles.
+            end = min(len(collapsed_text), max(end, start + 20_000))
 
     return start, end
 

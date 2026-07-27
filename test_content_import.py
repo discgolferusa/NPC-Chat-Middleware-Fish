@@ -54,6 +54,75 @@ def _load_chariot_pdfpig_fixture() -> str:
     return PDFPIG_FIXTURE_PATH.read_text(encoding="utf-8")
 
 
+def test_npc_section_header_end_pattern_is_whole_line_only():
+    assert content_import._NPC_SECTION_HEADER_END_PATTERN.match("APPENDIX I")
+    assert content_import._NPC_SECTION_HEADER_END_PATTERN.match("INDEX")
+    assert content_import._NPC_SECTION_HEADER_END_PATTERN.match("MAPS")
+    assert content_import._NPC_SECTION_HEADER_END_PATTERN.match("Appendix I on page 38.") is None
+    assert content_import._NPC_SECTION_HEADER_END_PATTERN.search(
+        "described in Appendix I on page 38. very good at giving orders."
+    ) is None
+    assert content_import._NPC_SECTION_HEADER_END_PATTERN.search(
+        "see the index for more NPCs listed elsewhere"
+    ) is None
+
+
+def test_mid_prose_appendix_does_not_end_npc_section():
+    """Short lines that mention Appendix mid-sentence must not truncate the span."""
+    text = """
+NON-PLAYER CHARACTERS
+JOHNS, OFFICER
+FULL NAME: Albert Johns
+PERSONALITY: Submissive. described in Appendix I on page 38. very good at giving orders.
+PERSONAL AGENDA: Find a leader.
+
+REID, COLONIAL MARINE
+FULL NAME: Valerie Reid
+PERSONALITY: On Edge
+PERSONAL AGENDA: Terminate threats.
+
+THE DECK PLANS
+Corridor map follows.
+"""
+    collapsed = content_import._collapse_spaced_caps(text)
+    span = content_import._find_npc_section_span(collapsed)
+    assert span is not None
+    section = collapsed[span[0] : span[1]]
+    assert "Albert Johns" in section
+    assert "Valerie Reid" in section
+    assert "THE DECK PLANS" not in section
+
+
+def test_small_npc_section_does_not_extend_past_deck_plans():
+    """Fewer than 3 FULL NAME rows must not swallow chapters after a hard end."""
+    text = """
+NON-PLAYER CHARACTERS
+JOHNS, OFFICER
+FULL NAME: Albert Johns
+PERSONALITY: Submissive
+PERSONAL AGENDA: Find a leader.
+
+REID, COLONIAL MARINE
+FULL NAME: Valerie Reid
+PERSONALITY: On Edge
+PERSONAL AGENDA: Terminate threats.
+
+THE DECK PLANS
+This chapter describes every corridor on the Cronus in great detail.
+FULL NAME: Should Not Be Imported
+Captain Miller warned David 8 that Miss Vickers would never approve.
+"""
+    collapsed = content_import._collapse_spaced_caps(text)
+    span = content_import._find_npc_section_span(collapsed)
+    assert span is not None
+    section = collapsed[span[0] : span[1]]
+    assert "Albert Johns" in section
+    assert "Valerie Reid" in section
+    assert "THE DECK PLANS" not in section
+    assert "Should Not Be Imported" not in section
+    assert "Captain Miller" not in section
+
+
 def test_chariot_pdfpig_extract_finds_all_stat_block_npcs():
     """PdfPig Y-grouped lines glue columns and mid-prose Appendix refs."""
     text = _load_chariot_pdfpig_fixture()
