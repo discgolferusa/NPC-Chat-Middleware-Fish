@@ -1,0 +1,314 @@
+CHARIOT OF THE GODS
+
+Sidebar quote: Captain Miller warned David 8 that Miss Vickers would never approve.
+
+o: Neomorphs (see page 292 of the 
+core rulebook) and Abominations, described in 
+Appendix I on page 38.
+Most of the Xeno morphs are birthed during 
+the course of the scenario, but some are al-
+ready on the Cronus when the PCs arrive:
+ T Neomorphic Egg Sacs at multiple locations 
+on the ship, ready to infect unwitting PCs.
+ T A vivisected Stage IV Abomination in the 
+Medlab (see page 24).
+ T A Stage IV Abomination hibernating in the 
+Reactor Control Room (see page 27).
+ T A Stage IV Abomination on the outer hull.
+ T Should you want to add some fuel to the 
+fire, you can add an adult Neomorph also 
+hibernating on the Cronus, stalking the PCs 
+as they arrive (see Events).
+All xeno morphs on the Cronus are considered 
+active in stealth mode at the start of the game, 
+except the Abominations.
+NON-PLAYER  
+CHARACTERS
+JOHNS, OFFICER
+Second Officer on the USCSS Cronus
+FULL NAME: Albert Johns
+AGE: 47
+PERSONALITY: Submissive
+Now the de facto Captain of the Cronus, Johns 
+has lost his edge. As someone who is really good 
+at making sure things get done, Johns is also not 
+very good at giving orders. He readily falls in as 
+second-in-command to whomever starts making 
+the hard choices needed to save lives.
+STRENGTH 4, AGILITY 3, WITS 3, EMPATHY 4
+HEALTH: 4
+SKILLS: Heavy Machinery 1, Stamina 2, 
+Ranged Combat 2, Piloting 2, Observation 2, 
+Command 1
+TALENT: Pull Rank
+GEAR: M4A3 Pistol (1 reload), key card
+PERSONAL AGENDA: Find a leader to follow 
+and help them to save human lives.
+BUDDY: –
+RIVAL: Clayton
+10  
+SCENARIO
+
+REID, COLONIAL MARINE FLYNN, MEDIC
+Security Officer on the USCSS Cronus
+FULL NAME: Valerie Reid
+AGE: 34
+PERSONALITY: On Edge
+An Outer Rim Defense Force veteran of the 
+Civil War on Torin Prime, the 1.50m Sgt. Reid 
+commanded the security team assigned to 
+protect the scientists aboard the Cronus. An 
+independent contractor, she was honorably 
+discharged from the ORDF and hired by Wey-
+land-Yutani. Reid lost an arm on Torin Prime, 
+but has a synthetic replacement. She saw a 
+lot of people under ORDF protection die on 
+LV-1113, and suffers from PTSD from both that 
+experience and the Civil War. People tend to 
+underestimate her because of her size.
+STRENGTH 5, AGILITY 4, WITS 2, EMPATHY 3
+HEALTH: 5
+SKILLS: Close Combat 3, Heavy Machinery 1, 
+Ranged Combat 3, Mobility 2, Command 1
+TALENT: Overkill
+GEAR: Armat 37A2 12 Shotgun (2 reloads)
+PERSONAL AGENDA: Terminate all threats to 
+the Cronus crew with extreme prejudice, no 
+matter the risks for you.
+BUDDY: Johns
+RIVAL: Flynn
+Ship Medic on the USCSS Cronus
+FULL NAME: Liam Flynn
+AGE: 27
+PERSONALITY: Fearful
+The ship’s remaining medical doctor, Flynn 
+was one of the junior scientists who helped 
+synthesize the derivative cure from the 26 
+Draconis Strain. Flynn suspects the cure isn’t 
+safe, but he would rather take the chance with 
+it than witness another Bloodburster birth. 
+The doctor is not willing to talk about what 
+happened on LV-1113, nor reveal what other 
+breakthroughs the scientific team achieved 
+before the Cronus left them behind. Flynn has 
+not informed anyone that the cure contains 
+the black goo within it.
+STRENGTH 2, AGILITY 3, WITS 4, EMPATHY 5
+HEALTH: 2
+SKILLS: Mobility 1, Observation 2, Comtech 2, 
+Manipulation 2, Medical Aid 3
+TALENT: Compassion
+GEAR: Personal Medkit, Surgical Kit
+PERSONAL AGENDA: Get out of this mess alive, 
+no matter what the cost or what lies you need 
+to tell.
+BUDDY: Cooper
+RIVAL: Reid
+ 11
+CHARIOT OF THE GODS
+
+COOPER, SCIENTIST CLAYTON, COMPANY AGENT
+Chief Scientist on the USCSS Cronus
+FULL NAME: Daniel Cooper
+AGE: 53
+PERSONALITY: Rational
+A scientist assigned to the Cronus, Professor 
+Cooper was infected by Neomorphic Motes 
+before he went into hypersleep. He knows that 
+the 26 Draconis Strain cure is derived from the 
+black goo, and feared it was unsafe. He nev-
+er took his inoculation, instead pocketing his 
+syringe and claiming he had administered the 
+shot to himself. Feeling sick before entering 
+stasis, Cooper quickly deteriorates upon regain-
+ing consciousness, complaining of immense 
+migraines before beginning to talk nonsense 
+and going into epileptic shock. See the “Mother 
+of all Migraines” event for his final fate.
+STRENGTH 2, AGILITY 3, WITS 5, EMPATHY 4
+HEALTH: 2
+SKILLS: Mobility 1, Observation 2, Comtech 3, 
+Manipulation 1, Medical Aid 3
+TALENT: Analyze
+GEAR: Personal data tablet
+PERSONAL AGENDA: To make sure the 26 
+Draconis Strain does not become a threat to 
+human civilization.
+BUDDY: Flynn
+RIVAL: Clayton
+Corporate Liaison on the USCSS Cronus
+FULL NAME: Lori Clayton
+AGE: 42
+PERSONALITY: Ruthless
+While cool on the surface, Clayton is seething 
+with rage over a life lost in cryosleep. Aware 
+that both Cooper and Flynn have invaluable 
+information and experience regarding the 
+scientific team's experiments on LV-1113, she 
+wants to bring both Flynn and a sample of the 
+26 Draconis Strain back to Weyland-Yutani for 
+a nice fat paycheck.
+NOTE that only Clayton has the codes to the 
+wall safe and the EEV in her quarters on Deck B 
+of the Cronus.
+STRENGTH 2, AGILITY 3, WITS 4, EMPATHY 5
+HEALTH: 2
+SKILLS: Ranged Combat 2, Mobility 1, 
+Observation 2, Command 2, Manipulation 3
+TALENT: Personal Safety
+GEAR: M4A3 Pistol (2 reloads), key card
+PERSONAL AGENDA: Bring both Flynn and a 
+sample of the 26 Draconis Strain back to Wey-
+land-Yutani for a nice fat paycheck—no matter 
+who you need to kill to get there.
+BUDDY: –
+RIVAL: Cooper
+12  
+SCENARIO
+
+AVA 6, SYNTHETIC BOLAJI, OFFICER
+Android on the USCSS Cronus
+AGE: Appears to be in her twenties
+PERSONALITY: Helpful
+Introduced by Weyland-Yutani at the be-
+ginning of the century and now long since 
+discontinued, Ava is the female-presenting 
+equivalent of the Walter series android. Con-
+sidered by the crew to be nothing more than a 
+machine, she was locked outside the cryodeck 
+in an attempt to maintain the ship despite its 
+Neomorph infestation. Damaged soon after-
+wards, she has wandered the ship in a daze for 
+decades. Ava believes in duty and service, and 
+always puts humankind before herself, even 
+when they do not deserve it.
+STRENGTH 5, AGILITY 6, WITS 5, EMPATHY 4
+HEALTH: 5
+SKILLS: Mobility 1, Stamina 2, Observation 2, 
+Comtech 3, Medical Aid 2
+GEAR: None
+PERSONAL AGENDA: Help the humans on the 
+Cronus survive, without regard to your own 
+safety.
+BUDDY: –
+RIVAL: –
+Captain of the Sotillo
+FULL NAME: Adisa Bolaji
+AGE: 30
+PERSONALITY: Resolute
+Awkward, tall, and gaunt, Bolaji isn’t your typi-
+cal criminal. Under contract from Seegson, the 
+captain is paid to harass Weyland-Yutani ships 
+on the Frontier. This pirating gig is a full time 
+job with benefits and paid vacation for him 
+and his entire crew, not to mention bonuses 
+for any unique hauls they might bring in. While 
+everything is business first, Bolaji also knows 
+that some things are too dangerous to be left 
+in the hands of the wrong people.
+STRENGTH 3, AGILITY 5, WITS 3, EMPATHY 3
+HEALTH: 3
+SKILLS: Heavy Machinery 1, Mobility 2,  
+Piloting 1, Ranged Combat 3, Manipulation 1, 
+Command 2
+TALENT: Pull Rank
+GEAR: Rexim RXF-M5 EVA Pistol (3 reloads)
+PERSONAL AGENDA: Turn this tricky situation 
+into a profit without risking your ship and 
+crew.
+BUDDY: Pin
+RIVAL: –
+ 13
+CHARIOT OF THE GODS
+
+PIN, MERCENARY BEIN, PILOT
+Hired muscle on the Sotillo
+FULL NAME: Pinion
+AGE: 31
+PERSONALITY: Steadfast
+Pinion grew up with Bolaji in the Solomons. 
+In their teens, they stole moon shuttles to-
+gether. A year older than Bolaji, Pinion once 
+accidentally crashed a commercial transport 
+while joyriding and wounded six people. Bolaji 
+took the fall and went to juvie for the crime, 
+keeping Pinion from suffering a real prison 
+sentence. She has stayed loyal ever since. At 
+1.95m, Pin is the muscle of the Sotillo crew. 
+Pinion enforces Bolaji’s will.
+STRENGTH 5, AGILITY 4, WITS 3, EMPATHY 2
+HEALTH: 5
+SKILLS: Close Combat 3, Heavy 
+Machinery 1, Stamina 1, Ranged Combat 2, 
+Mobility 2, Command 1
+TALENT: Overkill
+GEAR: Armat M41A Pulse Rifle (2 reloads)
+PERSONAL AGENDA: Follow and protect Bolaji, 
+no matter what the cost or risk.
+BUDDY: Bolaji
+RIVAL: Bein
+Pilot on the Sotillo
+FULL NAME: Helen Bein
+AGE: 53
+PERSONALITY: Cynical
+A former combat pilot for the Colonial Ma-
+rines, Bein was dishonorably discharged for 
+nuking the wrong outpost during the Tientsin 
+Campaign. An alcoholic, Bein is still a better 
+pilot drunk than most colonial pilots are sober. 
+Bein’s military knowledge and experience have 
+been invaluable to the Sotillo.
+ALCOHOLIC: Se page 101 of the core rulebook.
+STRENGTH 3, AGILITY 5, WITS 3, EMPATHY 3
+HEALTH: 3
+SKILLS: Heavy Machinery 2, Ranged Combat 
+2, Piloting 3, Observation 1, Command 2
+TALENT: Reckless
+GEAR: .357 Magnum Revolver (2 reloads)
+PERSONAL AGENDA: Find a drink on this god-
+damn ship.
+BUDDY: Horton
+RIVAL: Pin
+14  
+SCENARIO
+
+HORTON, MECHANIC
+Mechanic on the Sotillo
+FULL NAME: Micky Horton
+AGE: 12
+PERSONALITY: Friendly
+The twelve-year-old son of a minor Wey-
+land-Yutani exec that shafted Bolaji on a deal, 
+Horton was kidnapped by the captain in an 
+attempt to get the exec to pay up. When Hor-
+ton’s father was killed by another mercenary he 
+hadn’t paid, Bolaji decided to keep the kid. The 
+self-taught and scruffy mechanic has been re-
+building sensor suites and assembling thruster 
+arrays since the age of nine. The boy is well-
+liked and well-treated by the crew of the Sotillo.
+STRENGTH 2, AGILITY 4, WITS 5, EMPATHY 3
+HEALTH: 2
+SKILLS: Mobility 2, Observation 2, Survival 2, 
+Comtech 3, Medical Aid 1
+TALENT: Beneath Notice
+GEAR: M240 Incinerator Unit (1 reload)
+PERSONAL AGENDA: Help your crewmates from 
+the Sotillo to get out alive.
+BUDDY: Bein
+RIVAL: –
+The Cronus is a science exploration vehicle 
+launched at the beginning of the 22nd centu-
+ry. Modern vessels in this design lineage are 
+of the Magellan class, and a PC might mis-
+take the ship for its newer brethren. Just as 
+the Montero is a slightly newer variant of the 
+Nostromo, The Cronus is a variant of a Heli-
+ades-class ship with many similarities to the 
+Prometheus. On the Cronus, however, the sep-
+arate Class D module was not a lifeboat, but 
+instead a classified and specially-equipped 
+science lab that could be jettisoned in the 
+case of an emergency. When the PCs encoun-
+ter her, that module is missing, ejected at 
+some point during the SEV’s original mission.

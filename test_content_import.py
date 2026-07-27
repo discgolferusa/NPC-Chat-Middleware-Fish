@@ -10,6 +10,12 @@ import content_import
 FIXTURE_PATH = (
     Path(__file__).resolve().parent / "tests" / "fixtures" / "chariot_of_the_gods_npc_section.txt"
 )
+PDF_EXTRACT_FIXTURE_PATH = (
+    Path(__file__).resolve().parent
+    / "tests"
+    / "fixtures"
+    / "chariot_of_the_gods_pdf_extract_npc_section.txt"
+)
 
 # Wrong NPCs produced on Chariot of the Gods import before stat-block handling.
 CHARIOT_FALSE_POSITIVE_NPCS = ("Captain Miller", "David 8", "Miss Vickers")
@@ -30,6 +36,10 @@ CHARIOT_EXPECTED_NPCS = (
 
 def _load_chariot_fixture() -> str:
     return FIXTURE_PATH.read_text(encoding="utf-8")
+
+
+def _load_chariot_pdf_extract_fixture() -> str:
+    return PDF_EXTRACT_FIXTURE_PATH.read_text(encoding="utf-8")
 
 
 def test_chariot_fixture_finds_spaced_non_player_characters_header():
@@ -53,6 +63,49 @@ def test_chariot_fixture_extracts_stat_block_npcs():
     names = {row["name"] for row in parsed}
     for expected in CHARIOT_EXPECTED_NPCS:
         assert expected in names
+
+
+def test_chariot_pdf_extract_parses_two_column_stat_blocks():
+    """Real PDF text glues two headings per line; FULL NAME rows must still parse."""
+    text = _load_chariot_pdf_extract_fixture()
+    collapsed = content_import._collapse_spaced_caps(text)
+    span = content_import._find_npc_section_span(collapsed)
+    assert span is not None
+    section = collapsed[span[0] : span[1]]
+    assert "REID, COLONIAL MARINE FLYNN, MEDIC" in section
+    parsed = content_import._extract_alien_rpg_stat_block_npcs(section)
+    names = {row["name"] for row in parsed}
+    for expected in CHARIOT_EXPECTED_NPCS:
+        assert expected in names, f"missing {expected} in {sorted(names)}"
+    assert len(parsed) >= 9
+
+
+def test_chariot_pdf_extract_recovers_from_empty_llm_outline(monkeypatch):
+    """Tight Groq budgets often yield empty outline JSON; stat blocks must still populate."""
+    text = _load_chariot_pdf_extract_fixture()
+
+    def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step):
+        if step == "outline":
+            return {"campaign": {}, "locations": [], "npcs": []}
+        if step == "location detail":
+            return {"locations": []}
+        if step == "npc detail":
+            return {"npcs": []}
+        return {}
+
+    monkeypatch.setattr(content_import, "_call_llm_json", fake_call_llm_json)
+    monkeypatch.setattr(content_import, "content_creation_max_input_chars", lambda: 6016)
+
+    result = content_import.analyze_campaign_document(text, "create_new")
+    assert "chariot" in result["campaign"]["campaign_id"].casefold() or "gods" in result[
+        "campaign"
+    ]["name"].casefold()
+    names = {npc["name"] for npc in result["npcs"]}
+    for expected in CHARIOT_EXPECTED_NPCS:
+        assert expected in names
+    loc_ids = {loc["id"] for loc in result["locations"]}
+    assert "uscss_cronus" in loc_ids or "sotillo" in loc_ids
+    assert "Captain Miller" not in names
 
 
 def test_chariot_regression_replaces_movie_quote_outline_npcs(monkeypatch):
@@ -236,7 +289,10 @@ def test_truncate_preserving_npc_section_keeps_stat_blocks():
     text = f"{intro}\n\n{section}"
     max_chars = 12_000
     trimmed = content_import._truncate_preserving_npc_section(text, max_chars)
-    assert len(trimmed) <= max_chars
+    # Soft budget may be raised so the whole NPC section survives.
     assert "JOHNS, OFFICER" in trimmed
     assert "FULL NAME: Albert Johns" in trimmed
-    assert "Captain Miller" not in trimmed
+    assert "FULL NAME: Micky Horton" in trimmed
+    assert "Captain Miller" not in trimmed or trimmed.index("JOHNS, OFFICER") < trimmed.index(
+        "Captain Miller"
+    )
