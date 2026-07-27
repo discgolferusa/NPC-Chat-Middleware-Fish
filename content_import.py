@@ -13,9 +13,12 @@ Pipeline:
   2. Location detail pass — small batches (<= MAX_LOCATIONS_PER_BATCH) using
      name-focused source excerpts; extract-over-invent; retry if sparse.
   3. NPC detail pass — one NPC per call with name-focused excerpts; maps
-     NPCNarrator section headers (Voice Direction, What the NPC Knows/Hides,
-     Memory Triggers, etc.) into voice/personality/facts/secrets/llm_rules;
+     NPCNarrator section headers and published RPG stat blocks (e.g. ALIEN RPG
+     FULL NAME / PERSONAL AGENDA) into voice/personality/facts/secrets/llm_rules;
      retry if sparse.
+
+When a NON-PLAYER CHARACTERS section is detected, stat-block names override
+bad LLM outline guesses (see test_content_import.py / Chariot of the Gods).
 """
 
 from __future__ import annotations
@@ -42,6 +45,30 @@ _EXCERPT_STOPWORDS = frozenset(
     {
         "a", "an", "and", "at", "by", "de", "for", "from", "in", "into", "la", "le",
         "npc", "of", "on", "or", "the", "to", "van", "von", "with",
+    }
+)
+
+# Published module headers (PDFs often space letters: N O N - P L A Y E R).
+_NPC_SECTION_PATTERN = re.compile(
+    r"non\s*[- ]?\s*player[\s\n]+characters?",
+    re.IGNORECASE,
+)
+_NPC_SECTION_END_PATTERN = re.compile(
+    r"(?:^|\n)\s*(?:auxiliary\s+vehicles|the\s+deck\s+plans|appendix\b|index\b|maps?\b)",
+    re.IGNORECASE,
+)
+_STAT_BLOCK_HEADING = re.compile(
+    r"^([A-Z][A-Z0-9][A-Z0-9 '\-]*?)\s*,\s*([A-Z][A-Z0-9][A-Z0-9 '\-/]*)$",
+)
+# Movie/sidebar names that are not scenario NPCs (Chariot of the Gods regression).
+_KNOWN_IMPORT_FALSE_POSITIVE_NAMES = frozenset(
+    {
+        "captain miller",
+        "miller",
+        "david 8",
+        "david",
+        "miss vickers",
+        "vickers",
     }
 )
 
@@ -159,6 +186,239 @@ def _as_str_list(value: Any) -> list[str]:
 
 def _batches(items: list[Any], size: int) -> list[list[Any]]:
     return [items[i : i + size] for i in range(0, len(items), size)] if items else []
+
+
+def _collapse_spaced_caps(text: str) -> str:
+    """Collapse PDF letter-spacing (N O N - P L A Y E R -> NON-PLAYER)."""
+    lines: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped and re.fullmatch(r"[A-Z0-9](?:\s+[A-Z0-9-])+", stripped):
+            lines.append(re.sub(r"\s+", "", stripped))
+            continue
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _find_npc_section_span(collapsed_text: str) -> tuple[int, int] | None:
+    """Return [start, end) slice of the authoritative NPC section when present.
+
+    ``collapsed_text`` should already be passed through ``_collapse_spaced_caps``.
+    """
+    if not collapsed_text:
+        return None
+    match = _NPC_SECTION_PATTERN.search(collapsed_text)
+    if not match:
+        return None
+    start = match.start()
+    remainder = collapsed_text[match.end() :]
+    end_match = _NPC_SECTION_END_PATTERN.search(remainder)
+    end = match.end() + end_match.start() if end_match else len(collapsed_text)
+    return start, end
+
+
+def _extract_alien_rpg_stat_block_npcs(section_text: str) -> list[dict[str, str]]:
+    """Parse ALIEN RPG module stat blocks (JOHNS, OFFICER + FULL NAME lines)."""
+    if not section_text.strip():
+        return []
+
+    lines = section_text.splitlines()
+    results: list[dict[str, str]] = []
+    seen_names: set[str] = set()
+
+    for index, raw_line in enumerate(lines):
+        line = raw_line.strip()
+        if not line:
+            continue
+        segments = re.split(r"\t+", line) if "\t" in line else [line]
+        for segment in segments:
+            segment = segment.strip()
+            if not _STAT_BLOCK_HEADING.match(segment):
+                continue
+
+            short_name = segment.split(",", 1)[0].strip()
+            descriptor = segment.split(",", 1)[1].strip() if "," in segment else ""
+            window = "\n".join(lines[index : index + 30])
+            full_name_match = re.search(r"FULL NAME:\s*(.+)", window)
+            if not full_name_match:
+                # ALIEN RPG stat blocks always publish FULL NAME; skip generic headings.
+                continue
+            display_name = full_name_match.group(1).strip()
+            name_key = display_name.casefold()
+            if name_key in seen_names:
+                continue
+
+            role = descriptor.replace("/", " ").title()
+            for look_ahead in lines[index + 1 : index + 4]:
+                candidate = look_ahead.strip()
+                if not candidate or candidate.startswith("FULL NAME:"):
+                    continue
+                if _STAT_BLOCK_HEADING.match(candidate):
+                    break
+                if not re.match(r"^(AGE|PERSONALITY|STRENGTH|HEALTH|SKILLS)\b", candidate):
+                    role = candidate
+                    break
+
+            location_hint = ""
+            if re.search(r"\bSotillo\b", window, re.IGNORECASE):
+                location_hint = "sotillo"
+            elif re.search(r"\bCronus\b", window, re.IGNORECASE):
+                location_hint = "uscss_cronus"
+
+            seen_names.add(name_key)
+            results.append(
+                {
+                    "name": display_name,
+                    "role": role,
+                    "short_name": short_name,
+                    "location_hint": location_hint,
+                }
+            )
+
+    return results
+
+
+def _prepare_outline_document_text(text: str, warnings: list[str]) -> str:
+    """Bias the outline pass toward the module's NPC section when present."""
+    collapsed = _collapse_spaced_caps(text)
+    span = _find_npc_section_span(collapsed)
+    if span is None:
+        return text
+
+    start, end = span
+    intro = collapsed[: min(start, 2500)].strip()
+    npc_section = collapsed[start:end].strip()
+    warnings.append(
+        "Detected a NON-PLAYER CHARACTERS section; outline will prioritize that "
+        "section over names from intro text, quotes, or player-facing material."
+    )
+    if intro:
+        return f"{intro}\n\n--- NON-PLAYER CHARACTERS (authoritative NPC list) ---\n\n{npc_section}"
+    return npc_section
+
+
+def _npc_stubs_from_stat_blocks(
+    section_text: str,
+    *,
+    location_ids: set[str],
+    warnings: list[str],
+) -> list[dict[str, Any]]:
+    """Build outline NPC stubs from ALIEN RPG stat blocks."""
+    parsed = _extract_alien_rpg_stat_block_npcs(section_text)
+    if not parsed:
+        return []
+
+    def _resolve_hint(hint: str) -> str:
+        if not location_ids:
+            return ""
+        if hint in location_ids:
+            return hint
+        for loc_id in location_ids:
+            if hint in loc_id or loc_id in hint:
+                return loc_id
+        return next(iter(location_ids), "")
+
+    stubs: list[dict[str, Any]] = []
+    for row in parsed:
+        loc = _resolve_hint(row.get("location_hint") or "")
+        stubs.append(
+            {
+                "id": snake_case(row["name"]),
+                "name": row["name"],
+                "role": row.get("role") or "",
+                "first_location_id": loc,
+                "other_location_ids": [],
+            }
+        )
+
+    warnings.append(
+        f"Parsed {len(stubs)} NPC(s) from published stat blocks in NON-PLAYER CHARACTERS."
+    )
+    return stubs
+
+
+def _npc_already_exists_in_campaign(
+    name: str,
+    *,
+    mode: str,
+    existing_npc_names: list[str],
+) -> bool:
+    if mode != "merge":
+        return False
+    key = name.casefold()
+    existing_name_keys = {n.casefold() for n in existing_npc_names if n}
+    existing_id_keys = {snake_case(n) for n in existing_npc_names if n}
+    base_id = snake_case(name)
+    return key in existing_name_keys or base_id in existing_id_keys
+
+
+def _merge_outline_npcs_with_stat_blocks(
+    llm_npcs: list[dict[str, Any]],
+    document_text: str,
+    *,
+    mode: str,
+    existing_npc_names: list[str],
+    location_ids: set[str],
+    warnings: list[str],
+) -> list[dict[str, Any]]:
+    """Merge ALIEN RPG stat-block NPCs with outline stubs when confidently detected."""
+    collapsed = _collapse_spaced_caps(document_text)
+    span = _find_npc_section_span(collapsed)
+    if span is None:
+        return llm_npcs
+
+    start, end = span
+    section_text = collapsed[start:end]
+    stat_stubs = _npc_stubs_from_stat_blocks(
+        section_text,
+        location_ids=location_ids,
+        warnings=warnings,
+    )
+    if len(stat_stubs) < 3:
+        return llm_npcs
+
+    filtered_stat_stubs: list[dict[str, Any]] = []
+    for stub in stat_stubs:
+        name = str(stub.get("name") or "").strip()
+        if not name:
+            continue
+        if _npc_already_exists_in_campaign(
+            name, mode=mode, existing_npc_names=existing_npc_names
+        ):
+            warnings.append(
+                f"NPC '{name}' already exists in the campaign; "
+                "reusing existing character and skipping stat-block regeneration."
+            )
+            continue
+        filtered_stat_stubs.append(stub)
+    stat_stubs = filtered_stat_stubs
+    if len(stat_stubs) < 3:
+        return llm_npcs
+
+    stat_names = {stub["name"].casefold() for stub in stat_stubs}
+    dropped: list[str] = []
+    kept_llm: list[dict[str, Any]] = []
+    for npc in llm_npcs:
+        name = str(npc.get("name") or "").strip()
+        if not name:
+            continue
+        key = name.casefold()
+        if key in stat_names:
+            continue
+        if key in _KNOWN_IMPORT_FALSE_POSITIVE_NAMES or any(
+            bad in key for bad in ("miller", "vickers", "david 8")
+        ):
+            dropped.append(name)
+            continue
+        kept_llm.append(npc)
+
+    if dropped:
+        warnings.append(
+            "Ignored outline NPC(s) outside the stat-block section: "
+            + ", ".join(dropped)
+        )
+
+    return kept_llm + stat_stubs
 
 
 _PRONOUN_OBJECTS: dict[str, dict[str, str]] = {
@@ -489,7 +749,15 @@ def _build_outline_prompt(
         "- Use snake_case for every id (lowercase letters, digits, underscores only).\n"
         "- Every id used as an NPC's first_location_id or in other_location_ids MUST also "
         "appear in the locations list.\n"
-        "- Include every named location and every named NPC you can find, even minor ones.\n"
+        "- If the document has a NON-PLAYER CHARACTERS (or NPCs / Supporting Cast) section, "
+        "that section is the authoritative NPC list. List every stat-block NPC there and do "
+        "NOT list names only mentioned in intro text, movie quotes, sidebars, or player "
+        "(PC) material.\n"
+        "- Do NOT list player characters, the PC party, or the PC ship crew as NPCs.\n"
+        "- Published RPG stat blocks (e.g. lines like 'JOHNS, OFFICER' with FULL NAME, "
+        "PERSONALITY, PERSONAL AGENDA) are always NPCs when inside the NPC section.\n"
+        "- Include every named location and every named NPC from the authoritative NPC section; "
+        "minor NPCs in that section still count.\n"
         "- other_location_ids should only be non-empty for NPCs who travel or appear in more "
         "than one place in the text.\n"
         f"{mode_guidance}"
@@ -753,6 +1021,8 @@ def _build_npc_detail_prompt(batch: list[dict[str, Any]], text: str, campaign: d
         "- Appearance → public_facts and/or personality cues\n"
         "- Voice Direction → voice (short delivery traits) AND llm_rules about speech style\n"
         "- Personality and Motivation / Goals → personality + known_facts + llm_rules\n"
+        "- PERSONALITY / PERSONAL AGENDA (ALIEN RPG modules) → personality + known_facts + llm_rules\n"
+        "- BUDDY / RIVAL (ALIEN RPG) → llm_rules about relationships\n"
         "- What the NPC Knows → known_facts (one bullet per distinct fact)\n"
         "- What the NPC Hides → secrets\n"
         "- Initial Attitude and Development / Breaking Point → llm_rules\n"
@@ -937,9 +1207,10 @@ def analyze_campaign_document(
         raise ContentImportError("No document text provided")
 
     document_text = _truncate_input(text, warnings)
+    outline_source = _prepare_outline_document_text(document_text, warnings)
 
     outline_prompt = _build_outline_prompt(
-        document_text, mode, existing_campaign_id, existing_location_ids, existing_npc_names
+        outline_source, mode, existing_campaign_id, existing_location_ids, existing_npc_names
     )
 
     try:
@@ -956,6 +1227,17 @@ def analyze_campaign_document(
         existing_campaign_id=existing_campaign_id,
         existing_location_ids=existing_location_ids,
         existing_npc_names=existing_npc_names,
+        warnings=warnings,
+    )
+
+    existing_location_set = {snake_case(loc_id) for loc_id in existing_location_ids}
+    location_ids = {loc["id"] for loc in location_stubs} | existing_location_set
+    npc_stubs = _merge_outline_npcs_with_stat_blocks(
+        npc_stubs,
+        document_text,
+        mode=mode,
+        existing_npc_names=existing_npc_names,
+        location_ids=location_ids,
         warnings=warnings,
     )
 
