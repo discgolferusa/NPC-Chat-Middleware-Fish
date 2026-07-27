@@ -10,12 +10,12 @@ elsewhere in this repo) for the caller to review and persist.
 Pipeline:
   1. Outline pass — one LLM call that reads the whole document and proposes
      the campaign, a location list, and an NPC list (name/role/locations).
-  2. Location detail pass — batched LLM calls (<= MAX_LOCATIONS_PER_BATCH per
-     call) that fill in summary/current_events/important_locations/rumors/
-     local_tone/knowledge_rules for each location.
-  3. NPC detail pass — batched LLM calls (<= MAX_NPCS_PER_BATCH per call) that
-     fill in personality/public_facts/known_facts/secrets/llm_rules/pronouns/
-     race/gender for each NPC.
+  2. Location detail pass — small batches (<= MAX_LOCATIONS_PER_BATCH) using
+     name-focused source excerpts; extract-over-invent; retry if sparse.
+  3. NPC detail pass — one NPC per call with name-focused excerpts; maps
+     NPCNarrator section headers (Voice Direction, What the NPC Knows/Hides,
+     Memory Triggers, etc.) into voice/personality/facts/secrets/llm_rules;
+     retry if sparse.
 """
 
 from __future__ import annotations
@@ -27,10 +27,23 @@ from typing import Any
 from llm_router import content_creation_max_input_chars, generate_llm_response
 
 MAX_INPUT_CHARS = 120_000
-MAX_LOCATIONS_PER_BATCH = 8
-MAX_NPCS_PER_BATCH = 5
-IMPORT_TEMPERATURE = 0.2
-IMPORT_MAX_TOKENS = 4096
+# Small batches: local 8B models (and Groq fallbacks) often return empty/partial JSON
+# when asked for many rich NPCs at once. One NPC per call preserves source detail.
+MAX_LOCATIONS_PER_BATCH = 2
+MAX_NPCS_PER_BATCH = 1
+IMPORT_TEMPERATURE = 0.15
+IMPORT_MAX_TOKENS = 6144
+# NPCNarrator writeups put the name in a header, then many blocks after it.
+# Bias the window forward so Knows/Hides/Memory/Finale are kept.
+EXCERPT_WINDOW_BEFORE = 400
+EXCERPT_WINDOW_AFTER = 7_000
+EXCERPT_MAX_CHARS = 28_000
+_EXCERPT_STOPWORDS = frozenset(
+    {
+        "a", "an", "and", "at", "by", "de", "for", "from", "in", "into", "la", "le",
+        "npc", "of", "on", "or", "the", "to", "van", "von", "with",
+    }
+)
 
 VALID_MODES = frozenset({"create_new", "merge"})
 
@@ -148,6 +161,199 @@ def _batches(items: list[Any], size: int) -> list[list[Any]]:
     return [items[i : i + size] for i in range(0, len(items), size)] if items else []
 
 
+_PRONOUN_OBJECTS: dict[str, dict[str, str]] = {
+    "he/him": {
+        "subject": "he",
+        "object": "him",
+        "possessive_adjective": "his",
+        "possessive_pronoun": "his",
+        "reflexive": "himself",
+    },
+    "she/her": {
+        "subject": "she",
+        "object": "her",
+        "possessive_adjective": "her",
+        "possessive_pronoun": "hers",
+        "reflexive": "herself",
+    },
+    "they/them": {
+        "subject": "they",
+        "object": "them",
+        "possessive_adjective": "their",
+        "possessive_pronoun": "theirs",
+        "reflexive": "themselves",
+    },
+}
+
+
+def _normalize_pronouns(value: Any, gender: str) -> dict[str, str]:
+    """Return structured pronouns the Yaml Editor can persist.
+
+    Avoid substring checks like ``\"he\" in text`` — that matches inside ``the``.
+    Prefer slash-forms and whole-word pronoun tokens only.
+    """
+    if isinstance(value, dict):
+        subject = str(value.get("subject") or "").strip().lower()
+        obj = str(value.get("object") or "").strip().lower()
+        if subject and obj:
+            return {
+                "subject": subject,
+                "object": obj,
+                "possessive_adjective": str(value.get("possessive_adjective") or "").strip().lower()
+                or ("her" if subject == "she" else "his" if subject == "he" else "their"),
+                "possessive_pronoun": str(value.get("possessive_pronoun") or "").strip().lower()
+                or ("hers" if subject == "she" else "his" if subject == "he" else "theirs"),
+                "reflexive": str(value.get("reflexive") or "").strip().lower()
+                or ("herself" if subject == "she" else "himself" if subject == "he" else "themselves"),
+            }
+
+    text = str(value or "").strip().lower()
+    compact = re.sub(r"\s+", "", text)
+    for key, obj in _PRONOUN_OBJECTS.items():
+        head = key.split("/")[0]
+        if compact == key or compact.startswith(head + "/"):
+            return dict(obj)
+
+    tokens = set(re.findall(r"[a-z]+", text))
+    if tokens & {"she", "her", "hers", "herself"}:
+        return dict(_PRONOUN_OBJECTS["she/her"])
+    if tokens & {"they", "them", "their", "theirs", "themselves"}:
+        return dict(_PRONOUN_OBJECTS["they/them"])
+    if tokens & {"he", "him", "his", "himself"}:
+        return dict(_PRONOUN_OBJECTS["he/him"])
+
+    gender_l = (gender or "").strip().lower()
+    if gender_l in {"female", "woman", "f"}:
+        return dict(_PRONOUN_OBJECTS["she/her"])
+    if gender_l in {"male", "man", "m"}:
+        return dict(_PRONOUN_OBJECTS["he/him"])
+    return dict(_PRONOUN_OBJECTS["they/them"])
+
+
+def _distinctive_name_needles(name: str, entity_id: str = "") -> list[str]:
+    """Needles safe for excerpt search — full name/id plus distinctive tokens only."""
+    needles: list[str] = []
+    for raw in (name, entity_id):
+        value = str(raw or "").strip()
+        if value:
+            needles.append(value)
+
+    for part in re.split(r"[\s_/]+", str(name or "").strip()):
+        cleaned = part.strip("-").strip()
+        if len(cleaned) < 4:
+            continue
+        if cleaned.casefold() in _EXCERPT_STOPWORDS:
+            continue
+        # Skip pure numeric fragments.
+        if cleaned.isdigit():
+            continue
+        needles.append(cleaned)
+
+    # Prefer longer / more specific needles first when budget is tight.
+    unique: list[str] = []
+    seen: set[str] = set()
+    for needle in sorted(needles, key=lambda n: len(n), reverse=True):
+        key = needle.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(needle)
+    return unique
+
+
+def _mention_indexes(haystack_cf: str, needle: str) -> list[int]:
+    """Casefolded bounded substring matches (not bare 'he' inside 'the')."""
+    v = str(needle or "").strip().casefold()
+    if len(v) < 3:
+        return []
+    pattern = re.compile(rf"(?<![a-z0-9]){re.escape(v)}(?![a-z0-9])")
+    return [match.start() for match in pattern.finditer(haystack_cf)]
+
+
+def _relevant_excerpts(
+    text: str,
+    needles: list[str],
+    *,
+    window_before: int = EXCERPT_WINDOW_BEFORE,
+    window_after: int = EXCERPT_WINDOW_AFTER,
+) -> str:
+    """Pull document windows around name/id mentions so detail passes stay focused."""
+    if not text or not needles:
+        return text
+
+    lower = text.casefold()
+    # Prefer long/specific needles so short tokens cannot flood the budget.
+    ranked = sorted(
+        {str(n).strip() for n in needles if str(n).strip()},
+        key=lambda n: len(n),
+        reverse=True,
+    )
+    primary = [n for n in ranked if len(n) >= 6 or any(ch in n for ch in (" ", "-", "_"))]
+    search_needles = primary or [n for n in ranked if len(n) >= 4]
+
+    spans: list[tuple[int, int, int]] = []  # start, end, needle_len
+    for needle in search_needles:
+        for idx in _mention_indexes(lower, needle):
+            start = max(0, idx - window_before)
+            end = min(len(text), idx + len(needle) + window_after)
+            spans.append((start, end, len(needle)))
+
+    if not spans:
+        return text[: min(len(text), EXCERPT_MAX_CHARS)]
+
+    # Keep matches from the longest needles when they exist.
+    best_len = max(span[2] for span in spans)
+    if best_len >= 6:
+        spans = [span for span in spans if span[2] >= max(6, best_len - 4)]
+
+    spans.sort(key=lambda s: s[0])
+    merged: list[list[int]] = []
+    for start, end, _needle_len in spans:
+        if not merged or start > merged[-1][1] + 80:
+            merged.append([start, end])
+        else:
+            merged[-1][1] = max(merged[-1][1], end)
+
+    chunks: list[str] = []
+    total = 0
+    for start, end in merged:
+        piece = text[start:end].strip()
+        if not piece:
+            continue
+        if total + len(piece) > EXCERPT_MAX_CHARS:
+            remain = EXCERPT_MAX_CHARS - total
+            if remain > 400:
+                chunks.append(piece[:remain])
+            break
+        chunks.append(piece)
+        total += len(piece)
+
+    return "\n\n---\n\n".join(chunks) if chunks else text[: min(len(text), EXCERPT_MAX_CHARS)]
+
+
+def _npc_detail_is_sparse(detail: dict[str, Any] | None) -> bool:
+    if not detail:
+        return True
+    filled = 0
+    for key in ("personality", "public_facts", "known_facts", "secrets", "llm_rules", "voice"):
+        if _as_str_list(detail.get(key)):
+            filled += 1
+    if str(detail.get("race") or "").strip().lower() not in {"", "unknown"}:
+        filled += 1
+    return filled < 2
+
+
+def _location_detail_is_sparse(detail: dict[str, Any] | None) -> bool:
+    if not detail:
+        return True
+    if str(detail.get("summary") or "").strip():
+        return False
+    for key in ("current_events", "rumors", "local_tone", "important_locations", "knowledge_rules"):
+        if _as_list(detail.get(key)):
+            return False
+    return True
+
+
 def _coerce_container(data: Any, key: str) -> list[dict[str, Any]]:
     if isinstance(data, list):
         return [item for item in data if isinstance(item, dict)]
@@ -224,10 +430,11 @@ def _call_llm_json(
 
 
 _SYSTEM_PROMPT = (
-    "You are a tabletop RPG campaign content structuring assistant. You read campaign "
-    "documents (adventure modules, session prep notes, wiki exports) and convert them into "
-    "strict JSON matching the schema the user requests. Respond with ONLY the JSON value — "
-    "no markdown code fences, no commentary before or after it."
+    "You are a tabletop RPG campaign content structuring assistant for NPCNarrator. "
+    "You convert campaign documents into strict JSON matching the requested schema. "
+    "Prefer extracting and preserving concrete facts, wording, goals, secrets, and "
+    "voice notes from the source text over inventing new content. "
+    "Respond with ONLY the JSON value — no markdown code fences, no commentary."
 )
 
 
@@ -464,25 +671,27 @@ def _build_location_detail_prompt(batch: list[dict[str, Any]], text: str, campai
     location_list = "\n".join(f"- id: {loc['id']} | name: {loc['name']} | type: {loc['type']}" for loc in batch)
     return (
         f'Campaign: "{campaign["name"]}" ({campaign["campaign_id"]}).\n\n'
-        "Fill in details for EACH of the following locations using the campaign document text "
-        'below. Respond with exactly {"locations": [ ... ]} where each array item has this '
-        "shape:\n\n"
+        "Fill in details for EACH location below from the SOURCE EXCERPTS. "
+        'Respond with exactly {"locations": [ ... ]} where each item has this shape:\n\n'
         "{\n"
         '  "id": "<exact id from the list below>",\n'
-        '  "summary": "2-4 sentence overview of the location",\n'
-        '  "current_events": ["ongoing situations relevant right now, 2-5 items"],\n'
-        '  "important_locations": [{"name": "sub-location name", "description": "1 sentence", '
+        '  "summary": "faithful overview; keep concrete sensory and plot details from the source; '
+        'use as many sentences as needed (typically 2-8)",\n'
+        '  "current_events": ["ongoing situations from the source; include all that are stated"],\n'
+        '  "important_locations": [{"name": "sub-location name", "description": "what the source says", '
         '"public_knowledge": "what ordinary people believe or know about it"}],\n'
-        '  "rumors": ["uncertain rumors circulating, 2-5 items"],\n'
-        '  "local_tone": ["3-6 single-word or short-phrase mood/atmosphere descriptors"],\n'
-        '  "knowledge_rules": ["1-3 short rules about what NPCs here generally do or do not '
-        'know, e.g. \'NPCs here do not automatically know secrets belonging to other NPCs.\'"]\n'
+        '  "rumors": ["rumors or uncertain talk from the source"],\n'
+        '  "local_tone": ["mood/atmosphere descriptors from the source"],\n'
+        '  "knowledge_rules": ["rules about what NPCs here generally do or do not know"]\n'
         "}\n\n"
-        "If the document does not give enough detail for a field, invent a short, reasonable, "
-        "in-setting default rather than leaving it empty.\n\n"
+        "CRITICAL EXTRACTION RULES:\n"
+        "- Prefer copying concrete names, objects, factions, and plot facts from the source.\n"
+        "- Do NOT invent major plot facts. If a field has no source support, use [] or \"\".\n"
+        "- If the source uses section headers (Appearance, Green Line, etc.), mine them for this location.\n"
+        "- Keep fidelity high: longer accurate lists beat short generic ones.\n\n"
         "Locations to fill in:\n"
         f"{location_list}\n\n"
-        "Campaign document text:\n"
+        "SOURCE EXCERPTS (may be partial windows around these locations):\n"
         '"""\n'
         f"{text}\n"
         '"""\n\n'
@@ -537,42 +746,50 @@ def _build_npc_detail_prompt(batch: list[dict[str, Any]], text: str, campaign: d
 
     return (
         f'Campaign: "{campaign["name"]}" ({campaign["campaign_id"]}).\n\n'
-        "Fill in roleplay details for EACH of the following NPCs using the campaign document "
-        'text below. Respond with exactly {"npcs": [ ... ]} where each array item has this '
-        "shape:\n\n"
+        "Fill in roleplay details for EACH NPC below from the SOURCE EXCERPTS. "
+        "These excerpts often come from NPCNarrator-ready writeups. Map section headers "
+        "into fields when present:\n"
+        "- Role → keep/refine role (already provided on the stub; do not blank it)\n"
+        "- Appearance → public_facts and/or personality cues\n"
+        "- Voice Direction → voice (short delivery traits) AND llm_rules about speech style\n"
+        "- Personality and Motivation / Goals → personality + known_facts + llm_rules\n"
+        "- What the NPC Knows → known_facts (one bullet per distinct fact)\n"
+        "- What the NPC Hides → secrets\n"
+        "- Initial Attitude and Development / Breaking Point → llm_rules\n"
+        "- NPCNarrator Memory Triggers → llm_rules (remember X when players do Y)\n"
+        "- Sample Dialogue → optional llm_rules quoting tone; do not dump every line\n\n"
+        'Respond with exactly {"npcs": [ ... ]} where each array item has this shape:\n\n'
         "{\n"
         '  "id": "<exact id from the list below>",\n'
-        '  "pronouns": "he/him | she/her | they/them | <other, e.g. \'ze/zir\'>",\n'
-        '  "race": "npc\'s race or species if known, otherwise a reasonable guess, otherwise '
-        '\\"unknown\\"",\n'
+        '  "pronouns": {"subject":"she","object":"her","possessive_adjective":"her",'
+        '"possessive_pronoun":"hers","reflexive":"herself"},\n'
+        '  "race": "species/ancestry if stated, else \\"unknown\\"",\n'
         '  "gender": "male|female|nonbinary|unspecified",\n'
-        '  "personality": ["3-6 short personality traits"],\n'
-        '  "public_facts": ["facts about this NPC that OTHER NPCs and common folk already know '
-        'and might mention, 2-5 items"],\n'
-        '  "known_facts": ["facts this NPC personally knows and MAY share if asked or relevant, '
-        '2-6 items"],\n'
-        '  "secrets": ["facts this NPC will NOT willingly divulge, 0-5 items"],\n'
-        '  "llm_rules": ["short behavioral rules for roleplaying this NPC, 2-6 items"]\n'
+        '  "voice": ["short spoken-delivery traits from Voice Direction, e.g. quiet, compassionate, controlled"],\n'
+        '  "personality": ["traits and motives from Personality/Motivation; include all distinct ones"],\n'
+        '  "public_facts": ["appearance and reputation others can observe or commonly know"],\n'
+        '  "known_facts": ["EVERY distinct item from What the NPC Knows / Goals the NPC is pursuing"],\n'
+        '  "secrets": ["EVERY distinct item from What the NPC Hides"],\n'
+        '  "llm_rules": ["behavioral rules from Attitude, Development, Memory Triggers, Breaking Point, '
+        'and Voice Direction; include all actionable guidance"]\n'
         "}\n\n"
-        "CRITICAL RULES:\n"
-        "- public_facts = things OTHER characters already know about this NPC (reputation, "
-        "visible role, public history) — NOT things only the NPC themself knows.\n"
-        "- known_facts = things this NPC personally knows and may share in conversation.\n"
-        "- secrets = things this NPC will NOT willingly reveal to the party.\n"
-        "- If an NPC has ANY secrets, you MUST include at least one llm_rule of this exact "
-        'form: "If asked directly about <topic>, do not reveal it. Respond in character, then '
+        "CRITICAL EXTRACTION RULES:\n"
+        "- EXTRACT over invent. Copy concrete facts from the source; do not replace them with generics.\n"
+        "- Empty lists only when the source truly has nothing for that field.\n"
+        "- If the source says she/her (or uses she/her language), pronouns and gender must match.\n"
+        "- public_facts = what OTHER characters already know or can see (appearance, public role).\n"
+        "- known_facts = what THIS NPC knows and may share.\n"
+        "- secrets = what THIS NPC will not willingly reveal.\n"
+        "- If secrets is non-empty, include at least one llm_rule of this exact form: "
+        '"If asked directly about <topic>, do not reveal it. Respond in character, then '
         'end your reply with [DM CHECK: <short description of what the player is trying to '
-        'learn>] so the DM can decide if it comes out." Tailor <topic> and the bracketed '
-        "description to this NPC's actual secrets.\n"
-        "- If an NPC appears at more than one location (see location(s) below), any fact, "
-        "secret, or rule that should only apply at a specific location must be prefixed "
-        'exactly like this: "Only when scene location is <location_id>: <fact or rule>".\n'
-        "- Do not invent facts that contradict the source text. If the text gives no detail "
-        "for a field, provide a short reasonable in-setting default, except secrets (use an "
-        "empty list if the NPC clearly has nothing to hide).\n\n"
+        'learn>] so the DM can decide if it comes out."\n'
+        "- If an NPC appears at more than one location, prefix location-specific lines with "
+        '"Only when scene location is <location_id>: ...".\n'
+        "- Prefer longer accurate lists over short summaries when the source is explicit.\n\n"
         "NPCs to fill in:\n"
         f"{npc_list}\n\n"
-        "Campaign document text:\n"
+        "SOURCE EXCERPTS (windows around these NPCs — use them as the authority):\n"
         '"""\n'
         f"{text}\n"
         '"""\n\n'
@@ -583,6 +800,9 @@ def _build_npc_detail_prompt(batch: list[dict[str, Any]], text: str, campaign: d
 def _merge_npc_detail(stub: dict[str, Any], detail: dict[str, Any], campaign_id: str, warnings: list[str]) -> dict[str, Any]:
     secrets = _as_str_list(detail.get("secrets"))
     llm_rules = _as_str_list(detail.get("llm_rules"))
+    gender = str(detail.get("gender") or "unspecified").strip().lower() or "unspecified"
+    if gender not in {"male", "female", "nonbinary", "unspecified"}:
+        gender = "unspecified"
 
     if secrets and not any("[DM CHECK:" in rule for rule in llm_rules):
         llm_rules.append(
@@ -592,16 +812,19 @@ def _merge_npc_detail(stub: dict[str, Any], detail: dict[str, Any], campaign_id:
         )
         warnings.append(f"NPC '{stub['name']}': added a default [DM CHECK] rule for its secrets.")
 
+    role = stub["role"] or str(detail.get("role") or "").strip()
+
     return {
         "id": stub["id"],
         "campaign_id": campaign_id,
         "name": stub["name"],
-        "role": stub["role"],
+        "role": role,
         "location_id": stub["first_location_id"],
         "other_location_ids": stub["other_location_ids"],
-        "gender": str(detail.get("gender") or "unspecified").strip() or "unspecified",
+        "gender": gender,
         "race": str(detail.get("race") or "unknown").strip() or "unknown",
-        "pronouns": str(detail.get("pronouns") or "they/them").strip() or "they/them",
+        "pronouns": _normalize_pronouns(detail.get("pronouns"), gender),
+        "voice": _as_str_list(detail.get("voice")),
         "personality": _as_str_list(detail.get("personality")),
         "public_facts": _as_str_list(detail.get("public_facts")),
         "known_facts": _as_str_list(detail.get("known_facts")),
@@ -625,17 +848,60 @@ def _truncate_input(text: str, warnings: list[str]) -> str:
             "The content creation model's Groq tokens-per-minute budget is too small "
             "for document import (completion reserve fills the limit). Switch content "
             "creation to a higher-TPM model such as groq-llama-4-scout in Admin → LLM, "
-            "or wait a minute if recent usage exhausted the budget."
+            "or wait a minute if recent usage exhausted the budget. "
+            "If you use local llama.cpp, set content_creation provider mode to 'local' "
+            "so import is not pre-truncated for Groq TPM."
         )
     max_chars = min(MAX_INPUT_CHARS, max_chars)
     if len(text) > max_chars:
         warnings.append(
             f"Input document was {len(text)} characters; truncated to the first "
             f"{max_chars} characters so the outline pass fits the current "
-            "content_creation model's Groq token-per-minute budget."
+            "content_creation token budget. Later sections may be missing — "
+            "prefer content_creation=local or a higher-TPM Groq model for long docs."
         )
         return text[:max_chars]
     return text
+
+
+def _fetch_location_details(
+    batch: list[dict[str, Any]],
+    document_text: str,
+    campaign: dict[str, Any],
+    warnings: list[str],
+) -> dict[str, dict[str, Any]]:
+    needles: list[str] = []
+    for loc in batch:
+        needles.extend(_distinctive_name_needles(loc["name"], loc["id"]))
+    excerpt = _relevant_excerpts(document_text, needles)
+    prompt = _build_location_detail_prompt(batch, excerpt, campaign)
+    try:
+        detail_raw = _call_llm_json(_SYSTEM_PROMPT, prompt, warnings=warnings, step="location detail")
+        detail_items = _coerce_container(detail_raw, "locations")
+        return _index_details_by_stub_id(detail_items, batch)
+    except Exception as ex:
+        warnings.append(f"Location detail batch failed ({[loc['id'] for loc in batch]}): {ex}")
+        return {}
+
+
+def _fetch_npc_details(
+    batch: list[dict[str, Any]],
+    document_text: str,
+    campaign: dict[str, Any],
+    warnings: list[str],
+) -> dict[str, dict[str, Any]]:
+    needles: list[str] = []
+    for npc in batch:
+        needles.extend(_distinctive_name_needles(npc["name"], npc["id"]))
+    excerpt = _relevant_excerpts(document_text, needles)
+    prompt = _build_npc_detail_prompt(batch, excerpt, campaign)
+    try:
+        detail_raw = _call_llm_json(_SYSTEM_PROMPT, prompt, warnings=warnings, step="npc detail")
+        detail_items = _coerce_container(detail_raw, "npcs")
+        return _index_details_by_stub_id(detail_items, batch)
+    except Exception as ex:
+        warnings.append(f"NPC detail batch failed ({[npc['id'] for npc in batch]}): {ex}")
+        return {}
 
 
 def analyze_campaign_document(
@@ -695,37 +961,46 @@ def analyze_campaign_document(
 
     locations_by_id: dict[str, dict[str, Any]] = {}
     for batch in _batches(location_stubs, MAX_LOCATIONS_PER_BATCH):
-        prompt = _build_location_detail_prompt(batch, document_text, campaign)
-        try:
-            detail_raw = _call_llm_json(_SYSTEM_PROMPT, prompt, warnings=warnings, step="location detail")
-            detail_items = _coerce_container(detail_raw, "locations")
-            details_by_id = _index_details_by_stub_id(detail_items, batch)
-        except Exception as ex:
-            warnings.append(f"Location detail batch failed ({[loc['id'] for loc in batch]}): {ex}")
-            details_by_id = {}
+        details_by_id = _fetch_location_details(batch, document_text, campaign, warnings)
 
+        # Retry sparse singles once with a tighter excerpt focus.
         for stub in batch:
             detail = details_by_id.get(stub["id"], {})
-            if not detail:
-                warnings.append(f"Location '{stub['id']}': no detail returned; using minimal defaults.")
-            locations_by_id[stub["id"]] = _merge_location_detail(stub, detail, campaign["campaign_id"])
+            if _location_detail_is_sparse(detail):
+                retry = _fetch_location_details([stub], document_text, campaign, warnings)
+                retry_detail = retry.get(stub["id"], {})
+                if not _location_detail_is_sparse(retry_detail):
+                    details_by_id[stub["id"]] = retry_detail
+                    warnings.append(f"Location '{stub['id']}': recovered details on retry.")
+                elif not detail:
+                    warnings.append(f"Location '{stub['id']}': no detail returned; using minimal defaults.")
+
+            locations_by_id[stub["id"]] = _merge_location_detail(
+                stub, details_by_id.get(stub["id"], {}), campaign["campaign_id"]
+            )
 
     npcs_by_id: dict[str, dict[str, Any]] = {}
     for batch in _batches(npc_stubs, MAX_NPCS_PER_BATCH):
-        prompt = _build_npc_detail_prompt(batch, document_text, campaign)
-        try:
-            detail_raw = _call_llm_json(_SYSTEM_PROMPT, prompt, warnings=warnings, step="npc detail")
-            detail_items = _coerce_container(detail_raw, "npcs")
-            details_by_id = _index_details_by_stub_id(detail_items, batch)
-        except Exception as ex:
-            warnings.append(f"NPC detail batch failed ({[npc['id'] for npc in batch]}): {ex}")
-            details_by_id = {}
+        details_by_id = _fetch_npc_details(batch, document_text, campaign, warnings)
 
         for stub in batch:
             detail = details_by_id.get(stub["id"], {})
-            if not detail:
-                warnings.append(f"NPC '{stub['id']}': no detail returned; using minimal defaults.")
-            npcs_by_id[stub["id"]] = _merge_npc_detail(stub, detail, campaign["campaign_id"], warnings)
+            if _npc_detail_is_sparse(detail):
+                retry = _fetch_npc_details([stub], document_text, campaign, warnings)
+                retry_detail = retry.get(stub["id"], {})
+                if not _npc_detail_is_sparse(retry_detail):
+                    details_by_id[stub["id"]] = retry_detail
+                    warnings.append(f"NPC '{stub['id']}': recovered details on retry.")
+                elif not detail:
+                    warnings.append(
+                        f"NPC '{stub['id']}': no detail returned; using minimal defaults. "
+                        "Local small models often need content_creation set to Groq or a "
+                        "stronger local model for dense NPC writeups."
+                    )
+
+            npcs_by_id[stub["id"]] = _merge_npc_detail(
+                stub, details_by_id.get(stub["id"], {}), campaign["campaign_id"], warnings
+            )
 
     return {
         "campaign": campaign,

@@ -31,6 +31,10 @@ BASE_DIR = Path(__file__).resolve().parent
 
 LOCAL_LLM_URL = os.getenv("LOCAL_LLM_URL", "http://127.0.0.1:8080/v1/chat/completions")
 LOCAL_LLM_MODEL = os.getenv("LOCAL_LLM_MODEL", "npc")
+LOCAL_LLM_TIMEOUT_SECONDS = int(os.getenv("LOCAL_LLM_TIMEOUT_SECONDS", "180"))
+CONTENT_CREATION_LOCAL_TIMEOUT_SECONDS = int(
+    os.getenv("CONTENT_CREATION_LOCAL_TIMEOUT_SECONDS", "600")
+)
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1/chat/completions")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
@@ -615,13 +619,22 @@ _CONTENT_CREATION_PROMPT_OVERHEAD_TOKENS = 1_000
 
 
 def content_creation_max_input_chars() -> int:
-    """Chars of document body that fit the content_creation model's current TPM.
+    """Chars of document body that fit the content_creation model's current budget.
 
-    Returns 0 when the model cannot fit a minimal import request (e.g. low TPM
-    after reserving completion tokens). Callers must treat 0 as "cannot import
-    on this model" rather than truncating to a fake minimum.
+    Returns 0 when a strict-Groq setup cannot fit a minimal import request.
+    For local / groq_with_local_fallback, do NOT pre-truncate using Groq TPM —
+    otherwise Groq limit failures fall back to local with a head-chopped document
+    and NPC/location sections later in the file are invisible to the local model.
     """
     model_id = CONTENT_CREATION_MODEL_ID
+    provider_mode = CONTENT_CREATION_PROVIDER_MODE
+    if provider_mode == "local" or model_id == "local":
+        return 120_000
+    if provider_mode == "groq_with_local_fallback":
+        # Keep the full document available for local fallback; Groq still has its
+        # own preflight in generate_llm_response and will fall back when needed.
+        return 120_000
+
     model_entry = LLM_MODELS.get(model_id) or {}
     limits = model_entry.get("limits") or {}
     tpm = limits.get("tpm")
@@ -643,6 +656,7 @@ def call_local_chat_completions(
     *,
     temperature: float | None = None,
     max_tokens: int | None = None,
+    timeout_seconds: int | None = None,
     **kwargs: Any,
 ) -> tuple[str, dict[str, int]]:
     effective_max = _effective_max_tokens("local", max_tokens, model_name=LOCAL_LLM_MODEL)
@@ -655,9 +669,10 @@ def call_local_chat_completions(
         "stream": kwargs.pop("stream", False),
     }
     payload.update(kwargs)
+    timeout = timeout_seconds if timeout_seconds is not None else LOCAL_LLM_TIMEOUT_SECONDS
 
     try:
-        response = requests.post(LOCAL_LLM_URL, json=payload, timeout=180)
+        response = requests.post(LOCAL_LLM_URL, json=payload, timeout=timeout)
         response.raise_for_status()
     except requests.ConnectionError as ex:
         raise LLMProviderError(
@@ -667,7 +682,7 @@ def call_local_chat_completions(
         ) from ex
     except requests.Timeout as ex:
         raise LLMProviderError(
-            f"Local LLM timed out at {LOCAL_LLM_URL}."
+            f"Local LLM timed out at {LOCAL_LLM_URL} after {timeout}s."
         ) from ex
 
     data = response.json()
@@ -784,6 +799,12 @@ def _set_active(provider: str, model_id: str, purpose: str = DEFAULT_PURPOSE) ->
     LAST_ACTIVE_MODEL_ID[purpose] = model_id
 
 
+def _local_timeout_for_purpose(purpose: str) -> int:
+    if purpose == PURPOSE_CONTENT_CREATION:
+        return CONTENT_CREATION_LOCAL_TIMEOUT_SECONDS
+    return LOCAL_LLM_TIMEOUT_SECONDS
+
+
 def _fallback_to_local(
     messages: list[dict[str, Any]],
     *,
@@ -804,6 +825,7 @@ def _fallback_to_local(
         messages,
         temperature=temperature,
         max_tokens=max_tokens,
+        timeout_seconds=_local_timeout_for_purpose(purpose),
         **kwargs,
     )
     _set_active("local", "local", purpose)
@@ -854,6 +876,7 @@ def generate_llm_response(
             messages,
             temperature=temperature,
             max_tokens=effective_max_tokens,
+            timeout_seconds=_local_timeout_for_purpose(purpose),
             **kwargs,
         )
         _set_active("local", "local", purpose)
