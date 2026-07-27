@@ -658,3 +658,47 @@ def test_detail_npc_batch_preserves_campaign_id_and_empty_location(monkeypatch):
     npc = result["npcs"][0]
     assert npc["campaign_id"] == "MultiTest"
     assert npc["location_id"] == ""
+
+
+def _load_doctor_who_catseye_fixture() -> str:
+    path = (
+        Path(__file__).resolve().parent
+        / "tests"
+        / "fixtures"
+        / "doctor_who_catseye_npcs_excerpt.txt"
+    )
+    return path.read_text(encoding="utf-8")
+
+
+def test_seed_npc_detail_from_doctor_who_traits_and_bio():
+    text = _load_doctor_who_catseye_fixture()
+    for name in ("Max Eddings", "Peter Hutchins", "Chad"):
+        seeded = content_import._seed_npc_detail_from_document(name, "squatter", text)
+        assert seeded is not None, f"expected seed for {name}"
+        assert seeded["personality"] or seeded["public_facts"], f"empty seed for {name}"
+        assert not content_import._npc_detail_is_sparse(seeded), f"sparse seed for {name}"
+
+
+def test_detail_npc_batch_seeds_doctor_who_when_llm_empty(monkeypatch):
+    text = _load_doctor_who_catseye_fixture()
+
+    def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step):
+        return {"npcs": []}
+
+    monkeypatch.setattr(content_import, "_call_llm_json", fake_call_llm_json)
+    result = content_import.detail_npc_batch(
+        text,
+        {"campaign_id": "cats_eye", "name": "Cat's Eye"},
+        [{"id": "max_eddings", "name": "Max Eddings", "role": "squatter", "first_location_id": "majestic"}],
+    )
+    npc = result["npcs"][0]
+    assert any("Selfish" in p for p in npc["personality"])
+    assert any("Argumentative" in p for p in npc["personality"])
+    assert npc["public_facts"] or npc["known_facts"]
+    assert any("seeded from traits/bio" in w.lower() for w in result["warnings"])
+
+
+def test_mention_indexes_tolerates_pdf_split_hutchins():
+    hay = "Peter Hutc HiNs\nFriends: Hutchins has the majority"
+    hits = content_import._mention_indexes(hay.casefold(), "Peter Hutchins")
+    assert hits, "expected flexible match for PDF-split Hutchins"

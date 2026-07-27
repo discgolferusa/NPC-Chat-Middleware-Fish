@@ -801,6 +801,128 @@ def _npc_detail_from_stat_seed(stub: dict[str, Any]) -> dict[str, Any]:
     return detail
 
 
+_TRAIT_SECTION_HEADER = re.compile(r"(?im)^\s*traits?\s*$")
+_TRAIT_ITEM_START = re.compile(r"^([A-Za-z][A-Za-z][A-Za-z \-/]{0,32}):\s*(.*)$")
+_TRAIT_SECTION_END = re.compile(
+    r"(?i)^\s*(?:tech\s*level|story\s*points|skills|awareness|presence|coordination|"
+    r"resolve|ingenuity|strength|exploring|water\s+vs)\b"
+)
+
+
+def _parse_trait_blocks(excerpt: str) -> list[tuple[str, str]]:
+    """Parse Cubicle 7-style TRAITS blocks (Trait: description, possibly wrapped)."""
+    lines = excerpt.splitlines()
+    traits: list[tuple[str, str]] = []
+    in_traits = False
+    current_name = ""
+    current_parts: list[str] = []
+
+    def flush() -> None:
+        nonlocal current_name, current_parts
+        if current_name and current_parts:
+            text = " ".join(p.strip() for p in current_parts if p.strip()).strip()
+            if text:
+                traits.append((current_name, text))
+        current_name = ""
+        current_parts = []
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if _TRAIT_SECTION_HEADER.match(stripped):
+            flush()
+            in_traits = True
+            continue
+        if not in_traits:
+            continue
+        if _TRAIT_SECTION_END.match(stripped):
+            flush()
+            in_traits = False
+            continue
+        item = _TRAIT_ITEM_START.match(stripped)
+        if item and not stripped.lower().startswith("tech level"):
+            flush()
+            current_name = item.group(1).strip()
+            rest = item.group(2).strip()
+            current_parts = [rest] if rest else []
+            continue
+        if current_name:
+            current_parts.append(stripped)
+    flush()
+    return traits
+
+
+def _bio_paragraphs_for_name(excerpt: str, name: str) -> list[str]:
+    """Grab prose paragraphs that clearly describe this NPC by name."""
+    name = str(name or "").strip()
+    if not name or not excerpt:
+        return []
+    name_cf = name.casefold()
+    surname = name.split()[-1].casefold() if name.split() else ""
+    paragraphs: list[str] = []
+    for block in re.split(r"\n\s*\n+", excerpt):
+        text = " ".join(line.strip() for line in block.splitlines() if line.strip()).strip()
+        if len(text) < 40:
+            continue
+        head = text[:80].casefold()
+        if name_cf in head or (len(surname) >= 4 and head.startswith(surname)):
+            paragraphs.append(text)
+            continue
+        # PDF mid-word spaces: "Max Eddings" vs header noise still leaves surname in prose.
+        if len(surname) >= 4 and surname in text[:120].casefold() and (
+            " is " in text.casefold() or " suffers" in text.casefold() or " has " in text.casefold()
+        ):
+            paragraphs.append(text)
+    return paragraphs[:3]
+
+
+def _seed_npc_detail_from_document(
+    name: str,
+    role: str,
+    document_text: str,
+) -> dict[str, Any] | None:
+    """Deterministic detail seed from Cubicle 7 / Doctor Who-style stat writeups."""
+    needles = _distinctive_name_needles(name, snake_case(name))
+    excerpt = _relevant_excerpts(document_text, needles)
+    if not excerpt or len(excerpt.strip()) < 60:
+        return None
+
+    traits = _parse_trait_blocks(excerpt)
+    bios = _bio_paragraphs_for_name(excerpt, name)
+    personality: list[str] = []
+    llm_rules: list[str] = []
+    public_facts: list[str] = []
+    known_facts: list[str] = []
+
+    for trait_name, trait_text in traits:
+        personality.append(f"{trait_name}: {trait_text}")
+        llm_rules.append(f"Play the '{trait_name}' trait: {trait_text}")
+
+    if role:
+        public_facts.append(f"Role: {role}")
+    for bio in bios:
+        # First bio sentence-ish chunks as public/known facts.
+        if len(public_facts) < 4:
+            public_facts.append(bio if len(bio) <= 320 else bio[:317] + "...")
+        else:
+            known_facts.append(bio if len(bio) <= 320 else bio[:317] + "...")
+
+    detail: dict[str, Any] = {
+        "gender": "unspecified",
+        "race": "unknown",
+        "voice": [],
+        "personality": personality,
+        "public_facts": public_facts,
+        "known_facts": known_facts,
+        "secrets": [],
+        "llm_rules": llm_rules,
+    }
+    if _npc_detail_is_sparse(detail):
+        return None
+    return detail
+
+
 def _location_detail_from_seed(stub: dict[str, Any]) -> dict[str, Any]:
     name = str(stub.get("name") or stub.get("id") or "Location").strip()
     return {
@@ -998,12 +1120,26 @@ def _distinctive_name_needles(name: str, entity_id: str = "") -> list[str]:
 
 
 def _mention_indexes(haystack_cf: str, needle: str) -> list[int]:
-    """Casefolded bounded substring matches (not bare 'he' inside 'the')."""
+    """Casefolded matches; allow PDF mid-word spaces (Hutc HiNs ≈ Hutchins)."""
     v = str(needle or "").strip().casefold()
     if len(v) < 3:
         return []
-    pattern = re.compile(rf"(?<![a-z0-9]){re.escape(v)}(?![a-z0-9])")
-    return [match.start() for match in pattern.finditer(haystack_cf)]
+    # Exact bounded match first.
+    exact = re.compile(rf"(?<![a-z0-9]){re.escape(v)}(?![a-z0-9])")
+    hits = [match.start() for match in exact.finditer(haystack_cf)]
+    if hits:
+        return hits
+    # Fallback: optional whitespace between letters within each word token.
+    flex_words: list[str] = []
+    for word in v.split():
+        chars = [re.escape(ch) for ch in word if ch.isalnum()]
+        if len(chars) < 3:
+            continue
+        flex_words.append(r"\s*".join(chars))
+    if not flex_words:
+        return []
+    flexible = re.compile(rf"(?<![a-z0-9]){r'\s+'.join(flex_words)}(?![a-z0-9])")
+    return [match.start() for match in flexible.finditer(haystack_cf)]
 
 
 def _relevant_excerpts(
@@ -1491,13 +1627,18 @@ def _build_npc_detail_prompt(batch: list[dict[str, Any]], text: str, campaign: d
     return (
         f'Campaign: "{campaign["name"]}" ({campaign["campaign_id"]}).\n\n'
         "Fill in roleplay details for EACH NPC below from the SOURCE EXCERPTS. "
-        "These excerpts often come from NPCNarrator-ready writeups. Map section headers "
-        "into fields when present:\n"
+        "These excerpts often come from NPCNarrator-ready writeups or published RPG "
+        "stat blocks. Map section headers into fields when present:\n"
         "- Role → keep/refine role (already provided on the stub; do not blank it)\n"
         "- Appearance → public_facts and/or personality cues\n"
         "- Voice Direction → voice (short delivery traits) AND llm_rules about speech style\n"
         "- Personality and Motivation / Goals → personality + known_facts + llm_rules\n"
         "- PERSONALITY / PERSONAL AGENDA (ALIEN RPG modules) → personality + known_facts + llm_rules\n"
+        "- TRAITS (Doctor Who / Cubicle 7 modules: Selfish, Brave, Friends, Tough, etc.) → "
+        "each trait name+description becomes personality and an llm_rule\n"
+        "- SKILLS / attributes near a named NPC → optional known_facts (do not invent scores)\n"
+        "- Prose biography after TECH LEVEL / STORY POINTS → public_facts + known_facts + "
+        "personality; copy concrete wording\n"
         "- BUDDY / RIVAL (ALIEN RPG) → llm_rules about relationships\n"
         "- What the NPC Knows → known_facts (one bullet per distinct fact)\n"
         "- What the NPC Hides → secrets\n"
@@ -1908,12 +2049,24 @@ def detail_npc_batch(
                     f"NPC '{stub['id']}': detail sparse; fell back to "
                     "PERSONALITY / PERSONAL AGENDA from the stat block."
                 )
-            elif not detail:
-                warnings.append(
-                    f"NPC '{stub['id']}': no detail returned; using minimal defaults. "
-                    "Local small models often need content_creation set to Groq or a "
-                    "stronger local model for dense NPC writeups."
+            else:
+                seeded = _seed_npc_detail_from_document(
+                    str(stub.get("name") or ""),
+                    str(stub.get("role") or ""),
+                    text,
                 )
+                if seeded is not None:
+                    details_by_id[stub["id"]] = seeded
+                    warnings.append(
+                        f"NPC '{stub['id']}': detail sparse; seeded from TRAITS/bio "
+                        "excerpts in the source document."
+                    )
+                elif not detail:
+                    warnings.append(
+                        f"NPC '{stub['id']}': no detail returned; using minimal defaults. "
+                        "Local small models often need content_creation set to Groq or a "
+                        "stronger local model for dense NPC writeups."
+                    )
 
     npcs = [
         _merge_npc_detail(
