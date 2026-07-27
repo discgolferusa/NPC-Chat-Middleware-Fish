@@ -653,14 +653,20 @@ def _document_has_recoverable_stat_blocks(text: str) -> bool:
 
 def _guess_campaign_title(text: str) -> str | None:
     """Best-effort title from the document head when the LLM returns an empty campaign."""
-    head = (text or "")[:2500]
+    head = (text or "")[:3500]
     collapsed_head = _collapse_spaced_caps(head)
+    # Doctor Who / Cubicle 7 style titles often arrive letter-spaced: "Cat s Ey E".
+    if re.search(r"(?i)c\s*a\s*t\s*['’]?\s*s\s*e\s*y\s*e", head):
+        return "Cat's Eye"
     # Prefer an explicit scenario title near the top of the extract.
     for pattern in (
         r"(?is)\b(CHARIOT\s+OF\s+THE\s+GODS)\b",
+        r"(?is)\b(CAT'?S\s+EYE)\b",
         r"(?m)^\s*([A-Z0-9][A-Z0-9' \-]{2,48})\s*$",
     ):
         match = re.search(pattern, collapsed_head)
+        if not match:
+            match = re.search(pattern, head, flags=re.IGNORECASE) if "CAT" in pattern else None
         if not match:
             continue
         title = re.sub(r"\s+", " ", match.group(1)).strip(" :-")
@@ -669,8 +675,10 @@ def _guess_campaign_title(text: str) -> str | None:
         words = title.split()
         if len(words) > 8:
             continue
-        if title.casefold() in {"scenario", "contents", "introduction", "non-player characters"}:
+        if title.casefold() in {"scenario", "contents", "introduction", "non-player characters", "credits"}:
             continue
+        if "cat" in title.casefold() and "eye" in title.casefold():
+            return "Cat's Eye"
         if title.isupper() and len(words) >= 2:
             return title.title()
         if title.isupper() and len(words) == 1 and len(title) >= 4:
@@ -689,6 +697,9 @@ def _ensure_locations_for_npc_hints(
     defaults = {
         "uscss_cronus": ("USCSS Cronus", "building"),
         "sotillo": ("Sotillo", "building"),
+        "majestic_hotel": ("Majestic Hotel", "building"),
+        "the_majestic": ("The Majestic", "building"),
+        "majestic": ("Majestic Hotel", "building"),
     }
     added: list[str] = []
     for npc in npc_stubs:
@@ -1064,10 +1075,23 @@ def _seed_npc_detail_from_document(
     return detail
 
 
+def _flex_letters(word: str) -> str:
+    """Build a regex that allows PdfPig spaces between letters: 'awareness' ≈ 'AWAr eNe s s'."""
+    chars = [re.escape(ch) for ch in str(word or "") if ch.isalnum()]
+    if not chars:
+        return ""
+    return r"\s*".join(chars)
+
+
+# PdfPig two-column extracts often put two Awareness/Presence pairs on one line and
+# insert spaces inside words. Match flexibly anywhere on the line.
 _CALLOUT_AWARENESS_PRESENCE = re.compile(
-    r"(?i)^\s*awareness\s+\d+\s+presence\s+\d+\s*$"
+    rf"(?i)(?<![a-z0-9]){_flex_letters('awareness')}\s+(\d+)\s+{_flex_letters('presence')}\s+(\d+)(?![a-z0-9])"
 )
-_CALLOUT_STORY_OR_TECH = re.compile(r"(?i)\b(?:story\s*points|tech\s*level)\b")
+_CALLOUT_TRAITS_FLEX = re.compile(rf"(?i)(?<![a-z0-9]){_flex_letters('traits')}(?![a-z0-9])")
+_CALLOUT_STORY_OR_TECH = re.compile(
+    rf"(?i)(?:{_flex_letters('story')}\s*{_flex_letters('points')}|{_flex_letters('tech')}\s*{_flex_letters('level')})"
+)
 _CALLOUT_MONSTER_CONTEXT = re.compile(
     r"(?i)\b(?:creature\s*statistics?|monster(?:s)?|enemy\s*stat|adversary\s*stat|"
     r"alien\s*creature|beast(?:s)?\s*stat)\b"
@@ -1076,6 +1100,39 @@ _CREDIT_ROLE_LINE = re.compile(
     r"(?i)^\s*(?:writing|writer|line\s*developer|editing|editors?|cover|"
     r"graphic\s*design(?:\s*&\s*layout)?|layout|creative\s*director|"
     r"art\s*director|publisher|proofreading|playtesters?|thanks)\s*$"
+)
+_CALLOUT_BIO_NAME = re.compile(
+    r"\b([A-Z][a-z]{1,14}(?:\s+[A-Z][a-z]{1,14}){1,2})\b"
+)
+_CALLOUT_SINGLE_NAME = re.compile(r"[\"“”']([A-Za-z][A-Za-z'-]{1,20})[\"“”']")
+_CALLOUT_NAME_STOPWORDS = frozenset(
+    {
+        "awareness",
+        "presence",
+        "coordination",
+        "resolve",
+        "ingenuity",
+        "strength",
+        "fighting",
+        "survival",
+        "subterfuge",
+        "medicine",
+        "convince",
+        "skills",
+        "traits",
+        "story",
+        "points",
+        "tech",
+        "level",
+        "the majestic",
+        "majestic hotel",
+        "player characters",
+        "player group",
+        "poc unity",
+        "cats eye",
+        "cat's eye",
+        "unarmed combat",
+    }
 )
 
 
@@ -1116,6 +1173,162 @@ def _normalize_pdf_person_name(raw: str) -> str:
     return " ".join((t[0].upper() + t[1:].lower()) if t else t for t in tokens)
 
 
+def _collapse_alpha_shards(segment: str) -> str:
+    """Join PdfPig letter shards: 'MAx e d d iNGs' → 'MAxeddiNGs'."""
+    tokens = str(segment or "").split()
+    out: list[str] = []
+    for tok in tokens:
+        if (
+            out
+            and re.fullmatch(r"[A-Za-z]+", out[-1] or "")
+            and re.fullmatch(r"[A-Za-z]+", tok)
+            and (len(tok) <= 2 or tok[0].islower() or len(out[-1]) <= 3)
+        ):
+            out[-1] += tok
+            continue
+        out.append(tok)
+    return " ".join(out)
+
+
+def _is_plausible_callout_name(name: str) -> bool:
+    key = str(name or "").strip().casefold()
+    if not key or key in _CALLOUT_NAME_STOPWORDS:
+        return False
+    if any(key == stop or key.startswith(stop + " ") for stop in _CALLOUT_NAME_STOPWORDS):
+        return False
+    words = str(name).split()
+    if not (1 <= len(words) <= 3):
+        return False
+    return all(re.fullmatch(r"[A-Za-z][A-Za-z'-]{0,20}", w) for w in words)
+
+
+def _split_dual_column_headers(header_line: str, count: int) -> list[str]:
+    """Split a two-column name header into ``count`` groups by long-token boundaries."""
+    toks = [t for t in str(header_line or "").split() if t]
+    if not toks:
+        return []
+    if count <= 1 or len(toks) < 4:
+        return [_normalize_pdf_person_name(_collapse_alpha_shards(" ".join(toks)))]
+
+    if count == 2:
+        seen_long = 0
+        split_at = None
+        for i, tok in enumerate(toks):
+            if tok.isalpha() and len(tok) >= 3:
+                seen_long += 1
+                if seen_long >= 2 and i + 1 < len(toks):
+                    split_at = i + 1
+                    break
+        if split_at:
+            chunks = [toks[:split_at], toks[split_at:]]
+            return [
+                _normalize_pdf_person_name(_collapse_alpha_shards(" ".join(chunk)))
+                for chunk in chunks
+                if chunk
+            ]
+
+    # Fallback: even token slices.
+    size = len(toks) / count
+    names: list[str] = []
+    for i in range(count):
+        start = int(i * size)
+        end = int((i + 1) * size) if i < count - 1 else len(toks)
+        chunk = toks[start:end]
+        if chunk:
+            names.append(_normalize_pdf_person_name(_collapse_alpha_shards(" ".join(chunk))))
+    return names
+
+
+def _repair_glued_person_name(glued: str, window: str) -> str:
+    """Map Maxeddings/Peterhutchins/Katepetersen onto a spaced display name."""
+    glued_norm = _normalize_pdf_person_name(glued)
+    letters = re.sub(r"[^a-z]", "", glued_norm.casefold())
+    if not letters:
+        return glued_norm
+    if " " in glued_norm and _is_plausible_callout_name(glued_norm):
+        return glued_norm
+    hay = window or ""
+    for match in _CALLOUT_BIO_NAME.finditer(hay):
+        cand = match.group(1).strip()
+        if not _is_plausible_callout_name(cand):
+            continue
+        cand_letters = re.sub(r"[^a-z]", "", cand.casefold())
+        if cand_letters == letters or letters in cand_letters or cand_letters in letters:
+            return cand
+    # Split FirstLast when the first token appears nearby as a whole word (Kate / Max).
+    # Prefer longer first-name splits so Kate beats Kat.
+    for n in range(6, 2, -1):
+        if len(letters) <= n + 3:
+            continue
+        first = letters[:n]
+        rest = letters[n:]
+        if not re.search(rf"\b{re.escape(first)}\b", hay.casefold()):
+            continue
+        spaced = first.title() + " " + rest.title()
+        if re.search(rf"\b{re.escape(first)}\s+{re.escape(rest)}\b", hay.casefold()):
+            return spaced
+        if len(rest) >= 4:
+            return spaced
+    return glued_norm
+
+
+def _pick_callout_header_line(lines: list[str], awareness_line_idx: int) -> int:
+    """Choose the best short name-header line above an Awareness row (skip prose)."""
+    best_idx = -1
+    best_score = -1
+    for j in range(awareness_line_idx - 1, max(-1, awareness_line_idx - 14), -1):
+        candidate = lines[j].strip()
+        if not candidate:
+            continue
+        if _CREDIT_ROLE_LINE.match(candidate):
+            return -1
+        if _CALLOUT_AWARENESS_PRESENCE.search(candidate):
+            continue
+        shards = candidate.split()
+        short_shards = sum(1 for t in shards if t.isalpha() and len(t) <= 3)
+        collapsed = _collapse_alpha_shards(candidate)
+        score = 0
+        if len(candidate) <= 40:
+            score += 2
+        if len(candidate) > 70:
+            score -= 8
+        # PdfPig name headers are short lines with many letter shards.
+        if short_shards >= 3 and len(candidate) <= 42:
+            score += 10
+        # Also: 'Peter Hutc HiNs' style (few tokens, a split fragment, short line).
+        if (
+            2 <= len(shards) <= 5
+            and len(candidate) <= 42
+            and any(_token_looks_pdf_split_fragment(t) for t in shards)
+        ):
+            score += 10
+        if _CALLOUT_SINGLE_NAME.search(candidate) and len(candidate) <= 24:
+            score += 10
+        lowered = candidate.casefold()
+        if lowered.startswith(
+            ("the ", "a ", "an ", "this ", "that ", "hotel ", "by ", "in ", "of ", "to ")
+        ):
+            score -= 10
+        # Running headers / title chrome are not NPC names.
+        if "cat" in lowered and "eye" in lowered:
+            score -= 20
+        if "squatter" in lowered.replace(" ", "") and "meet" in lowered.replace(" ", ""):
+            score -= 10
+        if len(collapsed.split()) == 1 and len(re.sub(r"[^A-Za-z]", "", collapsed)) > 18:
+            # Collapsed prose blob, not a name.
+            score -= 6
+        if _looks_like_npc_name_header(candidate.strip("\"“”")):
+            score += 3
+        if _looks_like_npc_name_header(collapsed.strip("\"“”")):
+            score += 2
+        if score > best_score:
+            best_score = score
+            best_idx = j
+    if best_score < 5:
+        return -1
+    return best_idx
+
+
 def _guess_callout_role(preceding: str) -> str:
     window = (preceding or "")[-900:].casefold()
     if "squatter" in window:
@@ -1130,10 +1343,8 @@ def _guess_callout_role(preceding: str) -> str:
 def _extract_cubicle7_callout_npcs(document_text: str) -> list[dict[str, str]]:
     """Find Cubicle 7-style character callout boxes (name + attributes + TRAITS).
 
-    These appear mid-scene (like ALIEN sidebar/stat callouts), not only under an
-    NPC appendix. Credits/TOC names lack Awareness/Presence + TRAITS + Story Points
-    and are ignored. Creature-only blocks under monster headings are skipped when
-    that context is adjacent.
+    Tolerates PdfPig letter-spacing and two-column glue where two Awareness/Presence
+    pairs share a line. Credits/TOC names lack that sheet pattern and are ignored.
     """
     text = document_text or ""
     if not text.strip():
@@ -1144,50 +1355,66 @@ def _extract_cubicle7_callout_npcs(document_text: str) -> list[dict[str, str]]:
     seen: set[str] = set()
 
     for i, line in enumerate(lines):
-        if not _CALLOUT_AWARENESS_PRESENCE.match(line.strip()):
+        matches = list(_CALLOUT_AWARENESS_PRESENCE.finditer(line))
+        if not matches:
             continue
 
-        # Name header is the nearest prior non-empty line.
-        header_idx = -1
-        for j in range(i - 1, max(-1, i - 6), -1):
-            candidate = lines[j].strip()
-            if not candidate:
-                continue
-            if _CREDIT_ROLE_LINE.match(candidate) or _STAT_OR_SECTION_LINE.match(candidate):
-                header_idx = -1
-                break
-            header_idx = j
-            break
+        header_idx = _pick_callout_header_line(lines, i)
         if header_idx < 0:
-            continue
-
-        header_raw = lines[header_idx].strip()
-        if not _looks_like_npc_name_header(header_raw):
-            continue
-
-        # Look ahead for character-sheet signals (TRAITS + Story Points / Tech Level).
-        window = "\n".join(lines[i : min(len(lines), i + 22)])
-        if not _TRAIT_SECTION_HEADER.search(window):
-            continue
-        if not _CALLOUT_STORY_OR_TECH.search(window):
             continue
 
         preceding = "\n".join(lines[max(0, header_idx - 12) : header_idx])
         if _CALLOUT_MONSTER_CONTEXT.search(preceding):
             continue
 
-        name = _normalize_pdf_person_name(header_raw)
-        if not name or len(name) < 3:
+        header_raw = lines[header_idx].strip()
+        header_names = _split_dual_column_headers(header_raw, len(matches))
+        # Quoted single-name headers ("cHAd") for one-column sheets.
+        if len(matches) == 1:
+            quoted = _CALLOUT_SINGLE_NAME.search(header_raw)
+            if quoted:
+                header_names = [_normalize_pdf_person_name(quoted.group(1))]
+
+        window = "\n".join(lines[max(0, header_idx) : min(len(lines), i + 32)])
+        if not _CALLOUT_TRAITS_FLEX.search(window):
             continue
-        key = name.casefold()
-        if key in seen:
-            continue
-        if key in _KNOWN_IMPORT_FALSE_POSITIVE_NAMES:
+        if not _CALLOUT_STORY_OR_TECH.search(window):
             continue
 
-        seen.add(key)
-        role = _guess_callout_role(preceding + "\n" + window)
-        found.append({"name": name, "role": role, "location_hint": ""})
+        bio_names: list[str] = []
+        for match in _CALLOUT_BIO_NAME.finditer(window):
+            cand = match.group(1).strip()
+            if _is_plausible_callout_name(cand) and cand.casefold() not in {
+                n.casefold() for n in bio_names
+            }:
+                bio_names.append(cand)
+
+        for column_index, _match in enumerate(matches):
+            name = ""
+            if column_index < len(header_names):
+                name = _repair_glued_person_name(header_names[column_index], window)
+            if not _is_plausible_callout_name(name) or (
+                " " not in name and len(name) > 8
+            ):
+                for bio in bio_names:
+                    if bio.casefold() not in seen:
+                        name = bio
+                        break
+            name = _normalize_pdf_person_name(name)
+            if not _is_plausible_callout_name(name):
+                continue
+            # Prefer multi-word character names; allow short single tokens (Chad).
+            if " " not in name and len(name) > 8:
+                continue
+            key = name.casefold()
+            if key in seen:
+                continue
+            if key in _KNOWN_IMPORT_FALSE_POSITIVE_NAMES:
+                continue
+
+            seen.add(key)
+            role = _guess_callout_role(preceding + "\n" + window)
+            found.append({"name": name, "role": role, "location_hint": ""})
 
     return found
 
@@ -1214,6 +1441,8 @@ def _npc_stubs_from_cubicle7_callouts(
             if "majestic" in loc_id or "hotel" in loc_id:
                 loc = loc_id
                 break
+    if not loc and re.search(r"(?i)majestic", document_text or ""):
+        loc = "majestic_hotel"
 
     stubs: list[dict[str, Any]] = []
     for row in parsed:

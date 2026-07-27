@@ -723,6 +723,41 @@ def test_extract_cubicle7_callouts_from_catseye_pdf_fixture():
     assert "Gareth Ryder-Hanrahan" not in names
 
 
+def test_extract_cubicle7_callouts_from_pdfpig_letter_spacing():
+    """Editor PdfPig extracts space inside words and glue two columns onto one line."""
+    path = (
+        Path(__file__).resolve().parent
+        / "tests"
+        / "fixtures"
+        / "doctor_who_catseye_pdfpig_callouts.txt"
+    )
+    text = path.read_text(encoding="utf-8")
+    parsed = content_import._extract_cubicle7_callout_npcs(text)
+    names = {row["name"] for row in parsed}
+    assert names >= {"Kate Petersen", "Max Eddings", "Peter Hutchins", "Chad"}
+
+
+def test_outline_seeds_callouts_when_llm_returns_empty(monkeypatch):
+    path = (
+        Path(__file__).resolve().parent
+        / "tests"
+        / "fixtures"
+        / "doctor_who_catseye_pdfpig_callouts.txt"
+    )
+    # Prefix with title chrome so campaign title can be inferred.
+    text = "Cat s Ey E\nThe Majestic Hotel\n\n" + path.read_text(encoding="utf-8")
+
+    def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step):
+        return {"campaign": {}, "locations": [], "npcs": []}
+
+    monkeypatch.setattr(content_import, "_call_llm_json", fake_call_llm_json)
+    result = content_import.outline_campaign_document(text, "create_new")
+    assert result["campaign"]["name"] == "Cat's Eye"
+    names = {npc["name"] for npc in result["npcs"]}
+    assert names >= {"Kate Petersen", "Max Eddings", "Peter Hutchins", "Chad"}
+    assert any(loc["id"] == "majestic_hotel" for loc in result["locations"])
+
+
 def test_outline_prefers_callouts_over_credit_hallucinations(monkeypatch):
     text = _load_doctor_who_callout_pdf_fixture()
 
