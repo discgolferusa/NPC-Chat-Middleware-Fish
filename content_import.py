@@ -10,12 +10,14 @@ elsewhere in this repo) for the caller to review and persist.
 Pipeline:
   1. Outline pass — one LLM call that reads the whole document and proposes
      the campaign, a location list, and an NPC list (name/role/locations).
+     Skipped when recoverable published RPG stat blocks are present (names are
+     seeded deterministically); location/NPC detail sweeps still run.
   2. Location detail pass — small batches (<= MAX_LOCATIONS_PER_BATCH) using
      name-focused source excerpts; extract-over-invent; retry if sparse.
   3. NPC detail pass — one NPC per call with name-focused excerpts; maps
      NPCNarrator section headers and published RPG stat blocks (e.g. ALIEN RPG
      FULL NAME / PERSONAL AGENDA) into voice/personality/facts/secrets/llm_rules;
-     retry if sparse.
+     retry if sparse. PERSONALITY / PERSONAL AGENDA seeds are a fallback only.
 
 When a NON-PLAYER CHARACTERS section is detected, stat-block names override
 bad LLM outline guesses (see test_content_import.py / Chariot of the Gods).
@@ -1673,9 +1675,11 @@ def analyze_campaign_document(
 
     if use_stat_block_fast_path:
         # Avoid a long/fragile outline LLM call — merge already prefers stat blocks.
+        # Location and NPC detail sweeps still run so roleplay fields are filled
+        # from the document; PERSONALITY / AGENDA seeds are fallback only.
         warnings.append(
             "Published NON-PLAYER CHARACTERS stat blocks detected; skipping LLM outline "
-            "and seeding NPC details from PERSONALITY / PERSONAL AGENDA."
+            "and seeding NPC stubs from FULL NAME blocks (detail sweep still runs)."
         )
         outline_raw = {"campaign": {}, "locations": [], "npcs": []}
     else:
@@ -1736,21 +1740,27 @@ def analyze_campaign_document(
 
     locations_by_id: dict[str, dict[str, Any]] = {}
     for batch in _batches(location_stubs, MAX_LOCATIONS_PER_BATCH):
-        seeded_batch = [stub for stub in batch if stub.get("seeded_from_stat_blocks")]
-        llm_batch = [stub for stub in batch if not stub.get("seeded_from_stat_blocks")]
-        details_by_id: dict[str, dict[str, Any]] = {
-            stub["id"]: _location_detail_from_seed(stub) for stub in seeded_batch
-        }
-        if llm_batch:
-            details_by_id.update(_fetch_location_details(llm_batch, full_document_text, campaign, warnings))
-            for stub in llm_batch:
+        details_by_id: dict[str, dict[str, Any]] = {}
+        if batch:
+            details_by_id.update(
+                _fetch_location_details(batch, full_document_text, campaign, warnings)
+            )
+            for stub in batch:
                 detail = details_by_id.get(stub["id"], {})
                 if _location_detail_is_sparse(detail):
-                    retry = _fetch_location_details([stub], full_document_text, campaign, warnings)
+                    retry = _fetch_location_details(
+                        [stub], full_document_text, campaign, warnings
+                    )
                     retry_detail = retry.get(stub["id"], {})
                     if not _location_detail_is_sparse(retry_detail):
                         details_by_id[stub["id"]] = retry_detail
                         warnings.append(f"Location '{stub['id']}': recovered details on retry.")
+                    elif stub.get("seeded_from_stat_blocks"):
+                        details_by_id[stub["id"]] = _location_detail_from_seed(stub)
+                        warnings.append(
+                            f"Location '{stub['id']}': detail sparse; fell back to "
+                            "stat-block location stub defaults."
+                        )
                     elif not detail:
                         warnings.append(
                             f"Location '{stub['id']}': no detail returned; using minimal defaults."
@@ -1763,26 +1773,27 @@ def analyze_campaign_document(
 
     npcs_by_id: dict[str, dict[str, Any]] = {}
     for batch in _batches(npc_stubs, MAX_NPCS_PER_BATCH):
-        seeded_batch = [stub for stub in batch if _npc_stub_has_stat_seed(stub)]
-        llm_batch = [stub for stub in batch if not _npc_stub_has_stat_seed(stub)]
-        details_by_id: dict[str, dict[str, Any]] = {
-            stub["id"]: _npc_detail_from_stat_seed(stub) for stub in seeded_batch
-        }
-        if seeded_batch:
-            warnings.append(
-                f"Seeded roleplay fields for {len(seeded_batch)} NPC(s) from published "
-                "stat blocks (skipped slow per-NPC LLM detail)."
+        details_by_id: dict[str, dict[str, Any]] = {}
+        if batch:
+            details_by_id.update(
+                _fetch_npc_details(batch, full_document_text, campaign, warnings)
             )
-        if llm_batch:
-            details_by_id.update(_fetch_npc_details(llm_batch, full_document_text, campaign, warnings))
-            for stub in llm_batch:
+            for stub in batch:
                 detail = details_by_id.get(stub["id"], {})
                 if _npc_detail_is_sparse(detail):
-                    retry = _fetch_npc_details([stub], full_document_text, campaign, warnings)
+                    retry = _fetch_npc_details(
+                        [stub], full_document_text, campaign, warnings
+                    )
                     retry_detail = retry.get(stub["id"], {})
                     if not _npc_detail_is_sparse(retry_detail):
                         details_by_id[stub["id"]] = retry_detail
                         warnings.append(f"NPC '{stub['id']}': recovered details on retry.")
+                    elif _npc_stub_has_stat_seed(stub):
+                        details_by_id[stub["id"]] = _npc_detail_from_stat_seed(stub)
+                        warnings.append(
+                            f"NPC '{stub['id']}': detail sparse; fell back to "
+                            "PERSONALITY / PERSONAL AGENDA from the stat block."
+                        )
                     elif not detail:
                         warnings.append(
                             f"NPC '{stub['id']}': no detail returned; using minimal defaults. "

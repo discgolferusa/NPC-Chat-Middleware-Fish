@@ -141,13 +141,25 @@ def test_chariot_pdfpig_extract_finds_all_stat_block_npcs():
 
 
 def test_chariot_pdfpig_analyze_imports_all_npcs(monkeypatch):
+    """PdfPig extract skips outline but still runs location/NPC detail sweeps."""
     text = _load_chariot_pdfpig_fixture()
+    calls: list[str] = []
 
-    def fake_call_llm_json(*args, **kwargs):
-        raise AssertionError("stat-block fast path should not call the LLM")
+    def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step):
+        calls.append(step)
+        if step == "outline":
+            raise AssertionError("stat-block fast path should not call the outline LLM")
+        if step == "location detail":
+            return {"locations": []}
+        if step == "npc detail":
+            return {"npcs": []}
+        return {}
 
     monkeypatch.setattr(content_import, "_call_llm_json", fake_call_llm_json)
     result = content_import.analyze_campaign_document(text, "create_new")
+    assert "outline" not in calls
+    assert "location detail" in calls
+    assert "npc detail" in calls
     names = {npc["name"] for npc in result["npcs"]}
     for expected in CHARIOT_EXPECTED_NPCS:
         assert expected in names
@@ -206,18 +218,27 @@ def test_chariot_pdf_extract_parses_two_column_stat_blocks():
 
 
 def test_chariot_pdf_extract_recovers_from_empty_llm_outline(monkeypatch):
-    """Stat-block modules skip the outline LLM and still populate NPCs/locations."""
+    """Stat-block modules skip outline but still run location/NPC detail sweeps."""
     text = _load_chariot_pdf_extract_fixture()
     calls: list[str] = []
 
     def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step):
         calls.append(step)
-        raise AssertionError(f"unexpected LLM call for step={step}")
+        if step == "outline":
+            raise AssertionError("stat-block fast path should not call the outline LLM")
+        if step == "location detail":
+            return {"locations": []}
+        if step == "npc detail":
+            # Sparse on purpose so PERSONALITY / AGENDA seed fallback still applies.
+            return {"npcs": []}
+        return {}
 
     monkeypatch.setattr(content_import, "_call_llm_json", fake_call_llm_json)
 
     result = content_import.analyze_campaign_document(text, "create_new")
-    assert calls == []
+    assert "outline" not in calls
+    assert "location detail" in calls
+    assert "npc detail" in calls
     assert "chariot" in result["campaign"]["campaign_id"].casefold() or "gods" in result[
         "campaign"
     ]["name"].casefold()
@@ -233,20 +254,76 @@ def test_chariot_pdf_extract_recovers_from_empty_llm_outline(monkeypatch):
     assert "Captain Miller" not in names
     warning_blob = " ".join(result.get("warnings") or []).lower()
     assert "skipping llm outline" in warning_blob
+    assert "detail sweep still runs" in warning_blob
 
 
 def test_outline_failure_recovers_from_stat_blocks(monkeypatch):
-    """Non-ALIEN docs still fail hard on outline errors; ALIEN PDF uses fast path."""
+    """ALIEN PDF skips outline; detail may fail and still fall back to seeds."""
     text = _load_chariot_pdf_extract_fixture()
+    calls: list[str] = []
 
     def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step):
-        raise RuntimeError("should not be called on stat-block fast path")
+        calls.append(step)
+        if step == "outline":
+            raise RuntimeError("should not be called on stat-block fast path")
+        if step == "location detail":
+            return {"locations": []}
+        if step == "npc detail":
+            return {"npcs": []}
+        return {}
 
     monkeypatch.setattr(content_import, "_call_llm_json", fake_call_llm_json)
     result = content_import.analyze_campaign_document(text, "create_new")
+    assert "outline" not in calls
+    assert "npc detail" in calls
     names = {npc["name"] for npc in result["npcs"]}
     assert "Albert Johns" in names
     assert "Ava 6" in names
+
+
+def test_stat_block_fast_path_uses_llm_npc_detail_when_rich(monkeypatch):
+    """Detail sweep output should win over PERSONALITY/AGENDA seed stubs."""
+    text = _load_chariot_pdf_extract_fixture()
+
+    def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step):
+        if step == "outline":
+            raise AssertionError("outline must be skipped")
+        if step == "location detail":
+            return {
+                "locations": [
+                    {
+                        "id": "uscss_cronus",
+                        "summary": "A derelict science vessel drifting in deep space.",
+                        "current_events": ["Life support is failing on the lower decks."],
+                    }
+                ]
+            }
+        if step == "npc detail":
+            return {
+                "npcs": [
+                    {
+                        "id": "albert_johns",
+                        "gender": "male",
+                        "race": "human",
+                        "personality": ["LLM-enriched submissive officer"],
+                        "public_facts": ["Serves as third officer on the Cronus."],
+                        "known_facts": ["Needs a strong leader to function."],
+                        "secrets": ["Will betray the crew if cornered."],
+                        "llm_rules": ["Stay timid unless given orders."],
+                        "voice": ["Soft", "Deferential"],
+                    }
+                ]
+            }
+        return {}
+
+    monkeypatch.setattr(content_import, "_call_llm_json", fake_call_llm_json)
+    result = content_import.analyze_campaign_document(text, "create_new")
+    johns = next(npc for npc in result["npcs"] if npc["name"] == "Albert Johns")
+    assert "LLM-enriched submissive officer" in johns["personality"]
+    assert any("third officer" in fact.casefold() for fact in johns["public_facts"])
+    cronus = next((loc for loc in result["locations"] if loc["id"] == "uscss_cronus"), None)
+    if cronus is not None:
+        assert "derelict" in cronus["summary"].casefold()
 
 
 def test_truncate_preserving_npc_section_respects_max_chars():
