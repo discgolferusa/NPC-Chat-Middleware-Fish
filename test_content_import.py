@@ -204,6 +204,130 @@ def test_chariot_pdfpig_extract_finds_all_stat_block_npcs():
     assert "Micky Horton take the ship" not in names
 
 
+def test_docnet_toc_npc_header_does_not_block_stat_block_fast_path():
+    """PDFium/Docnet TOCs put dotted 'Non-Player Characters ... 12' before the real section."""
+    text = (
+        "Table of Contents\n"
+        "Non-Player Characters ........ 12\n"
+        "Deck Plans ........ 24\n\n"
+        + _load_chariot_pdfpig_fixture()
+    )
+    assert content_import._document_has_recoverable_stat_blocks(text)
+    result = content_import.outline_campaign_document(text, "create_new")
+    names = {npc["name"] for npc in result["npcs"]}
+    assert len(names) >= 5
+    assert "Albert Johns" in names
+    assert any("stat block" in w.lower() for w in result.get("warnings") or [])
+
+
+def test_find_npc_section_span_prefers_body_over_toc_without_full_name():
+    """Generic modules may list NPCs without FULL NAME markers; TOC must not win."""
+    text = (
+        "Table of Contents\n"
+        "Non-Player Characters ........ 12\n"
+        "Deck Plans ........ 24\n\n"
+        "INTRODUCTION\n"
+        "Welcome to the adventure.\n\n"
+        "NON-PLAYER CHARACTERS\n\n"
+        "JOHN SMITH, GUARD\n"
+        "A town guard on patrol.\n\n"
+        "JANE DOE, MERCHANT\n"
+        "Runs the general store.\n\n"
+        "BOB JONES, INNKEEPER\n"
+        "Owns the tavern.\n"
+    )
+    collapsed = content_import._collapse_spaced_caps(text)
+    span = content_import._find_npc_section_span(collapsed)
+    assert span is not None
+    section = collapsed[span[0] : span[1]]
+    assert "JOHN SMITH, GUARD" in section
+    assert "JANE DOE, MERCHANT" in section
+    assert "BOB JONES, INNKEEPER" in section
+    assert "........ 12" not in section
+
+    warnings: list[str] = []
+    prepared = content_import._prepare_outline_document_text(text, warnings)
+    assert "JOHN SMITH, GUARD" in prepared
+    assert "--- NON-PLAYER CHARACTERS (authoritative NPC list) ---" in prepared
+
+
+def test_stat_block_outline_succeeds_when_content_creation_budget_zero(monkeypatch):
+    """Deterministic stat-block outline must not require a Groq/local TPM budget."""
+    monkeypatch.setattr(content_import, "content_creation_max_input_chars", lambda: 0)
+    text = _load_chariot_pdfpig_fixture()
+    assert content_import._document_has_recoverable_stat_blocks(text)
+    result = content_import.outline_campaign_document(text, "create_new")
+    names = {npc["name"] for npc in result["npcs"]}
+    assert len(names) >= 5
+    assert "Albert Johns" in names
+    assert any("stat block" in w.lower() for w in result.get("warnings") or [])
+
+
+def test_stat_block_outline_ignores_tight_positive_content_creation_budget(monkeypatch):
+    """Stat-block fast path must not chop NPC section to the LLM TPM cap."""
+    monkeypatch.setattr(content_import, "content_creation_max_input_chars", lambda: 4_000)
+    text = _load_chariot_pdfpig_fixture()
+    result = content_import.outline_campaign_document(text, "create_new")
+    names = {npc["name"] for npc in result["npcs"]}
+    assert len(names) >= 5
+    assert "Albert Johns" in names
+
+
+def test_outline_stat_block_probe_bounds_huge_document(monkeypatch):
+    """Huge extracts must not fully collapse before the stat-block probe."""
+    chariot = _load_chariot_pdfpig_fixture()
+    huge = ("A" * 200_000) + chariot
+    collapsed_lengths: list[int] = []
+    original = content_import._collapse_spaced_caps
+
+    def spy(text: str) -> str:
+        collapsed_lengths.append(len(text))
+        return original(text)
+
+    monkeypatch.setattr(content_import, "_collapse_spaced_caps", spy)
+    result = content_import.outline_campaign_document(huge, "create_new")
+    names = {npc["name"] for npc in result["npcs"]}
+    assert len(names) >= 5
+    assert collapsed_lengths
+    assert max(collapsed_lengths) < len(huge)
+
+
+def test_find_npc_header_offset_detects_split_non_player_characters_lines():
+    """PdfPig/Docnet often put NON-PLAYER and CHARACTERS on separate lines."""
+    text = _load_chariot_pdfpig_fixture()
+    offset = content_import._find_best_npc_section_header_offset(text)
+    assert offset is not None
+    assert "NON-PLAYER" in text[offset : offset + 40]
+    assert "FULL NAME: Albert Johns" in text[offset : offset + 12_000]
+
+
+def test_find_npc_header_offset_detects_letter_spaced_split_header():
+    text = (
+        "Front matter\n\n"
+        "N O N - P L A Y E R\n"
+        "C H A R A C T E R S\n"
+        "JOHNS, OFFICER\n"
+        "FULL NAME: Albert Johns\n"
+        "FULL NAME: Valerie Reid\n"
+        "FULL NAME: Liam Flynn\n"
+    )
+    offset = content_import._find_best_npc_section_header_offset(text)
+    assert offset is not None
+    assert "Albert Johns" in text[offset : offset + 500]
+
+
+def test_bounded_text_preserves_mid_document_split_header_section():
+    """Huge extracts with a mid-document NPC section must not rely on head/tail only."""
+    chariot = _load_chariot_pdfpig_fixture()
+    huge = ("A" * 70_000) + chariot + ("B" * 70_000)
+    bounded = content_import._bounded_text_for_npc_operations(
+        huge, content_import.MAX_INPUT_CHARS
+    )
+    collapsed = content_import._collapse_spaced_caps(bounded)
+    assert "FULL NAME: Albert Johns" in collapsed
+    assert content_import._document_has_recoverable_stat_blocks(bounded)
+
+
 def test_chariot_pdfpig_analyze_imports_all_npcs(monkeypatch):
     """PdfPig extract skips outline but still runs location/NPC detail sweeps."""
     text = _load_chariot_pdfpig_fixture()
@@ -413,6 +537,42 @@ def test_truncate_preserving_npc_section_keeps_stat_blocks():
     assert "FULL NAME: Micky Horton" in trimmed
     assert "Captain Miller" not in trimmed
 
+
+def test_truncate_preserving_npc_section_keeps_document_head_for_title():
+    """Leftover budget must keep the document head so title/location callers still work."""
+    head = (
+        "CHARIOT OF THE GODS\n"
+        "A scenario for ALIEN RPG\n"
+        "USCSS Cronus is the primary location.\n"
+    )
+    filler = "Z" * 70_000
+    npc = (
+        "NON-PLAYER\n"
+        "CHARACTERS\n"
+        "JOHNS, OFFICER\n"
+        "FULL NAME: Albert Johns\n"
+        "PERSONALITY: Submissive\n"
+        "REID, COLONIAL MARINE\n"
+        "FULL NAME: Valerie Reid\n"
+        "PERSONALITY: On Edge\n"
+        "FLYNN, MEDIC\n"
+        "FULL NAME: Liam Flynn\n"
+        "PERSONALITY: Fearful\n"
+    )
+    # Mid-document NPC section with oversized post-header tail (no hard end).
+    tail = "T" * 70_000
+    text = f"{head}\n{filler}\n{npc}\n{tail}"
+    max_chars = 12_000
+    trimmed = content_import._truncate_preserving_npc_section(text, max_chars)
+    assert len(trimmed) <= max_chars
+    assert "CHARIOT OF THE GODS" in trimmed
+    assert "USCSS Cronus" in trimmed
+    assert "FULL NAME: Albert Johns" in trimmed
+    assert content_import._guess_campaign_title(trimmed) == "Chariot Of The Gods"
+    prepared = content_import._prepare_outline_document_text(trimmed, [])
+    assert "CHARIOT OF THE GODS" in prepared
+    assert "Albert Johns" in prepared
+
 def test_chariot_regression_replaces_movie_quote_outline_npcs(monkeypatch):
     """LLM outline picked Miller / David 8 / Vickers; stat blocks should win."""
     text = _load_chariot_fixture()
@@ -468,6 +628,42 @@ def test_chariot_regression_replaces_movie_quote_outline_npcs(monkeypatch):
     warning_blob = " ".join(result.get("warnings") or []).lower()
     assert "non-player characters" in warning_blob
     assert "stat block" in warning_blob
+
+
+def test_outline_truncates_huge_documents_at_start(monkeypatch):
+    monkeypatch.setattr(
+        content_import,
+        "_call_llm_json",
+        lambda *args, **kwargs: {"campaign": {}, "locations": [], "npcs": []},
+    )
+    # TPM at/above hop max so only the MAX_INPUT_CHARS cap applies once.
+    monkeypatch.setattr(content_import, "content_creation_max_input_chars", lambda: 200_000)
+    huge = "a" * 150_000
+    result = content_import.outline_campaign_document(huge, "create_new")
+    truncate_warnings = [
+        w for w in (result.get("warnings") or []) if "truncated" in w.lower()
+    ]
+    assert len(truncate_warnings) == 1
+
+
+def test_outline_does_not_duplicate_truncation_warning_when_tpm_also_caps(monkeypatch):
+    """Oversized docs that miss the stat-block path must not warn twice for one truncate."""
+    monkeypatch.setattr(
+        content_import,
+        "_call_llm_json",
+        lambda *args, **kwargs: {"campaign": {}, "locations": [], "npcs": []},
+    )
+    monkeypatch.setattr(content_import, "content_creation_max_input_chars", lambda: 8_000)
+    huge = "a" * 150_000
+    result = content_import.outline_campaign_document(huge, "create_new")
+    truncate_warnings = [
+        w for w in (result.get("warnings") or []) if "truncated" in w.lower()
+    ]
+    # MAX_INPUT_CHARS cap, then TPM shrink of the already-bounded text — two
+    # distinct budgets is fine; two identical "was 150000" messages is not.
+    assert len(truncate_warnings) <= 2
+    assert len({w for w in truncate_warnings}) == len(truncate_warnings)
+    assert sum(1 for w in truncate_warnings if "150000" in w or "150,000" in w) == 1
 
 
 def test_generic_npc_section_without_full_name_keeps_llm_outline(monkeypatch):
