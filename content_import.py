@@ -886,6 +886,528 @@ def _ensure_locations_for_npc_hints(
     return location_stubs
 
 
+# --------------------------------------------------------------------------
+# Alien moonside / locations-chapter major-site seeding
+# --------------------------------------------------------------------------
+
+_MOONSIDE_LOCATIONS_HEADER = re.compile(r"moonside\s+locations", re.IGNORECASE)
+_COLON_PLACE_HEADER = re.compile(
+    r"^([A-Z][A-Z0-9][A-Z0-9 '\-/]{1,48})\s*:\s+(\S.+)$"
+)
+_ALIEN_MAP_CHROME = frozenset(
+    {
+        "pad",
+        "pads",
+        "in",
+        "aw",
+        "ma",
+        "ap",
+        "ta",
+        "km",
+        "1 km",
+        "wells",
+        "pumpjacks",
+        "marines",
+        "tank",
+        "apc",
+        "d6",
+        "encounter",
+        "incident",
+        "discovery",
+        "destroyer of worlds",
+        "moonside locations",
+    }
+)
+_ALIEN_ROOM_SCALE_TOKENS = frozenset(
+    {
+        "hangar",
+        "pad",
+        "landing",
+        "cell",
+        "room",
+        "bay",
+        "lift",
+        "ladder",
+        "hatch",
+        "gate",
+        "foyer",
+        "studio",
+        "alcove",
+        "gantry",
+        "armory",
+        "morgue",
+        "bullpen",
+        "reception",
+        "office",
+        "yard",
+        "shack",
+        "tower",
+        "operations",
+        "junction",
+        "tunnel",
+        "corridor",
+        "storage",
+        "tank",
+        "door",
+        "camera",
+        "crowd",
+        "table",
+        "tables",
+        "snake",
+        "act",
+        "pipeline",
+        "tactics",
+        "technomagic",
+        "havoc",
+        "recovery",
+        "examination",
+        "surgical",
+        "holding",
+        "interrogation",
+        "medtech",
+        "stores",
+        "cloak",
+        "restroom",
+        "alleyway",
+        "bedroom",
+        "hall",
+        "roof",
+        "sally",
+        "emplacement",
+        "emplacements",
+        "canopy",
+        "doors",
+        "hopper",
+        "hoppers",
+        "pillar",
+        "pillars",
+        "wall",
+        "pipes",
+        "car",
+        "people",
+        "awols",
+        "edie",
+        "dancer",
+        "cameras",
+        "footage",
+    }
+)
+# (regex on undoubled uppercase text, display name, type)
+_ALIEN_MAJOR_SITE_PATTERNS: list[tuple[re.Pattern[str], str, str]] = [
+    (re.compile(r"\bFORT\s+NEBRASKA\b"), "Fort Nebraska", "building"),
+    (
+        re.compile(r"\bSAN\s+ROCCO(?:\s+MEDICAL(?:\s+FACILITY)?)?\b"),
+        "San Rocco Medical Facility",
+        "building",
+    ),
+    (re.compile(r"\bMARSHAL(?:'S)?\s+STATION\b"), "Marshal Station", "building"),
+    (re.compile(r"\bOBLIVION(?:\s+BAR)?\b"), "Oblivion Bar", "building"),
+    (re.compile(r"\bWILDCATTER(?:\s+PARK)?\b"), "Wildcatter Park", "region"),
+    (
+        re.compile(r"\b(?:THE\s+)?INSURGENT\s+COMPOUND\b"),
+        "The Insurgent Compound",
+        "building",
+    ),
+    (re.compile(r"\bSPACEPORT\b"), "Spaceport", "building"),
+    (
+        re.compile(r"\b(?:OLD\s+)?(?:OIL\s+)?REFINERY\b|\bOIL\s+FIELDS?\b"),
+        "Oil Refinery",
+        "building",
+    ),
+    (re.compile(r"\bARIARCUS(?:\s+COLONY)?\b"), "Ariarcus Colony", "region"),
+    (re.compile(r"\bDISTRICT\s+NORTH\b"), "District North", "region"),
+    (re.compile(r"\bDISTRICT\s+SOUTH\b"), "District South", "region"),
+    (re.compile(r"\bDISTRICT\s+EAST\b"), "District East", "region"),
+    (re.compile(r"\bDISTRICT\s+WEST\b"), "District West", "region"),
+    (re.compile(r"\bDOWNTOWN\b"), "Downtown", "region"),
+]
+
+
+def _undouble_map_label(line: str) -> str:
+    """Undo two-column map glue: ``SPACEPORTSPACEPORT`` / ``SAN ROCCO SAN ROCCO``."""
+    s = re.sub(r"\s+", " ", str(line or "").strip())
+    if not s:
+        return ""
+    if len(s) >= 4 and len(s) % 2 == 0 and s[: len(s) // 2] == s[len(s) // 2 :]:
+        return s[: len(s) // 2].strip()
+    parts = s.split()
+    if len(parts) >= 2 and len(parts) % 2 == 0:
+        half = len(parts) // 2
+        if [p.casefold() for p in parts[:half]] == [p.casefold() for p in parts[half:]]:
+            return " ".join(parts[:half])
+    return s
+
+
+def _normalize_alien_location_scan_text(text: str) -> str:
+    """Undouble PDF map/section labels and collapse letter-spaced caps for site scans."""
+    lines: list[str] = []
+    for line in (text or "").splitlines():
+        lines.append(_undouble_map_label(line))
+    return _collapse_spaced_caps("\n".join(lines))
+
+
+def _count_colon_place_headers(text: str) -> int:
+    count = 0
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        # Strip leading list bullets like ``T THE GATE:``.
+        stripped = re.sub(r"^[T•\-]\s+", "", stripped)
+        if _COLON_PLACE_HEADER.match(stripped):
+            count += 1
+    return count
+
+
+def _document_has_recoverable_location_sites(text: str) -> bool:
+    """True when the extract looks like an Alien moonside / locations chapter."""
+    scan = _normalize_alien_location_scan_text(text or "")
+    if not scan.strip():
+        return False
+    if _MOONSIDE_LOCATIONS_HEADER.search(scan):
+        return _count_colon_place_headers(scan) >= 4
+    return _count_colon_place_headers(scan) >= 8
+
+
+def _is_alien_room_scale_place_name(name: str) -> bool:
+    key = re.sub(r"[^a-z0-9]+", " ", str(name or "").casefold()).strip()
+    if not key:
+        return True
+    if key in _ALIEN_MAP_CHROME:
+        return True
+    tokens = key.split()
+    if any(tok in _ALIEN_ROOM_SCALE_TOKENS for tok in tokens):
+        return True
+    if re.search(r"\d", key):
+        return True
+    if re.match(r"^act\s+[ivx\d]+\b", key):
+        return True
+    return False
+
+
+def _extract_alien_location_site_stubs(text: str) -> list[dict[str, Any]]:
+    """Seed major moonside sites (Fort Nebraska, Spaceport, …) — not every room."""
+    scan = _normalize_alien_location_scan_text(text or "")
+    if not scan.strip():
+        return []
+
+    # Join split doubled map rows: FORT / NEBRASKA on consecutive lines.
+    glued_lines: list[str] = []
+    pending: list[str] = []
+    for line in scan.splitlines():
+        stripped = line.strip()
+        if stripped and re.fullmatch(r"[A-Z0-9][A-Z0-9 '\-]{0,40}", stripped):
+            pending.append(stripped)
+            continue
+        if pending:
+            glued_lines.append(" ".join(pending))
+            pending = []
+        if stripped:
+            glued_lines.append(stripped)
+    if pending:
+        glued_lines.append(" ".join(pending))
+    glued = "\n".join(glued_lines)
+
+    found: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for pattern, display_name, loc_type in _ALIEN_MAJOR_SITE_PATTERNS:
+        if not pattern.search(glued):
+            continue
+        loc_id = snake_case(display_name)
+        if loc_id in seen:
+            continue
+        seen.add(loc_id)
+        found.append(
+            {
+                "id": loc_id,
+                "name": display_name,
+                "type": loc_type,
+                "seeded_from_location_sites": True,
+                "seeded_from_stat_blocks": False,
+            }
+        )
+        if len(found) >= 16:
+            break
+
+    return found
+
+
+def _merge_outline_locations_with_sites(
+    llm_locations: list[dict[str, Any]],
+    document_text: str,
+    *,
+    mode: str,
+    existing_location_ids: list[str] | set[str],
+    warnings: list[str],
+) -> list[dict[str, Any]]:
+    """Prefer deterministic Alien major sites when a locations chapter is present."""
+    if not _document_has_recoverable_location_sites(document_text):
+        return llm_locations
+
+    site_stubs = _extract_alien_location_site_stubs(document_text)
+    if len(site_stubs) < 2:
+        return llm_locations
+
+    existing = {snake_case(x) for x in existing_location_ids if str(x).strip()}
+    existing |= {loc["id"] for loc in llm_locations if loc.get("id")}
+
+    merged = list(llm_locations)
+    added: list[str] = []
+    for stub in site_stubs:
+        loc_id = stub["id"]
+        if mode == "merge" and loc_id in existing:
+            continue
+        if any(loc.get("id") == loc_id for loc in merged):
+            continue
+        # Soft match on name against LLM stubs.
+        name_key = stub["name"].casefold()
+        if any(str(loc.get("name") or "").casefold() == name_key for loc in merged):
+            continue
+        merged.append(stub)
+        existing.add(loc_id)
+        added.append(stub["name"])
+
+    if added:
+        warnings.append(
+            "Seeded major location site(s) from Alien moonside / locations chapter: "
+            + ", ".join(added)
+        )
+    return merged
+
+
+def _colon_place_header_name(line: str) -> str | None:
+    stripped = re.sub(r"^[T•\-]\s+", "", (line or "").strip())
+    match = _COLON_PLACE_HEADER.match(stripped)
+    if not match:
+        return None
+    raw_name = match.group(1).strip()
+    # Reject attribute / agenda field labels.
+    if _STAT_BLOCK_FIELD_STOP.match(raw_name + ":"):
+        return None
+    if raw_name.casefold() in {
+        "full name",
+        "personality",
+        "personal agenda",
+        "strength",
+        "health",
+        "skills",
+        "gear",
+        "talent",
+        "age",
+    }:
+        return None
+    return _display_place_name(raw_name) or raw_name.title()
+
+
+def _alien_site_boundary_pattern(location_name: str) -> re.Pattern[str] | None:
+    key = re.sub(r"[^a-z0-9]+", " ", str(location_name or "").casefold()).strip()
+    mapping = {
+        "fort nebraska": r"FORT\s+NEBRASKA",
+        "san rocco medical facility": r"SAN\s+ROCCO",
+        "san rocco": r"SAN\s+ROCCO",
+        "marshal station": r"MARSHAL(?:'S)?\s+STATION",
+        "oblivion bar": r"OBLIVION(?:\s+BAR)?",
+        "oblivion": r"OBLIVION(?:\s+BAR)?",
+        "wildcatter park": r"WILDCATTER(?:\s+PARK)?",
+        "the insurgent compound": r"(?:THE\s+)?INSURGENT\s+COMPOUND",
+        "insurgent compound": r"(?:THE\s+)?INSURGENT\s+COMPOUND",
+        "spaceport": r"SPACEPORT",
+        "oil refinery": r"(?:OLD\s+)?(?:OIL\s+)?REFINERY|OIL\s+FIELDS?",
+        "ariarcus colony": r"ARIARCUS(?:\s+COLONY)?",
+        "district north": r"DISTRICT\s+NORTH",
+        "district south": r"DISTRICT\s+SOUTH",
+        "district east": r"DISTRICT\s+EAST",
+        "district west": r"DISTRICT\s+WEST",
+        "downtown": r"DOWNTOWN",
+    }
+    pattern = mapping.get(key)
+    if not pattern:
+        # Generic: require a whole-word match of the display name letters.
+        escaped = re.escape(str(location_name or "").strip())
+        if len(escaped) < 4:
+            return None
+        pattern = escaped
+    return re.compile(pattern, re.IGNORECASE)
+
+
+_ALIEN_NEXT_SITE_BOUNDARY = re.compile(
+    r"(?i)(?:^|\n)\s*(?:FORT\s+NEBRASKA|SAN\s+ROCCO|MARSHAL(?:'S)?\s+STATION|"
+    r"OBLIVION(?:\s+BAR)?|WILDCATTER(?:\s+PARK)?|(?:THE\s+)?INSURGENT\s+COMPOUND|"
+    r"SPACEPORT|(?:OLD\s+)?(?:OIL\s+)?REFINERY|OIL\s+FIELDS?|ARIARCUS(?:\s+COLONY)?|"
+    r"DISTRICT\s+(?:NORTH|SOUTH|EAST|WEST)|DOWNTOWN)\b"
+)
+
+
+def _find_alien_site_body_span(text: str, location_name: str) -> tuple[int, int] | None:
+    """Return a document slice owned by one major site (until the next site)."""
+    if not text or not location_name:
+        return None
+    own = _alien_site_boundary_pattern(location_name)
+    if own is None:
+        return None
+    candidates = list(own.finditer(text))
+    if not candidates:
+        return None
+
+    match = None
+    for candidate in candidates:
+        line_start = text.rfind("\n", 0, candidate.start()) + 1
+        line_end = text.find("\n", candidate.start())
+        if line_end < 0:
+            line_end = len(text)
+        line = text[line_start:line_end].strip()
+        # Skip mid-prose mentions (``…Oblivion bar. There are six…``).
+        if candidate.start() - line_start > 8 or len(line) > 64:
+            continue
+        if "." in line or "," in line or ";" in line:
+            continue
+        letters = [c for c in line if c.isalpha()]
+        if letters and sum(1 for c in letters if c.islower()) / len(letters) > 0.35:
+            continue
+        # Require room writeups soon after the heading so map-legend labels
+        # (Fort / Oblivion / Spaceport stacked at the top) are skipped.
+        near_end = min(len(text), candidate.end() + 900)
+        for boundary in _ALIEN_NEXT_SITE_BOUNDARY.finditer(text, candidate.end() + 20):
+            snip = text[boundary.start() : boundary.start() + 100]
+            lead = re.match(r"\s*", snip)
+            pos = lead.end() if lead else 0
+            if own.match(snip, pos):
+                continue
+            near_end = min(near_end, boundary.start())
+            break
+        near = text[candidate.end() : near_end]
+        if _count_colon_place_headers(near) < 1:
+            continue
+        window_end = min(len(text), candidate.end() + 3_000)
+        for boundary in _ALIEN_NEXT_SITE_BOUNDARY.finditer(text, candidate.end() + 40):
+            snip = text[boundary.start() : boundary.start() + 100]
+            # Only treat as the same site when this site's pattern anchors the boundary.
+            lead = re.match(r"\s*", snip)
+            pos = lead.end() if lead else 0
+            if own.match(snip, pos):
+                continue
+            window_end = boundary.start()
+            break
+        window = text[candidate.end() : window_end]
+        if _count_colon_place_headers(window) >= 1:
+            match = candidate
+            break
+    if match is None:
+        # Map-legend hits come first; body writeups are usually later.
+        match = candidates[-1]
+
+    start = match.start()
+    min_body = 400
+    search_from = start + min_body
+    end = len(text)
+    for boundary in _ALIEN_NEXT_SITE_BOUNDARY.finditer(text, search_from):
+        # Ignore boundaries that still match this same site.
+        if own.search(text[boundary.start() : boundary.start() + 80]):
+            continue
+        end = boundary.start()
+        break
+    end = min(end, start + 12_000)
+    if end <= start + 80:
+        return None
+    return start, end
+
+
+def _harvest_colon_place_subareas(
+    document_text: str,
+    *,
+    location_name: str,
+    max_items: int = 16,
+) -> list[dict[str, str]]:
+    """Harvest Alien ``PLACE: prose`` room headers near a parent site name."""
+    # Undouble map glue so site boundaries like SPACEPORTSPACEPORT match.
+    text = _normalize_alien_location_scan_text(document_text or "")
+    parent = str(location_name or "").strip()
+    if not text.strip() or not parent:
+        return []
+
+    span = _find_alien_site_body_span(text, parent)
+    if span is None:
+        needles = _distinctive_name_needles(parent, snake_case(parent))
+        region = _relevant_excerpts(text, needles) if needles else ""
+        if len(region) < 200:
+            return []
+        if len(region) > 12_000:
+            region = region[:12_000]
+    else:
+        region = text[span[0] : span[1]]
+
+    lines = region.splitlines()
+    found: list[dict[str, str]] = []
+    seen: set[str] = set()
+    parent_key = parent.casefold()
+    for idx, line in enumerate(lines):
+        name = _colon_place_header_name(line)
+        if not name:
+            continue
+        key = name.casefold()
+        if key in seen or key == parent_key:
+            continue
+        # People / events as colon headers (EDIE:, AWOLS:, ACT II:).
+        if key in {"edie", "awols", "people of interest", "the disgruntled dancer"}:
+            continue
+        if re.match(r"^act\s+", key):
+            continue
+        if key in _ALIEN_MAP_CHROME or key in _SUBAREA_HEADER_STOPWORDS:
+            continue
+        if key.startswith(("page ", "cat s eye", "cats eye")):
+            continue
+        description = _prose_after_colon_header(lines, idx)
+        if len(description) < 40:
+            # Inline prose after the colon on the same line.
+            stripped = re.sub(r"^[T•\-]\s+", "", line.strip())
+            match = _COLON_PLACE_HEADER.match(stripped)
+            if match:
+                description = re.sub(r"\s+", " ", match.group(2)).strip()
+        if len(description) < 40:
+            continue
+        seen.add(key)
+        found.append(
+            {
+                "name": name,
+                "description": description[:400],
+                "public_knowledge": "",
+            }
+        )
+        if len(found) >= max_items:
+            break
+    return found
+
+
+def _prose_after_colon_header(lines: list[str], start_idx: int, *, max_chars: int = 280) -> str:
+    parts: list[str] = []
+    total = 0
+    # Include remainder of the header line after the colon.
+    header = re.sub(r"^[T•\-]\s+", "", lines[start_idx].strip())
+    match = _COLON_PLACE_HEADER.match(header)
+    if match:
+        first = re.sub(r"\s+", " ", match.group(2)).strip()
+        if first:
+            parts.append(first)
+            total += len(first)
+    for line in lines[start_idx + 1 :]:
+        stripped = line.strip()
+        if not stripped:
+            if parts:
+                break
+            continue
+        if _colon_place_header_name(stripped) or _looks_like_place_header(stripped):
+            break
+        if _STAT_OR_SECTION_LINE.match(stripped) or _CALLOUT_AWARENESS_PRESENCE.search(stripped):
+            break
+        chunk = re.sub(r"\s+", " ", stripped)
+        parts.append(chunk)
+        total += len(chunk) + 1
+        if total >= max_chars:
+            break
+    text = " ".join(parts).strip()
+    if len(text) > max_chars:
+        text = text[: max_chars - 3].rstrip() + "..."
+    return text
+
+
 def _npc_stubs_from_stat_blocks(
     section_text: str,
     *,
@@ -3201,17 +3723,27 @@ def _harvest_important_locations(
         return []
 
     exploring = _harvest_exploring_important_locations(text, parent)
+    is_ship = _location_looks_like_ship(
+        parent, location_type=location_type, document_text=text
+    )
     ship_rooms: list[dict[str, str]] = []
-    if _location_looks_like_ship(parent, location_type=location_type, document_text=text):
+    if is_ship:
         ship_rooms = _harvest_ship_room_subareas(text, location_name=parent)
+    colon_rooms: list[dict[str, str]] = []
+    # Alien moonside chapters use PLACE: prose rooms; do not apply that harvest to
+    # ships (Chariot deck plans), which already have dedicated ship-room parsing.
+    if _document_has_recoverable_location_sites(text) and not is_ship:
+        colon_rooms = _harvest_colon_place_subareas(text, location_name=parent)
 
-    if exploring and ship_rooms:
-        return _cap_ship_important_locations(
-            _merge_important_location_lists(exploring, ship_rooms)
-        )
+    combined = exploring
     if ship_rooms:
-        return _cap_ship_important_locations(ship_rooms)
-    return exploring[:16]
+        combined = _merge_important_location_lists(combined, ship_rooms)
+    if colon_rooms:
+        combined = _merge_important_location_lists(combined, colon_rooms)
+
+    if ship_rooms:
+        return _cap_ship_important_locations(combined)
+    return combined[:16]
 
 
 def _merge_important_location_lists(
@@ -4545,6 +5077,13 @@ def outline_campaign_document(
     location_stubs = _ensure_locations_for_npc_hints(
         location_stubs, npc_stubs, warnings=warnings
     )
+    location_stubs = _merge_outline_locations_with_sites(
+        location_stubs,
+        document_for_deterministic_merge,
+        mode=mode,
+        existing_location_ids=existing_location_ids,
+        warnings=warnings,
+    )
     for stub in npc_stubs:
         hint = str(stub.get("first_location_id") or "").strip()
         if not hint and location_stubs:
@@ -4604,6 +5143,7 @@ def _normalize_location_stubs(raw_locations: Any) -> list[dict[str, Any]]:
                 "name": name or loc_id.replace("_", " ").title(),
                 "type": str(raw.get("type") or "other").strip() or "other",
                 "seeded_from_stat_blocks": bool(raw.get("seeded_from_stat_blocks")),
+                "seeded_from_location_sites": bool(raw.get("seeded_from_location_sites")),
             }
         )
     return stubs

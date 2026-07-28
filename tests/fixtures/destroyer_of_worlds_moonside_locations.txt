@@ -1,0 +1,681 @@
+PAD
+E
+PAD
+D
+PAD
+C
+PAD
+B
+PAD
+A
+ARIARCUS
+united americas colony
+7
+7
+7
+7
+4
+3
+3
+3
+1
+5
+5
+5
+5
+6
+6
+6
+5
+2
+2
+2
+ARIARCUS COLONYARIARCUS COLONY
+INSURGENTSINSURGENTS
+AWOLSAWOLS
+IN
+AW
+OIL FIELDSOIL FIELDS
+OIL  OIL  
+REFINERYREFINERY
+WELLSWELLS
+1 KM
+WELLSWELLS
+FORTFORT
+NEBRASKANEBRASKA
+SAN ROCCO SAN ROCCO 
+MEDICAL FACILITYMEDICAL FACILITY
+MARSHAL MARSHAL 
+STATIONSTATION
+OBLIVION OBLIVION 
+BARBAR
+WILDCATTER WILDCATTER 
+PARKPARK
+THE INSURGENT  THE INSURGENT  
+COMPOUNDCOMPOUND
+PUMPJACKSPUMPJACKS
+PUMPJACKSPUMPJACKS
+DISTRICT NORTHDISTRICT NORTH
+DISTRICT  DISTRICT  
+E A S T E A S T 
+DOWNTOWNDOWNTOWN
+DISTRICT SOUTHDISTRICT SOUTH
+SPACEPORTSPACEPORT
+DISTRICT   DISTRICT   
+WESTWEST
+IN
+IN
+IN
+IN AW
+IN
+IN
+AW
+AW
+ 21
+MOONSIDE LOCATIONS
+PAD
+E
+PAD
+D
+PAD
+C
+PAD
+B
+PAD
+A MA
+MA
+MA
+MA
+MA
+AP
+TA
+MA
+MA
+MA
+MA
+5
+5
+PAD
+E
+PAD
+D
+PAD
+C
+PAD
+B
+PAD
+A MA
+MA
+MA
+MA
+MA
+AP
+TA
+MA
+MA
+MA
+MA
+THE GATE:  The perimeter fence’s sliding gate 
+is guarded by a Sergeant-led four-marine security 
+squad with an M40E Ridgeway heavy tank (page 
+85 for stats). Security will let the PCs enter the 
+airport if they present credentials.
+LANDING PAD A: The medical frigate USCSS 
+Monygham sits on the tarmac, guarded by twelve 
+marines. While the Monygham’s engines are warm, 
+her ramps are closed and she’s dark. Her vehicle 
+bays are packed with colony equipment. Her crew 
+won’t open her up as per Colonel Meyers’ orders. 
+Monygham could evacuate the entire settlement if 
+she were allowed to leave.
+LANDING PADS B-E: Designed for smaller 
+craft, these pads are empty—save for a refueling 
+station on B platform. If someone tries to use the 
+hose, the nozzle spits silt—tank’s dry (See Oil-Eat-
+er Bacteria, page 81).
+HANGAR 01: Inside is the HMS Magpie—a 
+G-Class Corvus salvage freighter with a gutted 
+reactor—she isn’t going anywhere. The HMS Mag-
+pie’s Captain, Edie, is drowning her sorrows at the 
+Oblivion bar. There are six P5000 Power Loaders 
+and any mechanical tools the players may think 
+of. An ASSO-400 Harpoon gun rests against a 
+dismantled thruster array. 
+HANGAR 02: It’s warm here—not only from 
+the heaters, but from the hundreds of people 
+crammed into close quarters. Some look angry 
+and desperate. Many wear hoods and scarves, 
+obscuring their features. Eight marines led by a 
+Sergeant maintain order with an APC and M56 
+Smartguns. If the PCs wade through the crowds 
+in Act I to search for the AWOLs, roll or choose 
+events from the table on the next page. In Act II, 
+the colonists here are prisoners of the UPP. By Act 
+III, they're dead.
+SPACEPORTSPACEPORT
+CONTROL TOWERCONTROL TOWER
+STORM WALLSTORM WALL
+LIFTLIFT
+OPERATIONSOPERATIONS
+LADDERLADDER
+PERIMETER FENCEPERIMETER FENCE
+PERIMETER FENCEPERIMETER FENCE
+MAIN ROADMAIN ROAD
+GATEGATE
+STORM WALLSTORM WALL
+STORM WALLSTORM WALL
+HANGAR 01HANGAR 01
+HANGAR 02HANGAR 02
+THE MONYGHAMTHE MONYGHAM
+CONTROLCONTROL
+TOWERTOWER
+MARINESMARINES
+TANKTANK
+APCAPC
+MA
+TA
+AP
+MA
+MA
+MA
+TA
+AP
+22  
+DESTROYER OF WORLDS  
+
+  
+HANGAR INCIDENTS
+D6 ENCOUNTER INCIDENT DISCOVERY
+1–2 Information A colonist named Connor wants 
+cash or a guaranteed seat out of 
+here in exchange for info.
+Claims he saw the AWOLs arguing last 
+night at Oblivion. 
+3–4 Terrorist An insurgent named Michael 
+begins to sweat profusely when 
+questioned. He’s wearing an 
+explosive belt attached to a 
+deadman’s switch.
+Michael’s plan is to cripple the 
+Monygham. If killed or cornered, he’ll 
+trigger a Blast Power 15 explosion. He can 
+be talked down with a 
+MANIPULATION  roll.
+5–6 Angry Mob Crowd gets ugly, and the NPC
+
+---
+
+OBLIVION BAR
+EYE OF OBLIVION: A large blue neon wink -
+ing-eye with a red crescent moon at its center 
+marks the entrance of the colony’s only open bar. 
+In Act II, Oblivion now services UPP troops and 
+loyalists, but is otherwise unchanged. By Act III it 
+is abandoned.
+Inside, the bass rumbles. Smoke stings the 
+PCs’ nostrils and the alternating crimson and 
+azure strobes burn haloed ghosts on their retinas. 
+Silhouetted dancers sway rhythmically on the 
+bar stage. While the rest of the colony is a ghost 
+town, Oblivion is packed with local and migrant 
+revelers celebrating the end of this world.
+ T THE SNAKE: The bar is curved like an S. Like all 
+the tables here, the bar has a lit surface that 
+doubles as a stage. Nine dancers, four of which 
+are male, are spread across the stage and pri-
+vate tables here.
+ T THE CROWD: As the marines move through the 
+dense crowd, patrons will shy away or quickly 
+hide their illicit substances—some will try to 
+slip out unnoticed. If any of them are ques-
+tioned, they will either be belligerent or aloof. 
+If a situation becomes tense, the manager Fei
+2 
+(see the boxed text) will step in.
+ T EDIE: The drunk migrant captain of the 3WE 
+freighter HMS Magpie, Edie’s stuck here while 
+her ship awaits repairs (see Hangar 02 on page 
+22). She is angry as the repair team and sup-
+plies she needs to get off the ground are stuck 
+in orbit thanks to the suspension of traffic. If 
+the PCs are sympathetic, Edie will say that she 
+and her crew have had lots of requests to get 
+people off-world, and it’s a good payday she’s 
+missing (if Wright is at the spaceport she will be 
+one of those who asked). She has a hidden boot 
+knife. In her jacket is a bottle of X-stim pills, a 
+flask of whiskey, and a pack of Imperials.
+ T THE DISGRUNTLED DANCER: A friendly and at-
+tractive albino woman named Bobbie dances 
+at the head of the bar. If shown an image of the 
+AWOLs she turns cranky, saying they were here 
+around 2 am last night and didn’t leave a tip. 
+That’s all she has to offer.
+ T THE TABLES: There are a dozen scattered 
+throughout the establishment. While most pa-
+trons are just concerned colonists, two of them 
+are insurgents named Petre and Mika. Mika will 
+slip out to contact Botos (offering the event 
+“Ambush” on page 54) but can be spotted 
+leaving suspiciously with an 
+OBSERVATION roll. 
+Petre is an X-Stim addict with a Rexim RXF-M5 
+EVA pistol. If questioned, he will try to bluff his 
+way out, but if cornered he’ll take a hostage.
+ T THE OFF
+
+---
+
+zen deputies. Marshal 
+Manning Hyams, 61, is in charge. For thirty years 
+he has told himself he’d stay on Ariarcus for just 
+one more rotation.
+In Act II and III, the Station is destroyed, but 
+a search of the rubble (taking a Turn) will reveal 
+Reese’s chestbursted body, the remains of a 
+Drone’s cocoon sack, and two dead UPP soldiers, 
+with acid burns on their bodies and terrible head 
+wounds.
+MARSHAL STATION
+RECEPTION: The frazzled receptionist Olga is 
+inundated with reports of looting, violence, and 
+monster sightings. These last she hasn’t logged as 
+they are clearly ridiculous, but if pressed she will 
+remember that one came in from District South 
+somewhere, and the other was at Wildcatter Park. 
+Olga will let the PCs into the Bullpen to meet 
+Marshal Hyams.
+BULLPEN: This is an open white-paneled room 
+where Marshal Hyams and his deputies have 
+their desks. If the PCs ask Hyams for leads, have 
+them make a 
+MANIPULATION roll. If it succeeds, he 
+will tell them that a deputy is currently question-
+ing a suspected insurgent in the Interrogation 
+room. In addition, Hyams will pull up a file with 
+a mugshot of a John Doe that was brought in for 
+disorderly conduct a few hours ago. The PCs will 
+immediately recognize the mugshot as Private 
+Reese. The marshals let him sleep it off in the 
+holding area—he is still there. The PCs can see 
+him if they’d like.
+Computers in the Bullpen monitor a multi-
+tude of locations and track colony alerts. Getting 
+access to these requires another 
+MANIPULATION  
+roll on Hyams. A satellite hookup can zoom in on 
+parts of the settlement. Many security camera 
+feeds are black—they were vandalized or suffered 
+power surges throughout the night. Checking the 
+comms, computers, or cameras and making a 
+COM-
+TECH roll can reveal the information in the table on 
+page 28.
+INTERROGATION ROOM: Deputy Mike 
+Dodd is questioning suspected insurgent Ivan 
+Stolls here. Ivan complains that he’s got severe 
+heartburn and is constantly touching his chest 
+and asking for water (this is to make the players 
+paranoid that he’s got a Chestburster inside him. 
+He does not). With a successful MANIPULATION  roll, 
+Stolls will reveal that Sergeant Wójcik was picked 
+up by the insurgents. She’s offering the UPP more 
+than just stolen intelligence—she and her marines 
+smuggled bioweapon samples out with them as 
+well.  He does not know where the insurgents took 
+h
+
+---
+
+h on 
+duty. Two Emergency Medical Teams are out 
+on calls. In Act II, San Rocco has been hit 
+by an airstrike and the Lobby and Recovery 
+blocks are shattered. The Examination bay 
+is intact but there is no power (read more 
+below). In Act III, the facility harbors eight 
+Freak Anathemas (page 65).
+SAN ROCCO MEDICAL FACILITY
+MEDTECH STATION: The front desk is va-
+cant, the comms beeping angrily. Frazzled 
+intern Duncan is down the corridor and will 
+notice the marines. If asked about AWOLs, 
+he vaguely remembers seeing someone re-
+sembling Wójcik and Carvalho check in this 
+morning. There’s no names or rooms listed, 
+but the place is pretty empty so there are 
+only a few rooms to check. Doctor Litvin was 
+the attending physician this morning, so he 
+might know something. He’s in Examination 
+Bay 04. Also, there are five bodies in the 
+morgue.
+RECOVERY 01: Only one of two beds here is 
+occupied, by an elderly patient in a coma. A 
+machine helps her breath and monitors her 
+vitals.
+  
+COMMS, COMPUTERS, 
+AND CAMERAS
+JAIL 
+CAM 
+One of the dead feeds is internal. 
+Deputies confirm it’s the Holding 
+Area but they've only got one oc-
+cupant in there—a drunk (page 26).
+INFRARED  
+SENSOR
+There’s a new heat source com-
+ing from the Old Oil Refinery. The 
+Refinery has been shut down for 
+decades.
+COMM  
+CHATTER
+ T San Rocco has reported no 
+deaths or new patients since 
+this afternoon. In fact, they 
+have stopped reporting alto-
+gether.
+ T A storm front is mounting with 
+a blizzard on its way.
+ T There’s an incident at the 
+Spaceport, where a person 
+climbed the fence to get in, 
+and caused a ruckus that has 
+breached the fence. Local ma-
+rines are repairing the breach 
+whilst trying to round up those 
+who got inside.
+ T The PCs identify a pattern to 
+the background clicking sounds 
+on some channels—it’s an 
+encrypted UPP code. A sec-
+ond 
+COMTECH  roll decrypts it: 
+“Awaiting package delivery.” 
+The signal comes from the 
+north in the vicinity of the Oil 
+Fields and Old Refinery.
+COLONY 
+RECORDS
+ T There are only two people 
+in Marshal custody at the 
+moment—Ivan Stolls (see In-
+terrogation Room on page 26) 
+and a John Doe (see Bullpen on 
+page 26).
+ T Imre Botos is a former marine 
+and suspected insurgency 
+leader. He was honorably 
+discharged, came home to 
+Ariarcus three years ago, and 
+promptly disappeared.
+28  
+DESTROYER OF WORLDS  
+STORAGESTORAGE
+STORAGESTORAGE
+STORAGESTORAGE
+STORAGESTORAGE
+STORAGESTORAGE
+SAN ROCCO MEDICAL FACILITYSAN ROCCO MEDICAL FACILITY
+DETAIL OF EXAMINATION/DETAIL 
+
+---
+
+ the situation. One has a coded comm 
+unit in his jacket that crackles to life just when he 
+doesn't want it to. The PCs can use it to isolate 
+the UPP frequency, listen in on communications, 
+and trace signals back to the insurgency base—
+the Insurgent Compound. Four AK-4047 rifles 
+lean against the wall.  
+If the insurgents hear the PCs coming, they 
+will be suspicious and take up positions in cover. 
+If this becomes a shootout, the last man stand-
+ing will try to escape, but if cornered, they might 
+strike a deal (roll 
+MANIPULATION ). In exchange for 
+immunity and transport off-moon, he’ll reveal that 
+Wójcik’s being kept at the Compound and was 
+supposed to be handed off to the UPP here.
+Once the PCs learn of the insurgent com-
+pound, move to the event “Location Acquired” 
+(page 54).
+OIL REFINERY
+DISTILLATION TOWER: At the base of the 
+tower is a case of ten M5 RPG Launchers—appar-
+ently stolen from the fort.
+OLD REFINERYOLD REFINERY
+DISTILLATIONDISTILLATION
+TOWERTOWER
+DISTILLATIONDISTILLATION
+TOWERTOWER
+OFFICEOFFICE
+DESTROYED HOPPERSDESTROYED HOPPERS
+WASTE HOPPERSWASTE HOPPERS
+WASTE HOPPERSWASTE HOPPERS
+BROKEN DOWN WALLBROKEN DOWN WALL
+BROKEN DOWN WALLBROKEN DOWN WALL
+BROKEN DOWN  BROKEN DOWN  
+PILLARSPILLARS
+BROKEN DOWN WALLBROKEN DOWN WALL
+GAS TREATMENT PIPESGAS TREATMENT PIPES
+5X5 METERS5X5 METERS
+32  
+DESTROYER OF WORLDS  
+
+WILDCATTER   
+CAR PARK
+There are 13 Daihotai 8X8s (page 85) 
+on this lot with berths for another 
+17. They're covered with snow tarps, 
+lashed down for the storm, and can be 
+hotwired (HEAVY MACHINERY  roll).
+THE INSURGENT   
+COMPOUND
+The former estate of one of the more well-to-do 
+colonists, this walled home is located in an active 
+residential area and is well fortified. Windows have 
+metal shutters pulled over them, and the doors are 
+reinforced and heavy (Armor Rating 6 and can take 8 
+points of damage before giving way).
+THE INSURGENT COMPOUND
+YARD: Pristine and laden with snow drifts, the yard 
+is quiet. The yard’s reinforced walls are three meters 
+high with one e
+
+---
+
+13 Daihotai 8X8s (page 85) 
+on this lot with berths for another 
+17. They're covered with snow tarps, 
+lashed down for the storm, and can be 
+hotwired (HEAVY MACHINERY  roll).
+THE INSURGENT   
+COMPOUND
+The former estate of one of the more well-to-do 
+colonists, this walled home is located in an active 
+residential area and is well fortified. Windows have 
+metal shutters pulled over them, and the doors are 
+reinforced and heavy (Armor Rating 6 and can take 8 
+points of damage before giving way).
+YARD: Pristine and laden with snow drifts, the yard 
+is quiet. The yard’s reinforced walls are three meters 
+high with one entrance facing the house and another 
+by the shack. Four PASSIVE insurgents guard the yard 
+with AK-4047s. Climbing a wall requires a hard (–2) 
+MOBILITY  roll (slow action).
+GUARD SHACK: Two more PASSIVE insurgents are 
+asleep on the job, but will set up a Smartgun if alert-
+ed. Three ATVs sit behind the shack near the closed 
+front gate—tracks indicate that they arrived not long 
+ago.
+THE HOUSE: The two-story house has an open 
+studio below and several smaller rooms above. The 
+front door access port needs to be bypassed to get 
+in, requiring an easy (+1) COMTECH roll, or a breaching 
+charge (page 84).
+Wójcik is here, and she is an ACTIVE Stage II 
+Anathema (page 65) that will soon transform into a 
+Bodyburster Xenomorph (page 80). The sounds of the 
+assault have enraged her, and she has been attacking 
+the insurgents within the house. As the PCs assault the 
+house, they will hear gunfire and terrified screams—as 
+Wójcik tears her victims apart.
+While the PCs are downstairs, they will hear a 
+struggle upstairs, punctuated by occasional gun shots, 
+screams and wails. Suddenly, the body of an insurgent 
+is flung down the stairs, triggering a Panic Roll for each 
+PC. They cannot see what threw the man, but he is 
+dead, his head dangling at an odd angle.
+DISTRICT WEST
+Most of the businesses and residences here are closed and boarded up.
+  
+FINDING THE COMPOUND
+Any insurgent captured at any time can be 
+interrogated. If they break (MANIPULATION  
+roll), they will offer up the name Imre Botos 
+as their leader. The insurgents always meet 
+at the Eye of Oblivion bar. Any broken 
+insurgent will know the location of Botos’ 
+Compound, but it takes another 
+
+
+---
+
+ sentry guns will chew the bastard to 
+ribbons and then go quiet until their next target 
+appears.
+The field of fire is three zones deep but starts 
+one zone out from the wall, meaning that brave 
+PCs can make a mad rush across. While in the 
+field of fire, a PC will be exposed to one attack 
+per Round. A better alternative might be to use 
+an armored vehicle for the approach. The system 
+doesn’t recognize transponder codes. Finally, if 
+the PCs want to try to take out a shielded sentry 
+gun, they will need to inflict 10 points of damage 
+with a weapon with a base Damage rating of 3 or 
+more.
+FORT NEBRASKA
+GATE: This four-meter-high ramp-style metal 
+door is also sentry gun protected. The gate has 
+Armor Rating 12 and needs 20 points of damage 
+to be broken down. However, weapons with a 
+base Damage rating of 3 or less cannot damage 
+the gate at all.
+SALLY PORT: This double-laned 60-meter 
+long paved corridor leads to the yard. As the PCs 
+traverse this area, they get the distinct feeling 
+they're being stalked.
+SEALED SUBLEVEL RAMP: Situated di-
+rectly at the end of the Sally Port but before the 
+guardhouse, this ramp would normally lower into 
+the ground to allow access to and from the motor 
+pool tunnel on Sublevel 01. It has no snow on it—
+anyone standing on it will feel warm and anyone 
+touching it will burn themselves. The PCs might 
+suspect the tunnel is on fire. Nothing reasonable 
+is going to crack this sealed door.
+38  
+DESTROYER OF WORLDS  
+THE GROUNDS
+Barren and desolate, the grounds are littered with 
+twisted, frozen bodies and wreckage. Black smoke 
+billows from impact craters everywhere. From 
+here PCs can see that the entire West Wing and 
+Southwest Bastion have collapsed. All is quiet. 
+There are three intact ATVs overturned here. 
+EASTERN GUN EMPLACEMENTS: Each 
+of these automated, massive surface-to-space 
+rail cannons is controlled from Operations in the 
+North Bastion.
+RETRACTABLE CANYON DOORS: These 
+large fan doors spread over and seal the base’s sub-
+levels from enemy attack, trapping the climber car 
+below. They're currently locked and nigh impenetra-
+ble. Unlike the ramp door, however, they aren’t hot to 
+the touch. With power restored they can be opened 
+from the Motor Pool, Operations, or Climber Control.
+SURFACE STORAGE TANKS: These six mas-
+sive spherical oil tanks are dry and about a third 
+full of sparkling carbon silt. PCs entering through 
+the pipeline will fall into it. There’s a ladder within 
+the tank that PCs can use to climb to the egress 
+hatch above. Moving through the vast amounts of 
+silt in the tanks requires a hard (–2) 
+MOBILITY  roll. 
+Also, see page 82 for the effects of the silt.
+  
+ELEVATOR SHAFTS AND 
+SERVICE TUNNELS
+No elevators on base work until power is re-
+stored, but most shafts can be rappelled down. 
+The PCs can also crawl through service tunnels 
+(
+CRAMPED ZONES ), indicated on the map. When 
+the PCs enter an elevator shaft or service tunnel, 
+roll on the chart below or pick from the options 
+to determine what makes the most sense for the 
+PCs’ current situation.
+D6 OBSTACLE
+1 One PASSIVE Xenomorph Drone lurks here.
+2 Appears clear but flooded with Extreme 
+radiation.
+3 Intensity 9 fire.
+4 Smoke-filled (counts as DARK).
+5 Impassible wreckage.
+6 All clear.
+  
+ALIEN TRACKER
+Outside of events, this list shows Xenomorph 
+numbers and locations within Fort Nebraska. 
+You can remove some or add more as needed to 
+adapt the PCs’ opposition.
+NORTH  
+BASTION:
+Two Soldier 
+Xenomorphs, Chest-
+bursters
+SUBLEVEL 
+02: 
+MAINTENANCE 
+PITS
+One Drone Xenom-
+orph, Chestbursters
+FUSION  
+TOWER
+Three Soldier 
+Xenomorphs
+AMMO  
+DEPOT
+One Charger 
+Xenomorph
+SUBLEVEL 
+03:
+COLD 
+STORAGE
+Twelve Soldier Xe-
+nomorphs (in stasis)
+LOADING 
+DOCK 03
+Four (and two 
+backup) Soldier 
+Xenomorphs
+CLIMBER 
+CAR:
+LEVEL C/
+CARGO
+One Queen, two Sol-
+diers, eight Worker 
+Xenomorphs, Nine 
+Ovomorphs with 
+Facehuggers
+“I'm telling ya, there's somethin’ movin’ 
+and it ain't us! Tracker's off scale, man. 
+They're all around us, man. Jesus!”
+—PRIVATE FIRST CLASS   
+WILLIAM HUDSON  
+ 39
+MOONSIDE LOCATIONS
+FORT NEBRASKA
+ammunitio
