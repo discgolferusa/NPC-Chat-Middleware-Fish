@@ -85,6 +85,31 @@ _STAT_BLOCK_HEADING = re.compile(
 _STAT_BLOCK_SHORT_NAME = re.compile(
     r"([A-Z][A-Z0-9'\-]*(?:\s+\d+)?)\s*,\s*"
 )
+# Act/Appendix roman numerals must never become NPC short names (``Act III, …``).
+_STAT_BLOCK_ROMAN_NUMERALS = frozenset(
+    {
+        "I",
+        "II",
+        "III",
+        "IV",
+        "V",
+        "VI",
+        "VII",
+        "VIII",
+        "IX",
+        "X",
+        "XI",
+        "XII",
+        "XIII",
+        "XIV",
+        "XV",
+        "XVI",
+        "XVII",
+        "XVIII",
+        "XIX",
+        "XX",
+    }
+)
 _STAT_BLOCK_FALSE_HEADING_NAMES = frozenset(
     {
         "STRENGTH",
@@ -103,11 +128,19 @@ _STAT_BLOCK_FALSE_HEADING_NAMES = frozenset(
 )
 _FULL_NAME_LINE = re.compile(r"^FULL NAME:\s*(.+)$", re.IGNORECASE)
 # PdfPig two-column lines often contain multiple FULL NAME markers on one line.
-# Restrict to Title-Case name tokens; stop before the next FULL NAME or lowercase prose.
+# Allow middle initials (``Edward R. Meyers``, ``A. Mallory Eckford``).
+# Restrict to name tokens; stop before the next FULL NAME or lowercase prose.
+_FULL_NAME_TOKEN = r"(?:[A-Z]\.|[A-Z][a-zA-Z0-9'\-]*)"
 _FULL_NAME_ANY = re.compile(
     r"(?:FULL|Full|full)\s+(?:NAME|Name|name):\s*"
-    r"([A-Z][a-zA-Z0-9'\-]+(?:\s+[A-Z][a-zA-Z0-9'\-]+){0,4})"
+    rf"({_FULL_NAME_TOKEN}(?:\s+{_FULL_NAME_TOKEN}){{0,5}})"
     r"(?=\s*(?:FULL|Full|full)\s+(?:NAME|Name|name)\s*:|\s+[a-z]|\s*$|[,;\n])",
+)
+# Two-column extracts often glue ``MEYERS, COLONELMEYERS, COLONEL``.
+_DOUBLED_STAT_HEADING = re.compile(
+    r"\b([A-Z][A-Z0-9'\-]*)\s*,\s*"
+    r"([A-Z][A-Z0-9'\-/]*(?:\s+[A-Z][A-Z0-9'\-/]*){0,5}?)"
+    r"\1\s*,\s*\2\b"
 )
 _STAT_BLOCK_FIELD_STOP = re.compile(
     r"^(?:AGE|PERSONALITY|PERSONAL\s+AGENDA|STRENGTH|HEALTH|SKILLS|GEAR|TALENT|"
@@ -448,6 +481,73 @@ def _find_npc_section_span(collapsed_text: str) -> tuple[int, int] | None:
     return best_span
 
 
+def _dedupe_repeated_full_name(name: str) -> str:
+    """Collapse two-column duplicates: ``Edward R. Meyers Edward R. Meyers`` → one name."""
+    parts = [p for p in str(name or "").split() if p]
+    if len(parts) < 2:
+        return str(name or "").strip()
+    if len(parts) == 2 and parts[0].casefold() == parts[1].casefold():
+        return parts[0]
+    if len(parts) >= 4 and len(parts) % 2 == 0:
+        half = len(parts) // 2
+        if [p.casefold() for p in parts[:half]] == [p.casefold() for p in parts[half:]]:
+            return " ".join(parts[:half])
+    return " ".join(parts)
+
+
+def _role_looks_like_prose(role: str) -> bool:
+    """Published roles are ALL-CAPS labels; reject sentence fragments from GEAR wraps."""
+    role = (role or "").strip()
+    if not role:
+        return True
+    if re.search(r"(?i)\bpage\s+\d+", role):
+        return True
+    if role.endswith((").", ".", ";")) or "(" in role or ")" in role:
+        return True
+    letters = [c for c in role if c.isalpha()]
+    if not letters:
+        return True
+    lower_ratio = sum(1 for c in letters if c.islower()) / len(letters)
+    return lower_ratio > 0.25
+
+
+def _subtitle_looks_like_prose(candidate: str) -> bool:
+    candidate = (candidate or "").strip()
+    if not candidate:
+        return True
+    if candidate[0].islower():
+        return True
+    if re.search(r"(?i)\bpage\s+\d+", candidate):
+        return True
+    if candidate.endswith((").", ".", ",", ";")) or "(" in candidate:
+        return True
+    if len(candidate.split()) > 8:
+        return True
+    return False
+
+
+def _normalize_alien_pdf_stat_text(text: str) -> str:
+    """Undo common two-column PDF gluing before heading / FULL NAME parsing."""
+    lines: list[str] = []
+    for line in (text or "").splitlines():
+        # FULL NAME:FULL NAME: … → FULL NAME: …
+        line = re.sub(r"(?i)\b(FULL\s+NAME:\s*)(?:FULL\s+NAME:\s*)+", r"\1", line)
+        line = re.sub(r"(?i)\b(PERSONALITY:\s*)(?:PERSONALITY:\s*)+", r"\1", line)
+        line = re.sub(r"(?i)\b(AGE:\s*)(?:AGE:\s*)+", r"\1", line)
+        prev = None
+        while prev != line:
+            prev = line
+            line = _DOUBLED_STAT_HEADING.sub(r"\1, \2", line)
+        stripped = line.strip()
+        # Exact doubled lines: ``COMMANDER OF FORT NEBRASKACOMMANDER OF FORT NEBRASKA``.
+        if len(stripped) >= 12 and len(stripped) % 2 == 0:
+            half = len(stripped) // 2
+            if stripped[:half] == stripped[half:]:
+                line = stripped[:half]
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def _iter_stat_block_headings(line: str) -> list[tuple[str, str]]:
     """Return (short_name, role) pairs from a line; supports PDF two-column glue.
 
@@ -468,6 +568,8 @@ def _iter_stat_block_headings(line: str) -> list[tuple[str, str]]:
         short_name = match.group(1).strip()
         short_key = short_name.upper()
         if short_key in _STAT_BLOCK_FALSE_HEADING_NAMES:
+            continue
+        if short_key in _STAT_BLOCK_ROMAN_NUMERALS:
             continue
         if short_key.split()[0] in _STAT_BLOCK_FALSE_HEADING_NAMES:
             continue
@@ -493,6 +595,8 @@ def _iter_stat_block_headings(line: str) -> list[tuple[str, str]]:
             continue
         # Roles are short labels (COLONIAL MARINE), not sentences.
         if len(role.split()) > 6 or "," in role:
+            continue
+        if _role_looks_like_prose(role):
             continue
         results.append((short_name, role))
     return results
@@ -584,14 +688,19 @@ def _labeled_field_from_window(window: str, label: str) -> str:
 
 def _iter_full_names_on_line(line: str) -> list[str]:
     """Return every FULL NAME value on a line (PdfPig often glues two columns)."""
-    return [match.group(1).strip() for match in _FULL_NAME_ANY.finditer(line.strip())]
+    names: list[str] = []
+    for match in _FULL_NAME_ANY.finditer(line.strip()):
+        name = _dedupe_repeated_full_name(match.group(1).strip())
+        if name:
+            names.append(name)
+    return names
 
 
 def _enrich_row_from_window(row: dict[str, str], window: str) -> dict[str, str]:
     personality = _labeled_field_from_window(window, "PERSONALITY")
     agenda = _labeled_field_from_window(window, "PERSONAL AGENDA")
     if personality:
-        row["personality"] = personality
+        row["personality"] = _dedupe_repeated_full_name(personality)
     if agenda:
         row["personal_agenda"] = agenda
     return row
@@ -607,6 +716,7 @@ def _extract_alien_rpg_stat_block_npcs(section_text: str) -> list[dict[str, str]
     if not section_text.strip():
         return []
 
+    section_text = _normalize_alien_pdf_stat_text(section_text)
     lines = section_text.splitlines()
     results: list[dict[str, str]] = []
     seen_names: set[str] = set()
@@ -647,8 +757,7 @@ def _extract_alien_rpg_stat_block_npcs(section_text: str) -> list[dict[str, str]
                         candidate
                         and not candidate.upper().startswith("FULL NAME:")
                         and not _iter_stat_block_headings(candidate)
-                        and len(candidate.split()) <= 8
-                        and not candidate.endswith(("-", ","))
+                        and not _subtitle_looks_like_prose(candidate)
                         and not re.match(
                             r"^(AGE|PERSONALITY|STRENGTH|HEALTH|SKILLS|GEAR|TALENT)\b",
                             candidate,
@@ -681,9 +790,12 @@ def _extract_alien_rpg_stat_block_npcs(section_text: str) -> list[dict[str, str]
                         continue
                     if _iter_stat_block_headings(candidate):
                         break
-                    if not _STAT_BLOCK_FIELD_STOP.match(candidate):
-                        role = candidate
+                    if _STAT_BLOCK_FIELD_STOP.match(candidate):
                         break
+                    if _subtitle_looks_like_prose(candidate):
+                        continue
+                    role = candidate
+                    break
 
             seen_names.add(name_key)
             row = {
@@ -692,7 +804,10 @@ def _extract_alien_rpg_stat_block_npcs(section_text: str) -> list[dict[str, str]
                 "short_name": short_name or display_name.split()[-1].upper(),
                 "location_hint": _location_hint_from(window),
             }
-            results.append(_enrich_row_from_window(row, window))
+            # Field labels must start at this FULL NAME — looking upward steals the
+            # previous column partner's PERSONALITY (Destroyer Jaell → Davydovich).
+            field_window = "\n".join(lines[index : index + 25])
+            results.append(_enrich_row_from_window(row, field_window))
 
     # Androids / entries with PERSONAL AGENDA but no FULL NAME (e.g. AVA 6).
     for index, raw_line in enumerate(lines):
@@ -724,9 +839,12 @@ def _extract_alien_rpg_stat_block_npcs(section_text: str) -> list[dict[str, str]
                     continue
                 if _iter_stat_block_headings(candidate):
                     break
-                if not _STAT_BLOCK_FIELD_STOP.match(candidate):
-                    role_text = candidate
+                if _STAT_BLOCK_FIELD_STOP.match(candidate):
                     break
+                if _subtitle_looks_like_prose(candidate):
+                    continue
+                role_text = candidate
+                break
             row = {
                 "name": display_name,
                 "role": role_text,
