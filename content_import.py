@@ -620,7 +620,6 @@ def _truncate_preserving_npc_section(text: str, max_chars: int) -> str:
     """Shrink long documents but keep the NON-PLAYER CHARACTERS section when present.
 
     Must not exceed ``max_chars`` — that budget is the Groq/local outline limit.
-    Deterministic stat-block merge uses the full document separately.
     """
     if len(text) <= max_chars:
         return text
@@ -4291,7 +4290,7 @@ def outline_campaign_document(
     if not text or not text.strip():
         raise ContentImportError("No document text provided")
 
-    full_document_text = text
+    full_document_text = _truncate_input(text, warnings)
     use_stat_block_fast_path = _document_has_recoverable_stat_blocks(full_document_text)
 
     if use_stat_block_fast_path:
@@ -4301,8 +4300,7 @@ def outline_campaign_document(
         )
         outline_raw = {"campaign": {}, "locations": [], "npcs": []}
     else:
-        outline_document_text = _truncate_input(text, warnings)
-        outline_source = _prepare_outline_document_text(outline_document_text, warnings)
+        outline_source = _prepare_outline_document_text(full_document_text, warnings)
         outline_prompt = _build_outline_prompt(
             outline_source, mode, existing_campaign_id, existing_location_ids, existing_npc_names
         )

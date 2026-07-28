@@ -470,6 +470,17 @@ def test_chariot_regression_replaces_movie_quote_outline_npcs(monkeypatch):
     assert "stat block" in warning_blob
 
 
+def test_outline_truncates_huge_documents_at_start(monkeypatch):
+    monkeypatch.setattr(
+        content_import,
+        "_call_llm_json",
+        lambda *args, **kwargs: {"campaign": {}, "locations": [], "npcs": []},
+    )
+    huge = "a" * 150_000
+    result = content_import.outline_campaign_document(huge, "create_new")
+    assert any("truncated" in w.lower() for w in result.get("warnings") or [])
+
+
 def test_generic_npc_section_without_full_name_keeps_llm_outline(monkeypatch):
     """Caps NAME, ROLE lines without FULL NAME must not replace the LLM outline."""
     text = """NON-PLAYER CHARACTERS
