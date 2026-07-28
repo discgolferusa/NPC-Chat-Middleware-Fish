@@ -75,9 +75,35 @@ DOCTOR_WHO_CALLOUT_PDF_FIXTURE_PATH = (
     / "doctor_who_catseye_pdf_extract_callouts.txt"
 )
 
+# Editor PdfPig Y-grouped extract: sequential callout blocks, stylized caps
+# (AWAreNess / Peter HutcHiNs), not mid-word spaces or dual-column line glue.
+DOCTOR_WHO_PDFPIG_FIXTURE_PATH = (
+    Path(__file__).resolve().parent
+    / "tests"
+    / "fixtures"
+    / "doctor_who_catseye_pdfpig_callouts.txt"
+)
+
+# Synthetic worst-case (columns glued + letter spaces). Not observed on live
+# Cat's Eye PdfPig dumps; kept only for resilience of flex helpers.
+DOCTOR_WHO_PDFPIG_GLUED_SYNTHETIC_PATH = (
+    Path(__file__).resolve().parent
+    / "tests"
+    / "fixtures"
+    / "doctor_who_catseye_pdfpig_glued_columns_synthetic.txt"
+)
+
 
 def _load_doctor_who_callout_pdf_fixture() -> str:
     return DOCTOR_WHO_CALLOUT_PDF_FIXTURE_PATH.read_text(encoding="utf-8")
+
+
+def _load_doctor_who_pdfpig_fixture() -> str:
+    return DOCTOR_WHO_PDFPIG_FIXTURE_PATH.read_text(encoding="utf-8")
+
+
+def _load_doctor_who_pdfpig_glued_synthetic() -> str:
+    return DOCTOR_WHO_PDFPIG_GLUED_SYNTHETIC_PATH.read_text(encoding="utf-8")
 
 
 def test_npc_section_header_end_pattern_is_whole_line_only():
@@ -712,15 +738,11 @@ def test_seed_npc_detail_from_doctor_who_traits_and_bio():
         assert not content_import._npc_detail_is_sparse(seeded), f"sparse seed for {name}"
 
 
-def test_seed_peter_hutchins_from_pdfpig_letter_spacing():
-    """PdfPig dual-column Cat's Eye extract must still fill Hutchins personality/public facts."""
-    path = (
-        Path(__file__).resolve().parent
-        / "tests"
-        / "fixtures"
-        / "doctor_who_catseye_pdfpig_callouts.txt"
-    )
-    text = path.read_text(encoding="utf-8")
+def test_seed_peter_hutchins_from_pdfpig_editor_extract():
+    """Real editor PdfPig Cat's Eye dump: sequential callouts, stylized caps."""
+    text = _load_doctor_who_pdfpig_fixture()
+    assert "Peter HutcHiNs" in text
+    assert "MAx e d d iNGs Pe t e r" not in text  # not the synthetic glued header
     seeded = content_import._seed_npc_detail_from_document("Peter Hutchins", "squatter", text)
     assert seeded is not None
     joined = " ".join(seeded["personality"])
@@ -730,7 +752,7 @@ def test_seed_peter_hutchins_from_pdfpig_letter_spacing():
     assert "Friendly" in seeded["personality"]
     assert "Easy to smile" in seeded["personality"]
     assert any("leader" in fact.casefold() for fact in seeded["public_facts"])
-    # Must not steal Max's traits from the glued left column.
+    # Max's block is adjacent but sequential — do not steal his traits.
     assert "Selfish" not in joined
     assert "Argumentative" not in joined
 
@@ -746,29 +768,19 @@ def test_extract_cubicle7_callouts_from_catseye_pdf_fixture():
     assert "Gareth Ryder-Hanrahan" not in names
 
 
-def test_extract_cubicle7_callouts_from_pdfpig_letter_spacing():
-    """Editor PdfPig extracts space inside words and glue two columns onto one line."""
-    path = (
-        Path(__file__).resolve().parent
-        / "tests"
-        / "fixtures"
-        / "doctor_who_catseye_pdfpig_callouts.txt"
-    )
-    text = path.read_text(encoding="utf-8")
+def test_extract_cubicle7_callouts_from_pdfpig_editor_extract():
+    """Editor PdfPig Cat's Eye: stylized caps, intact sequential NPC callouts."""
+    text = _load_doctor_who_pdfpig_fixture()
     parsed = content_import._extract_cubicle7_callout_npcs(text)
     names = {row["name"] for row in parsed}
     assert names >= {"Kate Petersen", "Max Eddings", "Peter Hutchins", "Chad"}
+    assert "Nick Huggins" not in names
+    assert "Paul Bourne" not in names
 
 
 def test_outline_seeds_callouts_when_llm_returns_empty(monkeypatch):
-    path = (
-        Path(__file__).resolve().parent
-        / "tests"
-        / "fixtures"
-        / "doctor_who_catseye_pdfpig_callouts.txt"
-    )
-    # Prefix with title chrome so campaign title can be inferred.
-    text = "Cat s Ey E\nThe Majestic Hotel\n\n" + path.read_text(encoding="utf-8")
+    # Fixture already includes Cat's EyE chrome + Majestic / callout NPCs.
+    text = _load_doctor_who_pdfpig_fixture()
 
     def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step):
         return {"campaign": {}, "locations": [], "npcs": []}
@@ -779,6 +791,19 @@ def test_outline_seeds_callouts_when_llm_returns_empty(monkeypatch):
     names = {npc["name"] for npc in result["npcs"]}
     assert names >= {"Kate Petersen", "Max Eddings", "Peter Hutchins", "Chad"}
     assert any(loc["id"] == "majestic_hotel" for loc in result["locations"])
+
+
+def test_seed_and_callouts_still_tolerate_synthetic_glued_columns():
+    """Resilience only: mid-word spaces + dual-column glue (not live Cat's Eye PdfPig)."""
+    text = _load_doctor_who_pdfpig_glued_synthetic()
+    assert "Pe t e r Hu t cHiNs" in text or "t rAi t s" in text
+    names = {row["name"] for row in content_import._extract_cubicle7_callout_npcs(text)}
+    assert names >= {"Kate Petersen", "Max Eddings", "Peter Hutchins", "Chad"}
+    seeded = content_import._seed_npc_detail_from_document("Peter Hutchins", "squatter", text)
+    assert seeded is not None
+    joined = " ".join(seeded["personality"])
+    assert "Friends:" in joined
+    assert "Selfish" not in joined
 
 
 def test_outline_prefers_callouts_over_credit_hallucinations(monkeypatch):
@@ -822,6 +847,9 @@ def test_outline_prefers_callouts_over_credit_hallucinations(monkeypatch):
 
 def test_normalize_pdf_person_name_repairs_split_tokens():
     assert content_import._normalize_pdf_person_name("Peter Hutc HiNs") == "Peter Hutchins"
+    # Live editor PdfPig often keeps the surname token joined with mixed caps.
+    assert content_import._normalize_pdf_person_name("Peter HutcHiNs") == "Peter Hutchins"
+    assert content_import._normalize_pdf_person_name("KAte PeterseN") == "Kate Petersen"
     assert content_import._normalize_pdf_person_name("KAte Peterse N") == "Kate Petersen"
     assert content_import._normalize_pdf_person_name('"cHAd"') == "Chad"
     # Legitimate multi-word names must not be smashed into one surname.
