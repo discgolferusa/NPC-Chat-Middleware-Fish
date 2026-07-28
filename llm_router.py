@@ -154,7 +154,7 @@ GROQ_ON_DEMAND_PRICES_USD: dict[str, dict[str, float]] = {
     "local": {"input": 0.0, "output": 0.0},
     "groq-llama-3.1-8b-instant": {"input": 0.05, "output": 0.08},
     "groq-llama-3.3-70b": {"input": 0.59, "output": 0.79},
-    "groq-qwen3.6-27b": {"input": 0.29, "output": 0.59},
+    "groq-qwen3.6-27b": {"input": 0.60, "output": 3.00},
     "groq-gpt-oss-120b": {"input": 0.15, "output": 0.60},
     "groq-gpt-oss-20b": {"input": 0.075, "output": 0.30},
 }
