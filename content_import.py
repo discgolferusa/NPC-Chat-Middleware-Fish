@@ -4474,8 +4474,11 @@ def outline_campaign_document(
     if use_stat_block_fast_path:
         full_document_text = bounded_text
     else:
+        # Further shrink the already-bounded text to the LLM TPM budget.
+        # Do not re-truncate the original extract — that duplicated the
+        # MAX_INPUT_CHARS truncation warning on every oversized non-stat-block import.
         full_document_text = _truncate_for_import_document(
-            text, warnings, require_llm_budget=True
+            bounded_text, warnings, require_llm_budget=True
         )
 
     if use_stat_block_fast_path:

@@ -636,9 +636,34 @@ def test_outline_truncates_huge_documents_at_start(monkeypatch):
         "_call_llm_json",
         lambda *args, **kwargs: {"campaign": {}, "locations": [], "npcs": []},
     )
+    # TPM at/above hop max so only the MAX_INPUT_CHARS cap applies once.
+    monkeypatch.setattr(content_import, "content_creation_max_input_chars", lambda: 200_000)
     huge = "a" * 150_000
     result = content_import.outline_campaign_document(huge, "create_new")
-    assert any("truncated" in w.lower() for w in result.get("warnings") or [])
+    truncate_warnings = [
+        w for w in (result.get("warnings") or []) if "truncated" in w.lower()
+    ]
+    assert len(truncate_warnings) == 1
+
+
+def test_outline_does_not_duplicate_truncation_warning_when_tpm_also_caps(monkeypatch):
+    """Oversized docs that miss the stat-block path must not warn twice for one truncate."""
+    monkeypatch.setattr(
+        content_import,
+        "_call_llm_json",
+        lambda *args, **kwargs: {"campaign": {}, "locations": [], "npcs": []},
+    )
+    monkeypatch.setattr(content_import, "content_creation_max_input_chars", lambda: 8_000)
+    huge = "a" * 150_000
+    result = content_import.outline_campaign_document(huge, "create_new")
+    truncate_warnings = [
+        w for w in (result.get("warnings") or []) if "truncated" in w.lower()
+    ]
+    # MAX_INPUT_CHARS cap, then TPM shrink of the already-bounded text — two
+    # distinct budgets is fine; two identical "was 150000" messages is not.
+    assert len(truncate_warnings) <= 2
+    assert len({w for w in truncate_warnings}) == len(truncate_warnings)
+    assert sum(1 for w in truncate_warnings if "150000" in w or "150,000" in w) == 1
 
 
 def test_generic_npc_section_without_full_name_keeps_llm_outline(monkeypatch):
