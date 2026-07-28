@@ -271,14 +271,50 @@ def _is_toc_npc_header_line(collapsed_line: str) -> bool:
     return False
 
 
-def _line_is_npc_section_header(line: str) -> bool:
-    collapsed = _collapsed_line_from_raw_line(line)
-    if not collapsed:
-        return False
+def _npc_header_collapsed_from_lines(lines: list[str]) -> str | None:
+    """Return collapsed heading text when 1-2 lines form NON-PLAYER CHARACTERS."""
+    stripped_lines = [line.strip() for line in lines if line.strip()]
+    if not stripped_lines or len(stripped_lines) > 2:
+        return None
+    if any(len(line) > 96 for line in stripped_lines):
+        return None
+
+    collapsed = " ".join(_collapsed_line_from_raw_line(line) for line in stripped_lines)
     match = _NPC_SECTION_PATTERN.search(collapsed)
     if not match:
-        return False
-    return not collapsed[: match.start()].strip() and not collapsed[match.end() :].strip()
+        return None
+    if collapsed[: match.start()].strip():
+        return None
+
+    remainder = collapsed[match.end() :].strip()
+    if remainder and not _is_toc_npc_header_line(collapsed):
+        return None
+    return collapsed
+
+
+def _iter_npc_section_header_starts(text: str):
+    """Yield raw offsets for NON-PLAYER CHARACTERS headings, including split lines."""
+    if not text:
+        return
+
+    lines = text.splitlines(keepends=True)
+    pos = 0
+    for index, line in enumerate(lines):
+        line_start = pos
+        pos += len(line)
+        groups = [([line], line_start)]
+        if index + 1 < len(lines):
+            next_line = lines[index + 1]
+            if line.strip() and next_line.strip():
+                groups.append(([line, next_line], line_start))
+
+        seen_collapsed: set[str] = set()
+        for group_lines, start in groups:
+            collapsed = _npc_header_collapsed_from_lines(group_lines)
+            if collapsed is None or collapsed in seen_collapsed:
+                continue
+            seen_collapsed.add(collapsed)
+            yield start, collapsed
 
 
 def _find_best_npc_section_header_offset(text: str) -> int | None:
@@ -288,14 +324,7 @@ def _find_best_npc_section_header_offset(text: str) -> int | None:
 
     best_offset: int | None = None
     best_rank: tuple[int, int, int] | None = None
-    pos = 0
-    for line in text.splitlines(keepends=True):
-        line_start = pos
-        pos += len(line)
-        if not _line_is_npc_section_header(line):
-            continue
-
-        collapsed_line = _collapsed_line_from_raw_line(line)
+    for line_start, collapsed_line in _iter_npc_section_header_starts(text):
         is_toc = _is_toc_npc_header_line(collapsed_line)
         lookahead = _collapse_spaced_caps(text[line_start : line_start + 25_000])
         match = _NPC_SECTION_PATTERN.search(lookahead)
@@ -330,10 +359,10 @@ def _bounded_text_for_npc_operations(text: str, max_chars: int) -> str:
     if len(text) <= MAX_INPUT_CHARS:
         return text
 
-    tail = text[-max_chars:]
-    collapsed_tail = _collapse_spaced_caps(tail)
-    if _find_npc_section_span(collapsed_tail) is not None:
-        return tail
+    for window in (text[-max_chars:], text[:max_chars]):
+        collapsed_window = _collapse_spaced_caps(window)
+        if _find_npc_section_span(collapsed_window) is not None:
+            return window
 
     return text[:max_chars]
 
@@ -737,28 +766,18 @@ def _truncate_preserving_npc_section(text: str, max_chars: int) -> str:
         return text
 
     sliced = _bounded_text_for_npc_operations(text, max_chars)
-    if len(sliced) <= max_chars:
-        return _collapse_spaced_caps(sliced)
-
     collapsed = _collapse_spaced_caps(sliced)
     span = _find_npc_section_span(collapsed)
-    if span is None:
-        return collapsed[:max_chars]
+    if span is not None:
+        start, end = span
+        section = collapsed[start:end].strip()
+        if len(section) >= max_chars:
+            return section[:max_chars]
+        return section
 
-    start, end = span
-    section = collapsed[start:end].strip()
-    separator = "\n\n--- NON-PLAYER CHARACTERS (priority excerpt) ---\n\n"
-    if len(section) >= max_chars:
-        return section[:max_chars]
-
-    intro_budget = max_chars - len(section) - len(separator)
-    if intro_budget > 0:
-        intro_source = collapsed[:start].strip()
-        intro = intro_source[:intro_budget]
-        combined = f"{intro}{separator}{section}" if intro else section
-        return combined[:max_chars]
-
-    return section[:max_chars]
+    if len(collapsed) <= max_chars:
+        return collapsed
+    return collapsed[:max_chars]
 
 
 def _document_has_recoverable_stat_blocks(text: str) -> bool:

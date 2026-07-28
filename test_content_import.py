@@ -292,6 +292,42 @@ def test_outline_stat_block_probe_bounds_huge_document(monkeypatch):
     assert max(collapsed_lengths) < len(huge)
 
 
+def test_find_npc_header_offset_detects_split_non_player_characters_lines():
+    """PdfPig/Docnet often put NON-PLAYER and CHARACTERS on separate lines."""
+    text = _load_chariot_pdfpig_fixture()
+    offset = content_import._find_best_npc_section_header_offset(text)
+    assert offset is not None
+    assert "NON-PLAYER" in text[offset : offset + 40]
+    assert "FULL NAME: Albert Johns" in text[offset : offset + 12_000]
+
+
+def test_find_npc_header_offset_detects_letter_spaced_split_header():
+    text = (
+        "Front matter\n\n"
+        "N O N - P L A Y E R\n"
+        "C H A R A C T E R S\n"
+        "JOHNS, OFFICER\n"
+        "FULL NAME: Albert Johns\n"
+        "FULL NAME: Valerie Reid\n"
+        "FULL NAME: Liam Flynn\n"
+    )
+    offset = content_import._find_best_npc_section_header_offset(text)
+    assert offset is not None
+    assert "Albert Johns" in text[offset : offset + 500]
+
+
+def test_bounded_text_preserves_mid_document_split_header_section():
+    """Huge extracts with a mid-document NPC section must not rely on head/tail only."""
+    chariot = _load_chariot_pdfpig_fixture()
+    huge = ("A" * 70_000) + chariot + ("B" * 70_000)
+    bounded = content_import._bounded_text_for_npc_operations(
+        huge, content_import.MAX_INPUT_CHARS
+    )
+    collapsed = content_import._collapse_spaced_caps(bounded)
+    assert "FULL NAME: Albert Johns" in collapsed
+    assert content_import._document_has_recoverable_stat_blocks(bounded)
+
+
 def test_chariot_pdfpig_analyze_imports_all_npcs(monkeypatch):
     """PdfPig extract skips outline but still runs location/NPC detail sweeps."""
     text = _load_chariot_pdfpig_fixture()
