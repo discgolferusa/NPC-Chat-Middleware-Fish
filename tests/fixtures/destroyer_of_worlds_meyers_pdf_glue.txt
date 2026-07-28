@@ -1,0 +1,34 @@
+NON-PLAYER CHARACTERS
+
+Destroyer of Worlds — Fort Nebraska staff (two-column PDF glue regression).
+
+MEYERS, COLONELMEYERS, COLONEL JAELL, CHIEF WARRANT OFFICERJAELL, CHIEF WARRANT OFFICER
+COMMANDER OF FORT NEBRASKACOMMANDER OF FORT NEBRASKA
+FULL NAME:FULL NAME: Edward R. Meyers Edward R. Meyers
+PERSONALITY:PERSONALITY: Manipulative Manipulative
+Colonel Meyers doesn't seem like a bad guy.
+STRENGTH 3, AGILITY 3, WITS 4, EMPATHY 4
+HEALTH:  3
+SKILLS: Close Combat 3, Command 5, Manipulation 5
+GEAR: Remote handheld kill-switch fob that
+can deactivate Jaell, lockdown the base, and
+wipe project files from the mainframe (When
+found in Act III, Meyers has it concealed,
+taped to his inner thigh—see page 61).
+PERSONAL AGENDA: Erase all traces of Project
+Life Force on Ariarcus and escape with Xeno-
+biological material in hand (or chest).
+FORT NEBRASKA SECURITYFORT NEBRASKA SECURITY
+FULL NAME:FULL NAME: Jaell Jaell
+AGE:AGE: 5 (appears 25) 5 (appears 25)
+PERSONALITY:PERSONALITY: Duplicitous Duplicitous
+An experimental Hyperdyne combat synthetic.
+PERSONAL AGENDA: Please Colonel Meyers at
+all costs.
+STRENGTH 7, AGILITY 7, WITS 5, EMPATHY 2
+DAVYDOVICH, VICE SERGEANT MAJORDAVYDOVICH, VICE SERGEANT MAJOR
+FULL NAME:FULL NAME: AA83 Syem Davydovich AA83 Syem Davydovich
+AGE:AGE: Unknown Unknown
+PERSONALITY:PERSONALITY: Stoic Stoic
+PERSONAL AGENDA: Protect the UPP mission.
+STRENGTH 7, AGILITY 7, WITS 3, EMPATHY 3

@@ -78,6 +78,16 @@ DESTROYER_MOONSIDE_FIXTURE_PATH = (
 
 def _load_destroyer_moonside_fixture() -> str:
     return DESTROYER_MOONSIDE_FIXTURE_PATH.read_text(encoding="utf-8")
+DESTROYER_MEYERS_FIXTURE_PATH = (
+    Path(__file__).resolve().parent
+    / "tests"
+    / "fixtures"
+    / "destroyer_of_worlds_meyers_pdf_glue.txt"
+)
+
+
+def _load_destroyer_meyers_fixture() -> str:
+    return DESTROYER_MEYERS_FIXTURE_PATH.read_text(encoding="utf-8")
 
 
 DOCTOR_WHO_CATSEYE_FIXTURE_PATH = (
@@ -288,6 +298,66 @@ def test_destroyer_important_locations_include_colon_rooms():
     names = {row["name"] for row in harvested}
     assert "Sally Port" in names or "Gate" in names
     assert all(row.get("description") for row in harvested)
+def test_full_name_accepts_middle_initial_with_period():
+    assert content_import._iter_full_names_on_line(
+        "FULL NAME: Edward R. Meyers"
+    ) == ["Edward R. Meyers"]
+    assert content_import._iter_full_names_on_line(
+        "FULL NAME:FULL NAME: Edward R. Meyers Edward R. Meyers"
+    ) == ["Edward R. Meyers"]
+    assert content_import._iter_full_names_on_line(
+        "FULL NAME: A. Mallory Eckford"
+    ) == ["A. Mallory Eckford"]
+
+
+def test_act_iii_prose_is_not_a_stat_block_heading():
+    assert content_import._iter_stat_block_headings(
+        "found in Act III, Meyers has it concealed,"
+    ) == []
+    assert content_import._iter_stat_block_headings("MEYERS, COLONEL") == [
+        ("MEYERS", "COLONEL")
+    ]
+
+
+def test_destroyer_pdf_glue_parses_meyers_not_iii():
+    """Destroyer of Worlds two-column glue must not invent NPC 'Iii' from Act III."""
+    text = _load_destroyer_meyers_fixture()
+    collapsed = content_import._collapse_spaced_caps(text)
+    span = content_import._find_npc_section_span(collapsed)
+    assert span is not None
+    parsed = content_import._extract_alien_rpg_stat_block_npcs(
+        collapsed[span[0] : span[1]]
+    )
+    by_name = {row["name"]: row for row in parsed}
+    assert "Iii" not in by_name
+    assert "III" not in {row.get("short_name") for row in parsed}
+    assert "Edward R. Meyers" in by_name
+    meyers = by_name["Edward R. Meyers"]
+    assert meyers["short_name"] == "MEYERS"
+    assert "colonel" in meyers["role"].casefold() or "fort nebraska" in meyers[
+        "role"
+    ].casefold()
+    assert "thigh" not in meyers["role"].casefold()
+    assert "page" not in meyers["role"].casefold()
+    assert meyers.get("personality", "").casefold() == "manipulative"
+    assert "Jaell" in by_name
+    assert by_name["Jaell"].get("personality", "").casefold() == "duplicitous"
+    assert "AA83 Syem Davydovich" in by_name
+    assert by_name["AA83 Syem Davydovich"].get("personality", "").casefold() == "stoic"
+
+
+def test_destroyer_outline_seeds_meyers(monkeypatch):
+    text = _load_destroyer_meyers_fixture()
+
+    def fake_call_llm_json(*args, **kwargs):
+        raise AssertionError("stat-block fast path should not call outline LLM")
+
+    monkeypatch.setattr(content_import, "_call_llm_json", fake_call_llm_json)
+    result = content_import.outline_campaign_document(text, "create_new")
+    names = {npc["name"] for npc in result["npcs"]}
+    assert "Edward R. Meyers" in names
+    assert "Iii" not in names
+    assert "AA83 Syem Davydovich" in names
 
 
 def test_find_npc_section_span_prefers_body_over_toc_without_full_name():
