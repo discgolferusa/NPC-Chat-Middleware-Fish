@@ -24,6 +24,7 @@ from llm_router import (
     generate_llm_response,
     get_llm_models_payload,
     get_llm_status,
+    get_llm_usage_cost_report,
     reset_usage_tracking,
     select_llm_model,
 )
@@ -3110,6 +3111,17 @@ def settings_prompt_caps_put():
 @app.get("/llm/status")
 def llm_status():
     return jsonify(get_llm_status())
+
+
+@app.get("/llm/usage/report")
+def llm_usage_report():
+    """Alpha token/cost report for Admin charts (by model, by user, hourly series)."""
+    hours_raw = request.args.get("hours", "24")
+    try:
+        hours = int(hours_raw)
+    except (TypeError, ValueError):
+        hours = 24
+    return jsonify(get_llm_usage_cost_report(hours=hours))
 
 
 @app.post("/llm/select")
