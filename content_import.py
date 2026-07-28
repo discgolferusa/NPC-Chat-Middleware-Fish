@@ -323,24 +323,23 @@ def _find_npc_section_span(collapsed_text: str) -> tuple[int, int] | None:
         return None
 
     best_span: tuple[int, int] | None = None
-    best_full_names = -1
+    best_rank: tuple[int, int, int] | None = None
+
     for match in _NPC_SECTION_PATTERN.finditer(collapsed_text):
-        if _looks_like_toc_npc_section_hit(collapsed_text, match):
-            continue
+        is_toc = _looks_like_toc_npc_section_hit(collapsed_text, match)
         start, end = _npc_section_span_from_match(collapsed_text, match)
+        span_len = end - start
         full_name_count = len(_FULL_NAME_ANY.findall(collapsed_text[start:end]))
-        if full_name_count > best_full_names:
-            best_full_names = full_name_count
+        # Drop bare TOC index lines with no body.
+        if is_toc and full_name_count == 0 and span_len < 120:
+            continue
+        # Prefer non-TOC headers, then more FULL NAME markers, then longer body.
+        rank = (0 if is_toc else 1, full_name_count, span_len)
+        if best_rank is None or rank > best_rank:
+            best_rank = rank
             best_span = (start, end)
 
-    if best_span is not None and best_full_names > 0:
-        return best_span
-
-    # Fallback: first header even if it looked TOC-like (unusual layouts).
-    match = _NPC_SECTION_PATTERN.search(collapsed_text)
-    if not match:
-        return None
-    return _npc_section_span_from_match(collapsed_text, match)
+    return best_span
 
 
 def _iter_stat_block_headings(line: str) -> list[tuple[str, str]]:
@@ -4216,6 +4215,20 @@ def _merge_npc_detail(stub: dict[str, Any], detail: dict[str, Any], campaign_id:
 # --------------------------------------------------------------------------
 
 
+def _cap_document_text(text: str, max_chars: int, warnings: list[str]) -> str:
+    text = text or ""
+    if len(text) <= max_chars:
+        return text
+    warnings.append(
+        f"Input document was {len(text)} characters; truncated to fit the current "
+        f"content_creation context budget ({max_chars} characters). "
+        "When a NON-PLAYER CHARACTERS section exists it is kept in priority. "
+        "For long PDFs use Groq for content_creation or raise LOCAL_LLM_CONTEXT_TOKENS "
+        "to match llama.cpp n_ctx."
+    )
+    return _truncate_preserving_npc_section(text, max_chars)
+
+
 def _truncate_input(text: str, warnings: list[str]) -> str:
     text = text or ""
     # Fit the selected content_creation model's Groq TPM when configured.
@@ -4223,17 +4236,20 @@ def _truncate_input(text: str, warnings: list[str]) -> str:
     max_chars = content_creation_max_input_chars()
     if max_chars <= 0:
         raise ContentImportError(content_creation_zero_budget_error_message())
-    max_chars = min(MAX_INPUT_CHARS, max_chars)
-    if len(text) > max_chars:
-        warnings.append(
-            f"Input document was {len(text)} characters; truncated to fit the current "
-            f"content_creation context budget ({max_chars} characters). "
-            "When a NON-PLAYER CHARACTERS section exists it is kept in priority. "
-            "For long PDFs use Groq for content_creation or raise LOCAL_LLM_CONTEXT_TOKENS "
-            "to match llama.cpp n_ctx."
-        )
-        return _truncate_preserving_npc_section(text, max_chars)
-    return text
+    return _cap_document_text(text, min(MAX_INPUT_CHARS, max_chars), warnings)
+
+
+def _truncate_for_import_document(text: str, warnings: list[str], *, require_llm_budget: bool) -> str:
+    """Cap document length for import hops.
+
+    Stat-block / callout fast paths skip the LLM and must still work when the
+    content_creation TPM budget is zero.
+    """
+    if require_llm_budget:
+        return _truncate_input(text, warnings)
+    budget = content_creation_max_input_chars()
+    cap = min(MAX_INPUT_CHARS, budget) if budget > 0 else MAX_INPUT_CHARS
+    return _cap_document_text(text, cap, warnings)
 
 
 def _fetch_location_details(
@@ -4326,8 +4342,15 @@ def outline_campaign_document(
     if not text or not text.strip():
         raise ContentImportError("No document text provided")
 
-    full_document_text = _truncate_input(text, warnings)
-    use_stat_block_fast_path = _document_has_recoverable_stat_blocks(full_document_text)
+    use_stat_block_fast_path = _document_has_recoverable_stat_blocks(text)
+    if use_stat_block_fast_path:
+        full_document_text = _truncate_for_import_document(
+            text, warnings, require_llm_budget=False
+        )
+    else:
+        full_document_text = _truncate_for_import_document(
+            text, warnings, require_llm_budget=True
+        )
 
     if use_stat_block_fast_path:
         warnings.append(

@@ -220,6 +220,49 @@ def test_docnet_toc_npc_header_does_not_block_stat_block_fast_path():
     assert any("stat block" in w.lower() for w in result.get("warnings") or [])
 
 
+def test_find_npc_section_span_prefers_body_over_toc_without_full_name():
+    """Generic modules may list NPCs without FULL NAME markers; TOC must not win."""
+    text = (
+        "Table of Contents\n"
+        "Non-Player Characters ........ 12\n"
+        "Deck Plans ........ 24\n\n"
+        "INTRODUCTION\n"
+        "Welcome to the adventure.\n\n"
+        "NON-PLAYER CHARACTERS\n\n"
+        "JOHN SMITH, GUARD\n"
+        "A town guard on patrol.\n\n"
+        "JANE DOE, MERCHANT\n"
+        "Runs the general store.\n\n"
+        "BOB JONES, INNKEEPER\n"
+        "Owns the tavern.\n"
+    )
+    collapsed = content_import._collapse_spaced_caps(text)
+    span = content_import._find_npc_section_span(collapsed)
+    assert span is not None
+    section = collapsed[span[0] : span[1]]
+    assert "JOHN SMITH, GUARD" in section
+    assert "JANE DOE, MERCHANT" in section
+    assert "BOB JONES, INNKEEPER" in section
+    assert "........ 12" not in section
+
+    warnings: list[str] = []
+    prepared = content_import._prepare_outline_document_text(text, warnings)
+    assert "JOHN SMITH, GUARD" in prepared
+    assert "--- NON-PLAYER CHARACTERS (authoritative NPC list) ---" in prepared
+
+
+def test_stat_block_outline_succeeds_when_content_creation_budget_zero(monkeypatch):
+    """Deterministic stat-block outline must not require a Groq/local TPM budget."""
+    monkeypatch.setattr(content_import, "content_creation_max_input_chars", lambda: 0)
+    text = _load_chariot_pdfpig_fixture()
+    assert content_import._document_has_recoverable_stat_blocks(text)
+    result = content_import.outline_campaign_document(text, "create_new")
+    names = {npc["name"] for npc in result["npcs"]}
+    assert len(names) >= 5
+    assert "Albert Johns" in names
+    assert any("stat block" in w.lower() for w in result.get("warnings") or [])
+
+
 def test_chariot_pdfpig_analyze_imports_all_npcs(monkeypatch):
     """PdfPig extract skips outline but still runs location/NPC detail sweeps."""
     text = _load_chariot_pdfpig_fixture()
