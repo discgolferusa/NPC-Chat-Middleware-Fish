@@ -145,6 +145,20 @@ LAST_LLM_ERROR: dict[str, str | None] = {PURPOSE_CHAT: None, PURPOSE_CONTENT_CRE
 
 ONLINE_DISABLED_UNTIL: datetime | None = None
 
+# Keep ledger longer than the 24h rate-limit window so Admin cost charts have history.
+USAGE_RETENTION_HOURS = int(os.getenv("LLM_USAGE_RETENTION_HOURS", str(24 * 30)))
+
+# Alpha on-demand Groq list prices (USD per 1M tokens). Not billed by us — estimation only.
+# Source: https://groq.com/pricing (update when Groq changes rates).
+GROQ_ON_DEMAND_PRICES_USD: dict[str, dict[str, float]] = {
+    "local": {"input": 0.0, "output": 0.0},
+    "groq-llama-3.1-8b-instant": {"input": 0.05, "output": 0.08},
+    "groq-llama-3.3-70b": {"input": 0.59, "output": 0.79},
+    "groq-qwen3.6-27b": {"input": 0.29, "output": 0.59},
+    "groq-gpt-oss-120b": {"input": 0.15, "output": 0.60},
+    "groq-gpt-oss-20b": {"input": 0.075, "output": 0.30},
+}
+
 _STATE_LOCK = threading.Lock()
 _USAGE_LOCK = threading.Lock()
 
@@ -458,7 +472,7 @@ def _load_usage_records() -> list[dict[str, Any]]:
 
 
 def _save_usage_records(records: list[dict[str, Any]]) -> None:
-    cutoff = _utc_now() - timedelta(hours=24)
+    cutoff = _utc_now() - timedelta(hours=max(24, USAGE_RETENTION_HOURS))
     pruned = []
     for record in records:
         ts = _parse_utc_iso(record.get("timestamp"))
@@ -469,6 +483,38 @@ def _save_usage_records(records: list[dict[str, Any]]) -> None:
         LLM_USAGE_FILE.write_text(json.dumps(pruned, indent=2), encoding="utf-8")
     except OSError as ex:
         print(f"[LLM] failed to save usage ledger: {ex}", flush=True)
+
+
+def _request_owner_user_id() -> str:
+    try:
+        from session_context import get_request_owner
+
+        return (get_request_owner() or "").strip()
+    except Exception:
+        return ""
+
+
+def _pricing_for_model(model_id: str) -> dict[str, float]:
+    entry = GROQ_ON_DEMAND_PRICES_USD.get(model_id)
+    if entry:
+        return {"input": float(entry["input"]), "output": float(entry["output"])}
+    # Unknown online ids: treat as zero so we still show tokens without inventing rates.
+    if model_id == "local" or not model_id:
+        return {"input": 0.0, "output": 0.0}
+    return {"input": 0.0, "output": 0.0}
+
+
+def _estimate_cost_usd(model_id: str, prompt_tokens: int, completion_tokens: int) -> dict[str, float]:
+    prices = _pricing_for_model(model_id)
+    input_cost = (max(0, int(prompt_tokens)) / 1_000_000.0) * prices["input"]
+    output_cost = (max(0, int(completion_tokens)) / 1_000_000.0) * prices["output"]
+    return {
+        "input_price_per_mtok": prices["input"],
+        "output_price_per_mtok": prices["output"],
+        "estimated_input_cost_usd": round(input_cost, 6),
+        "estimated_output_cost_usd": round(output_cost, 6),
+        "estimated_total_cost_usd": round(input_cost + output_cost, 6),
+    }
 
 
 def record_llm_usage(
@@ -483,12 +529,29 @@ def record_llm_usage(
     fallback: bool = False,
     error: str | None = None,
     purpose: str = DEFAULT_PURPOSE,
+    selected_model_id: str | None = None,
+    attribute_cost_to_selected: bool = False,
 ) -> None:
+    """Append one usage row.
+
+    When ``attribute_cost_to_selected`` is true (local fallback while an online model
+    was selected), ``cost_model_id`` points at the selected online model so Admin
+    alpha cost charts treat the tokens as if that model had succeeded.
+    """
+    selected = (selected_model_id or model_id or "").strip() or model_id
+    if attribute_cost_to_selected and selected and selected != "local":
+        cost_model_id = selected
+    else:
+        cost_model_id = model_id
+
     record = {
         "timestamp": _utc_iso(_utc_now()),
         "provider": provider,
         "model_id": model_id,
         "model": model,
+        "selected_model_id": selected,
+        "cost_model_id": cost_model_id,
+        "owner_user_id": _request_owner_user_id(),
         "purpose": _normalize_purpose(purpose),
         "prompt_tokens": int(prompt_tokens),
         "completion_tokens": int(completion_tokens),
@@ -984,6 +1047,8 @@ def _fallback_to_local(
         fallback=True,
         error=error,
         purpose=purpose,
+        selected_model_id=selected_model_id,
+        attribute_cost_to_selected=True,
     )
 
     return content
@@ -1036,6 +1101,7 @@ def generate_llm_response(
             success=True,
             fallback=False,
             purpose=purpose,
+            selected_model_id=selected_model_id,
         )
         return content
 
@@ -1282,6 +1348,7 @@ def generate_llm_response(
         success=True,
         fallback=False,
         purpose=purpose,
+        selected_model_id=selected_model_id,
     )
 
     return content
@@ -1342,6 +1409,177 @@ def select_llm_model(
 def reset_usage_tracking() -> None:
     with _USAGE_LOCK:
         _save_usage_records([])
+
+
+def _empty_token_bucket() -> dict[str, Any]:
+    return {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "requests": 0,
+        "fallback_attributed_requests": 0,
+        "estimated_input_cost_usd": 0.0,
+        "estimated_output_cost_usd": 0.0,
+        "estimated_total_cost_usd": 0.0,
+    }
+
+
+def _accumulate_usage_bucket(bucket: dict[str, Any], record: dict[str, Any], cost_model_id: str) -> None:
+    prompt = int(record.get("prompt_tokens") or 0)
+    completion = int(record.get("completion_tokens") or 0)
+    total = int(record.get("total_tokens") or (prompt + completion))
+    costs = _estimate_cost_usd(cost_model_id, prompt, completion)
+    bucket["prompt_tokens"] += prompt
+    bucket["completion_tokens"] += completion
+    bucket["total_tokens"] += total
+    bucket["requests"] += 1
+    if record.get("fallback") and (record.get("cost_model_id") or "") not in {"", "local"}:
+        if record.get("model_id") == "local" or record.get("provider") == "local":
+            bucket["fallback_attributed_requests"] += 1
+    bucket["estimated_input_cost_usd"] = round(
+        bucket["estimated_input_cost_usd"] + costs["estimated_input_cost_usd"], 6
+    )
+    bucket["estimated_output_cost_usd"] = round(
+        bucket["estimated_output_cost_usd"] + costs["estimated_output_cost_usd"], 6
+    )
+    bucket["estimated_total_cost_usd"] = round(
+        bucket["estimated_total_cost_usd"] + costs["estimated_total_cost_usd"], 6
+    )
+
+
+def get_llm_usage_cost_report(*, hours: int = 24) -> dict[str, Any]:
+    """Alpha cost/token report for Admin charts.
+
+    Successful rows only. Local fallbacks with ``cost_model_id`` set to the selected
+    online model are billed against that model for estimation.
+    """
+    hours = max(1, min(int(hours or 24), USAGE_RETENTION_HOURS))
+    cutoff = _utc_now() - timedelta(hours=hours)
+
+    by_model: dict[str, dict[str, Any]] = {}
+    by_user: dict[str, dict[str, Any]] = {}
+    series_map: dict[str, dict[str, dict[str, Any]]] = {}
+    totals = _empty_token_bucket()
+
+    with _USAGE_LOCK:
+        records = list(_load_usage_records())
+
+    for record in records:
+        if not record.get("success"):
+            continue
+        ts = _parse_utc_iso(record.get("timestamp"))
+        if ts is None or ts < cutoff:
+            continue
+
+        cost_model_id = str(
+            record.get("cost_model_id") or record.get("selected_model_id") or record.get("model_id") or "local"
+        ).strip() or "local"
+        owner = str(record.get("owner_user_id") or "").strip() or "(unknown)"
+        purpose = str(record.get("purpose") or DEFAULT_PURPOSE)
+
+        model_bucket = by_model.get(cost_model_id)
+        if model_bucket is None:
+            prices = _pricing_for_model(cost_model_id)
+            public = _public_model_entry(cost_model_id) if cost_model_id in LLM_MODELS else {
+                "id": cost_model_id,
+                "label": cost_model_id,
+            }
+            model_bucket = {
+                **_empty_token_bucket(),
+                "model_id": cost_model_id,
+                "label": public.get("label") or cost_model_id,
+                "input_price_per_mtok": prices["input"],
+                "output_price_per_mtok": prices["output"],
+                "by_purpose": {},
+            }
+            by_model[cost_model_id] = model_bucket
+        _accumulate_usage_bucket(model_bucket, record, cost_model_id)
+        purpose_bucket = model_bucket["by_purpose"].setdefault(purpose, _empty_token_bucket())
+        _accumulate_usage_bucket(purpose_bucket, record, cost_model_id)
+
+        user_bucket = by_user.get(owner)
+        if user_bucket is None:
+            user_bucket = {
+                **_empty_token_bucket(),
+                "owner_user_id": owner,
+                "by_model": {},
+            }
+            by_user[owner] = user_bucket
+        _accumulate_usage_bucket(user_bucket, record, cost_model_id)
+        user_model = user_bucket["by_model"].setdefault(
+            cost_model_id,
+            {
+                **_empty_token_bucket(),
+                "model_id": cost_model_id,
+                "label": model_bucket["label"],
+            },
+        )
+        _accumulate_usage_bucket(user_model, record, cost_model_id)
+
+        _accumulate_usage_bucket(totals, record, cost_model_id)
+
+        hour_key = ts.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0).isoformat().replace(
+            "+00:00", "Z"
+        )
+        hour_models = series_map.setdefault(hour_key, {})
+        hour_bucket = hour_models.setdefault(
+            cost_model_id,
+            {
+                **_empty_token_bucket(),
+                "model_id": cost_model_id,
+                "label": model_bucket["label"],
+            },
+        )
+        _accumulate_usage_bucket(hour_bucket, record, cost_model_id)
+
+    series = []
+    for hour in sorted(series_map.keys()):
+        models = sorted(series_map[hour].values(), key=lambda row: row["model_id"])
+        series.append(
+            {
+                "hour": hour,
+                "models": models,
+                "prompt_tokens": sum(m["prompt_tokens"] for m in models),
+                "completion_tokens": sum(m["completion_tokens"] for m in models),
+                "estimated_total_cost_usd": round(sum(m["estimated_total_cost_usd"] for m in models), 6),
+            }
+        )
+
+    return {
+        "window_hours": hours,
+        "retention_hours": USAGE_RETENTION_HOURS,
+        "pricing_note": (
+            "Alpha estimates using Groq on-demand list prices. "
+            "When provider mode is groq_with_local_fallback, successful local fallbacks "
+            "are attributed to the selected online model for cost estimation."
+        ),
+        "pricing": {
+            model_id: {"input_per_mtok": prices["input"], "output_per_mtok": prices["output"]}
+            for model_id, prices in GROQ_ON_DEMAND_PRICES_USD.items()
+        },
+        "by_model": sorted(
+            by_model.values(),
+            key=lambda row: row["estimated_total_cost_usd"],
+            reverse=True,
+        ),
+        "by_user": sorted(
+            (
+                {
+                    **user,
+                    "by_model": sorted(
+                        user["by_model"].values(),
+                        key=lambda row: row["estimated_total_cost_usd"],
+                        reverse=True,
+                    ),
+                }
+                for user in by_user.values()
+            ),
+            key=lambda row: row["estimated_total_cost_usd"],
+            reverse=True,
+        ),
+        "series": series,
+        "totals": totals,
+    }
 
 
 def _remaining_estimate(model_id: str) -> dict[str, int | None]:
