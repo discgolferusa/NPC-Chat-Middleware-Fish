@@ -1935,6 +1935,47 @@ def _collapsed_alpha(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(value or "").casefold())
 
 
+def _significant_location_tokens(name: str) -> set[str]:
+    """Distinctive tokens from a location name (for scoping harvest/excerpts)."""
+    skip = {
+        "the",
+        "a",
+        "an",
+        "and",
+        "of",
+        "or",
+        "to",
+        "in",
+        "on",
+        "at",
+        "location",
+        "area",
+        "place",
+        "region",
+        "zone",
+    }
+    tokens: set[str] = set()
+    for part in re.split(r"[\s_/.\-]+", str(name or "").strip()):
+        cleaned = re.sub(r"[^a-z0-9]+", "", part.casefold())
+        if len(cleaned) < 4 or cleaned in skip:
+            continue
+        tokens.add(cleaned)
+    return tokens
+
+
+def _text_matches_location(blob: str, location_name: str) -> bool:
+    """True when blob shares a significant token with the location name."""
+    tokens = _significant_location_tokens(location_name)
+    if not tokens or not blob:
+        return False
+    collapsed = _collapsed_alpha(blob)
+    spaced = re.sub(r"[^a-z0-9]+", " ", str(blob).casefold())
+    for token in tokens:
+        if token in collapsed or re.search(rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])", spaced):
+            return True
+    return False
+
+
 def _display_place_name(raw: str) -> str:
     """Turn stylized PDF headers into readable place names."""
     cleaned = re.sub(r"\s+", " ", str(raw or "").strip().strip("\"“”'"))
@@ -1961,7 +2002,8 @@ def _is_subarea_stop_name(name: str) -> bool:
     if key.startswith(("cat s eye", "cats eye", "page ")):
         return True
     collapsed = _collapsed_alpha(name)
-    if any(token in collapsed for token in _STAT_NAME_COLLAPSED):
+    # Exact collapsed match only — "Portraits" must not die on substring "traits".
+    if collapsed in _STAT_NAME_COLLAPSED:
         return True
     if re.search(r"\d", name):
         return True
@@ -2129,8 +2171,12 @@ def _harvest_toc_place_names(text: str) -> list[str]:
     return names[:20]
 
 
-def _find_exploring_section_span(text: str) -> tuple[int, int] | None:
-    """Locate an Exploring… scene block (generic module pattern)."""
+def _find_exploring_section_span(
+    text: str,
+    *,
+    location_name: str = "",
+) -> tuple[int, int] | None:
+    """Locate an Exploring… scene block, optionally scoped to a parent location."""
     if not text:
         return None
     matches = list(_EXPLORING_SECTION.finditer(text))
@@ -2145,11 +2191,17 @@ def _find_exploring_section_span(text: str) -> tuple[int, int] | None:
         line_end = text.find("\n", match.start() + 1)
         return text[match.start() : line_end if line_end >= 0 else match.end()].strip()
 
-    # Prefer body chapter headers over TOC rows ("Exploring the Hotel 12").
-    body = next(
-        (m for m in matches if not re.search(r"\d{1,3}\s*$", _header_line(m))),
-        matches[-1],
-    )
+    # Drop TOC rows ("Exploring the Hotel 12").
+    body_matches = [m for m in matches if not re.search(r"\d{1,3}\s*$", _header_line(m))]
+    candidates = body_matches or matches
+
+    if location_name.strip():
+        scoped = [m for m in candidates if _text_matches_location(_header_line(m), location_name)]
+        if not scoped:
+            return None
+        candidates = scoped
+
+    body = candidates[-1]
     start = body.start()
     rest = text[body.end() :]
     end_rel = len(rest)
@@ -2163,9 +2215,9 @@ def _find_exploring_section_span(text: str) -> tuple[int, int] | None:
     return start, end
 
 
-def _harvest_scene_subareas(text: str) -> list[dict[str, str]]:
-    """Harvest short scene/room headers and nearby prose from Exploring sections only."""
-    span = _find_exploring_section_span(text)
+def _harvest_scene_subareas(text: str, *, location_name: str = "") -> list[dict[str, str]]:
+    """Harvest short scene/room headers from an Exploring section scoped to the location."""
+    span = _find_exploring_section_span(text, location_name=location_name)
     if not span:
         return []
     region = text[span[0] : span[1]]
@@ -2204,9 +2256,11 @@ def _harvest_scene_subareas(text: str) -> list[dict[str, str]]:
 def _attach_scene_descriptions(
     items: dict[str, dict[str, str]],
     document_text: str,
+    *,
+    location_name: str = "",
 ) -> None:
     """Fill empty TOC descriptions from matching Exploring scene headers."""
-    span = _find_exploring_section_span(document_text)
+    span = _find_exploring_section_span(document_text, location_name=location_name)
     if not span:
         return
     region = document_text[span[0] : span[1]]
@@ -2240,27 +2294,59 @@ def _attach_scene_descriptions(
             items[key]["description"] = description
 
 
+def _toc_name_appears_in_region(name: str, region: str) -> bool:
+    """True when a TOC place name (possibly stylized) occurs in the scoped region."""
+    if not name or not region:
+        return False
+    if _mention_indexes(region.casefold(), name):
+        return True
+    collapsed_name = _collapsed_alpha(name)
+    if len(collapsed_name) < 4:
+        return False
+    # Stylized headers: "tHe cOurtyArd" ≈ "The Courtyard".
+    flex_parts: list[str] = []
+    for word in re.findall(r"[A-Za-z0-9]+", name):
+        chars = [re.escape(ch) for ch in word.casefold() if ch.isalnum()]
+        if len(chars) >= 3:
+            flex_parts.append(r"\s*".join(chars))
+    if not flex_parts:
+        return False
+    pattern = re.compile(rf"(?i)(?<![a-z0-9]){r'\s+'.join(flex_parts)}(?![a-z0-9])")
+    return bool(pattern.search(region))
+
+
 def _harvest_important_locations(document_text: str, location_name: str) -> list[dict[str, str]]:
-    """Generic sub-area harvest from TOC + Exploring/scene headers (no publisher parser)."""
+    """Harvest sub-areas for one parent location from its Exploring section (+ matching TOC).
+
+    Does not attach a shared document TOC/Exploring block to unrelated location stubs.
+    """
     text = document_text or ""
-    if not text.strip():
+    parent = str(location_name or "").strip()
+    if not text.strip() or not parent:
         return []
+
+    span = _find_exploring_section_span(text, location_name=parent)
+    if not span:
+        return []
+    region = text[span[0] : span[1]]
     by_key: dict[str, dict[str, str]] = {}
 
     for toc_name in _harvest_toc_place_names(text):
+        # Only keep TOC rows that also appear inside this location's exploring region.
+        if not _toc_name_appears_in_region(toc_name, region):
+            continue
         key = toc_name.casefold()
         by_key.setdefault(
             key,
             {"name": toc_name, "description": "", "public_knowledge": ""},
         )
 
-    for item in _harvest_scene_subareas(text):
+    for item in _harvest_scene_subareas(text, location_name=parent):
         key = str(item.get("name") or "").casefold()
         if not key:
             continue
         existing = by_key.get(key)
         if existing is None:
-            # Only add free scene headers that look like places (have place noun or short label).
             if not any(
                 token in key
                 for token in (
@@ -2283,13 +2369,13 @@ def _harvest_important_locations(document_text: str, location_name: str) -> list
         ):
             existing["description"] = item["description"]
 
-    _attach_scene_descriptions(by_key, text)
+    _attach_scene_descriptions(by_key, text, location_name=parent)
 
-    parent = _display_place_name(location_name).casefold()
-    parent_tokens = {t for t in re.split(r"[\s_/]+", parent) if len(t) >= 4}
+    parent_key = _display_place_name(parent).casefold()
+    parent_tokens = {t for t in re.split(r"[\s_/]+", parent_key) if len(t) >= 4}
     results: list[dict[str, str]] = []
     for key, item in by_key.items():
-        if parent and (key == parent or key in parent_tokens):
+        if parent_key and (key == parent_key or key in parent_tokens):
             continue
         if parent_tokens and key.replace(" ", "") == "".join(parent_tokens):
             continue
@@ -2358,9 +2444,10 @@ def _contents_excerpt(document_text: str, *, max_chars: int = 2_500) -> str:
 
 
 def _location_detail_excerpt(document_text: str, loc: dict[str, Any]) -> str:
-    """Parent-name windows plus TOC / Exploring sections so room headers are visible."""
+    """Parent-name windows plus location-scoped TOC / Exploring sections."""
     text = document_text or ""
-    needles = _distinctive_name_needles(loc.get("name", ""), loc.get("id", ""))
+    loc_name = str(loc.get("name") or "")
+    needles = _distinctive_name_needles(loc_name, loc.get("id", ""))
     chunks: list[str] = []
     seen: set[str] = set()
 
@@ -2374,25 +2461,27 @@ def _location_detail_excerpt(document_text: str, loc: dict[str, Any]) -> str:
         seen.add(key)
         chunks.append(piece)
 
-    add_chunk(_relevant_excerpts(text, needles))
-    add_chunk(_contents_excerpt(text))
-    span = _find_exploring_section_span(text)
+    lower = text.casefold()
+    has_parent_hits = any(_mention_indexes(lower, needle) for needle in needles if needle)
+    if has_parent_hits:
+        add_chunk(_relevant_excerpts(text, needles))
+        # Prefer a later parent-name mention (often scene pages) beyond the first overview.
+        for needle in needles:
+            hits = _mention_indexes(lower, needle)
+            if len(hits) < 2:
+                continue
+            idx = hits[min(len(hits) - 1, 2)]
+            start = max(0, idx - 200)
+            end = min(len(text), idx + 5_000)
+            add_chunk(text[start:end])
+            break
+
+    toc = _contents_excerpt(text)
+    if toc and _text_matches_location(toc, loc_name):
+        add_chunk(toc)
+    span = _find_exploring_section_span(text, location_name=loc_name)
     if span:
         add_chunk(text[span[0] : span[1]])
-
-    # If parent name is a hotel/building, also grab nearby "Majestic" scene prose
-    # beyond the first overview window by taking a later mention window.
-    lower = text.casefold()
-    for needle in needles:
-        hits = _mention_indexes(lower, needle)
-        if len(hits) < 2:
-            continue
-        # Prefer a later mention (often the exploring / scene pages).
-        idx = hits[min(len(hits) - 1, 2)]
-        start = max(0, idx - 200)
-        end = min(len(text), idx + 5_000)
-        add_chunk(text[start:end])
-        break
 
     combined: list[str] = []
     total = 0
@@ -2404,7 +2493,10 @@ def _location_detail_excerpt(document_text: str, loc: dict[str, Any]) -> str:
             break
         combined.append(piece)
         total += len(piece)
-    return "\n\n---\n\n".join(combined) if combined else text[: min(len(text), EXCERPT_MAX_CHARS)]
+    if combined:
+        return "\n\n---\n\n".join(combined)
+    # Unmatched stub: do not dump the whole module into the prompt.
+    return ""
 
 
 def _location_detail_from_seed(stub: dict[str, Any], document_text: str = "") -> dict[str, Any]:

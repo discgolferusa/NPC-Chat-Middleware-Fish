@@ -686,6 +686,62 @@ def test_harvest_important_locations_from_catseye_pdfpig():
     assert "investigate the courtyard" in courtyard["description"].casefold()
 
 
+def test_subarea_stop_name_uses_exact_stat_match_not_substring():
+    assert content_import._is_subarea_stop_name("Awareness")
+    assert content_import._is_subarea_stop_name("Traits")
+    assert content_import._is_subarea_stop_name("Survival")
+    assert content_import._is_subarea_stop_name("Medicine")
+    # Real place names that merely contain stat letter sequences must survive.
+    assert not content_import._is_subarea_stop_name("Portraits")
+    assert not content_import._is_subarea_stop_name("Firefighting")
+    assert not content_import._is_subarea_stop_name("Survival Bunker")
+    assert not content_import._is_subarea_stop_name("Medicine Cabinet")
+
+
+def test_harvest_important_locations_scoped_to_parent_location():
+    """Shared TOC/Exploring rooms must not attach to every location stub in the doc."""
+    text = _load_doctor_who_pdfpig_fixture()
+    hotel = content_import._harvest_important_locations(text, "Majestic Hotel")
+    assert hotel
+    assert any("courtyard" in row["name"].casefold() for row in hotel)
+
+    other = content_import._harvest_important_locations(text, "USCSS Cronus")
+    other_names = {row["name"].casefold() for row in other}
+    assert not any("courtyard" in n for n in other_names)
+    assert "eddings" not in other_names
+    assert not any("swimming pool" in n for n in other_names)
+
+    merged_other = content_import._merge_location_detail(
+        {"id": "uscss_cronus", "name": "USCSS Cronus", "type": "building"},
+        {
+            "summary": "A ship.",
+            "important_locations": [{"name": "Bridge", "description": "Command deck.", "public_knowledge": ""}],
+        },
+        "cats_eye",
+        document_text=text,
+    )
+    merged_names = {row["name"].casefold() for row in merged_other["important_locations"]}
+    assert "bridge" in merged_names
+    assert not any("courtyard" in n for n in merged_names)
+
+
+def test_location_detail_excerpt_scopes_exploring_to_parent():
+    text = _load_doctor_who_pdfpig_fixture()
+    hotel_excerpt = content_import._location_detail_excerpt(
+        text,
+        {"id": "majestic_hotel", "name": "Majestic Hotel", "type": "building"},
+    )
+    assert "cOurtyArd" in hotel_excerpt or "Courtyard" in hotel_excerpt
+
+    other_excerpt = content_import._location_detail_excerpt(
+        text,
+        {"id": "uscss_cronus", "name": "USCSS Cronus", "type": "building"},
+    )
+    # Unrelated stubs should not receive the hotel Exploring window wholesale.
+    assert "exPLOriNG tHe HOteL" not in other_excerpt
+    assert "tHe cOurtyArd" not in other_excerpt
+
+
 def test_location_detail_merges_harvested_subareas_when_llm_omits_them(monkeypatch):
     text = _load_doctor_who_pdfpig_fixture()
 
