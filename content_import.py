@@ -814,265 +814,6 @@ _STAT_OR_SECTION_LINE = re.compile(
     r"(?i)^\s*(?:traits?|skills?|tech\s*level|story\s*points|awareness|presence|"
     r"coordination|resolve|ingenuity|strength)\b"
 )
-# Seed windows stay tighter than LLM excerpts so packed modules do not blend NPCs.
-_SEED_EXCERPT_WINDOW_BEFORE = 120
-_SEED_EXCERPT_WINDOW_AFTER = 2_200
-_SEED_WRITEUP_MAX_CHARS = 1_800
-_BIO_CHUNK_MAX_CHARS = 280
-
-
-def _parse_trait_blocks(
-    excerpt: str,
-    *,
-    first_section_only: bool = False,
-) -> list[tuple[str, str]]:
-    """Parse Cubicle 7-style TRAITS blocks (Trait: description, possibly wrapped)."""
-    lines = excerpt.splitlines()
-    traits: list[tuple[str, str]] = []
-    in_traits = False
-    section_count = 0
-    current_name = ""
-    current_parts: list[str] = []
-
-    def flush() -> None:
-        nonlocal current_name, current_parts
-        if current_name and current_parts:
-            text = " ".join(p.strip() for p in current_parts if p.strip()).strip()
-            if text:
-                traits.append((current_name, text))
-        current_name = ""
-        current_parts = []
-
-    for line in lines:
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if _TRAIT_SECTION_HEADER.match(stripped):
-            if first_section_only and section_count >= 1:
-                break
-            flush()
-            in_traits = True
-            section_count += 1
-            continue
-        if not in_traits:
-            continue
-        if _TRAIT_SECTION_END.match(stripped):
-            flush()
-            in_traits = False
-            if first_section_only and section_count >= 1:
-                break
-            continue
-        item = _TRAIT_ITEM_START.match(stripped)
-        if item and not stripped.lower().startswith("tech level"):
-            flush()
-            current_name = item.group(1).strip()
-            rest = item.group(2).strip()
-            current_parts = [rest] if rest else []
-            continue
-        if current_name:
-            current_parts.append(stripped)
-    flush()
-    return traits
-
-
-def _looks_like_npc_name_header(line: str, *, exclude_name: str = "") -> bool:
-    """True for short title-like lines that often introduce the next NPC writeup."""
-    s = str(line or "").strip().strip("\"“”")
-    if not s or len(s) < 3 or len(s) > 42:
-        return False
-    if s.endswith((".", ":", ";", ",")):
-        return False
-    if re.search(r"\d", s):
-        return False
-    if _STAT_OR_SECTION_LINE.match(s) or _TRAIT_SECTION_HEADER.match(s):
-        return False
-    words = s.split()
-    if not (1 <= len(words) <= 4):
-        return False
-    if exclude_name and _mention_indexes(s.casefold(), exclude_name):
-        return False
-    # Avoid cutting on ordinary prose openers.
-    if words[0].casefold() in {
-        "the",
-        "a",
-        "an",
-        "for",
-        "and",
-        "but",
-        "as",
-        "in",
-        "on",
-        "at",
-        "to",
-        "of",
-        "with",
-        "from",
-        "this",
-        "that",
-        "he",
-        "she",
-        "they",
-        "his",
-        "her",
-        "their",
-    }:
-        return False
-    return True
-
-
-def _clip_npc_writeup(excerpt: str, name: str) -> str:
-    """Keep only the local writeup for ``name`` so neighbor TRAITS/bios are excluded."""
-    name = str(name or "").strip()
-    if not excerpt:
-        return ""
-    if not name:
-        return excerpt[:_SEED_WRITEUP_MAX_CHARS]
-
-    cf = excerpt.casefold()
-    hits = _mention_indexes(cf, name)
-    if not hits and " " in name:
-        hits = _mention_indexes(cf, name.split()[-1])
-    if not hits:
-        return excerpt[:_SEED_WRITEUP_MAX_CHARS]
-
-    # Prefer a short header-line hit (PDF-split / quoted names) over an earlier
-    # prose mention ("including the formidable Chad").
-    start = None
-    for idx in hits:
-        line_start = excerpt.rfind("\n", 0, idx) + 1
-        line_end = excerpt.find("\n", idx)
-        line = excerpt[line_start : line_end if line_end >= 0 else len(excerpt)].strip()
-        label = line.strip("\"“”").strip()
-        if not label or not _mention_indexes(label.casefold(), name):
-            continue
-        if _looks_like_npc_name_header(line) or len(label.split()) <= max(1, len(name.split())):
-            start = line_start
-            break
-    if start is None:
-        start = excerpt.rfind("\n", 0, hits[0]) + 1
-
-    hard_end = min(len(excerpt), start + _SEED_WRITEUP_MAX_CHARS)
-    region = excerpt[start:hard_end]
-    offset = 0
-    for i, line in enumerate(region.splitlines(keepends=True)):
-        stripped = line.strip()
-        if i > 0 and stripped and _looks_like_npc_name_header(stripped, exclude_name=name):
-            return excerpt[start : start + offset]
-        offset += len(line)
-    return excerpt[start:hard_end]
-
-
-def _split_writeup_blocks(excerpt: str) -> list[str]:
-    """Split PdfPig-style single-newline text on blank lines and structural headers."""
-    blocks: list[str] = []
-    current: list[str] = []
-
-    def flush() -> None:
-        if current:
-            blocks.append("\n".join(current))
-            current.clear()
-
-    for line in excerpt.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            flush()
-            continue
-        if (
-            _TRAIT_SECTION_HEADER.match(stripped)
-            or _STAT_OR_SECTION_LINE.match(stripped)
-            or _TRAIT_SECTION_END.match(stripped)
-            or _looks_like_npc_name_header(stripped)
-        ):
-            flush()
-            # Keep name headers so flexible matching can see "Peter Hutc HiNs".
-            if _looks_like_npc_name_header(stripped) and not _STAT_OR_SECTION_LINE.match(stripped):
-                current.append(stripped)
-            continue
-        current.append(stripped)
-    flush()
-    return blocks
-
-
-def _bio_paragraphs_for_name(excerpt: str, name: str) -> list[str]:
-    """Grab prose paragraphs that clearly describe this NPC by name."""
-    name = str(name or "").strip()
-    if not name or not excerpt:
-        return []
-    surname = name.split()[-1] if name.split() else ""
-    paragraphs: list[str] = []
-    for block in _split_writeup_blocks(excerpt):
-        text = " ".join(line.strip() for line in block.splitlines() if line.strip()).strip()
-        if len(text) < 40:
-            continue
-        head = text[:120]
-        name_in_head = bool(_mention_indexes(head.casefold(), name))
-        surname_in_open = bool(
-            len(surname) >= 4 and _mention_indexes(text[:160].casefold(), surname)
-        )
-        if name_in_head or (
-            surname_in_open
-            and any(
-                marker in text.casefold()
-                for marker in (" is ", " suffers", " has ", " would ", " can ")
-            )
-        ):
-            if len(text) > _BIO_CHUNK_MAX_CHARS:
-                text = text[: _BIO_CHUNK_MAX_CHARS - 3] + "..."
-            paragraphs.append(text)
-    return paragraphs[:3]
-
-
-def _seed_npc_detail_from_document(
-    name: str,
-    role: str,
-    document_text: str,
-) -> dict[str, Any] | None:
-    """Deterministic detail seed from Cubicle 7 / Doctor Who-style stat writeups."""
-    needles = _distinctive_name_needles(name, snake_case(name))
-    excerpt = _relevant_excerpts(
-        document_text,
-        needles,
-        window_before=_SEED_EXCERPT_WINDOW_BEFORE,
-        window_after=_SEED_EXCERPT_WINDOW_AFTER,
-    )
-    excerpt = _clip_npc_writeup(excerpt, name)
-    if not excerpt or len(excerpt.strip()) < 60:
-        return None
-
-    # Only the first TRAITS section in this clipped writeup belongs to the target NPC.
-    traits = _parse_trait_blocks(excerpt, first_section_only=True)
-    bios = _bio_paragraphs_for_name(excerpt, name)
-    personality: list[str] = []
-    llm_rules: list[str] = []
-    public_facts: list[str] = []
-    known_facts: list[str] = []
-
-    for trait_name, trait_text in traits:
-        personality.append(f"{trait_name}: {trait_text}")
-        llm_rules.append(f"Play the '{trait_name}' trait: {trait_text}")
-
-    if role:
-        public_facts.append(f"Role: {role}")
-    for bio in bios:
-        # First bio sentence-ish chunks as public/known facts.
-        if len(public_facts) < 4:
-            public_facts.append(bio)
-        else:
-            known_facts.append(bio)
-
-    detail: dict[str, Any] = {
-        "gender": "unspecified",
-        "race": "unknown",
-        "voice": [],
-        "personality": personality,
-        "public_facts": public_facts,
-        "known_facts": known_facts,
-        "secrets": [],
-        "llm_rules": llm_rules,
-    }
-    if _npc_detail_is_sparse(detail):
-        return None
-    return detail
 
 
 def _flex_letters(word: str) -> str:
@@ -1134,6 +875,651 @@ _CALLOUT_NAME_STOPWORDS = frozenset(
         "unarmed combat",
     }
 )
+
+# Seed windows stay tighter than LLM excerpts so packed modules do not blend NPCs.
+_SEED_EXCERPT_WINDOW_BEFORE = 120
+_SEED_EXCERPT_WINDOW_AFTER = 2_200
+_SEED_WRITEUP_MAX_CHARS = 1_800
+_BIO_CHUNK_MAX_CHARS = 280
+
+
+def _parse_trait_blocks(
+    excerpt: str,
+    *,
+    first_section_only: bool = False,
+) -> list[tuple[str, str]]:
+    """Parse Cubicle 7-style TRAITS blocks (Trait: description, possibly wrapped)."""
+    lines = excerpt.splitlines()
+    traits: list[tuple[str, str]] = []
+    in_traits = False
+    section_count = 0
+    current_name = ""
+    current_parts: list[str] = []
+
+    def flush() -> None:
+        nonlocal current_name, current_parts
+        if current_name and current_parts:
+            text = " ".join(p.strip() for p in current_parts if p.strip()).strip()
+            if text:
+                traits.append((current_name, text))
+        current_name = ""
+        current_parts = []
+
+    def _is_traits_header(stripped: str) -> bool:
+        if _TRAIT_SECTION_HEADER.match(stripped):
+            return True
+        # PdfPig: "t rAi t s" or "t rAi t s Friends: Hutchins has..."
+        flex = _CALLOUT_TRAITS_FLEX.search(stripped)
+        if not flex:
+            return False
+        after = stripped[flex.end() :].strip()
+        if not after:
+            return True
+        if _TRAIT_ITEM_START.match(after):
+            return True
+        # Bare spaced header with junk; keep short-only guard.
+        return len(stripped) <= 48
+
+    def _is_traits_end(stripped: str) -> bool:
+        if _TRAIT_SECTION_END.match(stripped):
+            return True
+        if _CALLOUT_STORY_OR_TECH.search(stripped):
+            return True
+        return False
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if _is_traits_header(stripped):
+            if first_section_only and section_count >= 1:
+                break
+            flush()
+            in_traits = True
+            section_count += 1
+            # Same line may continue with "Friends: ..." after a spaced TRAITS header.
+            after = _CALLOUT_TRAITS_FLEX.sub("", stripped, count=1).strip()
+            if after:
+                item = _TRAIT_ITEM_START.match(after)
+                if item:
+                    current_name = item.group(1).strip()
+                    rest = item.group(2).strip()
+                    current_parts = [rest] if rest else []
+            continue
+        if not in_traits:
+            # Mid-line trait items in two-column glue: "Friends: Hutchins has..."
+            item = _TRAIT_ITEM_START.match(stripped)
+            if item and not stripped.lower().startswith("tech level"):
+                # Only accept when a traits header appeared earlier in the excerpt.
+                if _CALLOUT_TRAITS_FLEX.search(excerpt[: excerpt.find(stripped) + 1] if stripped in excerpt else excerpt):
+                    flush()
+                    in_traits = True
+                    section_count = max(1, section_count)
+                    current_name = item.group(1).strip()
+                    rest = item.group(2).strip()
+                    current_parts = [rest] if rest else []
+            continue
+        if _is_traits_end(stripped):
+            flush()
+            in_traits = False
+            if first_section_only and section_count >= 1:
+                break
+            continue
+        item = _TRAIT_ITEM_START.match(stripped)
+        if item and not stripped.lower().startswith("tech level"):
+            flush()
+            current_name = item.group(1).strip()
+            rest = item.group(2).strip()
+            current_parts = [rest] if rest else []
+            continue
+        # Trait text may continue after another column's trait name mid-line.
+        inline = re.search(
+            r"(?<![A-Za-z])([A-Z][a-z]{2,24}):\s+(.+)$",
+            stripped,
+        )
+        if inline and current_name:
+            # Keep prior trait text before the new inline trait starts.
+            before = stripped[: inline.start()].strip()
+            if before:
+                current_parts.append(before)
+            flush()
+            current_name = inline.group(1).strip()
+            current_parts = [inline.group(2).strip()]
+            continue
+        if current_name:
+            current_parts.append(stripped)
+    flush()
+    return traits
+
+
+def _traits_for_npc(traits: list[tuple[str, str]], name: str) -> list[tuple[str, str]]:
+    """Keep traits that mention this NPC when two callouts are column-glued."""
+    parts = str(name or "").split()
+    if not traits or not parts:
+        return traits
+    surname = parts[-1].casefold()
+    first = parts[0].casefold()
+    matched = []
+    for trait_name, trait_text in traits:
+        blob = f"{trait_name} {trait_text}".casefold()
+        if (len(surname) >= 3 and surname in blob) or (len(first) >= 4 and first in blob):
+            matched.append((trait_name, trait_text))
+    return matched if matched else traits
+
+
+def _looks_like_npc_name_header(line: str, *, exclude_name: str = "") -> bool:
+    """True for short title-like lines that often introduce the next NPC writeup."""
+    s = str(line or "").strip().strip("\"“”")
+    if not s or len(s) < 3 or len(s) > 42:
+        return False
+    if s.endswith((".", ":", ";", ",")):
+        return False
+    if re.search(r"\d", s):
+        return False
+    if _STAT_OR_SECTION_LINE.match(s) or _TRAIT_SECTION_HEADER.match(s):
+        return False
+    # PdfPig letter-spacing: "t rAi t s" / "sKiLLs" must not look like an NPC name.
+    collapsed = re.sub(r"[^a-z0-9]+", "", s.casefold())
+    if collapsed in {
+        "traits",
+        "trait",
+        "skills",
+        "skill",
+        "awareness",
+        "presence",
+        "coordination",
+        "resolve",
+        "ingenuity",
+        "strength",
+        "storypoints",
+        "techlevel",
+    }:
+        return False
+    if _CALLOUT_TRAITS_FLEX.fullmatch(s) or _CALLOUT_AWARENESS_PRESENCE.search(s):
+        return False
+    if _CALLOUT_STORY_OR_TECH.search(s) and len(s) <= 64:
+        return False
+    words = s.split()
+    if not (1 <= len(words) <= 4):
+        return False
+    if exclude_name and _mention_indexes(s.casefold(), exclude_name):
+        return False
+    # Avoid cutting on ordinary prose openers.
+    if words[0].casefold() in {
+        "the",
+        "a",
+        "an",
+        "for",
+        "and",
+        "but",
+        "as",
+        "in",
+        "on",
+        "at",
+        "to",
+        "of",
+        "with",
+        "from",
+        "this",
+        "that",
+        "he",
+        "she",
+        "they",
+        "his",
+        "her",
+        "their",
+    }:
+        return False
+    return True
+
+
+def _clip_npc_writeup(excerpt: str, name: str) -> str:
+    """Keep only the local writeup for ``name`` so neighbor TRAITS/bios are excluded."""
+    name = str(name or "").strip()
+    if not excerpt:
+        return ""
+    if not name:
+        return excerpt[:_SEED_WRITEUP_MAX_CHARS]
+
+    cf = excerpt.casefold()
+    hits = _mention_indexes(cf, name)
+    if not hits and " " in name:
+        hits = _mention_indexes(cf, name.split()[-1])
+    if not hits:
+        return excerpt[:_SEED_WRITEUP_MAX_CHARS]
+
+    # Prefer the callout/bio mention over an earlier casual name-drop in the window.
+    best_start = None
+    best_score = -10_000
+    for idx in hits:
+        line_start = excerpt.rfind("\n", 0, idx) + 1
+        score = _npc_writeup_score_at(excerpt, idx, name)
+        if score > best_score:
+            best_score = score
+            best_start = line_start
+    start = best_start if best_start is not None else excerpt.rfind("\n", 0, hits[0]) + 1
+
+    hard_end = min(len(excerpt), start + _SEED_WRITEUP_MAX_CHARS)
+    region = excerpt[start:hard_end]
+    offset = 0
+    for i, line in enumerate(region.splitlines(keepends=True)):
+        stripped = line.strip()
+        if i > 0 and stripped and _looks_like_npc_name_header(stripped, exclude_name=name):
+            return excerpt[start : start + offset]
+        offset += len(line)
+    return excerpt[start:hard_end]
+
+
+def _split_writeup_blocks(excerpt: str) -> list[str]:
+    """Split PdfPig-style single-newline text on blank lines and structural headers."""
+    blocks: list[str] = []
+    current: list[str] = []
+
+    def flush() -> None:
+        if current:
+            blocks.append("\n".join(current))
+            current.clear()
+
+    for line in excerpt.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            flush()
+            continue
+        if (
+            _TRAIT_SECTION_HEADER.match(stripped)
+            or _STAT_OR_SECTION_LINE.match(stripped)
+            or _TRAIT_SECTION_END.match(stripped)
+            or _looks_like_npc_name_header(stripped)
+        ):
+            flush()
+            # Keep name headers so flexible matching can see "Peter Hutc HiNs".
+            if _looks_like_npc_name_header(stripped) and not _STAT_OR_SECTION_LINE.match(stripped):
+                current.append(stripped)
+            continue
+        current.append(stripped)
+    flush()
+    return blocks
+
+
+def _bio_paragraphs_for_name(excerpt: str, name: str) -> list[str]:
+    """Grab prose paragraphs that clearly describe this NPC by name."""
+    name = str(name or "").strip()
+    if not name or not excerpt:
+        return []
+    surname = name.split()[-1] if name.split() else ""
+    paragraphs: list[str] = []
+    for block in _split_writeup_blocks(excerpt):
+        text = " ".join(line.strip() for line in block.splitlines() if line.strip()).strip()
+        if len(text) < 40:
+            continue
+        # Stat/callout chrome is not biography.
+        if _CALLOUT_AWARENESS_PRESENCE.search(text) or _CALLOUT_TRAITS_FLEX.search(text):
+            continue
+        if _CALLOUT_STORY_OR_TECH.search(text) and len(text) < 120:
+            continue
+        head = text[:120]
+        name_in_head = bool(_mention_indexes(head.casefold(), name))
+        surname_in_open = bool(
+            len(surname) >= 4 and _mention_indexes(text[:160].casefold(), surname)
+        )
+        if name_in_head or (
+            surname_in_open
+            and any(
+                marker in text.casefold()
+                for marker in (" is ", " suffers", " has ", " would ", " can ")
+            )
+        ):
+            if len(text) > _BIO_CHUNK_MAX_CHARS:
+                text = text[: _BIO_CHUNK_MAX_CHARS - 3] + "..."
+            paragraphs.append(text)
+    return paragraphs[:3]
+
+
+def _writeup_search_needles(name: str) -> list[str]:
+    """Needles for locating an NPC writeup — avoid bare given names (Peter ≠ Petersen)."""
+    name = str(name or "").strip()
+    needles = _distinctive_name_needles(name, snake_case(name))
+    parts = [p for p in re.split(r"[\s_/]+", name) if len(p) >= 3]
+    if len(parts) < 2:
+        return needles
+    given = parts[0].casefold()
+    # Keep full name + surname/id; drop "Peter" alone so Kate Petersen cannot win.
+    return [n for n in needles if n.casefold() != given]
+
+
+def _line_at(text: str, idx: int) -> str:
+    line_start = text.rfind("\n", 0, idx) + 1
+    line_end = text.find("\n", idx)
+    return text[line_start : line_end if line_end >= 0 else len(text)].strip()
+
+
+def _npc_writeup_score_at(text: str, mention_idx: int, name: str) -> int:
+    """Score a name mention by how much it looks like a character writeup callout.
+
+    Use a tight forward window so earlier prose name-drops do not inherit a later
+    neighbor's Awareness/TRAITS block (common in PdfPig two-column extracts).
+    """
+    tight = text[mention_idx : min(len(text), mention_idx + 420)]
+    mid = text[mention_idx : min(len(text), mention_idx + 900)]
+    score = 0
+    if _CALLOUT_AWARENESS_PRESENCE.search(tight):
+        score += 60
+    elif _CALLOUT_AWARENESS_PRESENCE.search(mid):
+        score += 12
+    if _CALLOUT_TRAITS_FLEX.search(tight):
+        score += 50
+    elif _CALLOUT_TRAITS_FLEX.search(mid):
+        score += 12
+    if _CALLOUT_STORY_OR_TECH.search(tight):
+        score += 20
+    elif _CALLOUT_STORY_OR_TECH.search(mid):
+        score += 8
+
+    name_cf = str(name or "").casefold()
+    surname = name.split()[-1].casefold() if name.split() else ""
+    head = mid[:520].casefold()
+    if name_cf and (
+        f"{name_cf} is " in head
+        or f"{name_cf} suffers" in head
+        or f"{name_cf} can " in head
+        or f"{name_cf} has " in head
+    ):
+        score += 40
+    elif len(surname) >= 4 and (
+        f"{surname} is " in head
+        or f"{surname} can " in head
+        or f"{surname} has " in head
+    ):
+        score += 25
+
+    line = _line_at(text, mention_idx)
+    label = line.strip("\"“”").strip()
+    if label and (
+        _looks_like_npc_name_header(line)
+        or (
+            _mention_indexes(label.casefold(), name)
+            and len(label) <= max(48, len(name) + 18)
+        )
+    ):
+        score += 45
+    # Letter-spaced dual-column headers: "Pe t e r Hu t cHiNs" / "MAx e d d iNGs ..."
+    if name_cf and _mention_indexes(label.casefold(), name) and len(label) <= 64:
+        score += 20
+
+    before = text[max(0, mention_idx - 24) : mention_idx]
+    if re.search(
+        r"(?i)(?:\bof|\bto|\band|\bwith|\bfor|\btrust|\bincluding)\s+$|[a-z,;:]\s*$",
+        before,
+    ):
+        score -= 45
+    if re.search(r"\b\d{1,3}\s*$", line.strip()):
+        score -= 25  # TOC page refs
+    return score
+
+
+def _npc_writeup_excerpt(
+    document_text: str,
+    name: str,
+    *,
+    window_before: int = 450,
+    window_after: int = 2_400,
+) -> str:
+    """Prefer the name mention nearest Awareness/TRAITS/bio over casual name-drops."""
+    text = document_text or ""
+    if not text.strip():
+        return ""
+    needles = _writeup_search_needles(name)
+    if not needles:
+        needles = _distinctive_name_needles(name, snake_case(name))
+    lower = text.casefold()
+    scored: list[tuple[int, int, str]] = []
+    for needle in needles:
+        for idx in _mention_indexes(lower, needle):
+            scored.append((_npc_writeup_score_at(text, idx, name), idx, needle))
+    if not scored:
+        return _relevant_excerpts(
+            text,
+            needles,
+            window_before=_SEED_EXCERPT_WINDOW_BEFORE,
+            window_after=_SEED_EXCERPT_WINDOW_AFTER,
+        )
+    # Prefer richer writeup scores; on ties prefer longer needles then earlier idx.
+    scored.sort(key=lambda row: (-row[0], -len(row[2]), row[1]))
+    best_score, idx, needle = scored[0]
+    start = max(0, idx - window_before)
+    # If the best hit is the bio opener, include the attribute/TRAITS block above it.
+    back = text[max(0, idx - 900) : idx]
+    aw = list(_CALLOUT_AWARENESS_PRESENCE.finditer(back))
+    if aw:
+        start = max(0, idx - 900 + aw[-1].start() - 120)
+    elif best_score >= 40:
+        # Dual-column name header often sits just above Awareness.
+        start = max(0, idx - window_before)
+    end = min(len(text), max(idx + len(needle) + window_after, start + 1_200))
+    return text[start:end]
+
+
+def _bio_block_after_name(excerpt: str, name: str) -> list[str]:
+    """Grab prose starting at '<Name> is/suffers/can' through the next clear break."""
+    name = str(name or "").strip()
+    if not name or not excerpt:
+        return []
+    # Allow PdfPig letter-spacing inside the name for the bio opener.
+    name_flex_parts: list[str] = []
+    for word in name.split():
+        chars = [re.escape(ch) for ch in word if ch.isalnum()]
+        if len(chars) >= 2:
+            name_flex_parts.append(r"\s*".join(chars))
+    name_alt = re.escape(name)
+    if name_flex_parts:
+        name_alt = rf"(?:{name_alt}|{r'\s+'.join(name_flex_parts)})"
+    pattern = re.compile(
+        rf"(?is)({name_alt}\s+(?:is|suffers|can|has|would)\b.+?)(?="
+        rf"\n\s*[A-Z][a-z]+\s+[A-Z][a-z]+\s+(?:is|suffers)\b|"
+        rf"\n\s*(?:Cat.?s\s*Ey|PAGE|\d{{1,3}})\s*$|"
+        rf"$)",
+    )
+    match = pattern.search(excerpt)
+    if not match:
+        # Surname-led continuation paragraphs in glued columns.
+        surname = name.split()[-1]
+        match = re.search(
+            rf"(?is)({re.escape(surname)}\s+(?:is|can|has|would)\b.+?)(?=\n\s*[A-Z][a-z]+\s+[A-Z]|\n\s*\d{{1,3}}\s*$|$)",
+            excerpt,
+        )
+    if not match:
+        return []
+    raw = match.group(1)
+    # Drop PdfPig tech/story chrome glued into the bio column.
+    raw = _CALLOUT_STORY_OR_TECH.sub(" ", raw)
+    text = re.sub(r"\s+", " ", raw).strip()
+    if len(text) < 40:
+        return []
+    if len(text) > _BIO_CHUNK_MAX_CHARS * 2:
+        text = text[: _BIO_CHUNK_MAX_CHARS * 2 - 3] + "..."
+    return [text]
+
+
+_COLUMN_GLUE_PIVOT = re.compile(
+    r"(?i)\b(?:other than|suspicious by|nothing better)\s+"
+)
+
+
+def _scrub_seed_prose(text: str) -> str:
+    """Remove PdfPig tech/story chrome and leftover ': 4' crumbs from seed prose."""
+    cleaned = _CALLOUT_STORY_OR_TECH.sub(" ", str(text or ""))
+    cleaned = re.sub(r"\s*:\s*\d+\b", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" -:;,")
+    return cleaned
+
+
+def _expand_trait_text_from_excerpt(
+    excerpt: str,
+    trait_name: str,
+    partial_text: str,
+) -> str:
+    """Rebuild a trait description when PdfPig column-glue truncates the first line."""
+    partial = str(partial_text or "").strip()
+    name = str(trait_name or "").strip()
+    if not excerpt or not name:
+        return partial
+    looks_short = len(partial) < 80 or bool(
+        re.search(r"(?i)\b(?:the|of|a|and|to|his|her|than|by|with)\s*$", partial)
+    )
+    if not looks_short and partial.endswith((".", "!", "?")):
+        return partial
+
+    start = re.search(rf"(?i)\b{re.escape(name)}:", excerpt)
+    if not start:
+        return partial
+
+    chunks = [partial]
+    for line in excerpt[start.end() :].splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if re.match(
+            r"(?i)^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}\s+(?:is|suffers)\b",
+            stripped,
+        ):
+            break
+        # Pure tech/story chrome ends the traits block.
+        if _CALLOUT_STORY_OR_TECH.search(stripped) and not _TRAIT_ITEM_START.match(stripped):
+            break
+
+        item = _TRAIT_ITEM_START.match(stripped)
+        body = item.group(2).strip() if item else stripped
+        if item and item.group(1).strip().casefold() == name.casefold():
+            if body:
+                chunks = [body]
+            continue
+
+        pivots = list(_COLUMN_GLUE_PIVOT.finditer(body))
+        if pivots:
+            frag = body[pivots[-1].end() :].strip(" -:;,")
+            # Drop trailing tech chrome glued onto the right column.
+            frag = _CALLOUT_STORY_OR_TECH.split(frag)[0].strip(" -:;,")
+            if frag and not frag.casefold().startswith("eddings"):
+                chunks.append(frag)
+        elif (
+            item is None
+            and re.search(r"(?i)\b(?:would fight|on his side|some would)\b", body)
+            and not re.search(r"(?i)\beddings\b", body)
+        ):
+            chunks.append(body)
+
+        if item and item.group(1).strip().casefold() in {
+            "argumentative",
+            "brave",
+            "tough",
+            "attractive",
+        }:
+            # Next left-column trait — stop once we already recovered a continuation.
+            if len(chunks) > 1:
+                break
+
+    text = _scrub_seed_prose(" ".join(chunks))
+    m = re.search(r"(?is)(.+?\bsome would\.)", text)
+    if m:
+        text = m.group(1).strip()
+    if len(text) > len(partial) + 8:
+        return text[:420].rstrip()
+    return partial
+
+
+def _enrich_personality_and_public_facts_from_bio(
+    bios: list[str],
+    *,
+    personality: list[str],
+    public_facts: list[str],
+    excerpt: str = "",
+) -> None:
+    """Pull obvious roleplay cues from biography prose into structured fields."""
+    joined = " ".join(bios)
+    if excerpt:
+        joined = f"{joined} {excerpt}"
+    if not joined.strip():
+        return
+    cf = joined.casefold()
+    cues = [
+        (r"\bwarm\b", "Warm"),
+        (r"\bfriendly\b", "Friendly"),
+        (r"easy to smile", "Easy to smile"),
+        (r"quick to thank", "Quick to thank others"),
+        (r"hard man to dislike|hard to dislike", "Hard to dislike"),
+        (r"natural gift for organisation|gift for organisation|organization and management", "Organized / managerial"),
+    ]
+    for pattern, label in cues:
+        if re.search(pattern, cf) and not any(label.casefold() in p.casefold() for p in personality):
+            personality.append(label)
+    if re.search(r"\bleader\b|father or uncle|considers himself more as a father", cf):
+        fact = "Considered the leader (or father-figure) of the squatters."
+        if not any("leader" in p.casefold() for p in public_facts):
+            public_facts.append(fact)
+    if re.search(r"\bfamily\b", cf) and not any("family" in p.casefold() for p in public_facts):
+        public_facts.append("Treats the squatters as family.")
+
+
+def _seed_npc_detail_from_document(
+    name: str,
+    role: str,
+    document_text: str,
+) -> dict[str, Any] | None:
+    """Deterministic detail seed from Cubicle 7 / Doctor Who-style stat writeups."""
+    excerpt = _npc_writeup_excerpt(document_text, name)
+    excerpt = _clip_npc_writeup(excerpt, name)
+    if not excerpt or len(excerpt.strip()) < 60:
+        return None
+
+    traits = _traits_for_npc(
+        _parse_trait_blocks(excerpt, first_section_only=False),
+        name,
+    )
+    traits = [
+        (trait_name, _expand_trait_text_from_excerpt(excerpt, trait_name, trait_text))
+        for trait_name, trait_text in traits
+    ]
+    bios = _bio_paragraphs_for_name(excerpt, name) or _bio_block_after_name(excerpt, name)
+    personality: list[str] = []
+    llm_rules: list[str] = []
+    public_facts: list[str] = []
+    known_facts: list[str] = []
+
+    for trait_name, trait_text in traits:
+        personality.append(f"{trait_name}: {trait_text}")
+        llm_rules.append(f"Play the '{trait_name}' trait: {trait_text}")
+
+    if role:
+        public_facts.append(f"Role: {role}")
+    for bio in bios:
+        cleaned = _scrub_seed_prose(bio)
+        if len(cleaned) < 40:
+            continue
+        # Prefer short public facts; keep long glued OCR bios in known_facts.
+        if len(cleaned) <= _BIO_CHUNK_MAX_CHARS and len(public_facts) < 4:
+            public_facts.append(cleaned)
+        else:
+            known_facts.append(cleaned[: _BIO_CHUNK_MAX_CHARS * 2])
+    _enrich_personality_and_public_facts_from_bio(
+        bios,
+        personality=personality,
+        public_facts=public_facts,
+        excerpt=excerpt,
+    )
+
+    detail: dict[str, Any] = {
+        "gender": "unspecified",
+        "race": "unknown",
+        "voice": [],
+        "personality": personality,
+        "public_facts": public_facts,
+        "known_facts": known_facts,
+        "secrets": [],
+        "llm_rules": llm_rules,
+    }
+    if _npc_detail_is_sparse(detail):
+        return None
+    return detail
 
 
 def _token_looks_pdf_split_fragment(tok: str) -> bool:
@@ -2433,10 +2819,14 @@ def _fetch_npc_details(
     *,
     is_retry: bool = False,
 ) -> dict[str, dict[str, Any]]:
-    needles: list[str] = []
-    for npc in batch:
-        needles.extend(_distinctive_name_needles(npc["name"], npc["id"]))
-    excerpt = _relevant_excerpts(document_text, needles)
+    if len(batch) == 1:
+        # Prefer the callout/stat writeup over early name-drops in scene prose.
+        excerpt = _npc_writeup_excerpt(document_text, str(batch[0].get("name") or ""))
+    else:
+        needles: list[str] = []
+        for npc in batch:
+            needles.extend(_distinctive_name_needles(npc["name"], npc["id"]))
+        excerpt = _relevant_excerpts(document_text, needles)
     prompt = _build_npc_detail_prompt(batch, excerpt, campaign, is_retry=is_retry)
     try:
         detail_raw = _call_llm_json(_SYSTEM_PROMPT, prompt, warnings=warnings, step="npc detail")

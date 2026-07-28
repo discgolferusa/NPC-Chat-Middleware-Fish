@@ -712,6 +712,29 @@ def test_seed_npc_detail_from_doctor_who_traits_and_bio():
         assert not content_import._npc_detail_is_sparse(seeded), f"sparse seed for {name}"
 
 
+def test_seed_peter_hutchins_from_pdfpig_letter_spacing():
+    """PdfPig dual-column Cat's Eye extract must still fill Hutchins personality/public facts."""
+    path = (
+        Path(__file__).resolve().parent
+        / "tests"
+        / "fixtures"
+        / "doctor_who_catseye_pdfpig_callouts.txt"
+    )
+    text = path.read_text(encoding="utf-8")
+    seeded = content_import._seed_npc_detail_from_document("Peter Hutchins", "squatter", text)
+    assert seeded is not None
+    joined = " ".join(seeded["personality"])
+    assert "Friends:" in joined
+    assert "majority of the squatters" in joined
+    assert "Warm" in seeded["personality"]
+    assert "Friendly" in seeded["personality"]
+    assert "Easy to smile" in seeded["personality"]
+    assert any("leader" in fact.casefold() for fact in seeded["public_facts"])
+    # Must not steal Max's traits from the glued left column.
+    assert "Selfish" not in joined
+    assert "Argumentative" not in joined
+
+
 def test_extract_cubicle7_callouts_from_catseye_pdf_fixture():
     text = _load_doctor_who_callout_pdf_fixture()
     parsed = content_import._extract_cubicle7_callout_npcs(text)
