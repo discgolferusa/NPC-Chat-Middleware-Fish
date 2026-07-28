@@ -743,6 +743,49 @@ def test_location_looks_like_ship_from_name_and_type():
     assert not content_import._location_looks_like_ship("Majestic Hotel", location_type="building")
 
 
+def test_ship_room_name_key_normalizes_apostrophes_and_hyphens():
+    assert content_import._ship_room_name_key("Clayton's Secret Stash") == "clayton s secret stash"
+    assert content_import._ship_room_name_key("Walk-In Closet") == "walk in closet"
+    assert content_import._is_ship_false_room_name("Clayton's Secret Stash")
+    assert content_import._is_ship_false_room_name("Walk-In Closet")
+    assert content_import._is_ship_false_room_name("Pandora's Box")
+    assert not content_import._is_ship_false_room_name("Storage Units")
+
+
+def test_harvest_ship_rooms_include_cargo_deck():
+    text = _load_chariot_ship_rooms_fixture()
+    harvested = content_import._harvest_important_locations(
+        text,
+        "USCSS Cronus",
+        location_type="ship",
+    )
+    names = {row["name"].casefold() for row in harvested}
+    assert any("storage units" in n for n in names)
+    assert any("cargo bays" in n for n in names)
+    assert any("reactor relay" in n for n in names)
+    assert len(harvested) >= 20
+
+
+def test_merge_location_detail_filters_apostrophe_false_room_names():
+    merged = content_import._merge_location_detail(
+        {"id": "uscss_cronus", "name": "USCSS Cronus", "type": "ship"},
+        {
+            "summary": "A ship.",
+            "important_locations": [
+                {"name": "Bridge", "description": "Command.", "public_knowledge": ""},
+                {"name": "Clayton's Secret Stash", "description": "Hidden urns.", "public_knowledge": ""},
+                {"name": "Walk-In Closet", "description": "Escape pod.", "public_knowledge": ""},
+            ],
+        },
+        "chariot",
+        document_text="",
+    )
+    names = {row["name"].casefold() for row in merged["important_locations"]}
+    assert "bridge" in names
+    assert not any("clayton" in n for n in names)
+    assert not any("closet" in n for n in names)
+
+
 def test_harvest_ship_rooms_include_deck_in_description():
     """ALIEN-style deck plans: ship stays parent; rooms become important_locations with deck."""
     text = _load_chariot_ship_rooms_fixture()

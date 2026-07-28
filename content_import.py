@@ -2516,7 +2516,53 @@ _SHIP_EVENT_HEADER = re.compile(
     r"(?i)^(act\s*[ivx0-9]+|ping|brace\s+for\s+impact|ghost\s+ship|bad\s+air|no\s+money|"
     r"breaking\s+loose|egg\s+sacs(?:\s+afoot)?|pandora|the\s+long\s+night|mandatory)\b"
 )
+_SHIP_JUNCTION_WAYPOINT = re.compile(
+    r"^junction\s+[a-z]\s*-\s*\d+$",
+    re.IGNORECASE,
+)
 _SHIP_JUNCTION_DECK = re.compile(r"\bJUNCTION\s*([A-Z])(?:\s*[-–—]?\s*\d+)?\b", re.IGNORECASE)
+_SHIP_ROOM_HARVEST_LIMIT = 24
+
+
+def _ship_room_name_key(name: str) -> str:
+    """Normalize ship room labels for false-name / dedupe comparisons."""
+    s = str(name or "").casefold()
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", s)).strip()
+
+
+_SHIP_FALSE_ROOM_NAME_KEYS = frozenset(
+    _ship_room_name_key(name) for name in _SHIP_FALSE_ROOM_NAMES
+)
+
+
+def _is_ship_false_room_name(name: str) -> bool:
+    key = _ship_room_name_key(name)
+    if not key:
+        return False
+    if key in _SHIP_FALSE_ROOM_NAME_KEYS:
+        return True
+    return bool(_SHIP_EVENT_HEADER.match(key))
+
+
+def _is_ship_junction_waypoint(name: str) -> bool:
+    """Bare junction labels (Junction B-1) are map chrome, not room slots."""
+    return bool(_SHIP_JUNCTION_WAYPOINT.match(str(name or "").strip()))
+
+
+def _cap_ship_important_locations(
+    rooms: list[dict[str, str]],
+    limit: int = _SHIP_ROOM_HARVEST_LIMIT,
+) -> list[dict[str, str]]:
+    """Keep up to ``limit`` rooms, dropping bare junction labels before named rooms."""
+    if len(rooms) <= limit:
+        return rooms
+    kept = list(rooms)
+    for idx in range(len(kept) - 1, -1, -1):
+        if len(kept) <= limit:
+            break
+        if _is_ship_junction_waypoint(kept[idx]["name"]):
+            kept.pop(idx)
+    return kept[:limit]
 
 
 def _location_looks_like_ship(
@@ -2673,20 +2719,22 @@ def _looks_like_ship_room_header(line: str) -> tuple[str, str] | None:
     upper_ratio = sum(1 for ch in letters if ch.isupper()) / len(letters)
     if upper_ratio < 0.55:
         return None
-    if raw_name.casefold() in _SHIP_ROOM_HEADER_STOP:
-        return None
-    if raw_name.casefold().startswith(("doors on the", "appendix", "chapter", "the deck")):
-        return None
     display = _display_place_name(raw_name)
     if not display:
         display = raw_name.title()
-    key = display.casefold()
-    if key in _SHIP_ROOM_HEADER_STOP or key in _SHIP_FALSE_ROOM_NAMES:
+    key = _ship_room_name_key(display)
+    if key in {_ship_room_name_key(stop) for stop in _SHIP_ROOM_HEADER_STOP}:
+        return None
+    if raw_name.casefold().startswith(("doors on the", "appendix", "chapter", "the deck")):
+        return None
+    if _is_ship_false_room_name(display) or _is_ship_false_room_name(raw_name):
         return None
     if _SHIP_EVENT_HEADER.match(key) or _SHIP_EVENT_HEADER.match(raw_name.casefold()):
         return None
     words = display.split()
-    if len(words) == 1 and key not in _SHIP_SINGLE_WORD_ROOMS:
+    if len(words) == 1 and key not in {
+        _ship_room_name_key(room) for room in _SHIP_SINGLE_WORD_ROOMS
+    }:
         return None
     # Reject glued map-legend headers ("Intercom Cryo Chambers").
     if any(w.casefold() in _SHIP_MAP_LEGEND_TOKENS for w in words[:1]) and len(words) >= 2:
@@ -2845,7 +2893,7 @@ def _find_ship_room_description_span(
 
     # Stop before scenario acts/events — those are not ship rooms.
     enders = list(_SHIP_SECTION_ENDER.finditer(text[start + 1 :]))
-    end = start + 1 + enders[0].start() if enders else min(len(text), start + 24_000)
+    end = start + 1 + enders[0].start() if enders else min(len(text), start + 30_000)
     if end - start < 200:
         return None
     return start, end
@@ -2860,6 +2908,7 @@ def _harvest_ship_room_subareas(text: str, *, location_name: str = "") -> list[d
     lines = region.splitlines()
     found: list[dict[str, str]] = []
     seen: set[str] = set()
+    room_slots = 0
     # Only named decks (Cargo Deck, etc.) update current_deck. Bare DECK D map
     # chrome would otherwise stamp every room as Deck D.
     current_deck = ""
@@ -2898,8 +2947,10 @@ def _harvest_ship_room_subareas(text: str, *, location_name: str = "") -> list[d
                 "public_knowledge": "",
             }
         )
-        if len(found) >= 18:
-            break
+        if not _is_ship_junction_waypoint(name):
+            room_slots += 1
+            if room_slots >= _SHIP_ROOM_HARVEST_LIMIT:
+                break
     return found
 
 
@@ -2997,9 +3048,11 @@ def _harvest_important_locations(
         ship_rooms = _harvest_ship_room_subareas(text, location_name=parent)
 
     if exploring and ship_rooms:
-        return _merge_important_location_lists(exploring, ship_rooms)[:24]
+        return _cap_ship_important_locations(
+            _merge_important_location_lists(exploring, ship_rooms)
+        )
     if ship_rooms:
-        return ship_rooms[:24]
+        return _cap_ship_important_locations(ship_rooms)
     return exploring[:16]
 
 
@@ -3974,10 +4027,9 @@ def _merge_location_detail(
         cleaned: list[dict[str, str]] = []
         for item in important_locations:
             name = str(item.get("name") or "").strip()
-            key = name.casefold()
             if not name:
                 continue
-            if key in _SHIP_FALSE_ROOM_NAMES or _SHIP_EVENT_HEADER.match(key):
+            if _is_ship_false_room_name(name):
                 continue
             cleaned.append(item)
         important_locations = cleaned
