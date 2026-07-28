@@ -263,6 +263,35 @@ def test_stat_block_outline_succeeds_when_content_creation_budget_zero(monkeypat
     assert any("stat block" in w.lower() for w in result.get("warnings") or [])
 
 
+def test_stat_block_outline_ignores_tight_positive_content_creation_budget(monkeypatch):
+    """Stat-block fast path must not chop NPC section to the LLM TPM cap."""
+    monkeypatch.setattr(content_import, "content_creation_max_input_chars", lambda: 4_000)
+    text = _load_chariot_pdfpig_fixture()
+    result = content_import.outline_campaign_document(text, "create_new")
+    names = {npc["name"] for npc in result["npcs"]}
+    assert len(names) >= 5
+    assert "Albert Johns" in names
+
+
+def test_outline_stat_block_probe_bounds_huge_document(monkeypatch):
+    """Huge extracts must not fully collapse before the stat-block probe."""
+    chariot = _load_chariot_pdfpig_fixture()
+    huge = ("A" * 200_000) + chariot
+    collapsed_lengths: list[int] = []
+    original = content_import._collapse_spaced_caps
+
+    def spy(text: str) -> str:
+        collapsed_lengths.append(len(text))
+        return original(text)
+
+    monkeypatch.setattr(content_import, "_collapse_spaced_caps", spy)
+    result = content_import.outline_campaign_document(huge, "create_new")
+    names = {npc["name"] for npc in result["npcs"]}
+    assert len(names) >= 5
+    assert collapsed_lengths
+    assert max(collapsed_lengths) < len(huge)
+
+
 def test_chariot_pdfpig_analyze_imports_all_npcs(monkeypatch):
     """PdfPig extract skips outline but still runs location/NPC detail sweeps."""
     text = _load_chariot_pdfpig_fixture()

@@ -254,6 +254,90 @@ def _collapse_spaced_caps(text: str) -> str:
     return "\n".join(lines)
 
 
+def _collapsed_line_from_raw_line(line: str) -> str:
+    stripped = line.strip()
+    if stripped and re.fullmatch(r"[A-Z0-9](?:\s+[A-Z0-9-])+", stripped):
+        return re.sub(r"\s+", "", stripped)
+    return stripped
+
+
+def _is_toc_npc_header_line(collapsed_line: str) -> bool:
+    if not collapsed_line:
+        return False
+    if _TOC_NPC_HEADER_LINE.search(collapsed_line):
+        return True
+    if len(collapsed_line) <= 48 and re.search(r"\bpage\s+\d+\b", collapsed_line, re.IGNORECASE):
+        return True
+    return False
+
+
+def _line_is_npc_section_header(line: str) -> bool:
+    collapsed = _collapsed_line_from_raw_line(line)
+    if not collapsed:
+        return False
+    match = _NPC_SECTION_PATTERN.search(collapsed)
+    if not match:
+        return False
+    return not collapsed[: match.start()].strip() and not collapsed[match.end() :].strip()
+
+
+def _find_best_npc_section_header_offset(text: str) -> int | None:
+    """Locate the best NON-PLAYER CHARACTERS header without collapsing the full extract."""
+    if not text:
+        return None
+
+    best_offset: int | None = None
+    best_rank: tuple[int, int, int] | None = None
+    pos = 0
+    for line in text.splitlines(keepends=True):
+        line_start = pos
+        pos += len(line)
+        if not _line_is_npc_section_header(line):
+            continue
+
+        collapsed_line = _collapsed_line_from_raw_line(line)
+        is_toc = _is_toc_npc_header_line(collapsed_line)
+        lookahead = _collapse_spaced_caps(text[line_start : line_start + 25_000])
+        match = _NPC_SECTION_PATTERN.search(lookahead)
+        if not match:
+            continue
+        start, end = _npc_section_span_from_match(lookahead, match)
+        span_len = end - start
+        full_name_count = len(_FULL_NAME_ANY.findall(lookahead[start:end]))
+        if is_toc and full_name_count == 0 and span_len < 120:
+            continue
+        rank = (0 if is_toc else 1, full_name_count, span_len)
+        if best_rank is None or rank > best_rank:
+            best_rank = rank
+            best_offset = line_start
+
+    return best_offset
+
+
+def _bounded_text_for_npc_operations(text: str, max_chars: int) -> str:
+    """Return a bounded raw slice that should still contain the NPC section when present."""
+    text = text or ""
+    if len(text) <= max_chars:
+        return text
+
+    header_off = _find_best_npc_section_header_offset(text)
+    if header_off is not None:
+        intro_start = max(0, header_off - 2500)
+        slice_end = min(len(text), header_off + max(max_chars, 80_000))
+        return text[intro_start:slice_end]
+
+    # Moderate extracts: collapse the full text so mid-document NPC sections are found.
+    if len(text) <= MAX_INPUT_CHARS:
+        return text
+
+    tail = text[-max_chars:]
+    collapsed_tail = _collapse_spaced_caps(tail)
+    if _find_npc_section_span(collapsed_tail) is not None:
+        return tail
+
+    return text[:max_chars]
+
+
 def _npc_section_header_line(collapsed_text: str, match: re.Match[str]) -> str:
     line_start = collapsed_text.rfind("\n", 0, match.start()) + 1
     line_end = collapsed_text.find("\n", match.start())
@@ -264,14 +348,7 @@ def _npc_section_header_line(collapsed_text: str, match: re.Match[str]) -> str:
 
 def _looks_like_toc_npc_section_hit(collapsed_text: str, match: re.Match[str]) -> bool:
     """Docnet/PDFium TOCs often put 'Non-Player Characters ........ 12' before the real section."""
-    line = _npc_section_header_line(collapsed_text, match)
-    if not line:
-        return False
-    if _TOC_NPC_HEADER_LINE.search(line):
-        return True
-    if len(line) <= 48 and re.search(r"\bpage\s+\d+\b", line, re.IGNORECASE):
-        return True
-    return False
+    return _is_toc_npc_header_line(_npc_section_header_line(collapsed_text, match))
 
 
 def _npc_section_span_from_match(
@@ -659,10 +736,14 @@ def _truncate_preserving_npc_section(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
 
-    collapsed = _collapse_spaced_caps(text)
+    sliced = _bounded_text_for_npc_operations(text, max_chars)
+    if len(sliced) <= max_chars:
+        return _collapse_spaced_caps(sliced)
+
+    collapsed = _collapse_spaced_caps(sliced)
     span = _find_npc_section_span(collapsed)
     if span is None:
-        return text[:max_chars]
+        return collapsed[:max_chars]
 
     start, end = span
     section = collapsed[start:end].strip()
@@ -4242,14 +4323,12 @@ def _truncate_input(text: str, warnings: list[str]) -> str:
 def _truncate_for_import_document(text: str, warnings: list[str], *, require_llm_budget: bool) -> str:
     """Cap document length for import hops.
 
-    Stat-block / callout fast paths skip the LLM and must still work when the
-    content_creation TPM budget is zero.
+    Stat-block / callout fast paths skip the LLM and always use the full hop budget
+    so the preserved NPC section is not chopped below recoverable stat blocks.
     """
     if require_llm_budget:
         return _truncate_input(text, warnings)
-    budget = content_creation_max_input_chars()
-    cap = min(MAX_INPUT_CHARS, budget) if budget > 0 else MAX_INPUT_CHARS
-    return _cap_document_text(text, cap, warnings)
+    return _cap_document_text(text, MAX_INPUT_CHARS, warnings)
 
 
 def _fetch_location_details(
@@ -4342,11 +4421,15 @@ def outline_campaign_document(
     if not text or not text.strip():
         raise ContentImportError("No document text provided")
 
-    use_stat_block_fast_path = _document_has_recoverable_stat_blocks(text)
+    if len(text) > MAX_INPUT_CHARS:
+        bounded_text = _cap_document_text(text, MAX_INPUT_CHARS, warnings)
+    else:
+        bounded_text = text
+
+    use_stat_block_fast_path = _document_has_recoverable_stat_blocks(bounded_text)
+    document_for_deterministic_merge = bounded_text
     if use_stat_block_fast_path:
-        full_document_text = _truncate_for_import_document(
-            text, warnings, require_llm_budget=False
-        )
+        full_document_text = bounded_text
     else:
         full_document_text = _truncate_for_import_document(
             text, warnings, require_llm_budget=True
@@ -4399,7 +4482,7 @@ def outline_campaign_document(
     location_ids = {loc["id"] for loc in location_stubs} | existing_location_set
     npc_stubs = _merge_outline_npcs_with_stat_blocks(
         npc_stubs,
-        full_document_text,
+        document_for_deterministic_merge,
         mode=mode,
         existing_npc_names=existing_npc_names,
         location_ids=location_ids,
@@ -4407,7 +4490,7 @@ def outline_campaign_document(
     )
     npc_stubs = _merge_outline_npcs_with_callouts(
         npc_stubs,
-        full_document_text,
+        document_for_deterministic_merge,
         mode=mode,
         existing_npc_names=existing_npc_names,
         location_ids=location_ids,
