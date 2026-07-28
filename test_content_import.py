@@ -670,6 +670,124 @@ def test_detail_location_batch_does_not_sparse_retry(monkeypatch):
     assert any("fell back" in w.lower() for w in result["warnings"])
 
 
+def test_harvest_important_locations_from_catseye_pdfpig():
+    """TOC + Exploring headers fill hotel sub-areas without a Cubicle 7-specific parser."""
+    text = _load_doctor_who_pdfpig_fixture()
+    harvested = content_import._harvest_important_locations(text, "Majestic Hotel")
+    names = {row["name"].casefold() for row in harvested}
+    assert "eddings" in names
+    assert any("courtyard" in n for n in names)
+    assert any("confusing room" in n for n in names)
+    assert any("swimming pool" in n for n in names)
+    # NPC callouts / credits must not become rooms.
+    assert "chad" not in names
+    assert not any("hutchins" in n for n in names)
+    courtyard = next(row for row in harvested if "courtyard" in row["name"].casefold())
+    assert "investigate the courtyard" in courtyard["description"].casefold()
+
+
+def test_subarea_stop_name_uses_exact_stat_match_not_substring():
+    assert content_import._is_subarea_stop_name("Awareness")
+    assert content_import._is_subarea_stop_name("Traits")
+    assert content_import._is_subarea_stop_name("Survival")
+    assert content_import._is_subarea_stop_name("Medicine")
+    # Real place names that merely contain stat letter sequences must survive.
+    assert not content_import._is_subarea_stop_name("Portraits")
+    assert not content_import._is_subarea_stop_name("Firefighting")
+    assert not content_import._is_subarea_stop_name("Survival Bunker")
+    assert not content_import._is_subarea_stop_name("Medicine Cabinet")
+
+
+def test_harvest_important_locations_scoped_to_parent_location():
+    """Shared TOC/Exploring rooms must not attach to every location stub in the doc."""
+    text = _load_doctor_who_pdfpig_fixture()
+    hotel = content_import._harvest_important_locations(text, "Majestic Hotel")
+    assert hotel
+    assert any("courtyard" in row["name"].casefold() for row in hotel)
+
+    other = content_import._harvest_important_locations(text, "USCSS Cronus")
+    other_names = {row["name"].casefold() for row in other}
+    assert not any("courtyard" in n for n in other_names)
+    assert "eddings" not in other_names
+    assert not any("swimming pool" in n for n in other_names)
+
+    merged_other = content_import._merge_location_detail(
+        {"id": "uscss_cronus", "name": "USCSS Cronus", "type": "building"},
+        {
+            "summary": "A ship.",
+            "important_locations": [{"name": "Bridge", "description": "Command deck.", "public_knowledge": ""}],
+        },
+        "cats_eye",
+        document_text=text,
+    )
+    merged_names = {row["name"].casefold() for row in merged_other["important_locations"]}
+    assert "bridge" in merged_names
+    assert not any("courtyard" in n for n in merged_names)
+
+
+def test_location_detail_excerpt_scopes_exploring_to_parent():
+    text = _load_doctor_who_pdfpig_fixture()
+    hotel_excerpt = content_import._location_detail_excerpt(
+        text,
+        {"id": "majestic_hotel", "name": "Majestic Hotel", "type": "building"},
+    )
+    assert "cOurtyArd" in hotel_excerpt or "Courtyard" in hotel_excerpt
+
+    other_excerpt = content_import._location_detail_excerpt(
+        text,
+        {"id": "uscss_cronus", "name": "USCSS Cronus", "type": "building"},
+    )
+    # Unrelated stubs should not receive the hotel Exploring window wholesale.
+    assert "exPLOriNG tHe HOteL" not in other_excerpt
+    assert "tHe cOurtyArd" not in other_excerpt
+
+
+def test_location_detail_merges_harvested_subareas_when_llm_omits_them(monkeypatch):
+    text = _load_doctor_who_pdfpig_fixture()
+
+    def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step):
+        assert "important_locations" in user_prompt
+        # Good hotel summary, but empty sub-areas — the common failure mode.
+        return {
+            "locations": [
+                {
+                    "id": "majestic_hotel",
+                    "summary": "A boarded-up 1980s hotel occupied by squatters and feral cats.",
+                    "current_events": ["Heavy rain traps the Poc Unity inside."],
+                    "important_locations": [],
+                    "rumors": [],
+                    "local_tone": ["gloomy"],
+                    "knowledge_rules": [],
+                }
+            ]
+        }
+
+    monkeypatch.setattr(content_import, "_call_llm_json", fake_call_llm_json)
+    result = content_import.detail_location_batch(
+        text,
+        {"campaign_id": "cats_eye", "name": "Cat's Eye"},
+        [{"id": "majestic_hotel", "name": "Majestic Hotel", "type": "building"}],
+    )
+    loc = result["locations"][0]
+    names = {row["name"].casefold() for row in loc["important_locations"]}
+    assert any("courtyard" in n for n in names)
+    assert any("eddings" in n for n in names)
+    assert any("confusing room" in n for n in names)
+    assert any("swimming pool" in n for n in names)
+    assert "boarded-up" in loc["summary"].casefold()
+
+
+def test_location_detail_excerpt_includes_exploring_scenes():
+    text = _load_doctor_who_pdfpig_fixture()
+    excerpt = content_import._location_detail_excerpt(
+        text,
+        {"id": "majestic_hotel", "name": "Majestic Hotel", "type": "building"},
+    )
+    assert "cOurtyArd" in excerpt or "Courtyard" in excerpt
+    assert "cONFusiNG" in excerpt or "Confusing" in excerpt
+    assert "sWiMMiNG" in excerpt or "Swimming" in excerpt
+
+
 def test_detail_npc_batch_rejects_oversized_batch():
     with pytest.raises(content_import.ContentImportError, match="at most"):
         content_import.detail_npc_batch(

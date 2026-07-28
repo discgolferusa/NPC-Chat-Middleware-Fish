@@ -12,7 +12,9 @@ Pipeline:
      published callouts are present (ALIEN FULL NAME blocks, or Cubicle 7-style
      name + Awareness/Presence + TRAITS character boxes). Exposed as
      ``outline_campaign_document``.
-  2. Location detail — format-agnostic LLM extraction from name-focused excerpts.
+  2. Location detail — format-agnostic LLM extraction from name-focused excerpts,
+     plus TOC/Exploring windows and a generic sub-area harvest into
+     ``important_locations`` when the model returns a summary without rooms.
      One call per Funnel hop; editor retries sparse results as a separate hop, then
      may request ``allow_seed_fallback``.
   3. NPC detail — same pattern. Layout examples (labeled writeups, FULL NAME blocks,
@@ -1856,12 +1858,654 @@ def _document_has_recoverable_callouts(text: str) -> bool:
     return len(_extract_cubicle7_callout_npcs(text or "")) >= 2
 
 
-def _location_detail_from_seed(stub: dict[str, Any]) -> dict[str, Any]:
+_SUBAREA_HEADER_STOPWORDS = frozenset(
+    {
+        "awareness",
+        "presence",
+        "coordination",
+        "resolve",
+        "ingenuity",
+        "strength",
+        "skills",
+        "traits",
+        "introduction",
+        "contents",
+        "credits",
+        "writing",
+        "editing",
+        "cover",
+        "publisher",
+        "appendix",
+        "index",
+        "maps",
+        "arrival",
+        "talking with the squatters",
+        "the afflicted",
+        "meet the squatters",
+        "herding cats",
+        "the villain revealed",
+        "water vs the poc unity",
+        "water vs. the poc unity",
+        "different character types",
+        "so why not just leave",
+        "highly armed",
+        "time lords telepathy cats",
+        "exploring the hotel",
+        "the majestic hotel",
+        "majestic hotel",
+        "the majestic hotel map",
+        "majestic hotel map",
+        "the feral cat colony",
+        "the squatters",
+        "the poc unity",
+        "a sudden deluge",
+        "sleeping squatter",
+        "a sleeping squatter",
+    }
+)
+
+_TOC_PLACE_LINE = re.compile(
+    r"(?im)^\s*(?:[Bb]\s+)?([A-Za-z\"“”'][A-Za-z0-9'\"“”’\- ]{1,42}?)\s+(\d{1,3})\s*$"
+)
+_EXPLORING_SECTION = re.compile(
+    rf"(?is)(?:^|\n)\s*(?:[Bb]\s+)?{_flex_letters('exploring')}[^\n]{{0,80}}\n"
+)
+_STAT_NAME_COLLAPSED = frozenset(
+    {
+        "awareness",
+        "presence",
+        "coordination",
+        "resolve",
+        "ingenuity",
+        "strength",
+        "skills",
+        "traits",
+        "fighting",
+        "survival",
+        "subterfuge",
+        "medicine",
+        "convince",
+        "techlevel",
+        "storypoints",
+    }
+)
+
+
+def _collapsed_alpha(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").casefold())
+
+
+def _significant_location_tokens(name: str) -> set[str]:
+    """Distinctive tokens from a location name (for scoping harvest/excerpts)."""
+    skip = {
+        "the",
+        "a",
+        "an",
+        "and",
+        "of",
+        "or",
+        "to",
+        "in",
+        "on",
+        "at",
+        "location",
+        "area",
+        "place",
+        "region",
+        "zone",
+    }
+    tokens: set[str] = set()
+    for part in re.split(r"[\s_/.\-]+", str(name or "").strip()):
+        cleaned = re.sub(r"[^a-z0-9]+", "", part.casefold())
+        if len(cleaned) < 4 or cleaned in skip:
+            continue
+        tokens.add(cleaned)
+    return tokens
+
+
+def _text_matches_location(blob: str, location_name: str) -> bool:
+    """True when blob shares a significant token with the location name."""
+    tokens = _significant_location_tokens(location_name)
+    if not tokens or not blob:
+        return False
+    collapsed = _collapsed_alpha(blob)
+    spaced = re.sub(r"[^a-z0-9]+", " ", str(blob).casefold())
+    for token in tokens:
+        if token in collapsed or re.search(rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])", spaced):
+            return True
+    return False
+
+
+def _display_place_name(raw: str) -> str:
+    """Turn stylized PDF headers into readable place names."""
+    cleaned = re.sub(r"\s+", " ", str(raw or "").strip().strip("\"“”'"))
+    if not cleaned:
+        return ""
+    parts: list[str] = []
+    for token in cleaned.split():
+        letters = "".join(ch for ch in token if ch.isalnum() or ch in "'’-")
+        if not letters:
+            continue
+        if letters.isupper() and len(letters) <= 4:
+            parts.append(letters.title())
+        elif any(c.islower() for c in letters) and any(c.isupper() for c in letters[1:]):
+            parts.append(letters[:1].upper() + letters[1:].lower())
+        else:
+            parts.append(letters[:1].upper() + letters[1:].lower() if letters.isalpha() else letters)
+    return " ".join(parts).strip()
+
+
+def _is_subarea_stop_name(name: str) -> bool:
+    key = re.sub(r"[^a-z0-9]+", " ", str(name or "").casefold()).strip()
+    if not key or key in _SUBAREA_HEADER_STOPWORDS:
+        return True
+    if key.startswith(("cat s eye", "cats eye", "page ")):
+        return True
+    collapsed = _collapsed_alpha(name)
+    # Exact collapsed match only — "Portraits" must not die on substring "traits".
+    if collapsed in _STAT_NAME_COLLAPSED:
+        return True
+    if re.search(r"\d", name):
+        return True
+    return False
+
+
+def _looks_like_place_header(line: str) -> bool:
+    s = str(line or "").strip().strip("\"“”")
+    if not s or len(s) < 3 or len(s) > 42:
+        return False
+    if s.endswith((".", ":", ";", ",")):
+        return False
+    if re.search(r"\d", s):
+        return False
+    if _STAT_OR_SECTION_LINE.match(s) or _TRAIT_SECTION_HEADER.match(s):
+        return False
+    if _CALLOUT_AWARENESS_PRESENCE.search(s) or _CALLOUT_TRAITS_FLEX.search(s):
+        return False
+    if s.casefold().startswith(("b  ", "b ")):
+        # Section chrome like "B  exPLOriNG..." — allow only pure exploring titles elsewhere.
+        return False
+    words = s.split()
+    if not (1 <= len(words) <= 5):
+        return False
+    # Reject wrapped prose: too many common lowercase glue words.
+    lower_glues = sum(1 for w in words if w.casefold() in {
+        "and", "or", "of", "to", "for", "with", "from", "that", "this", "his", "her", "their",
+        "is", "are", "was", "were", "be", "by", "as", "in", "on", "at", "into", "than", "but",
+    })
+    if lower_glues >= 2:
+        return False
+    name = _display_place_name(s)
+    if not name or _is_subarea_stop_name(name):
+        return False
+    # Reject obvious NPC full names ("Max Eddings") while keeping "Confusing Room".
+    parts = name.split()
+    if len(parts) == 2 and all(p[:1].isupper() for p in parts):
+        first, last = parts
+        if last.casefold() not in {
+            "room",
+            "pool",
+            "wing",
+            "hall",
+            "deck",
+            "inn",
+            "barracks",
+            "courtyard",
+            "restaurant",
+            "reception",
+            "centre",
+            "center",
+        } and first.casefold() in {
+            "max",
+            "peter",
+            "kate",
+            "albert",
+            "mary",
+            "jean",
+            "nick",
+            "paul",
+            "chad",
+        }:
+            return False
+    return True
+
+
+def _prose_after_header(lines: list[str], start_idx: int, *, max_chars: int = 280) -> str:
+    parts: list[str] = []
+    total = 0
+    for line in lines[start_idx + 1 :]:
+        stripped = line.strip()
+        if not stripped:
+            if parts:
+                break
+            continue
+        if _looks_like_place_header(stripped) or _looks_like_npc_name_header(stripped):
+            break
+        if _STAT_OR_SECTION_LINE.match(stripped) or _CALLOUT_AWARENESS_PRESENCE.search(stripped):
+            break
+        chunk = re.sub(r"\s+", " ", stripped)
+        parts.append(chunk)
+        total += len(chunk) + 1
+        if total >= max_chars:
+            break
+    text = " ".join(parts).strip()
+    if len(text) > max_chars:
+        text = text[: max_chars - 3].rstrip() + "..."
+    return text
+
+
+def _harvest_toc_place_names(text: str) -> list[str]:
+    """Collect place-like TOC entries ('The Courtyard 14') from the document head."""
+    head = (text or "")[:6_000]
+    names: list[str] = []
+    seen: set[str] = set()
+    chapter_skips = {
+        "introduction",
+        "arrival",
+        "contents",
+        "credits",
+        "exploring the hotel",
+        "the majestic hotel map",
+        "majestic hotel map",
+        "the majestic hotel",
+        "majestic hotel",
+        "the feral cat colony",
+        "the squatters",
+        "the poc unity",
+        "meet the squatters",
+        "talking with the squatters",
+        "the afflicted",
+        "water vs the poc unity",
+        "the villain revealed",
+        "herding cats",
+        "a sudden deluge",
+        "a sleeping squatter",
+        "sleeping squatter",
+    }
+    for match in _TOC_PLACE_LINE.finditer(head):
+        label = _display_place_name(match.group(1))
+        if not label or _is_subarea_stop_name(label):
+            continue
+        if label.casefold() in chapter_skips:
+            continue
+        words = label.split()
+        if len(words) == 2 and words[0][:1].isupper() and words[1][:1].isupper():
+            if words[0].casefold() in {
+                "max",
+                "peter",
+                "kate",
+                "nick",
+                "paul",
+                "gareth",
+                "andrew",
+                "chad",
+            }:
+                continue
+            if words[0].casefold() not in {"the", "a", "an", "old", "new"} and words[
+                1
+            ].casefold() not in {
+                "room",
+                "pool",
+                "wing",
+                "hall",
+                "deck",
+                "inn",
+                "courtyard",
+                "restaurant",
+                "reception",
+                "centre",
+                "center",
+            }:
+                # Likely an NPC TOC row (First Last), not a place.
+                continue
+        if label.casefold() in {"chad", "hamish"} or label.casefold().strip("\"“”") in {
+            "chad",
+            "hamish",
+        }:
+            continue
+        key = label.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        names.append(label)
+    return names[:20]
+
+
+def _find_exploring_section_span(
+    text: str,
+    *,
+    location_name: str = "",
+) -> tuple[int, int] | None:
+    """Locate an Exploring… scene block, optionally scoped to a parent location."""
+    if not text:
+        return None
+    matches = list(_EXPLORING_SECTION.finditer(text))
+    if not matches:
+        matches = list(
+            re.finditer(r"(?is)(?:^|\n)\s*(?:[Bb]\s+)?exploring\b[^\n]{0,80}\n", text)
+        )
+    if not matches:
+        return None
+
+    def _header_line(match: re.Match[str]) -> str:
+        line_end = text.find("\n", match.start() + 1)
+        return text[match.start() : line_end if line_end >= 0 else match.end()].strip()
+
+    # Drop TOC rows ("Exploring the Hotel 12").
+    body_matches = [m for m in matches if not re.search(r"\d{1,3}\s*$", _header_line(m))]
+    candidates = body_matches or matches
+
+    if location_name.strip():
+        scoped = [m for m in candidates if _text_matches_location(_header_line(m), location_name)]
+        if not scoped:
+            return None
+        candidates = scoped
+
+    body = candidates[-1]
+    start = body.start()
+    rest = text[body.end() :]
+    end_rel = len(rest)
+    for ender in re.finditer(
+        r"(?im)^\s*(?:[Bb]\s+)?(?:the\s+villain|herding|appendix|index|maps?)\b",
+        rest,
+    ):
+        end_rel = ender.start()
+        break
+    end = body.end() + min(end_rel, 14_000)
+    return start, end
+
+
+def _harvest_scene_subareas(text: str, *, location_name: str = "") -> list[dict[str, str]]:
+    """Harvest short scene/room headers from an Exploring section scoped to the location."""
+    span = _find_exploring_section_span(text, location_name=location_name)
+    if not span:
+        return []
+    region = text[span[0] : span[1]]
+    lines = region.splitlines()
+    found: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or not _looks_like_place_header(stripped):
+            continue
+        name = _display_place_name(stripped)
+        if not name or _is_subarea_stop_name(name):
+            continue
+        if name.casefold() in {"chad", "hamish"}:
+            continue
+        key = name.casefold()
+        if key in seen:
+            continue
+        description = _prose_after_header(lines, idx)
+        # Exploring headers should usually have following prose; TOC can fill names alone.
+        if len(description) < 40:
+            continue
+        seen.add(key)
+        found.append(
+            {
+                "name": name,
+                "description": description,
+                "public_knowledge": "",
+            }
+        )
+        if len(found) >= 16:
+            break
+    return found
+
+
+def _attach_scene_descriptions(
+    items: dict[str, dict[str, str]],
+    document_text: str,
+    *,
+    location_name: str = "",
+) -> None:
+    """Fill empty TOC descriptions from matching Exploring scene headers."""
+    span = _find_exploring_section_span(document_text, location_name=location_name)
+    if not span:
+        return
+    region = document_text[span[0] : span[1]]
+    lines = region.splitlines()
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or not _looks_like_place_header(stripped):
+            continue
+        name = _display_place_name(stripped)
+        key = name.casefold()
+        if key not in items:
+            # Soft match: "The Courtyard" vs "Courtyard".
+            soft = next(
+                (
+                    k
+                    for k in items
+                    if k == key
+                    or k.endswith(key)
+                    or key.endswith(k)
+                    or _collapsed_alpha(k) == _collapsed_alpha(name)
+                ),
+                None,
+            )
+            if soft is None:
+                continue
+            key = soft
+        if items[key].get("description"):
+            continue
+        description = _prose_after_header(lines, idx)
+        if description:
+            items[key]["description"] = description
+
+
+def _toc_name_appears_in_region(name: str, region: str) -> bool:
+    """True when a TOC place name (possibly stylized) occurs in the scoped region."""
+    if not name or not region:
+        return False
+    if _mention_indexes(region.casefold(), name):
+        return True
+    collapsed_name = _collapsed_alpha(name)
+    if len(collapsed_name) < 4:
+        return False
+    # Stylized headers: "tHe cOurtyArd" ≈ "The Courtyard".
+    flex_parts: list[str] = []
+    for word in re.findall(r"[A-Za-z0-9]+", name):
+        chars = [re.escape(ch) for ch in word.casefold() if ch.isalnum()]
+        if len(chars) >= 3:
+            flex_parts.append(r"\s*".join(chars))
+    if not flex_parts:
+        return False
+    pattern = re.compile(rf"(?i)(?<![a-z0-9]){r'\s+'.join(flex_parts)}(?![a-z0-9])")
+    return bool(pattern.search(region))
+
+
+def _harvest_important_locations(document_text: str, location_name: str) -> list[dict[str, str]]:
+    """Harvest sub-areas for one parent location from its Exploring section (+ matching TOC).
+
+    Does not attach a shared document TOC/Exploring block to unrelated location stubs.
+    """
+    text = document_text or ""
+    parent = str(location_name or "").strip()
+    if not text.strip() or not parent:
+        return []
+
+    span = _find_exploring_section_span(text, location_name=parent)
+    if not span:
+        return []
+    region = text[span[0] : span[1]]
+    by_key: dict[str, dict[str, str]] = {}
+
+    for toc_name in _harvest_toc_place_names(text):
+        # Only keep TOC rows that also appear inside this location's exploring region.
+        if not _toc_name_appears_in_region(toc_name, region):
+            continue
+        key = toc_name.casefold()
+        by_key.setdefault(
+            key,
+            {"name": toc_name, "description": "", "public_knowledge": ""},
+        )
+
+    for item in _harvest_scene_subareas(text, location_name=parent):
+        key = str(item.get("name") or "").casefold()
+        if not key:
+            continue
+        existing = by_key.get(key)
+        if existing is None:
+            if not any(
+                token in key
+                for token in (
+                    "room",
+                    "pool",
+                    "courtyard",
+                    "wing",
+                    "hall",
+                    "deck",
+                    "reception",
+                    "restaurant",
+                    "leisure",
+                    "eddings",
+                )
+            ) and len(key.split()) > 2:
+                continue
+            by_key[key] = item
+        elif item.get("description") and len(str(item["description"])) > len(
+            str(existing.get("description") or "")
+        ):
+            existing["description"] = item["description"]
+
+    _attach_scene_descriptions(by_key, text, location_name=parent)
+
+    parent_key = _display_place_name(parent).casefold()
+    parent_tokens = {t for t in re.split(r"[\s_/]+", parent_key) if len(t) >= 4}
+    results: list[dict[str, str]] = []
+    for key, item in by_key.items():
+        if parent_key and (key == parent_key or key in parent_tokens):
+            continue
+        if parent_tokens and key.replace(" ", "") == "".join(parent_tokens):
+            continue
+        results.append(item)
+    return results[:16]
+
+
+def _merge_important_location_lists(
+    primary: list[Any],
+    secondary: list[Any],
+) -> list[dict[str, str]]:
+    """Keep LLM entries first; fill gaps from harvested sub-areas."""
+    merged: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    def add(item: Any) -> None:
+        if isinstance(item, dict):
+            name = str(item.get("name") or "").strip()
+            if not name:
+                return
+            key = name.casefold()
+            if key in seen:
+                # Upgrade empty description if a later harvest has prose.
+                for row in merged:
+                    if row["name"].casefold() == key and not row.get("description"):
+                        desc = str(item.get("description") or "").strip()
+                        if desc:
+                            row["description"] = desc
+                        pk = str(item.get("public_knowledge") or "").strip()
+                        if pk and not row.get("public_knowledge"):
+                            row["public_knowledge"] = pk
+                return
+            seen.add(key)
+            merged.append(
+                {
+                    "name": name,
+                    "description": str(item.get("description") or "").strip(),
+                    "public_knowledge": str(item.get("public_knowledge") or "").strip(),
+                }
+            )
+        elif isinstance(item, str) and item.strip():
+            key = item.strip().casefold()
+            if key in seen:
+                return
+            seen.add(key)
+            merged.append({"name": item.strip(), "description": "", "public_knowledge": ""})
+
+    for item in primary or []:
+        add(item)
+    for item in secondary or []:
+        add(item)
+    return merged
+
+
+def _contents_excerpt(document_text: str, *, max_chars: int = 2_500) -> str:
+    text = document_text or ""
+    if not text:
+        return ""
+    head = text[:6_000]
+    match = re.search(r"(?is)(?:^|\n)\s*(?:[Bb]\s+)?c\s*o\s*n\s*t\s*e\s*n\s*t\s*s\b", head)
+    if match:
+        start = match.start()
+        return text[start : start + max_chars]
+    # Fallback: leading pages often hold the TOC even without a clear header.
+    return head[:max_chars]
+
+
+def _location_detail_excerpt(document_text: str, loc: dict[str, Any]) -> str:
+    """Parent-name windows plus location-scoped TOC / Exploring sections."""
+    text = document_text or ""
+    loc_name = str(loc.get("name") or "")
+    needles = _distinctive_name_needles(loc_name, loc.get("id", ""))
+    chunks: list[str] = []
+    seen: set[str] = set()
+
+    def add_chunk(piece: str) -> None:
+        piece = (piece or "").strip()
+        if not piece:
+            return
+        key = piece[:180].casefold()
+        if key in seen:
+            return
+        seen.add(key)
+        chunks.append(piece)
+
+    lower = text.casefold()
+    has_parent_hits = any(_mention_indexes(lower, needle) for needle in needles if needle)
+    if has_parent_hits:
+        add_chunk(_relevant_excerpts(text, needles))
+        # Prefer a later parent-name mention (often scene pages) beyond the first overview.
+        for needle in needles:
+            hits = _mention_indexes(lower, needle)
+            if len(hits) < 2:
+                continue
+            idx = hits[min(len(hits) - 1, 2)]
+            start = max(0, idx - 200)
+            end = min(len(text), idx + 5_000)
+            add_chunk(text[start:end])
+            break
+
+    toc = _contents_excerpt(text)
+    if toc and _text_matches_location(toc, loc_name):
+        add_chunk(toc)
+    span = _find_exploring_section_span(text, location_name=loc_name)
+    if span:
+        add_chunk(text[span[0] : span[1]])
+
+    combined: list[str] = []
+    total = 0
+    for piece in chunks:
+        if total + len(piece) > EXCERPT_MAX_CHARS:
+            remain = EXCERPT_MAX_CHARS - total
+            if remain > 500:
+                combined.append(piece[:remain])
+            break
+        combined.append(piece)
+        total += len(piece)
+    if combined:
+        return "\n\n---\n\n".join(combined)
+    # Unmatched stub: do not dump the whole module into the prompt.
+    return ""
+
+
+def _location_detail_from_seed(stub: dict[str, Any], document_text: str = "") -> dict[str, Any]:
     name = str(stub.get("name") or stub.get("id") or "Location").strip()
+    harvested = _harvest_important_locations(document_text, name) if document_text else []
     return {
         "summary": f"{name} appears in the imported module.",
         "current_events": [],
-        "important_locations": [],
+        "important_locations": harvested,
         "rumors": [],
         "local_tone": [],
         "knowledge_rules": [],
@@ -2566,7 +3210,9 @@ def _build_location_detail_prompt(
     if is_retry:
         retry_note = (
             "RETRY: A previous pass returned little or nothing useful for this location. "
-            "Read the excerpts again carefully and fill every field you can support from the text.\n\n"
+            "Read the excerpts again carefully and fill every field you can support from the text. "
+            "If important_locations was empty, list every named room, wing, courtyard, pool, "
+            "deck, or scene locale that belongs to this place.\n\n"
         )
     return (
         f'Campaign: "{campaign["name"]}" ({campaign["campaign_id"]}).\n\n'
@@ -2579,7 +3225,10 @@ def _build_location_detail_prompt(
         "when they clearly describe it.\n"
         "- Sensory description, hazards, who is present, and what is going on → summary / "
         "current_events / local_tone.\n"
-        "- Named sub-areas, rooms, decks, or landmarks → important_locations.\n"
+        "- Named sub-areas, rooms, decks, courtyards, pools, wings, or landmarks belonging to "
+        "this place → important_locations (not separate top-level locations).\n"
+        "- Table-of-contents entries and Exploring/scene headings for rooms inside this place "
+        "are high-confidence important_locations.\n"
         "- Gossip, hearsay, or uncertain talk → rumors.\n"
         "- What locals or visitors typically know or must not know → knowledge_rules.\n\n"
         'Respond with exactly {"locations": [ ... ]} where each item has this shape:\n\n'
@@ -2597,7 +3246,10 @@ def _build_location_detail_prompt(
         "CRITICAL EXTRACTION RULES:\n"
         "- Prefer copying concrete names, objects, factions, and plot facts from the source.\n"
         "- Do NOT invent major plot facts. If a field has no source support, use [] or \"\".\n"
-        "- Keep fidelity high: longer accurate lists beat short generic ones.\n\n"
+        "- Keep fidelity high: longer accurate lists beat short generic ones.\n"
+        "- Do NOT leave important_locations empty when the excerpts name rooms or scene locales "
+        "inside this place (for example courtyard, pool, a confusing room, or a named NPC's "
+        "territory used as a scene set).\n\n"
         "Locations to fill in:\n"
         f"{location_list}\n\n"
         "SOURCE EXCERPTS (may be partial windows around these locations):\n"
@@ -2608,7 +3260,13 @@ def _build_location_detail_prompt(
     )
 
 
-def _merge_location_detail(stub: dict[str, Any], detail: dict[str, Any], campaign_id: str) -> dict[str, Any]:
+def _merge_location_detail(
+    stub: dict[str, Any],
+    detail: dict[str, Any],
+    campaign_id: str,
+    *,
+    document_text: str = "",
+) -> dict[str, Any]:
     important_locations = []
     for item in _as_list(detail.get("important_locations")):
         if isinstance(item, dict):
@@ -2621,6 +3279,10 @@ def _merge_location_detail(stub: dict[str, Any], detail: dict[str, Any], campaig
             )
         elif isinstance(item, str) and item.strip():
             important_locations.append({"name": item.strip(), "description": "", "public_knowledge": ""})
+
+    if document_text:
+        harvested = _harvest_important_locations(document_text, str(stub.get("name") or ""))
+        important_locations = _merge_important_location_lists(important_locations, harvested)
 
     return {
         "id": stub["id"],
@@ -2797,10 +3459,14 @@ def _fetch_location_details(
     *,
     is_retry: bool = False,
 ) -> dict[str, dict[str, Any]]:
-    needles: list[str] = []
-    for loc in batch:
-        needles.extend(_distinctive_name_needles(loc["name"], loc["id"]))
-    excerpt = _relevant_excerpts(document_text, needles)
+    # One location per hop today; still build a focused parent+TOC+Exploring excerpt.
+    if len(batch) == 1:
+        excerpt = _location_detail_excerpt(document_text, batch[0])
+    else:
+        needles: list[str] = []
+        for loc in batch:
+            needles.extend(_distinctive_name_needles(loc["name"], loc["id"]))
+        excerpt = _relevant_excerpts(document_text, needles)
     prompt = _build_location_detail_prompt(batch, excerpt, campaign, is_retry=is_retry)
     try:
         detail_raw = _call_llm_json(_SYSTEM_PROMPT, prompt, warnings=warnings, step="location detail")
@@ -3068,23 +3734,23 @@ def detail_location_batch(
     for stub in batch:
         detail = details_by_id.get(stub["id"], {})
         if _location_detail_is_sparse(detail) and allow_seed_fallback:
-            if stub.get("seeded_from_stat_blocks"):
-                details_by_id[stub["id"]] = _location_detail_from_seed(stub)
-                warnings.append(
-                    f"Location '{stub['id']}': detail sparse after LLM; fell back to "
-                    "minimal location stub defaults."
-                )
-            elif not detail:
-                warnings.append(
-                    f"Location '{stub['id']}': no detail returned; using minimal defaults."
-                )
+            details_by_id[stub["id"]] = _location_detail_from_seed(stub, text)
+            warnings.append(
+                f"Location '{stub['id']}': detail sparse after LLM; fell back to "
+                "minimal location defaults plus harvested sub-areas when available."
+            )
         elif _location_detail_is_sparse(detail) and not detail:
             warnings.append(
                 f"Location '{stub['id']}': LLM detail sparse (editor may retry this hop)."
             )
 
     locations = [
-        _merge_location_detail(stub, details_by_id.get(stub["id"], {}), campaign["campaign_id"])
+        _merge_location_detail(
+            stub,
+            details_by_id.get(stub["id"], {}),
+            campaign["campaign_id"],
+            document_text=text,
+        )
         for stub in batch
     ]
     return {"locations": locations, "warnings": warnings}
