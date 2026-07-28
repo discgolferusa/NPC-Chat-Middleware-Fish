@@ -2384,7 +2384,6 @@ _SHIP_ROOM_HEADER = re.compile(
     r"([A-Z0-9][A-Z0-9 /'\-]{1,55}(?:,\s*[A-Z0-9][A-Z0-9 /'\-]{0,40})?)"
     r"\s*:\s*(.*)$"
 )
-_SHIP_JUNCTION_DECK = re.compile(r"\bJUNCTION\s+([A-Z])(?:-\d+)?\b", re.IGNORECASE)
 _SHIP_FALSE_ROOM_NAMES = frozenset(
     {
         "cold",
@@ -2410,6 +2409,26 @@ _SHIP_FALSE_ROOM_NAMES = frozenset(
         "bloodbursters",
         "medpod",
         "wall safe",
+        "act i",
+        "act ii",
+        "act iii",
+        "act iv",
+        "ping",
+        "brace for impact",
+        "ghost ship",
+        "bad air",
+        "no money",
+        "breaking loose",
+        "egg sacs afoot",
+        "egg sacs",
+        "pandora s box",
+        "pandoras box",
+        "the long night",
+        "sterilization protocol",
+        "clayton s secret stash",
+        "tools",
+        "walk in closet",
+        "escape pod",
     }
 )
 _SHIP_SINGLE_WORD_ROOMS = frozenset(
@@ -2432,9 +2451,72 @@ _SHIP_SINGLE_WORD_ROOMS = frozenset(
         "barracks",
         "mess",
         "infirmary",
-        "bridge",
+        "garage",
     }
 )
+_SHIP_RESPACE_LABELS = (
+    ("MAINAIRLOCK", "MAIN AIRLOCK"),
+    ("AIRSCRUBBERS", "AIR SCRUBBERS"),
+    ("CRYOCHAMBERS", "CRYO CHAMBERS"),
+    ("EXAMINATIONROOM", "EXAMINATION ROOM"),
+    ("EVASTORAGE", "EVA STORAGE"),
+    ("CREWQUARTERS", "CREW QUARTERS"),
+    ("MESSHALL", "MESS HALL"),
+    ("CORPORATESUITE", "CORPORATE SUITE"),
+    ("SCIENCELAB", "SCIENCE LAB"),
+    ("CARGOBAYS", "CARGO BAYS"),
+    ("CARGOOFFICE", "CARGO OFFICE"),
+    ("STORAGEUNITS", "STORAGE UNITS"),
+    ("COOLANTTANKS", "COOLANT TANKS"),
+    ("REACTORRELAYANDCONTROL", "REACTOR RELAY AND CONTROL"),
+    ("MUTHER2000MAINFRAME", "MU/TH/UR 2000 MAINFRAME"),
+    ("MUTHUR2000MAINFRAME", "MU/TH/UR 2000 MAINFRAME"),
+    ("MUTHER", "MU/TH/UR"),
+    ("MUTHUR", "MU/TH/UR"),
+    ("LIFESUPPORTMONITORS", "LIFE SUPPORT MONITORS"),
+)
+_SHIP_MAP_LEGEND_TOKENS = frozenset(
+    {
+        "airlock",
+        "ladder",
+        "access",
+        "restricted",
+        "area",
+        "vacc",
+        "suit",
+        "storage",
+        "med",
+        "kit",
+        "workshop",
+        "engineering",
+        "intercom",
+        "terminal",
+        "power",
+        "system",
+        "weapon",
+        "medlab",
+        "mainframe",
+        "observation",
+        "cpt",
+        "quarters",
+        "barracks",
+        "cryosleep",
+        "pods",
+        "elevator",
+        "escape",
+        "pod",
+        "radioactive",
+    }
+)
+_SHIP_SECTION_ENDER = re.compile(
+    r"(?im)^\s*(?:A\s*C\s*T\s+[IVX0-9]+|ACT\s+[IVX0-9]+|APPENDIX(?:\s+[A-Z0-9]+)?|"
+    r"INDEX|EPILOGUE|HANDOUTS?|PANDORA|GHOST\s+SHIP|THE\s+LONG\s+NIGHT)\b"
+)
+_SHIP_EVENT_HEADER = re.compile(
+    r"(?i)^(act\s*[ivx0-9]+|ping|brace\s+for\s+impact|ghost\s+ship|bad\s+air|no\s+money|"
+    r"breaking\s+loose|egg\s+sacs(?:\s+afoot)?|pandora|the\s+long\s+night|mandatory)\b"
+)
+_SHIP_JUNCTION_DECK = re.compile(r"\bJUNCTION\s*([A-Z])(?:\s*[-–—]?\s*\d+)?\b", re.IGNORECASE)
 
 
 def _location_looks_like_ship(
@@ -2488,8 +2570,64 @@ def _deck_from_ship_room_name(name: str) -> str:
     return ""
 
 
-def _parse_ship_deck_marker(line: str) -> str:
-    stripped = str(line or "").strip()
+def _respace_collapsed_ship_label(label: str) -> str:
+    """Re-insert spaces into a fully collapsed ship room label."""
+    s = re.sub(r"\s+", "", str(label or "")).upper()
+    if not s:
+        return ""
+    s = s.replace("MU/TH/UR", "MUTHER")
+    for src, dest in _SHIP_RESPACE_LABELS:
+        s = s.replace(src, dest.upper().replace(" ", "\0"))
+    s = s.replace("\0", " ")
+    # Common glue after collapsing letter-spaced headers.
+    s = s.replace("AIRLOCKJUNCTION", "AIRLOCK JUNCTION")
+    s = s.replace("MAINFRAME", " MAINFRAME")
+    s = re.sub(r"\s+", " ", s).strip()
+    s = re.sub(r"JUNCTION([A-Z])-?(\d+)", r"JUNCTION \1-\2", s)
+    s = re.sub(r"SCIENCE LAB(\d+)", r"SCIENCE LAB \1", s)
+    s = re.sub(r"EVA STORAGE(\d+)", r"EVA STORAGE \1", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _collapse_letter_spaced_phrase(phrase: str) -> str:
+    """Collapse PdfPig letter-spacing ('M A I N A I R Lo C K' → 'MAIN AIRLOCK')."""
+    parts = [p for p in str(phrase or "").split() if p]
+    if len(parts) < 4:
+        return re.sub(r"\s+", " ", str(phrase or "")).strip()
+    short = 0
+    for part in parts:
+        core = re.sub(r"[^A-Za-z0-9-]", "", part)
+        if 0 < len(core) <= 2:
+            short += 1
+    if short < max(3, int(len(parts) * 0.55)):
+        return re.sub(r"\s+", " ", phrase).strip()
+    collapsed = "".join(re.sub(r"\s+", "", p) for p in parts)
+    collapsed = re.sub(r"([A-Za-z])-(\d)", r"\1-\2", collapsed)
+    return _respace_collapsed_ship_label(collapsed)
+
+
+def _normalize_ship_line(line: str) -> str:
+    """Normalize one ship-section line for header/deck detection."""
+    raw = str(line or "")
+    if ":" not in raw:
+        collapsed = _collapse_letter_spaced_phrase(raw.strip())
+        return collapsed or raw.strip()
+    left, right = raw.split(":", 1)
+    return f"{_collapse_letter_spaced_phrase(left)}:{right}"
+
+
+def _is_ship_map_legend_line(line: str) -> bool:
+    tokens = [re.sub(r"[^a-z0-9]+", "", t.casefold()) for t in str(line or "").split()]
+    tokens = [t for t in tokens if t]
+    if len(tokens) < 2 or len(tokens) > 10:
+        return False
+    hits = sum(1 for t in tokens if t in _SHIP_MAP_LEGEND_TOKENS)
+    return hits >= 2 and hits >= len(tokens) * 0.6
+
+
+def _parse_ship_deck_marker(line: str, *, allow_lettered_map: bool = False) -> str:
+    stripped = _normalize_ship_line(str(line or "")).strip()
     if not stripped or len(stripped) > 48:
         return ""
     # Heading lines only — never retarget deck from mid-sentence "Deck C" prose.
@@ -2500,6 +2638,9 @@ def _parse_ship_deck_marker(line: str) -> str:
     named = _SHIP_NAMED_DECK.match(stripped)
     if named:
         return _normalize_deck_label(named.group(1))
+    if not allow_lettered_map:
+        # Bare DECK A/B/C/D lines are usually map chrome and end on Deck D.
+        return ""
     lettered = _SHIP_DECK_MARKER.match(stripped)
     if lettered:
         return _normalize_deck_label(f"Deck {lettered.group(1)}")
@@ -2507,12 +2648,17 @@ def _parse_ship_deck_marker(line: str) -> str:
 
 
 def _looks_like_ship_room_header(line: str) -> tuple[str, str] | None:
-    """Return (room_name, same_line_prose) for ALL-CAPS ship room headers ending in ':'."""
-    stripped = str(line or "").strip()
-    if not stripped or len(stripped) > 120:
+    """Return (room_name, same_line_prose) for ship room headers ending in ':'."""
+    normalized = _normalize_ship_line(str(line or ""))
+    stripped = normalized.strip()
+    if not stripped:
         return None
     # Nested bullet/triangle substations ("T COMMAND STATION:") stay under the parent room.
-    if re.match(r"^[T•▪\-]\s+\S", stripped):
+    if re.match(r"^[T•▪\-]\s+\S", str(line or "").strip()):
+        return None
+    # Only the header label must stay short; same-line prose may be long.
+    header_label = stripped.split(":", 1)[0]
+    if len(header_label) > 80:
         return None
     match = _SHIP_ROOM_HEADER.match(stripped)
     if not match:
@@ -2525,7 +2671,7 @@ def _looks_like_ship_room_header(line: str) -> tuple[str, str] | None:
     if len(letters) < 3:
         return None
     upper_ratio = sum(1 for ch in letters if ch.isupper()) / len(letters)
-    if upper_ratio < 0.75:
+    if upper_ratio < 0.55:
         return None
     if raw_name.casefold() in _SHIP_ROOM_HEADER_STOP:
         return None
@@ -2537,9 +2683,15 @@ def _looks_like_ship_room_header(line: str) -> tuple[str, str] | None:
     key = display.casefold()
     if key in _SHIP_ROOM_HEADER_STOP or key in _SHIP_FALSE_ROOM_NAMES:
         return None
+    if _SHIP_EVENT_HEADER.match(key) or _SHIP_EVENT_HEADER.match(raw_name.casefold()):
+        return None
     words = display.split()
     if len(words) == 1 and key not in _SHIP_SINGLE_WORD_ROOMS:
         return None
+    # Reject glued map-legend headers ("Intercom Cryo Chambers").
+    if any(w.casefold() in _SHIP_MAP_LEGEND_TOKENS for w in words[:1]) and len(words) >= 2:
+        if words[0].casefold() in {"intercom", "access", "terminal", "power", "weapon"}:
+            return None
     return display, prose
 
 
@@ -2548,33 +2700,46 @@ def _prose_after_ship_header(
     start_idx: int,
     *,
     initial: str = "",
-    max_chars: int = 420,
+    max_chars: int = 360,
 ) -> str:
     parts: list[str] = []
     total = 0
     if initial.strip():
         chunk = re.sub(r"\s+", " ", initial.strip())
-        parts.append(chunk)
-        total += len(chunk) + 1
+        if not _is_ship_map_legend_line(chunk):
+            parts.append(chunk)
+            total += len(chunk) + 1
     for line in lines[start_idx + 1 :]:
         stripped = line.strip()
         if not stripped:
             if parts:
                 break
             continue
-        if _parse_ship_deck_marker(stripped):
+        normalized = _normalize_ship_line(stripped)
+        if _SHIP_SECTION_ENDER.match(normalized) or _SHIP_SECTION_ENDER.match(stripped):
             break
-        if _looks_like_ship_room_header(stripped):
+        if _parse_ship_deck_marker(normalized, allow_lettered_map=False):
+            break
+        if _looks_like_ship_room_header(stripped) or _looks_like_ship_room_header(normalized):
             break
         if _looks_like_place_header(stripped) or _looks_like_npc_name_header(stripped):
             break
         if _STAT_OR_SECTION_LINE.match(stripped) or _CALLOUT_AWARENESS_PRESENCE.search(stripped):
             break
-        # Nested bullet stations end the parent room's short description window.
         if re.match(r"^[T•▪\-]\s+[A-Z0-9].*:\s*\S", stripped):
             if parts:
                 break
+        if _is_ship_map_legend_line(stripped) or _is_ship_map_legend_line(normalized):
+            continue
         chunk = re.sub(r"\s+", " ", stripped)
+        # Drop two-column legend glue mixed mid-sentence.
+        legend_hits = sum(
+            1
+            for tok in chunk.casefold().split()
+            if re.sub(r"[^a-z0-9]+", "", tok) in _SHIP_MAP_LEGEND_TOKENS
+        )
+        if legend_hits >= 3:
+            continue
         parts.append(chunk)
         total += len(chunk) + 1
         if total >= max_chars:
@@ -2592,7 +2757,6 @@ def _description_with_deck(deck: str, prose: str) -> str:
         return f"{deck}." if deck else ""
     if not deck:
         return prose
-    # Avoid double-prefixing when source already leads with the deck.
     if prose.casefold().startswith(deck.casefold()):
         return prose
     return f"{deck}. {prose}"
@@ -2628,9 +2792,9 @@ def _find_ship_room_description_span(
     ]
 
     def _belongs_to_parent(start_idx: int) -> bool:
-        # Lead-in must mention this ship; do not accept a far-forward jump from an
-        # earlier Sotillo name-drop into Cronus deck plans.
-        lead = text[max(0, start_idx - 3_000) : min(len(text), start_idx + 1_200)]
+        # Ownership comes from the lead-in before the room block. Do not look far
+        # forward — scenario text after rooms often mentions Montero/other ships.
+        lead = text[max(0, start_idx - 3_000) : min(len(text), start_idx + 160)]
         if not _text_matches_location(lead, parent):
             return False
         parent_tokens = _significant_location_tokens(parent)
@@ -2658,7 +2822,6 @@ def _find_ship_room_description_span(
                 continue
             other_pos = lead_cf.rfind(other)
             if other_pos >= 0 and other_pos > parent_pos:
-                # Other ship name is closer to the room-block start than parent.
                 return False
         return True
 
@@ -2680,17 +2843,13 @@ def _find_ship_room_description_span(
     elif scoped_rooms:
         start = scoped_rooms[0]
 
-    # Whole-line chapter chrome only — do not stop on mid-prose "Events)".
-    enders = list(
-        re.finditer(
-            r"(?im)^\s*(?:APPENDIX(?:\s+[A-Z0-9]+)?|INDEX|EPILOGUE|HANDOUTS?|ACT\s+[IVX0-9]+)\s*$",
-            text[start + 1 :],
-        )
-    )
-    end = start + 1 + enders[0].start() if enders else min(len(text), start + 22_000)
-    if end - start < 400:
+    # Stop before scenario acts/events — those are not ship rooms.
+    enders = list(_SHIP_SECTION_ENDER.finditer(text[start + 1 :]))
+    end = start + 1 + enders[0].start() if enders else min(len(text), start + 24_000)
+    if end - start < 200:
         return None
     return start, end
+
 
 def _harvest_ship_room_subareas(text: str, *, location_name: str = "") -> list[dict[str, str]]:
     """Harvest deck-scoped ship rooms from ALL-CAPS 'ROOM NAME: prose' headers."""
@@ -2701,15 +2860,19 @@ def _harvest_ship_room_subareas(text: str, *, location_name: str = "") -> list[d
     lines = region.splitlines()
     found: list[dict[str, str]] = []
     seen: set[str] = set()
-    # Only trust deck headings inside the room block (or junction codes on the room name).
-    # Prefacing map pages often end on Deck D and would mis-label early rooms.
+    # Only named decks (Cargo Deck, etc.) update current_deck. Bare DECK D map
+    # chrome would otherwise stamp every room as Deck D.
     current_deck = ""
 
     for idx, line in enumerate(lines):
         stripped = line.strip()
         if not stripped:
             continue
-        deck_marker = _parse_ship_deck_marker(stripped)
+        if _SHIP_SECTION_ENDER.match(_normalize_ship_line(stripped)) or _SHIP_SECTION_ENDER.match(
+            stripped
+        ):
+            break
+        deck_marker = _parse_ship_deck_marker(stripped, allow_lettered_map=False)
         if deck_marker:
             current_deck = deck_marker
             continue
@@ -2735,7 +2898,7 @@ def _harvest_ship_room_subareas(text: str, *, location_name: str = "") -> list[d
                 "public_knowledge": "",
             }
         )
-        if len(found) >= 24:
+        if len(found) >= 18:
             break
     return found
 
@@ -3802,6 +3965,22 @@ def _merge_location_detail(
             location_type=str(stub.get("type") or ""),
         )
         important_locations = _merge_important_location_lists(important_locations, harvested)
+
+    if _location_looks_like_ship(
+        str(stub.get("name") or ""),
+        location_type=str(stub.get("type") or ""),
+        document_text=document_text,
+    ):
+        cleaned: list[dict[str, str]] = []
+        for item in important_locations:
+            name = str(item.get("name") or "").strip()
+            key = name.casefold()
+            if not name:
+                continue
+            if key in _SHIP_FALSE_ROOM_NAMES or _SHIP_EVENT_HEADER.match(key):
+                continue
+            cleaned.append(item)
+        important_locations = cleaned
 
     return {
         "id": stub["id"],

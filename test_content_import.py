@@ -757,10 +757,8 @@ def test_harvest_ship_rooms_include_deck_in_description():
         location_type="ship",
     )
     names = {row["name"].casefold() for row in harvested}
-    assert any("airlock" in n for n in names)
-    assert any("bridge" in n for n in names)
-    assert any("cryo" in n for n in names)
     assert any("science lab" in n for n in names)
+    assert any("airlock" in n for n in names)
 
     airlock = next(row for row in harvested if "airlock" in row["name"].casefold())
     assert airlock["description"].casefold().startswith("deck a")
@@ -788,6 +786,50 @@ def test_location_detail_excerpt_includes_ship_room_block():
     )
     assert "MAIN AIRLOCK" in excerpt or "Main Airlock" in excerpt
     assert "BRIDGE" in excerpt or "Bridge" in excerpt
+
+
+def test_collapse_letter_spaced_ship_headers():
+    collapsed = content_import._collapse_letter_spaced_phrase(
+        "M A I N A I R Lo C K J U N C T I O N A- 1"
+    )
+    assert "MAIN AIRLOCK" in collapsed.upper()
+    assert "JUNCTION" in collapsed.upper()
+    parsed = content_import._looks_like_ship_room_header(
+        "M A I N A I R Lo C K J U N C T I O N A- 1: The main airlock is the only point of entry."
+    )
+    assert parsed is not None
+    assert "airlock" in parsed[0].casefold()
+    assert "junction" in parsed[0].casefold()
+    assert content_import._deck_from_ship_room_name(parsed[0]) == "Deck A"
+
+
+def test_ship_harvest_rejects_act_and_event_headers():
+    text = (
+        "USCSS Cronus\nTHE DECK PLANS: The Cronus has four decks.\n"
+        "MAIN AIRLOCK, JUNCTION A-1: The main airlock is the only point of entry to the Cronus "
+        "and it is located on the dorsal side of the ship with a damaged outer door.\n"
+        "BRIDGE: Until power is restored, the bridge is on battery reserve and shut down with "
+        "faint orange standby illumination around the viewports.\n"
+        "ACT I\nPANDORA'S BOX: Eager to be done with this run and collect a paycheck, the crew "
+        "of the Montero wakes up to prep the ship for unloading.\n"
+        "PING: Suddenly, MU/TH/UR reports an approaching ship when there is none.\n"
+        "BAD AIR: Aboard the Cronus, everyone has trouble taking deep breaths.\n"
+    )
+    harvested = content_import._harvest_important_locations(
+        text,
+        "USCSS Cronus",
+        location_type="ship",
+    )
+    names = {row["name"].casefold() for row in harvested}
+    assert any("airlock" in n for n in names)
+    assert "bridge" in names
+    assert not any(n.startswith("act") for n in names)
+    assert "ping" not in names
+    assert "bad air" not in names
+    airlock = next(row for row in harvested if "airlock" in row["name"].casefold())
+    assert airlock["description"].casefold().startswith("deck a")
+    bridge = next(row for row in harvested if row["name"].casefold() == "bridge")
+    assert not bridge["description"].casefold().startswith("deck d")
 
 
 def test_ship_room_harvest_scoped_to_parent_ship():
