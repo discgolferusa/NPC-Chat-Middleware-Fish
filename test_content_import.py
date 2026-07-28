@@ -68,6 +68,16 @@ def _load_chariot_pdfpig_fixture() -> str:
     return PDFPIG_FIXTURE_PATH.read_text(encoding="utf-8")
 
 
+DESTROYER_MOONSIDE_FIXTURE_PATH = (
+    Path(__file__).resolve().parent
+    / "tests"
+    / "fixtures"
+    / "destroyer_of_worlds_moonside_locations.txt"
+)
+
+
+def _load_destroyer_moonside_fixture() -> str:
+    return DESTROYER_MOONSIDE_FIXTURE_PATH.read_text(encoding="utf-8")
 DESTROYER_MEYERS_FIXTURE_PATH = (
     Path(__file__).resolve().parent
     / "tests"
@@ -232,6 +242,62 @@ def test_docnet_toc_npc_header_does_not_block_stat_block_fast_path():
     assert any("stat block" in w.lower() for w in result.get("warnings") or [])
 
 
+def test_destroyer_moonside_seeds_major_location_sites(monkeypatch):
+    """Locations-chapter PDFs must seed Fort Nebraska / Spaceport stubs without LLM help."""
+    text = _load_destroyer_moonside_fixture()
+    assert content_import._document_has_recoverable_location_sites(text)
+
+    def fake_call_llm_json(*args, **kwargs):
+        return {
+            "campaign": {
+                "campaign_id": "destroyer_of_worlds",
+                "name": "Destroyer of Worlds",
+                "description": "Ariarcus under siege.",
+            },
+            "locations": [],
+            "npcs": [],
+        }
+
+    monkeypatch.setattr(content_import, "_call_llm_json", fake_call_llm_json)
+    result = content_import.outline_campaign_document(text, "create_new")
+    names = {loc["name"] for loc in result["locations"]}
+    for expected in (
+        "Fort Nebraska",
+        "Spaceport",
+        "Oblivion Bar",
+        "Marshal Station",
+        "San Rocco Medical Facility",
+        "The Insurgent Compound",
+        "Oil Refinery",
+    ):
+        assert expected in names, expected
+    # Room-scale headers must not become top-level stubs.
+    assert "Hangar 01" not in names
+    assert "The Gate" not in names
+    assert "Landing Pad A" not in names
+    assert any("moonside" in w.lower() or "location site" in w.lower() for w in result["warnings"])
+
+
+def test_destroyer_colon_rooms_harvest_under_spaceport():
+    text = _load_destroyer_moonside_fixture()
+    rooms = content_import._harvest_colon_place_subareas(text, location_name="Spaceport")
+    names = {row["name"] for row in rooms}
+    assert "The Gate" in names
+    assert "Landing Pad A" in names
+    assert "Hangar 01" in names
+    # Other sites' rooms should not bleed into Spaceport.
+    assert "Yard" not in names
+    assert "Sally Port" not in names
+
+
+def test_destroyer_important_locations_include_colon_rooms():
+    text = _load_destroyer_moonside_fixture()
+    harvested = content_import._harvest_important_locations(
+        text, "Fort Nebraska", location_type="building"
+    )
+    names = {row["name"] for row in harvested}
+    assert "Sally Port" in names or "Gate" in names
+    assert all(row.get("description") for row in harvested)
 def test_full_name_accepts_middle_initial_with_period():
     assert content_import._iter_full_names_on_line(
         "FULL NAME: Edward R. Meyers"
