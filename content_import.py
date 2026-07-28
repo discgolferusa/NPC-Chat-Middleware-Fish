@@ -2603,32 +2603,17 @@ def _find_ship_room_description_span(
     *,
     location_name: str = "",
 ) -> tuple[int, int] | None:
-    """Locate the room-description block for a ship (after deck plans / first room header)."""
+    """Locate the room-description block for one parent ship.
+
+    Requires ``location_name`` and only accepts deck-plan / room-header starts whose
+    nearby lead-in mentions that ship — otherwise Sotillo would inherit Cronus rooms.
+    """
     if not text:
         return None
-    start_candidates: list[int] = []
-    for match in re.finditer(r"(?im)(?:^|\n)\s*(?:the\s+)?deck\s+plans\b", text):
-        start_candidates.append(match.start())
-    # First ALL-CAPS room header with junction / airlock / bridge / medlab cues.
-    for match in re.finditer(
-        r"(?im)^\s*(?:MAIN\s+AIRLOCK|BRIDGE|MEDLAB|CRYO\s+CHAMBERS|CARGO\s+BAYS|"
-        r"REACTOR\s+RELAY|SCIENCE\s+LAB|MU/TH/UR)[^\n]{0,40}:",
-        text,
-    ):
-        start_candidates.append(match.start())
-    if location_name.strip():
-        needles = _distinctive_name_needles(location_name, "")
-        lower = text.casefold()
-        for needle in needles:
-            for idx in _mention_indexes(lower, needle)[:6]:
-                window = text[idx : min(len(text), idx + 2_500)]
-                if re.search(r"(?im)^\s*[A-Z0-9][A-Z0-9 /'\-]{2,40}:\s+\S", window):
-                    start_candidates.append(idx)
-                    break
-    if not start_candidates:
+    parent = str(location_name or "").strip()
+    if not parent:
         return None
-    start = min(start_candidates)
-    # Prefer the earliest room-header after deck plans when both exist.
+
     deck_plan_hits = [
         m.start()
         for m in re.finditer(r"(?im)(?:^|\n)\s*(?:the\s+)?deck\s+plans\b", text)
@@ -2637,14 +2622,63 @@ def _find_ship_room_description_span(
         m.start()
         for m in re.finditer(
             r"(?im)^\s*(?:MAIN\s+AIRLOCK|BRIDGE|MEDLAB|CRYO\s+CHAMBERS|CARGO\s+BAYS|"
-            r"REACTOR\s+RELAY|SCIENCE\s+LAB)[^\n]{0,40}:",
+            r"REACTOR\s+RELAY|SCIENCE\s+LAB|MU/TH/UR)[^\n]{0,40}:",
             text,
         )
     ]
-    if deck_plan_hits and room_hits:
-        after_plans = [h for h in room_hits if h >= deck_plan_hits[0]]
+
+    def _belongs_to_parent(start_idx: int) -> bool:
+        # Lead-in must mention this ship; do not accept a far-forward jump from an
+        # earlier Sotillo name-drop into Cronus deck plans.
+        lead = text[max(0, start_idx - 3_000) : min(len(text), start_idx + 1_200)]
+        if not _text_matches_location(lead, parent):
+            return False
+        parent_tokens = _significant_location_tokens(parent)
+        if not parent_tokens:
+            return True
+        lead_cf = lead.casefold()
+        parent_pos = -1
+        for token in parent_tokens:
+            pos = lead_cf.rfind(token)
+            if pos > parent_pos:
+                parent_pos = pos
+        if parent_pos < 0:
+            return False
+        competing = (
+            "uscss",
+            "cronus",
+            "nostromo",
+            "montero",
+            "prometheus",
+            "heliades",
+            "sotillo",
+        )
+        for other in competing:
+            if any(other == t or other in t or t in other for t in parent_tokens):
+                continue
+            other_pos = lead_cf.rfind(other)
+            if other_pos >= 0 and other_pos > parent_pos:
+                # Other ship name is closer to the room-block start than parent.
+                return False
+        return True
+
+    start_candidates = [
+        idx
+        for idx in sorted(set(deck_plan_hits + room_hits))
+        if _belongs_to_parent(idx)
+    ]
+    if not start_candidates:
+        return None
+
+    start = start_candidates[0]
+    scoped_deck = [h for h in deck_plan_hits if _belongs_to_parent(h)]
+    scoped_rooms = [h for h in room_hits if _belongs_to_parent(h)]
+    if scoped_deck and scoped_rooms:
+        after_plans = [h for h in scoped_rooms if h >= scoped_deck[0]]
         if after_plans:
             start = after_plans[0]
+    elif scoped_rooms:
+        start = scoped_rooms[0]
 
     # Whole-line chapter chrome only — do not stop on mid-prose "Events)".
     enders = list(
@@ -2657,7 +2691,6 @@ def _find_ship_room_description_span(
     if end - start < 400:
         return None
     return start, end
-
 
 def _harvest_ship_room_subareas(text: str, *, location_name: str = "") -> list[dict[str, str]]:
     """Harvest deck-scoped ship rooms from ALL-CAPS 'ROOM NAME: prose' headers."""
@@ -2877,6 +2910,7 @@ def _location_detail_excerpt(document_text: str, loc: dict[str, Any]) -> str:
     needles = _distinctive_name_needles(loc_name, loc.get("id", ""))
     chunks: list[str] = []
     seen: set[str] = set()
+    is_ship = _location_looks_like_ship(loc_name, location_type=loc_type, document_text=text)
 
     def add_chunk(piece: str) -> None:
         piece = (piece or "").strip()
@@ -2891,17 +2925,26 @@ def _location_detail_excerpt(document_text: str, loc: dict[str, Any]) -> str:
     lower = text.casefold()
     has_parent_hits = any(_mention_indexes(lower, needle) for needle in needles if needle)
     if has_parent_hits:
-        add_chunk(_relevant_excerpts(text, needles))
-        # Prefer a later parent-name mention (often scene pages) beyond the first overview.
-        for needle in needles:
-            hits = _mention_indexes(lower, needle)
-            if len(hits) < 2:
-                continue
-            idx = hits[min(len(hits) - 1, 2)]
-            start = max(0, idx - 200)
-            end = min(len(text), idx + 5_000)
-            add_chunk(text[start:end])
-            break
+        if is_ship:
+            # Ships: keep tight overview windows. A 7k forward window from an early
+            # Sotillo mention would otherwise swallow Cronus deck rooms.
+            for needle in needles:
+                for idx in _mention_indexes(lower, needle)[:4]:
+                    start = max(0, idx - 250)
+                    end = min(len(text), idx + 1_800)
+                    add_chunk(text[start:end])
+        else:
+            add_chunk(_relevant_excerpts(text, needles))
+            # Prefer a later parent-name mention (often scene pages) beyond the first overview.
+            for needle in needles:
+                hits = _mention_indexes(lower, needle)
+                if len(hits) < 2:
+                    continue
+                idx = hits[min(len(hits) - 1, 2)]
+                start = max(0, idx - 200)
+                end = min(len(text), idx + 5_000)
+                add_chunk(text[start:end])
+                break
 
     toc = _contents_excerpt(text)
     if toc and _text_matches_location(toc, loc_name):
@@ -2910,7 +2953,7 @@ def _location_detail_excerpt(document_text: str, loc: dict[str, Any]) -> str:
     if span:
         add_chunk(text[span[0] : span[1]])
 
-    if _location_looks_like_ship(loc_name, location_type=loc_type, document_text=text):
+    if is_ship:
         ship_span = _find_ship_room_description_span(text, location_name=loc_name)
         if ship_span:
             add_chunk(text[ship_span[0] : ship_span[1]])

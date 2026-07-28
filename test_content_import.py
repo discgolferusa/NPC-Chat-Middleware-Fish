@@ -790,6 +790,38 @@ def test_location_detail_excerpt_includes_ship_room_block():
     assert "BRIDGE" in excerpt or "Bridge" in excerpt
 
 
+def test_ship_room_harvest_scoped_to_parent_ship():
+    """Sotillo must not inherit Cronus deck rooms just because both are ships."""
+    text = (
+        "NON-PLAYER CHARACTERS\n"
+        "Mechanic on the Sotillo\n"
+        "The Sotillo is a battered freighter used by Bolaji's crew.\n\n"
+        + _load_chariot_ship_rooms_fixture()
+    )
+    cronus = content_import._harvest_important_locations(
+        text,
+        "USCSS Cronus",
+        location_type="ship",
+    )
+    sotillo = content_import._harvest_important_locations(
+        text,
+        "Sotillo",
+        location_type="ship",
+    )
+    assert any("airlock" in row["name"].casefold() for row in cronus)
+    assert any(row["name"].casefold() == "bridge" for row in cronus)
+    assert sotillo == []
+    assert content_import._find_ship_room_description_span(text, location_name="Sotillo") is None
+
+    sotillo_excerpt = content_import._location_detail_excerpt(
+        text,
+        {"id": "sotillo", "name": "Sotillo", "type": "ship"},
+    )
+    assert "MAIN AIRLOCK" not in sotillo_excerpt
+    assert "BRIDGE:" not in sotillo_excerpt
+    assert "sotillo" in sotillo_excerpt.casefold()
+
+
 def test_location_detail_prompt_mentions_ship_deck_guidance():
     prompt = content_import._build_location_detail_prompt(
         [{"id": "uscss_cronus", "name": "USCSS Cronus", "type": "ship"}],
