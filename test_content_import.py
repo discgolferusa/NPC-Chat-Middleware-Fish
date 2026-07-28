@@ -44,6 +44,18 @@ def _load_chariot_pdf_extract_fixture() -> str:
     return PDF_EXTRACT_FIXTURE_PATH.read_text(encoding="utf-8")
 
 
+SHIP_ROOMS_FIXTURE_PATH = (
+    Path(__file__).resolve().parent
+    / "tests"
+    / "fixtures"
+    / "chariot_of_the_gods_pdf_ship_rooms.txt"
+)
+
+
+def _load_chariot_ship_rooms_fixture() -> str:
+    return SHIP_ROOMS_FIXTURE_PATH.read_text(encoding="utf-8")
+
+
 PDFPIG_FIXTURE_PATH = (
     Path(__file__).resolve().parent
     / "tests"
@@ -723,6 +735,135 @@ def test_harvest_important_locations_scoped_to_parent_location():
     merged_names = {row["name"].casefold() for row in merged_other["important_locations"]}
     assert "bridge" in merged_names
     assert not any("courtyard" in n for n in merged_names)
+
+
+def test_location_looks_like_ship_from_name_and_type():
+    assert content_import._location_looks_like_ship("USCSS Cronus", location_type="ship")
+    assert content_import._location_looks_like_ship("The Sotillo", location_type="building")
+    assert not content_import._location_looks_like_ship("Majestic Hotel", location_type="building")
+
+
+def test_harvest_ship_rooms_include_deck_in_description():
+    """ALIEN-style deck plans: ship stays parent; rooms become important_locations with deck."""
+    text = _load_chariot_ship_rooms_fixture()
+    assert content_import._location_looks_like_ship(
+        "USCSS Cronus",
+        location_type="ship",
+        document_text=text,
+    )
+    harvested = content_import._harvest_important_locations(
+        text,
+        "USCSS Cronus",
+        location_type="ship",
+    )
+    names = {row["name"].casefold() for row in harvested}
+    assert any("airlock" in n for n in names)
+    assert any("bridge" in n for n in names)
+    assert any("cryo" in n for n in names)
+    assert any("science lab" in n for n in names)
+
+    airlock = next(row for row in harvested if "airlock" in row["name"].casefold())
+    assert airlock["description"].casefold().startswith("deck a")
+    assert "point of entry" in airlock["description"].casefold() or "airlock" in airlock[
+        "description"
+    ].casefold()
+
+    bridge = next(row for row in harvested if row["name"].casefold() == "bridge")
+    assert len(bridge["description"]) > 40
+    assert "power" in bridge["description"].casefold() or "bridge" in bridge["description"].casefold()
+    # Nested bridge stations / boxed callouts should not crowd out real rooms.
+    assert not any(n == "dark" for n in names)
+    assert not any(n == "command station" for n in names)
+
+    # Map chrome / technical specs must not become rooms.
+    assert not any("technical specifications" in n for n in names)
+    assert not any("map legend" in n for n in names)
+
+
+def test_location_detail_excerpt_includes_ship_room_block():
+    text = _load_chariot_ship_rooms_fixture()
+    excerpt = content_import._location_detail_excerpt(
+        text,
+        {"id": "uscss_cronus", "name": "USCSS Cronus", "type": "ship"},
+    )
+    assert "MAIN AIRLOCK" in excerpt or "Main Airlock" in excerpt
+    assert "BRIDGE" in excerpt or "Bridge" in excerpt
+
+
+def test_ship_room_harvest_scoped_to_parent_ship():
+    """Sotillo must not inherit Cronus deck rooms just because both are ships."""
+    text = (
+        "NON-PLAYER CHARACTERS\n"
+        "Mechanic on the Sotillo\n"
+        "The Sotillo is a battered freighter used by Bolaji's crew.\n\n"
+        + _load_chariot_ship_rooms_fixture()
+    )
+    cronus = content_import._harvest_important_locations(
+        text,
+        "USCSS Cronus",
+        location_type="ship",
+    )
+    sotillo = content_import._harvest_important_locations(
+        text,
+        "Sotillo",
+        location_type="ship",
+    )
+    assert any("airlock" in row["name"].casefold() for row in cronus)
+    assert any(row["name"].casefold() == "bridge" for row in cronus)
+    assert sotillo == []
+    assert content_import._find_ship_room_description_span(text, location_name="Sotillo") is None
+
+    sotillo_excerpt = content_import._location_detail_excerpt(
+        text,
+        {"id": "sotillo", "name": "Sotillo", "type": "ship"},
+    )
+    assert "MAIN AIRLOCK" not in sotillo_excerpt
+    assert "BRIDGE:" not in sotillo_excerpt
+    assert "sotillo" in sotillo_excerpt.casefold()
+
+
+def test_location_detail_prompt_mentions_ship_deck_guidance():
+    prompt = content_import._build_location_detail_prompt(
+        [{"id": "uscss_cronus", "name": "USCSS Cronus", "type": "ship"}],
+        "THE DECK PLANS: The Cronus has four decks.\nMAIN AIRLOCK, JUNCTION A-1: The main airlock.",
+        {"campaign_id": "chariot", "name": "Chariot of the Gods"},
+    )
+    assert "SHIP / VESSEL LAYOUT" in prompt
+    assert "important_locations" in prompt
+    assert "Deck" in prompt
+
+
+def test_location_detail_merges_ship_rooms_when_llm_omits_them(monkeypatch):
+    text = _load_chariot_ship_rooms_fixture()
+
+    def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step):
+        assert "SHIP / VESSEL LAYOUT" in user_prompt
+        return {
+            "locations": [
+                {
+                    "id": "uscss_cronus",
+                    "summary": "A derelict Weyland science exploration vessel.",
+                    "current_events": ["Life support is offline."],
+                    "important_locations": [],
+                    "rumors": [],
+                    "local_tone": ["cold"],
+                    "knowledge_rules": [],
+                }
+            ]
+        }
+
+    monkeypatch.setattr(content_import, "_call_llm_json", fake_call_llm_json)
+    result = content_import.detail_location_batch(
+        text,
+        {"campaign_id": "chariot", "name": "Chariot of the Gods"},
+        [{"id": "uscss_cronus", "name": "USCSS Cronus", "type": "ship"}],
+    )
+    loc = result["locations"][0]
+    names = {row["name"].casefold() for row in loc["important_locations"]}
+    assert any("airlock" in n for n in names)
+    assert any("bridge" in n for n in names)
+    airlock = next(row for row in loc["important_locations"] if "airlock" in row["name"].casefold())
+    assert "deck" in airlock["description"].casefold()
 
 
 def test_location_detail_excerpt_scopes_exploring_to_parent():

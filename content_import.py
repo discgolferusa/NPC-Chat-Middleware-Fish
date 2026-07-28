@@ -15,6 +15,8 @@ Pipeline:
   2. Location detail — format-agnostic LLM extraction from name-focused excerpts,
      plus TOC/Exploring windows and a generic sub-area harvest into
      ``important_locations`` when the model returns a summary without rooms.
+     Ships also harvest deck-scoped room headers (e.g. ALIEN deck plans) and put
+     deck identity into each room's ``description``.
      One call per Funnel hop; editor retries sparse results as a separate hop, then
      may request ``allow_seed_fallback``.
   3. NPC detail — same pattern. Layout examples (labeled writeups, FULL NAME blocks,
@@ -697,8 +699,8 @@ def _ensure_locations_for_npc_hints(
     """Add minimal location stubs referenced by NPC first_location_id hints."""
     known = {loc["id"] for loc in location_stubs}
     defaults = {
-        "uscss_cronus": ("USCSS Cronus", "building"),
-        "sotillo": ("Sotillo", "building"),
+        "uscss_cronus": ("USCSS Cronus", "ship"),
+        "sotillo": ("Sotillo", "ship"),
         "majestic_hotel": ("Majestic Hotel", "building"),
         "the_majestic": ("The Majestic", "building"),
         "majestic": ("Majestic Hotel", "building"),
@@ -2315,11 +2317,434 @@ def _toc_name_appears_in_region(name: str, region: str) -> bool:
     return bool(pattern.search(region))
 
 
-def _harvest_important_locations(document_text: str, location_name: str) -> list[dict[str, str]]:
-    """Harvest sub-areas for one parent location from its Exploring section (+ matching TOC).
+_SHIP_TYPE_TOKENS = frozenset(
+    {
+        "ship",
+        "vessel",
+        "starship",
+        "spaceship",
+        "spacecraft",
+        "freighter",
+        "cruiser",
+        "destroyer",
+        "carrier",
+        "corvette",
+        "cutter",
+        "yacht",
+        "boat",
+        "submarine",
+        "station",
+    }
+)
+_SHIP_NAME_HINTS = (
+    "uscss",
+    "uss ",
+    "hms ",
+    "sev ",
+    "nostromo",
+    "montero",
+    "cronus",
+    "sotillo",
+    "prometheus",
+)
+_SHIP_ROOM_HEADER_STOP = frozenset(
+    {
+        "technical specifications",
+        "production information",
+        "map legend",
+        "auxiliary vehicles",
+        "the deck plans",
+        "deck plans",
+        "doors on the cronus",
+        "decompression",
+        "personal agenda",
+        "full name",
+        "buddy",
+        "rival",
+        "gear",
+        "talent",
+        "skills",
+        "health",
+        "strength",
+        "agility",
+        "wits",
+        "empathy",
+        "scenario",
+        "chariot of the gods",
+    }
+)
+_SHIP_DECK_MARKER = re.compile(
+    r"(?im)^\s*(?:[A-Z0-9][A-Z0-9 '\-]{0,40}\s*[—\-–]?\s*)?DECK\s+([A-Z])(?:\s*[-–—]?\s*\d+)?\s*$"
+)
+_SHIP_NAMED_DECK = re.compile(
+    r"(?im)^\s*((?:CARGO|ENGINEERING|HABITATION|SCIENCE|CREW|LOWER|UPPER)\s+DECK)\s*$"
+)
+_SHIP_ROOM_HEADER = re.compile(
+    r"^\s*"
+    r"([A-Z0-9][A-Z0-9 /'\-]{1,55}(?:,\s*[A-Z0-9][A-Z0-9 /'\-]{0,40})?)"
+    r"\s*:\s*(.*)$"
+)
+_SHIP_JUNCTION_DECK = re.compile(r"\bJUNCTION\s+([A-Z])(?:-\d+)?\b", re.IGNORECASE)
+_SHIP_FALSE_ROOM_NAMES = frozenset(
+    {
+        "cold",
+        "hot",
+        "dark",
+        "air",
+        "note",
+        "notes",
+        "important",
+        "warning",
+        "optional",
+        "example",
+        "events",
+        "event",
+        "drugs",
+        "vials",
+        "motes",
+        "bones",
+        "urns",
+        "fungal nodes",
+        "key card",
+        "the cure",
+        "bloodbursters",
+        "medpod",
+        "wall safe",
+    }
+)
+_SHIP_SINGLE_WORD_ROOMS = frozenset(
+    {
+        "bridge",
+        "armory",
+        "armoury",
+        "elevators",
+        "elevator",
+        "showers",
+        "shower",
+        "airlock",
+        "medlab",
+        "medbay",
+        "brig",
+        "galley",
+        "hangar",
+        "reactor",
+        "catwalk",
+        "barracks",
+        "mess",
+        "infirmary",
+        "bridge",
+    }
+)
 
-    Does not attach a shared document TOC/Exploring block to unrelated location stubs.
+
+def _location_looks_like_ship(
+    location_name: str,
+    *,
+    location_type: str = "",
+    document_text: str = "",
+) -> bool:
+    loc_type = str(location_type or "").casefold().strip()
+    if loc_type in _SHIP_TYPE_TOKENS:
+        return True
+    name_key = str(location_name or "").casefold()
+    if any(token in loc_type for token in _SHIP_TYPE_TOKENS):
+        return True
+    if any(hint in name_key for hint in _SHIP_NAME_HINTS):
+        return True
+    if any(token in name_key.split() for token in _SHIP_TYPE_TOKENS):
+        return True
+    text = document_text or ""
+    if not text or not str(location_name or "").strip():
+        return False
+    # Deck plans / vessel copy near this location name.
+    needles = _distinctive_name_needles(location_name, "")
+    lower = text.casefold()
+    for needle in needles:
+        for idx in _mention_indexes(lower, needle)[:4]:
+            window = text[max(0, idx - 400) : min(len(text), idx + 1_200)].casefold()
+            if "deck plan" in window or "deck plans" in window:
+                return True
+            if any(token in window for token in ("vessel", "starship", "spaceship", "spacecraft")):
+                return True
+            if "the ship" in window and ("deck" in window or "airlock" in window):
+                return True
+    return False
+
+
+def _normalize_deck_label(raw: str) -> str:
+    cleaned = re.sub(r"\s+", " ", str(raw or "").strip())
+    if not cleaned:
+        return ""
+    if cleaned.casefold().startswith("deck "):
+        suffix = cleaned[5:].strip()
+        return f"Deck {suffix.upper()}" if len(suffix) <= 3 else cleaned.title()
+    return cleaned.title()
+
+
+def _deck_from_ship_room_name(name: str) -> str:
+    match = _SHIP_JUNCTION_DECK.search(name or "")
+    if match:
+        return f"Deck {match.group(1).upper()}"
+    return ""
+
+
+def _parse_ship_deck_marker(line: str) -> str:
+    stripped = str(line or "").strip()
+    if not stripped or len(stripped) > 48:
+        return ""
+    # Heading lines only — never retarget deck from mid-sentence "Deck C" prose.
+    if any(ch in stripped for ch in ",.;()"):
+        return ""
+    if " plan" in stripped.casefold() or stripped.casefold().endswith("plans"):
+        return ""
+    named = _SHIP_NAMED_DECK.match(stripped)
+    if named:
+        return _normalize_deck_label(named.group(1))
+    lettered = _SHIP_DECK_MARKER.match(stripped)
+    if lettered:
+        return _normalize_deck_label(f"Deck {lettered.group(1)}")
+    return ""
+
+
+def _looks_like_ship_room_header(line: str) -> tuple[str, str] | None:
+    """Return (room_name, same_line_prose) for ALL-CAPS ship room headers ending in ':'."""
+    stripped = str(line or "").strip()
+    if not stripped or len(stripped) > 120:
+        return None
+    # Nested bullet/triangle substations ("T COMMAND STATION:") stay under the parent room.
+    if re.match(r"^[T•▪\-]\s+\S", stripped):
+        return None
+    match = _SHIP_ROOM_HEADER.match(stripped)
+    if not match:
+        return None
+    raw_name = re.sub(r"\s+", " ", match.group(1)).strip(" -—–")
+    prose = (match.group(2) or "").strip()
+    if not raw_name or len(raw_name) < 3:
+        return None
+    letters = [ch for ch in raw_name if ch.isalpha()]
+    if len(letters) < 3:
+        return None
+    upper_ratio = sum(1 for ch in letters if ch.isupper()) / len(letters)
+    if upper_ratio < 0.75:
+        return None
+    if raw_name.casefold() in _SHIP_ROOM_HEADER_STOP:
+        return None
+    if raw_name.casefold().startswith(("doors on the", "appendix", "chapter", "the deck")):
+        return None
+    display = _display_place_name(raw_name)
+    if not display:
+        display = raw_name.title()
+    key = display.casefold()
+    if key in _SHIP_ROOM_HEADER_STOP or key in _SHIP_FALSE_ROOM_NAMES:
+        return None
+    words = display.split()
+    if len(words) == 1 and key not in _SHIP_SINGLE_WORD_ROOMS:
+        return None
+    return display, prose
+
+
+def _prose_after_ship_header(
+    lines: list[str],
+    start_idx: int,
+    *,
+    initial: str = "",
+    max_chars: int = 420,
+) -> str:
+    parts: list[str] = []
+    total = 0
+    if initial.strip():
+        chunk = re.sub(r"\s+", " ", initial.strip())
+        parts.append(chunk)
+        total += len(chunk) + 1
+    for line in lines[start_idx + 1 :]:
+        stripped = line.strip()
+        if not stripped:
+            if parts:
+                break
+            continue
+        if _parse_ship_deck_marker(stripped):
+            break
+        if _looks_like_ship_room_header(stripped):
+            break
+        if _looks_like_place_header(stripped) or _looks_like_npc_name_header(stripped):
+            break
+        if _STAT_OR_SECTION_LINE.match(stripped) or _CALLOUT_AWARENESS_PRESENCE.search(stripped):
+            break
+        # Nested bullet stations end the parent room's short description window.
+        if re.match(r"^[T•▪\-]\s+[A-Z0-9].*:\s*\S", stripped):
+            if parts:
+                break
+        chunk = re.sub(r"\s+", " ", stripped)
+        parts.append(chunk)
+        total += len(chunk) + 1
+        if total >= max_chars:
+            break
+    text = " ".join(parts).strip()
+    if len(text) > max_chars:
+        text = text[: max_chars - 3].rstrip() + "..."
+    return text
+
+
+def _description_with_deck(deck: str, prose: str) -> str:
+    prose = re.sub(r"\s+", " ", str(prose or "").strip())
+    deck = _normalize_deck_label(deck)
+    if not prose:
+        return f"{deck}." if deck else ""
+    if not deck:
+        return prose
+    # Avoid double-prefixing when source already leads with the deck.
+    if prose.casefold().startswith(deck.casefold()):
+        return prose
+    return f"{deck}. {prose}"
+
+
+def _find_ship_room_description_span(
+    text: str,
+    *,
+    location_name: str = "",
+) -> tuple[int, int] | None:
+    """Locate the room-description block for one parent ship.
+
+    Requires ``location_name`` and only accepts deck-plan / room-header starts whose
+    nearby lead-in mentions that ship — otherwise Sotillo would inherit Cronus rooms.
     """
+    if not text:
+        return None
+    parent = str(location_name or "").strip()
+    if not parent:
+        return None
+
+    deck_plan_hits = [
+        m.start()
+        for m in re.finditer(r"(?im)(?:^|\n)\s*(?:the\s+)?deck\s+plans\b", text)
+    ]
+    room_hits = [
+        m.start()
+        for m in re.finditer(
+            r"(?im)^\s*(?:MAIN\s+AIRLOCK|BRIDGE|MEDLAB|CRYO\s+CHAMBERS|CARGO\s+BAYS|"
+            r"REACTOR\s+RELAY|SCIENCE\s+LAB|MU/TH/UR)[^\n]{0,40}:",
+            text,
+        )
+    ]
+
+    def _belongs_to_parent(start_idx: int) -> bool:
+        # Lead-in must mention this ship; do not accept a far-forward jump from an
+        # earlier Sotillo name-drop into Cronus deck plans.
+        lead = text[max(0, start_idx - 3_000) : min(len(text), start_idx + 1_200)]
+        if not _text_matches_location(lead, parent):
+            return False
+        parent_tokens = _significant_location_tokens(parent)
+        if not parent_tokens:
+            return True
+        lead_cf = lead.casefold()
+        parent_pos = -1
+        for token in parent_tokens:
+            pos = lead_cf.rfind(token)
+            if pos > parent_pos:
+                parent_pos = pos
+        if parent_pos < 0:
+            return False
+        competing = (
+            "uscss",
+            "cronus",
+            "nostromo",
+            "montero",
+            "prometheus",
+            "heliades",
+            "sotillo",
+        )
+        for other in competing:
+            if any(other == t or other in t or t in other for t in parent_tokens):
+                continue
+            other_pos = lead_cf.rfind(other)
+            if other_pos >= 0 and other_pos > parent_pos:
+                # Other ship name is closer to the room-block start than parent.
+                return False
+        return True
+
+    start_candidates = [
+        idx
+        for idx in sorted(set(deck_plan_hits + room_hits))
+        if _belongs_to_parent(idx)
+    ]
+    if not start_candidates:
+        return None
+
+    start = start_candidates[0]
+    scoped_deck = [h for h in deck_plan_hits if _belongs_to_parent(h)]
+    scoped_rooms = [h for h in room_hits if _belongs_to_parent(h)]
+    if scoped_deck and scoped_rooms:
+        after_plans = [h for h in scoped_rooms if h >= scoped_deck[0]]
+        if after_plans:
+            start = after_plans[0]
+    elif scoped_rooms:
+        start = scoped_rooms[0]
+
+    # Whole-line chapter chrome only — do not stop on mid-prose "Events)".
+    enders = list(
+        re.finditer(
+            r"(?im)^\s*(?:APPENDIX(?:\s+[A-Z0-9]+)?|INDEX|EPILOGUE|HANDOUTS?|ACT\s+[IVX0-9]+)\s*$",
+            text[start + 1 :],
+        )
+    )
+    end = start + 1 + enders[0].start() if enders else min(len(text), start + 22_000)
+    if end - start < 400:
+        return None
+    return start, end
+
+def _harvest_ship_room_subareas(text: str, *, location_name: str = "") -> list[dict[str, str]]:
+    """Harvest deck-scoped ship rooms from ALL-CAPS 'ROOM NAME: prose' headers."""
+    span = _find_ship_room_description_span(text, location_name=location_name)
+    if not span:
+        return []
+    region = text[span[0] : span[1]]
+    lines = region.splitlines()
+    found: list[dict[str, str]] = []
+    seen: set[str] = set()
+    # Only trust deck headings inside the room block (or junction codes on the room name).
+    # Prefacing map pages often end on Deck D and would mis-label early rooms.
+    current_deck = ""
+
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        deck_marker = _parse_ship_deck_marker(stripped)
+        if deck_marker:
+            current_deck = deck_marker
+            continue
+        parsed = _looks_like_ship_room_header(stripped)
+        if not parsed:
+            continue
+        name, same_line = parsed
+        key = name.casefold()
+        if key in seen:
+            continue
+        if location_name and _collapsed_alpha(name) == _collapsed_alpha(location_name):
+            continue
+        description = _prose_after_ship_header(lines, idx, initial=same_line)
+        # Require real room prose so map labels / chrome do not become rooms.
+        if len(description) < 50:
+            continue
+        deck = _deck_from_ship_room_name(name) or current_deck
+        seen.add(key)
+        found.append(
+            {
+                "name": name,
+                "description": _description_with_deck(deck, description),
+                "public_knowledge": "",
+            }
+        )
+        if len(found) >= 24:
+            break
+    return found
+
+
+def _harvest_exploring_important_locations(
+    document_text: str,
+    location_name: str,
+) -> list[dict[str, str]]:
+    """Harvest sub-areas from an Exploring section (+ matching TOC) for one parent."""
     text = document_text or ""
     parent = str(location_name or "").strip()
     if not text.strip() or not parent:
@@ -2360,6 +2785,11 @@ def _harvest_important_locations(document_text: str, location_name: str) -> list
                     "restaurant",
                     "leisure",
                     "eddings",
+                    "airlock",
+                    "bridge",
+                    "cargo",
+                    "medlab",
+                    "cryo",
                 )
             ) and len(key.split()) > 2:
                 continue
@@ -2383,6 +2813,33 @@ def _harvest_important_locations(document_text: str, location_name: str) -> list
     return results[:16]
 
 
+def _harvest_important_locations(
+    document_text: str,
+    location_name: str,
+    *,
+    location_type: str = "",
+) -> list[dict[str, str]]:
+    """Harvest sub-areas for one parent location (Exploring/TOC and/or ship decks).
+
+    Does not attach a shared document TOC/Exploring block to unrelated location stubs.
+    """
+    text = document_text or ""
+    parent = str(location_name or "").strip()
+    if not text.strip() or not parent:
+        return []
+
+    exploring = _harvest_exploring_important_locations(text, parent)
+    ship_rooms: list[dict[str, str]] = []
+    if _location_looks_like_ship(parent, location_type=location_type, document_text=text):
+        ship_rooms = _harvest_ship_room_subareas(text, location_name=parent)
+
+    if exploring and ship_rooms:
+        return _merge_important_location_lists(exploring, ship_rooms)[:24]
+    if ship_rooms:
+        return ship_rooms[:24]
+    return exploring[:16]
+
+
 def _merge_important_location_lists(
     primary: list[Any],
     secondary: list[Any],
@@ -2398,15 +2855,17 @@ def _merge_important_location_lists(
                 return
             key = name.casefold()
             if key in seen:
-                # Upgrade empty description if a later harvest has prose.
+                # Prefer richer descriptions (e.g. deck-prefixed ship room prose).
                 for row in merged:
-                    if row["name"].casefold() == key and not row.get("description"):
-                        desc = str(item.get("description") or "").strip()
-                        if desc:
-                            row["description"] = desc
-                        pk = str(item.get("public_knowledge") or "").strip()
-                        if pk and not row.get("public_knowledge"):
-                            row["public_knowledge"] = pk
+                    if row["name"].casefold() != key:
+                        continue
+                    desc = str(item.get("description") or "").strip()
+                    existing_desc = str(row.get("description") or "").strip()
+                    if desc and (not existing_desc or len(desc) > len(existing_desc)):
+                        row["description"] = desc
+                    pk = str(item.get("public_knowledge") or "").strip()
+                    if pk and not row.get("public_knowledge"):
+                        row["public_knowledge"] = pk
                 return
             seen.add(key)
             merged.append(
@@ -2444,12 +2903,14 @@ def _contents_excerpt(document_text: str, *, max_chars: int = 2_500) -> str:
 
 
 def _location_detail_excerpt(document_text: str, loc: dict[str, Any]) -> str:
-    """Parent-name windows plus location-scoped TOC / Exploring sections."""
+    """Parent-name windows plus location-scoped TOC / Exploring / ship-room sections."""
     text = document_text or ""
     loc_name = str(loc.get("name") or "")
+    loc_type = str(loc.get("type") or "")
     needles = _distinctive_name_needles(loc_name, loc.get("id", ""))
     chunks: list[str] = []
     seen: set[str] = set()
+    is_ship = _location_looks_like_ship(loc_name, location_type=loc_type, document_text=text)
 
     def add_chunk(piece: str) -> None:
         piece = (piece or "").strip()
@@ -2464,17 +2925,26 @@ def _location_detail_excerpt(document_text: str, loc: dict[str, Any]) -> str:
     lower = text.casefold()
     has_parent_hits = any(_mention_indexes(lower, needle) for needle in needles if needle)
     if has_parent_hits:
-        add_chunk(_relevant_excerpts(text, needles))
-        # Prefer a later parent-name mention (often scene pages) beyond the first overview.
-        for needle in needles:
-            hits = _mention_indexes(lower, needle)
-            if len(hits) < 2:
-                continue
-            idx = hits[min(len(hits) - 1, 2)]
-            start = max(0, idx - 200)
-            end = min(len(text), idx + 5_000)
-            add_chunk(text[start:end])
-            break
+        if is_ship:
+            # Ships: keep tight overview windows. A 7k forward window from an early
+            # Sotillo mention would otherwise swallow Cronus deck rooms.
+            for needle in needles:
+                for idx in _mention_indexes(lower, needle)[:4]:
+                    start = max(0, idx - 250)
+                    end = min(len(text), idx + 1_800)
+                    add_chunk(text[start:end])
+        else:
+            add_chunk(_relevant_excerpts(text, needles))
+            # Prefer a later parent-name mention (often scene pages) beyond the first overview.
+            for needle in needles:
+                hits = _mention_indexes(lower, needle)
+                if len(hits) < 2:
+                    continue
+                idx = hits[min(len(hits) - 1, 2)]
+                start = max(0, idx - 200)
+                end = min(len(text), idx + 5_000)
+                add_chunk(text[start:end])
+                break
 
     toc = _contents_excerpt(text)
     if toc and _text_matches_location(toc, loc_name):
@@ -2482,6 +2952,11 @@ def _location_detail_excerpt(document_text: str, loc: dict[str, Any]) -> str:
     span = _find_exploring_section_span(text, location_name=loc_name)
     if span:
         add_chunk(text[span[0] : span[1]])
+
+    if is_ship:
+        ship_span = _find_ship_room_description_span(text, location_name=loc_name)
+        if ship_span:
+            add_chunk(text[ship_span[0] : ship_span[1]])
 
     combined: list[str] = []
     total = 0
@@ -2501,7 +2976,15 @@ def _location_detail_excerpt(document_text: str, loc: dict[str, Any]) -> str:
 
 def _location_detail_from_seed(stub: dict[str, Any], document_text: str = "") -> dict[str, Any]:
     name = str(stub.get("name") or stub.get("id") or "Location").strip()
-    harvested = _harvest_important_locations(document_text, name) if document_text else []
+    harvested = (
+        _harvest_important_locations(
+            document_text,
+            name,
+            location_type=str(stub.get("type") or ""),
+        )
+        if document_text
+        else []
+    )
     return {
         "summary": f"{name} appears in the imported module.",
         "current_events": [],
@@ -2993,7 +3476,7 @@ def _build_outline_prompt(
         '  "campaign": {"campaign_id": "snake_case_id", "name": "Display Name", '
         '"description": "1-3 sentence summary"},\n'
         '  "locations": [{"id": "snake_case_id", "name": "Display Name", '
-        '"type": "city|town|dungeon|forest|building|region|other"}],\n'
+        '"type": "city|town|dungeon|forest|building|ship|region|other"}],\n'
         '  "npcs": [{"name": "Display Name", "role": "short role or title", '
         '"first_location_id": "snake_case id of the location where this NPC is first '
         'encountered", "other_location_ids": ["snake_case_id", ...]}]\n'
@@ -3021,6 +3504,9 @@ def _build_outline_prompt(
         "PERSONALITY, PERSONAL AGENDA) are always NPCs when inside the NPC section.\n"
         "- Include every named location and every named NPC from the authoritative NPC section "
         "or character callout boxes; minor NPCs in those places still count.\n"
+        "- If the document centers on a ship or vessel, list the ship as one location "
+        "(type ship) and put individual decks/rooms in later important_locations detail — "
+        "do not create a separate top-level location for every room.\n"
         "- other_location_ids should only be non-empty for NPCs who travel or appear in more "
         "than one place in the text.\n"
         f"{mode_guidance}"
@@ -3206,6 +3692,14 @@ def _build_location_detail_prompt(
     is_retry: bool = False,
 ) -> str:
     location_list = "\n".join(f"- id: {loc['id']} | name: {loc['name']} | type: {loc['type']}" for loc in batch)
+    ship_batch = any(
+        _location_looks_like_ship(
+            str(loc.get("name") or ""),
+            location_type=str(loc.get("type") or ""),
+            document_text=text,
+        )
+        for loc in batch
+    )
     retry_note = ""
     if is_retry:
         retry_note = (
@@ -3214,9 +3708,26 @@ def _build_location_detail_prompt(
             "If important_locations was empty, list every named room, wing, courtyard, pool, "
             "deck, or scene locale that belongs to this place.\n\n"
         )
+    ship_note = ""
+    if ship_batch:
+        ship_note = (
+            "SHIP / VESSEL LAYOUT (apply when this place is a ship, station, or vessel):\n"
+            "- Keep the ship itself as the single top-level location.\n"
+            "- After the ship overview / deck plans, look for ALL-CAPS or Title-Case subheaders "
+            "followed by prose (for example 'MAIN AIRLOCK, JUNCTION A-1:', 'BRIDGE:', "
+            "'SCIENCE LAB 1:').\n"
+            "- Treat each subheader whose following text reads like a room or area description "
+            "as one important_locations entry (not a separate top-level location).\n"
+            "- Track nearby deck headings (Deck A/B/C, Cargo Deck, etc.) and put that deck "
+            "identity at the start of each room's description "
+            "(example: 'Deck A. The main airlock is the only point of entry...').\n"
+            "- Junction codes like A-1 / B-2 also imply the matching deck letter.\n"
+            "- Do not invent rooms that lack a subheader or clear room prose in the excerpts.\n\n"
+        )
     return (
         f'Campaign: "{campaign["name"]}" ({campaign["campaign_id"]}).\n\n'
         f"{retry_note}"
+        f"{ship_note}"
         "Fill in details for EACH location below from the SOURCE EXCERPTS only.\n"
         "Modules use many layouts — room-by-room keys, ship deck notes, scene boxed text, "
         "faction writeups, maps with captions, or free prose. Do not assume one game's headings.\n\n"
@@ -3227,6 +3738,9 @@ def _build_location_detail_prompt(
         "current_events / local_tone.\n"
         "- Named sub-areas, rooms, decks, courtyards, pools, wings, or landmarks belonging to "
         "this place → important_locations (not separate top-level locations).\n"
+        "- When a location header has subheaders beneath it, read the text under each subheader. "
+        "If that text sounds like a room or place description (layout, contents, hazards, who is "
+        "there), add it as an important_locations entry for this location.\n"
         "- Table-of-contents entries and Exploring/scene headings for rooms inside this place "
         "are high-confidence important_locations.\n"
         "- Gossip, hearsay, or uncertain talk → rumors.\n"
@@ -3237,7 +3751,8 @@ def _build_location_detail_prompt(
         '  "summary": "faithful overview; keep concrete sensory and plot details from the source; '
         'use as many sentences as needed (typically 2-8)",\n'
         '  "current_events": ["ongoing situations from the source; include all that are stated"],\n'
-        '  "important_locations": [{"name": "sub-location name", "description": "what the source says", '
+        '  "important_locations": [{"name": "sub-location name", "description": "what the source says '
+        '(include deck/level when the source is a ship)", '
         '"public_knowledge": "what ordinary people believe or know about it"}],\n'
         '  "rumors": ["rumors or uncertain talk from the source"],\n'
         '  "local_tone": ["mood/atmosphere descriptors from the source"],\n'
@@ -3248,8 +3763,8 @@ def _build_location_detail_prompt(
         "- Do NOT invent major plot facts. If a field has no source support, use [] or \"\".\n"
         "- Keep fidelity high: longer accurate lists beat short generic ones.\n"
         "- Do NOT leave important_locations empty when the excerpts name rooms or scene locales "
-        "inside this place (for example courtyard, pool, a confusing room, or a named NPC's "
-        "territory used as a scene set).\n\n"
+        "inside this place (for example courtyard, pool, a confusing room, ship airlock/bridge/"
+        "medlab, or a named NPC's territory used as a scene set).\n\n"
         "Locations to fill in:\n"
         f"{location_list}\n\n"
         "SOURCE EXCERPTS (may be partial windows around these locations):\n"
@@ -3281,7 +3796,11 @@ def _merge_location_detail(
             important_locations.append({"name": item.strip(), "description": "", "public_knowledge": ""})
 
     if document_text:
-        harvested = _harvest_important_locations(document_text, str(stub.get("name") or ""))
+        harvested = _harvest_important_locations(
+            document_text,
+            str(stub.get("name") or ""),
+            location_type=str(stub.get("type") or ""),
+        )
         important_locations = _merge_important_location_lists(important_locations, harvested)
 
     return {

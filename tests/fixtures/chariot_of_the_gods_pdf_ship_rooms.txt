@@ -1,0 +1,1229 @@
+===== PAGE 1 =====
+HORTON, MECHANIC
+Mechanic on the Sotillo
+FULL NAME: Micky Horton
+AGE: 12
+PERSONALITY: Friendly
+The twelve-year-old son of a minor Wey-
+land-Yutani exec that shafted Bolaji on a deal, 
+Horton was kidnapped by the captain in an 
+attempt to get the exec to pay up. When Hor-
+ton’s father was killed by another mercenary he 
+hadn’t paid, Bolaji decided to keep the kid. The 
+self-taught and scruffy mechanic has been re-
+building sensor suites and assembling thruster 
+arrays since the age of nine. The boy is well-
+liked and well-treated by the crew of the Sotillo.
+STRENGTH 2, AGILITY 4, WITS 5, EMPATHY 3
+HEALTH: 2
+SKILLS: Mobility 2, Observation 2, Survival 2, 
+Comtech 3, Medical Aid 1
+TALENT: Beneath Notice
+GEAR: M240 Incinerator Unit (1 reload)
+PERSONAL AGENDA: Help your crewmates from 
+the Sotillo to get out alive.
+BUDDY: Bein
+RIVAL: –
+The Cronus is a science exploration vehicle 
+launched at the beginning of the 22nd centu-
+ry. Modern vessels in this design lineage are 
+of the Magellan class, and a PC might mis-
+take the ship for its newer brethren. Just as 
+the Montero is a slightly newer variant of the 
+Nostromo, The Cronus is a variant of a Heli-
+ades-class ship with many similarities to the 
+Prometheus. On the Cronus, however, the sep-
+arate Class D module was not a lifeboat, but 
+instead a classified and specially-equipped 
+science lab that could be jettisoned in the 
+case of an emergency. When the PCs encoun-
+ter her, that module is missing, ejected at 
+some point during the SEV’s original mission.
+AUXILIARY VEHICLES: The Cronus has 
+only two ATVs (see page 141 of the core rule-
+book) in her vehicle bay, and is missing all of 
+her Class A escape pods. Wherever she was, 
+whatever she was doing, she left in a hurry—
+and left her vehicle complement behind.
+THE DECK PLANS: The Cronus has four 
+decks, each accessible through main junc -
+tion ladderways, two large elevators, and a 
+staircase (that is collapsed). You'll find the 
+deck plans in the center of this booklet for 
+easy removal. Each room or corridor is one 
+zone for the purposes of movement (see 
+page 82 of the core rulebook). Larger rooms 
+are divided into several zones, separated by 
+thin lines. The dotted lines are ventilation 
+ducts, with larger dots marking zone limits.
+USCSS  
+CRONUS
+WEYLAND SEV M3 HELIADES-CLASS
+SCIENCE EXPLORATION VEHICLE
+ 15
+CHARIOT OF THE GODS
+===== PAGE 2 =====
+2X2 METERS
+CRONUS – DECK A
+AIR 
+SCRUBBERS
+SHAFT
+JUNCTION
+JUNCTION
+STAIR-
+WELL
+A-2
+A-1
+MU/TH/
+UR
+2000
+CRYO 1 CRYO 2
+CRYO 3
+EXAMINATION 
+ROOM
+SHOWERS AND
+WARDROBE
+SHOWERS AND
+WARDROBE
+TECHNICAL SPECIFICATIONS
+LENGTH: 130 metres
+WIDTH: 48.75 metres
+HEIGHT: 36.5 metres
+ENGINE POWER: Four nuclear-powered ion 
+plasma engines
+FUEL SOURCE: Ionized plasma drive
+POWER PLANT: Nuclear fission  
+generators
+SENSOR SYSTEMS: Various comm antennas
+NAVIGATION SYSTEMS: Independent ad-
+vanced navigation systems
+CREW: 17
+130m 
+16  
+SCENARIO
+===== PAGE 6 =====
+MAIN AIRLOCK, JUNCTION A-1: The 
+main airlock is the only point of entry to the 
+Cronus and it is located on the dorsal side of 
+the ship. The outer airlock door is damaged and 
+seems buckled from the inside, something that 
+the PCs notice if they spacewalk to it or try to 
+connect the Montero’s passageway umbilical.
+To open the outer airlock door requires a 
+cutting torch and a HEAVY MACHINERY  roll. In-
+side, a ladder leads down into the main airlock 
+junction, down to decks B and C. Covered 
+in scuff and scratch marks on the inside, the 
+door does not close again once opened. After 
+breaching the buckled door, the PCs must 
+connect the Montero’s passageway umbilical 
+to the Cronus and pressurize it before open-
+ing the inner airlock door. If the umbilical is 
+damaged, the airlock suffers explosive decom-
+pression (see page 107 of the core rulebook). 
+The other airlock doors operate properly.
+Anyone taking an environmental reading 
+finds the air stiflingly stale and the temperature 
+below freezing (see boxed text to the right).
+MU/TH/UR 2000 MAINFRAME: Locat-
+ed directly above the bridge, this small room 
+is accessible from the main airlock at Junction 
+A-1. This protected area can only be entered if 
+one has the correct command sequence or the 
+emergency access key—things only Wilson, 
+Johns and Cooper possess at the beginning of 
+the scenario. Inside this spotlessly clean room 
+is a blinking data server and a single terminal 
+which the highest-ranking member of a crew 
+can use to interface directly with MU/TH/UR. 
+Clever PCs can use the computer to ask the 
+right questions and the GM can feed them infor-
+mation as she so chooses.
+AIR SCRUBBERS: This large shaft is only 
+accessible via the ventilation and maintenance 
+shafts. When operational, massive carbon 
+filters clean the air of pollutants while churning 
+machines electrolyze the water and generate 
+oxygen. Powered by a direct feed from the 
+reactors, the shaft terminates in a water-filled 
+chamber on Deck C. Condensation accumulates 
+at the top of the shaft and rains down here.
+When the PCs arrive, the oxygen genera-
+tion is offline. The shaft is dark and the water 
+at the bottom of the shaft is frozen. Once MU/
+TH/UR 2000 goes online and power is re-
+stored, the air scrubbers are activated and the 
+ice melts. This chamber then becomes very 
+noisy and it is difficult to hear anything—all 
+OBSERVATION rolls get a –2 modification in here.
+The air scrubbers work via electrolysis—elec-
+trical current is channeled through submerged 
+rods and applied to the water, causing the 
+separation of hydrogen and oxygen. That means 
+that there is a real risk of electrocution in here 
+once the power is back on. Any failed skill roll in 
+here results in an immediate attack rolled with 
+six Base Dice and Damage 1.
+The carbon filters on the air scrubbers are 
+caked with decades of grime and mold, and 
+just restoring power won’t be enough to return 
+them to working order. The carbon filters need 
+to either be replaced or cleaned in order for the 
+air circulating on the ship to return to proper 
+oxygen levels. This requires a Shift of work and 
+a successful HEAVY MACHINERY roll. Only one PC 
+can roll, but others can help.
+If the PCs actively examine the carbon filters 
+before they get to work, they spot Neomorphic 
+Egg Sacs growing on them (see page 292 of the 
+core rulebook). If these are disturbed, Neomor-
+phic Motes are released throughout the ship. The 
+only way for the PCs to destroy the egg sacs is 
+to burn them, something that Ava 6 can explain.
+AIRLOCK
+LADDER ACCESS
+RESTRICTED AREA
+VACC SUIT STORAGE
+MED KIT STORAGE
+WORKSHOP/ENGINEERING
+INTERCOM
+ACCESS TERMINAL POWER SYSTEM
+WEAPON SYSTEM
+MEDLAB
+MAINFRAME
+OBSERVATION AREA
+CPT´S QUARTERS
+BARRACKS
+CRYOSLEEP PODS ELEVATOR
+ESCAPE POD
+RADIOACTIVE
+AIRLOCK
+LADDER ACCESS
+RESTRICTED AREA
+VACC SUIT STORAGE
+MED KIT STORAGE
+WORKSHOP/ENGINEERING
+INTERCOM
+ACCESS TERMINAL POWER SYSTEM
+WEAPON SYSTEM
+MEDLAB
+MAINFRAME
+OBSERVATION AREA
+CPT´S QUARTERS
+BARRACKS
+CRYOSLEEP PODS ELEVATOR
+ESCAPE POD
+RADIOACTIVE
+AIRLOCK
+LADDER ACCESS
+RESTRICTED AREA
+VACC SUIT STORAGE
+MED KIT STORAGE
+WORKSHOP/ENGINEERING
+INTERCOM
+ACCESS TERMINAL POWER SYSTEM
+WEAPON SYSTEM
+MEDLAB
+MAINFRAME
+OBSERVATION AREA
+CPT´S QUARTERS
+BARRACKS
+CRYOSLEEP PODS ELEVATOR
+ESCAPE POD
+RADIOACTIVE
+AIRLOCK
+LADDER ACCESS
+RESTRICTED AREA
+VACC SUIT STORAGE
+MED KIT STORAGE
+WORKSHOP/ENGINEERING
+INTERCOM
+ACCESS TERMINAL POWER SYSTEM
+WEAPON SYSTEM
+MEDLAB
+MAINFRAME
+OBSERVATION AREA
+CPT´S QUARTERS
+BARRACKS
+CRYOSLEEP PODS ELEVATOR
+ESCAPE POD
+RADIOACTIVE
+20  
+SCENARIO
+A
+deck
+CRYo DECK
+
+===== PAGE 7 =====
+ELEVATORS: These elevators provide access 
+to the vehicle bay in the Cronus’s belly. Eleva-
+tor 1 functions just fine once power is restored, 
+although there was definitely a firefight within it 
+at one point. Buckshot and dried blood pepper 
+the elevator’s interior. Elevator 2 is a different 
+story—the shaft doors are ajar and the elevator 
+is crumpled on the vehicle bay level. It looks like 
+someone had thrown an incendiary grenade or 
+two at it after it fell, just for good measure.
+CRYO CHAMBERS: The main door into this 
+area has claw marks around the edges of the door-
+way, as if something was trying to scratch its way 
+in. The door is locked from the inside and a HEAVY 
+MACHINERY  roll is required to open it. The cryo beds 
+in the chambers are covered in frost. Inside them is 
+the sleeping crew of the Cronus—at least the survi-
+vors of the crew. Most of the hypersleep chambers 
+are vacant. Two are filled with desiccated corpses, 
+mummified by the decades in dry air. As the life 
+support systems come online, the crew wakes up 
+(see page 30). In lockers in this room, the personal 
+gear of the Cronus crew is stored.
+EXAMINATION ROOM: The examination 
+room is a mess. There are two personal medkits 
+here (see page 136 of the core ruiebook). 
+SHOWERS: The showers are filthy, and some 
+Neomorphic egg sacs are growing in the shower 
+drains. Caution is advised.
+JUNCTION A-2: This shaft leads to the other 
+levels of the ship.
+EVA STORAGE 1 AND 2: There are a total of 
+three remaining space suits here, all older models 
+of the IRC Mk.50 Compression Suit. They have not 
+been tampered with and function fine.
+AIRLOCK
+LADDER ACCESS
+RESTRICTED AREA
+VACC SUIT STORAGE
+MED KIT STORAGE
+WORKSHOP/ENGINEERING
+INTERCOM
+ACCESS TERMINAL POWER SYSTEM
+WEAPON SYSTEM
+MEDLAB
+MAINFRAME
+OBSERVATION AREA
+CPT´S QUARTERS
+BARRACKS
+CRYOSLEEP PODS ELEVATOR
+ESCAPE POD
+RADIOACTIVE
+AIRLOCK
+LADDER ACCESS
+RESTRICTED AREA
+VACC SUIT STORAGE
+MED KIT STORAGE
+WORKSHOP/ENGINEERING
+INTERCOM
+ACCESS TERMINAL POWER SYSTEM
+WEAPON SYSTEM
+MEDLAB
+MAINFRAME
+OBSERVATION AREA
+CPT´S QUARTERS
+BARRACKS
+CRYOSLEEP PODS ELEVATOR
+ESCAPE POD
+RADIOACTIVE
+AIRLOCK
+LADDER ACCESS
+RESTRICTED AREA
+VACC SUIT STORAGE
+MED KIT STORAGE
+WORKSHOP/ENGINEERING
+INTERCOM
+ACCESS TERMINAL POWER SYSTEM
+WEAPON SYSTEM
+MEDLAB
+MAINFRAME
+OBSERVATION AREA
+CPT´S QUARTERS
+BARRACKS
+CRYOSLEEP PODS ELEVATOR
+ESCAPE POD
+RADIOACTIVE
+AIRLOCK
+LADDER ACCESS
+RESTRICTED AREA
+VACC SUIT STORAGE
+MED KIT STORAGE
+WORKSHOP/ENGINEERING
+INTERCOM
+ACCESS TERMINAL POWER SYSTEM
+WEAPON SYSTEM
+MEDLAB
+MAINFRAME
+OBSERVATION AREA
+CPT´S QUARTERS
+BARRACKS
+CRYOSLEEP PODS ELEVATOR
+ESCAPE POD
+RADIOACTIVE
+AIRLOCK
+LADDER ACCESS
+RESTRICTED AREA
+VACC SUIT STORAGE
+MED KIT STORAGE
+WORKSHOP/ENGINEERING
+INTERCOM
+ACCESS TERMINAL POWER SYSTEM
+WEAPON SYSTEM
+MEDLAB
+MAINFRAME
+OBSERVATION AREA
+CPT´S QUARTERS
+BARRACKS
+CRYOSLEEP PODS ELEVATOR
+ESCAPE POD
+RADIOACTIVE
+AIRLOCK
+LADDER ACCESS
+RESTRICTED AREA
+VACC SUIT STORAGE
+MED KIT STORAGE
+WORKSHOP/ENGINEERING
+INTERCOM
+ACCESS TERMINAL POWER SYSTEM
+WEAPON SYSTEM
+MEDLAB
+MAINFRAME
+OBSERVATION AREA
+CPT´S QUARTERS
+BARRACKS
+CRYOSLEEP PODS ELEVATOR
+ESCAPE POD
+RADIOACTIVE
+  
+ENVIRONMENT ON THE CRONUS
+COLD: When the PCs arrive, the interior of the 
+Cronus is in a deep freeze. If the PCs open 
+their suits before the life support systems 
+are brought online by MU/TH/UR 2000 (see 
+Events), they will become Freezing and need 
+to make STAMINA rolls against the cold once 
+per Turn.
+DARK: Until MU/TH/UR 2000 comes online, 
+the interior is lit only by weak emergency 
+lights (all zones on the ship count as dark, 
+see page 83 of the core rulebook).
+AIR: In addition, the air in the Cronus is stale 
+with a high concentration of carbon dioxide. 
+All STAMINA rolls are at –2 until the air scrub-
+bers have been fixed (see page 20).
+GRAVITY: The artificial gravity on board still 
+works.
+ 21
+CHARIOT OF THE GODS
+===== PAGE 8 =====
+BRIDGE: Until power is restored, the bridge is on 
+battery reserve and is otherwise shut down; only 
+faint standby illumination gives off an eerie orange 
+glow. The blast shutters are still lowered, shut tight 
+around the viewports. There is soot on the ceiling 
+and several of the stations are burned out.
+ T COMMAND STATION: Once power is up, the com-
+mand station works like a charm. Located under 
+a flip-up access panel on one of the treadmill 
+arms of the captain’s station is a small compart-
+ment that houses MU/TH/UR 2000’s emergency 
+access key. The glass panel that it typically lies 
+behind is shattered, the key missing. The cap-
+tain’s station monitors all relevant “at a glance” 
+information from other consoles. If the PCs 
+access the command station and make a COM-
+TECH roll, they can find information on where the 
+Cronus has been: on a distant, uncharted planet 
+in the 26 Draconis system.
+ T HOLOGRAPHIC DISPLAY TABLE: This station was 
+once state-of-the-art hologram technology, 
+but it’s now slagged, burnt out by a fire on the 
+bridge. It is damaged beyond repair.
+ T SENSOR STATION: This station was also damaged 
+by the fire but can be repaired to working order 
+with a Shift of work and a COMTECH roll. The dam-
+aged sensors sporadically pick up a sensor ghost 
+(see the Sensor Ghost Redux event).
+ T LIFE SUPPORT MONITORS: When power is 
+restored to this station, the monitors flash 
+red. The carbon dioxide content in the ship’s 
+recycled air is high—maintenance must be per-
+formed on the air scrubbers. The carbon filters 
+in the Oxygen Generation System must be re-
+placed (see page 20). If a PC manages to talk 
+to MU/TH/UR before power to this terminal is 
+restored, she shares the same information.
+ T PILOT STATIONS: Someone has taken an axe to 
+Station 1, and in fact has left it embedded in the 
+console. While it looks untouched, Station 2 is 
+also dead—something that is not evident until 
+power is restored. It’s possible to open up some 
+of the deck plating and try to reconnect power 
+(requires one Shift of work and a successful HEAVY 
+MACHINERY roll), but an easier solution would be to 
+cannibalize Station 2’s parts to reactivate Station 
+1 (also one Shift of work, but a COMTECH roll at +2). 
+Only one pilot station is needed to fly the ship.
+ARMORY: Stripped almost bare, this room 
+has a single Armat M41A Pulse Rifle with 
+one reload left in it. A case of shotgun shells 
+(one reload left) lies on the floor. Aside from 
+a splatter of dried milky-white spray on the 
+wall, the room is clean. The spray is syn-
+thetic blood. It was left there by Ava from 
+an encounter she had with an Abomination 
+many years earlier. There is no danger in this 
+room.
+JUNCTION B-1: The ladder is undamaged 
+and all doors at this junction work.
+VESTIBULES: Adjacent to Junction B-1 are 
+two bays for class A individual escape pods 
+embedded in the outer hull wall. All of the pods 
+are missing (the only escape pod still remaining 
+is in Clayton’s corporate suite, below.) If the PCs 
+are tense and power has yet to be restored, they 
+might mistake the two bulky, empty, red-armored 
+EVA suits (equivalent to Eco All-Worlds Survival 
+Suits, see page 128 of the core rulebook) standing 
+in the shadows for lurking stalkers. Opening fire 
+here is a bad idea, as it could compromise the hull.
+AIRLOCK
+LADDER ACCESS
+RESTRICTED AREA
+VACC SUIT STORAGE
+MED KIT STORAGE
+WORKSHOP/ENGINEERING
+INTERCOM
+ACCESS TERMINAL POWER SYSTEM
+WEAPON SYSTEM
+MEDLAB
+MAINFRAME
+OBSERVATION AREA
+CPT´S QUARTERS
+BARRACKS
+CRYOSLEEP PODS ELEVATOR
+ESCAPE POD
+RADIOACTIVE
+AIRLOCK
+LADDER ACCESS
+RESTRICTED AREA
+VACC SUIT STORAGE
+MED KIT STORAGE
+WORKSHOP/ENGINEERING
+INTERCOM
+ACCESS TERMINAL POWER SYSTEM
+WEAPON SYSTEM
+MEDLAB
+MAINFRAME
+OBSERVATION AREA
+CPT´S QUARTERS
+BARRACKS
+CRYOSLEEP PODS ELEVATOR
+ESCAPE POD
+RADIOACTIVE
+AIRLOCK
+LADDER ACCESS
+RESTRICTED AREA
+VACC SUIT STORAGE
+MED KIT STORAGE
+WORKSHOP/ENGINEERING
+INTERCOM
+ACCESS TERMINAL POWER SYSTEM
+WEAPON SYSTEM
+MEDLAB
+MAINFRAME
+OBSERVATION AREA
+CPT´S QUARTERS
+BARRACKS
+CRYOSLEEP PODS ELEVATOR
+ESCAPE POD
+RADIOACTIVE
+AIRLOCK
+LADDER ACCESS
+RESTRICTED AREA
+VACC SUIT STORAGE
+MED KIT STORAGE
+WORKSHOP/ENGINEERING
+INTERCOM
+ACCESS TERMINAL POWER SYSTEM
+WEAPON SYSTEM
+MEDLAB
+MAINFRAME
+OBSERVATION AREA
+CPT´S QUARTERS
+BARRACKS
+CRYOSLEEP PODS ELEVATOR
+ESCAPE POD
+RADIOACTIVE
+AIRLOCK
+LADDER ACCESS
+RESTRICTED AREA
+VACC SUIT STORAGE
+MED KIT STORAGE
+WORKSHOP/ENGINEERING
+INTERCOM
+ACCESS TERMINAL POWER SYSTEM
+WEAPON SYSTEM
+MEDLAB
+MAINFRAME
+OBSERVATION AREA
+CPT´S QUARTERS
+BARRACKS
+CRYOSLEEP PODS ELEVATOR
+ESCAPE POD
+RADIOACTIVE
+22  
+SCENARIO
+B
+deck
+MAIN DECK
+
+===== PAGE 9 =====
+CREW QUARTERS: All of these rooms are 
+either locked tight, ransacked, or smell like 
+death. Random personal items of worth can 
+be found in them, but the Cronus crew won’t 
+be pleased if they discover the PCs have been 
+looting their possessions.
+  
+DOORS ON THE CRONUS
+All doors on the Cronus can be opened by the push 
+of a button, unless stated otherwise in the room de-
+scriptions. Some doors can only be opened by MU/
+TH/UR 2000 or by using an encrypted key card—
+Wilson and Clayton carry one each, and one can be 
+found in Science Lab 1, dropped by Ava.
+DECOMPRESSION: The outer hull of the Cronus has 
+Armor Rating 6. Shots that miss the target in a 
+compartment next to an exterior bulkhead risk 
+rupturing the hull and causing explosive decom-
+pression (see page 107 of the core rulebook). If 
+this occurs, all doors and vents to the compart-
+ment are automatically and permanently sealed 
+after one Round.
+AIRLOCK
+LADDER ACCESS
+RESTRICTED AREA
+VACC SUIT STORAGE
+MED KIT STORAGE
+WORKSHOP/ENGINEERING
+INTERCOM
+ACCESS TERMINAL POWER SYSTEM
+WEAPON SYSTEM
+MEDLAB
+MAINFRAME
+OBSERVATION AREA
+CPT´S QUARTERS
+BARRACKS
+CRYOSLEEP PODS ELEVATOR
+ESCAPE POD
+RADIOACTIVE
+AIRLOCK
+LADDER ACCESS
+RESTRICTED AREA
+VACC SUIT STORAGE
+MED KIT STORAGE
+WORKSHOP/ENGINEERING
+INTERCOM
+ACCESS TERMINAL POWER SYSTEM
+WEAPON SYSTEM
+MEDLAB
+MAINFRAME
+OBSERVATION AREA
+CPT´S QUARTERS
+BARRACKS
+CRYOSLEEP PODS ELEVATOR
+ESCAPE POD
+RADIOACTIVE
+MESS HALL: Food stores were ravaged—it looks 
+like a pack of rabid raccoons have been through 
+here. Most of the exposed food stores are rotten 
+and covered in mold. Someone had been mak-
+ing origami animals out of metallic paper, setting 
+them up around the room. The origami animals 
+are a product of the android Ava’s deranged state. 
+While there is mold everywhere, none of it is of the 
+Neomorphic variety. The mess was scavenged and 
+ransacked by the Abominations long ago.
+CORPORATE SUITE: Clayton’s wardroom and 
+quarters, this spacious area was at one point lux-
+urious. The bed is soaked with blood, the couch 
+cushion stuffing is all torn out, and the furniture in 
+the room is destroyed.
+ T DRUGS: Under the mattress is a pack of illegal 
+stimulants that are to be injected into the ocular 
+cavity. Reduces STRESS LEVEL to zero. D6 doses.
+ T WALL SAFE: Built into the wall and only acces-
+sible via Clayton’s codes, the safe contains an 
+encrypted Modular Computing Device. This 
+cube contains all the data on the science mis-
+sion to LV-1113. There is also one million dol-
+lars-worth of rare cash bills. Without the code, 
+the safe needs to be cracked (requires a Shift 
+of work and a –3 COMTECH  roll), or the door 
+needs to be blown, requiring an explosion with 
+Blast Power of 12 or more—which damages the 
+cube and destroys most of the cash.
+ T WETBAR: The bar here was practically cleaved 
+in two. It is splintered and wrecked, as are 
+most of the bottles stored here. Only a few 
+bottles remain intact, scattered haphazardly 
+across the floor.
+ T WALK-IN CLOSET/ESCAPE POD: Anyone examining 
+this closet realizes that what appears to be a 
+walk-in closet door is in actuality the entry into 
+an EEV—the only one on the ship. It is func-
+tional, but can only be accessed with Clayton’s 
+codes. The escape pod has only three cryo-
+pods in it and it’s not FTL capable.
+AIRLOCK
+LADDER ACCESS
+RESTRICTED AREA
+VACC SUIT STORAGE
+MED KIT STORAGE
+WORKSHOP/ENGINEERING
+INTERCOM
+ACCESS TERMINAL POWER SYSTEM
+WEAPON SYSTEM
+MEDLAB
+MAINFRAME
+OBSERVATION AREA
+CPT´S QUARTERS
+BARRACKS
+CRYOSLEEP PODS ELEVATOR
+ESCAPE POD
+RADIOACTIVE
+AIRLOCK
+LADDER ACCESS
+RESTRICTED AREA
+VACC SUIT STORAGE
+MED KIT STORAGE
+WORKSHOP/ENGINEERING
+INTERCOM
+ACCESS TERMINAL POWER SYSTEM
+WEAPON SYSTEM
+MEDLAB
+MAINFRAME
+OBSERVATION AREA
+CPT´S QUARTERS
+BARRACKS
+CRYOSLEEP PODS ELEVATOR
+ESCAPE POD
+RADIOACTIVE
+ 23
+CHARIOT OF THE GODS
+===== PAGE 10 =====
+MED LAB: Within this room are two older-gener-
+ation Pauling Medpods (see page 136 of the core 
+rulebook). One has its plexiglass tube splintered 
+and shattered as if something broke out of it. The 
+other is sealed and lit from within, but the entire 
+inner surface of the plexiglass is covered in thick 
+dried blood. There is a row of large specimen jars. 
+Floating within two of them are two small alien 
+creatures (Bloodbursters, see page 292 of the 
+core rulebook).
+On a far shelf is a smaller specimen jar without 
+liquid, containing the same fungal nodes (Neo-
+morphic Egg Sacs) that can be found in various 
+areas of the ship. On the desk next to that is an 
+open metallic urn. Four organic-looking glass vials 
+are inside the urn—three of those are intact with 
+some kind of black liquid within them, while the 
+fourth is cracked open and empty.
+ T VIALS:  If a PC decides to take a vial with them, 
+they had best keep it in cold storage. If it starts 
+to sweat, it releases its contents and begins to 
+affect the PCs (see next page).
+ T THE CURE:  Under the desk is a medkit case 
+that contains six syringes full of the 26 Draco-
+nis Strain derivative, a “cure” for those infected 
+by Neomorphic Motes (see page 6).
+ T BLOODBURSTERS:  The two Bloodbursters 
+in the jars are indeed dead, but the PCs 
+don’t need to realize that at first. They were 
+surgically removed from their victims by 
+the medpods. Both those infected and the 
+embryonic Neomorphs were killed in the 
+process. The medpods were included on this 
+mission specifically for operating on and 
+removing parasitic organisms. 
+ T MOTES: If anyone disturbs the egg sac nodes 
+within the sealed jars, motes eject from 
+them and attempt to find a way out, even-
+tually settling down and dying from lack of 
+a host. However, if the container is broken 
+or opened in some way, the motes spread 
+throughout the ship. 
+ T MEDPOD:  The broken medpod works ( MEDICAL 
+AID +3), but any PC who uses it risks sepsis 
+because of the unsanitary environment (roll 
+for a disease with Virulence 6, see page 109 
+of the core rulebook). If a PC is morbidly 
+curious and opens the bloody medpod, they 
+find the remains of a Stage IV Abomination 
+within. Locked in the device to be vivisect-
+ed, the former crew member’s lower torso 
+has been dissected, and his soft elongated 
+skull has been opened and picked at. Data 
+gathered from the exploratory surgery can 
+be accessed using the medical computer at 
+the desk. While he appears dead, the de-
+cades-old Abomination has one last gasp in 
+him, which he uses to savagely attack the 
+closest PC. With its brain exposed, howev -
+er, the dreadful thing is easy enough to kill 
+(only 3 Health left and no Armor Rating).
+ T MEDS AND DRUGS:  Four personal medkits, 
+surgical instruments, and D6 doses each of 
+Neversleep Pills, Hydr8tion, and Naproleve 
+can all be found in the cabinets here.
+AIRLOCK
+LADDER ACCESS
+RESTRICTED AREA
+VACC SUIT STORAGE
+MED KIT STORAGE
+WORKSHOP/ENGINEERING
+INTERCOM
+ACCESS TERMINAL POWER SYSTEM
+WEAPON SYSTEM
+MEDLAB
+MAINFRAME
+OBSERVATION AREA
+CPT´S QUARTERS
+BARRACKS
+CRYOSLEEP PODS ELEVATOR
+ESCAPE POD
+RADIOACTIVE
+24  
+SCENARIO
+===== PAGE 11 =====
+SCIENCE LAB 1: The lights in this room 
+flicker, and the stench of decay is overwhelming. 
+There is a pile of gnawed bones in the room. 
+The main lab has an enclosed decontamination 
+area on the main examination table—and under 
+the de-con hood is a perfectly preserved metal-
+lic urn. A malfunctioning deep cold freezer with 
+a smashed glass door has four more of these 
+urns in it. An ooze has seeped out of them, 
+forming congealed pools on the floor. Strange, 
+black fungal nodes are growing on the urns and 
+in the pools. 
+ T BONES: A Medic or Scientist who examines 
+the bones realizes that they are not all 
+human. There are Neomorph and Abomina-
+tion bones mixed in as well. This room was 
+the nest of an adult Neomorph. If you use 
+the “Hunter and Prey” event, this Neo-
+morph is still around and could attack at 
+any time.
+ T URNS: These, of course, are the Engineer 
+Ampules that contain the black liquid 26 
+Draconis Strain of Agent A0-3959X.91–15. 
+Ingestion of the pure form of the agent has 
+fatal results (it counts as a Virulence 12 dis-
+ease). Each urn is a regular item in terms of 
+encumbrance.
+ T FUNGAL NODES:  These are in fact Neomor-
+phic Egg Sacs, ready to eject Motes and 
+infect any PC or NPC with exposed orific -
+es of any kind (see page 292 of the core 
+rulebook). A PC examining the room learns 
+that the nodes are underfoot throughout 
+the room, and difficult to avoid. Moving 
+through the room without disturbing the 
+egg sacs requires a MOBILITY  roll.
+ T KEY CARD: Sitting half-submerged in a pool 
+of black goo on the floor is the emergency 
+key card access to the MU/TH/UR mainframe 
+room on the Cronus—dropped here by Ava 
+during a scuffle with the Neomorphs. The key 
+card is a Tiny item.
+SCIENCE LAB 2: This is a charred shell of 
+a room—whatever happened here, the crew 
+ended it real quick with the liberal use of an in-
+cinerator or two. There’s the burnt-out, partial 
+remains of a drum of some kind in the room, 
+and a body buried in the debris, its arms shriv -
+eled up and clutching at its chest. The stale air 
+is thick with the smell of burnt rubber, plastic, 
+and flesh.
+There is nothing worthwhile in here—save 
+for the discovery that the body is not quite 
+human. It is the remains of a Stage IV Abomi-
+nation, its gelatinous cowl boiled away and its 
+features obscured by charring. The one give-
+away that it is something inhuman is the length 
+of its forearms, something any Scientist can 
+confirm using the ANALYZE talent. The drum was 
+previously filled with quinitricetyline from Deck 
+C (below).
+JUNCTION B-2: This junction works fine and 
+allows access from Decks A-C as well as the venti-
+lation and maintenance shafts.
+AIRLOCK
+LADDER ACCESS
+RESTRICTED AREA
+VACC SUIT STORAGE
+MED KIT STORAGE
+WORKSHOP/ENGINEERING
+INTERCOM
+ACCESS TERMINAL POWER SYSTEM
+WEAPON SYSTEM
+MEDLAB
+MAINFRAME
+OBSERVATION AREA
+CPT´S QUARTERS
+BARRACKS
+CRYOSLEEP PODS ELEVATOR
+ESCAPE POD
+RADIOACTIVE
+AIRLOCK
+LADDER ACCESS
+RESTRICTED AREA
+VACC SUIT STORAGE
+MED KIT STORAGE
+WORKSHOP/ENGINEERING
+INTERCOM
+ACCESS TERMINAL POWER SYSTEM
+WEAPON SYSTEM
+MEDLAB
+MAINFRAME
+OBSERVATION AREA
+CPT´S QUARTERS
+BARRACKS
+CRYOSLEEP PODS ELEVATOR
+ESCAPE POD
+RADIOACTIVE
+AIRLOCK
+LADDER ACCESS
+RESTRICTED AREA
+VACC SUIT STORAGE
+MED KIT STORAGE
+WORKSHOP/ENGINEERING
+INTERCOM
+ACCESS TERMINAL POWER SYSTEM
+WEAPON SYSTEM
+MEDLAB
+MAINFRAME
+OBSERVATION AREA
+CPT´S QUARTERS
+BARRACKS
+CRYOSLEEP PODS ELEVATOR
+ESCAPE POD
+RADIOACTIVE
+AIRLOCK
+LADDER ACCESS
+RESTRICTED AREA
+VACC SUIT STORAGE
+MED KIT STORAGE
+WORKSHOP/ENGINEERING
+INTERCOM
+ACCESS TERMINAL POWER SYSTEM
+WEAPON SYSTEM
+MEDLAB
+MAINFRAME
+OBSERVATION AREA
+CPT´S QUARTERS
+BARRACKS
+CRYOSLEEP PODS ELEVATOR
+ESCAPE POD
+RADIOACTIVE
+ 25
+CHARIOT OF THE GODS
+===== PAGE 12 =====
+c
+deck
+CARGO DECK
+JUNCTION C-1: Junction 1 begins at 
+the main airlock and terminates here. The 
+external airlock door is sabotaged, but the 
+internal doors work fine. The Cronus has an 
+external elevator attached to this airlock, 
+similar to the one on the Nostromo. It lowers 
+a crew to the surface of a planet if they 
+choose not to use the vehicle bay. Currently, 
+it is out of order.
+STORAGE UNITS: These units contain 
+various ship supplies and tools, in addition to 
+the following: 
+ T STERILIZATION PROTOCOL: One of them 
+contains seven drums of the highly unsta-
+ble napalm like chemical quinitricetyline, 
+brought along in case things got out of 
+hand on LV-1113. Lighting up a drum of 
+quinitricetyline (one item) will trigger an 
+explosion with Blast Power 12, followed by 
+an Intensity 12 fire.
+ T CLAYTON’S SECRET STASH: This unit requires 
+a code to gain access to it, and is full of 
+two dozen Engineer urns taken from LV-
+1113, each containing four vials of Agent 
+A0-3959X.91-15.
+ T TOOLS: Two bolt guns, a cutting torch, 
+and a maintenance jack can also be found 
+here. See Chapter 6 for more on these.
+CARGO BAYS: These cargo maws are pitch 
+black inside and even restoring the power will 
+not activate their lights. Inside, the rattling of 
+chains can be heard, likely pulled slack from 
+holding cargo crates in place. A winch in each 
+room pulls the chains tight and secures the 
+cargo safely.
+ T Bay 1 is filled with food stores that are un-
+touched.
+ T Bay 2 is mostly empty save for spare RV 
+tires.
+CATWALK: The catwalk overlooks the vehi-
+cle bay. A crane on ceiling tracks loads cargo 
+to and from the vehicle bay and the cargo 
+deck. Aside from directly in front of the cargo 
+bay doors, the catwalk has a railing on either 
+side, and the only way to reach the Technical 
+section from this deck is to cross it.
+CARGO OFFICE: The cargo crane is 
+operated from this room. It has a viewport 
+overlooking the vehicle bay.
+JUNCTION C-2: Another relatively safe 
+junction with functioning doors. Nothing to 
+see here.
+COOLANT TANKS: These help keep the 
+engines from overloading. If sabotaged, the reac-
+tor begins building to critical mass—but it would 
+take something very drastic and inventive to de-
+stroy the ship in this way. They aren’t accessible 
+except via service tunnels.
+AIRLOCK
+LADDER ACCESS
+RESTRICTED AREA
+VACC SUIT STORAGE
+MED KIT STORAGE
+WORKSHOP/ENGINEERING
+INTERCOM
+ACCESS TERMINAL POWER SYSTEM
+WEAPON SYSTEM
+MEDLAB
+MAINFRAME
+OBSERVATION AREA
+CPT´S QUARTERS
+BARRACKS
+CRYOSLEEP PODS ELEVATOR
+ESCAPE POD
+RADIOACTIVE
+AIRLOCK
+LADDER ACCESS
+RESTRICTED AREA
+VACC SUIT STORAGE
+MED KIT STORAGE
+WORKSHOP/ENGINEERING
+INTERCOM
+ACCESS TERMINAL POWER SYSTEM
+WEAPON SYSTEM
+MEDLAB
+MAINFRAME
+OBSERVATION AREA
+CPT´S QUARTERS
+BARRACKS
+CRYOSLEEP PODS ELEVATOR
+ESCAPE POD
+RADIOACTIVE
+AIRLOCK
+LADDER ACCESS
+RESTRICTED AREA
+VACC SUIT STORAGE
+MED KIT STORAGE
+WORKSHOP/ENGINEERING
+INTERCOM
+ACCESS TERMINAL POWER SYSTEM
+WEAPON SYSTEM
+MEDLAB
+MAINFRAME
+OBSERVATION AREA
+CPT´S QUARTERS
+BARRACKS
+CRYOSLEEP PODS ELEVATOR
+ESCAPE POD
+RADIOACTIVE
+AIRLOCK
+LADDER ACCESS
+RESTRICTED AREA
+VACC SUIT STORAGE
+MED KIT STORAGE
+WORKSHOP/ENGINEERING
+INTERCOM
+ACCESS TERMINAL POWER SYSTEM
+WEAPON SYSTEM
+MEDLAB
+MAINFRAME
+OBSERVATION AREA
+CPT´S QUARTERS
+BARRACKS
+CRYOSLEEP PODS ELEVATOR
+ESCAPE POD
+RADIOACTIVE
+AIRLOCK
+LADDER ACCESS
+RESTRICTED AREA
+VACC SUIT STORAGE
+MED KIT STORAGE
+WORKSHOP/ENGINEERING
+INTERCOM
+ACCESS TERMINAL POWER SYSTEM
+WEAPON SYSTEM
+MEDLAB
+MAINFRAME
+OBSERVATION AREA
+CPT´S QUARTERS
+BARRACKS
+CRYOSLEEP PODS ELEVATOR
+ESCAPE POD
+RADIOACTIVE
+AIRLOCK
+LADDER ACCESS
+RESTRICTED AREA
+VACC SUIT STORAGE
+MED KIT STORAGE
+WORKSHOP/ENGINEERING
+INTERCOM
+ACCESS TERMINAL POWER SYSTEM
+WEAPON SYSTEM
+MEDLAB
+MAINFRAME
+OBSERVATION AREA
+CPT´S QUARTERS
+BARRACKS
+CRYOSLEEP PODS ELEVATOR
+ESCAPE POD
+RADIOACTIVE
+AIRLOCK
+LADDER ACCESS
+RESTRICTED AREA
+VACC SUIT STORAGE
+MED KIT STORAGE
+WORKSHOP/ENGINEERING
+INTERCOM
+ACCESS TERMINAL POWER SYSTEM
+WEAPON SYSTEM
+MEDLAB
+MAINFRAME
+OBSERVATION AREA
+CPT´S QUARTERS
+BARRACKS
+CRYOSLEEP PODS ELEVATOR
+ESCAPE POD
+RADIOACTIVE
+26  
+SCENARIO
+===== PAGE 13 =====
+REACTOR RELAY AND CONTROL: The 
+only lighting here comes from an open ac -
+cess port on the reactor relay. It glows a dull, 
+pale blue, casting long and deep shadows. 
+Something tore up the furniture and loose 
+equipment to build a bizarre nest here. In the 
+pile of debris near the reactor lies a crum-
+pled-up spacesuit—its filthy helmet is mostly 
+fogged and the tattered suit looks like it was 
+set on fire at one point.
+ T CLEANING UP: There is some kind of yel-
+low-white resin covering most of the reac -
+tion chamber, and it needs to be removed 
+in order to bring the engines on line. While 
+cleaning up the control room restores the 
+reactor relay (no roll needed), repairs still 
+need to be made on the outside of the ship 
+to reconnect the relay to the four fission 
+engines themselves ( HEAVY MACHINERY  roll and 
+three Turns of work). The power generat-
+ed by the ship’s four engine pods channels 
+through the main relay here before being 
+distributed to the rest of the ship.
+ T THE ABOMINATION: The yellow-white residue is 
+dried Neomorph blood. The “spacesuit” is actu-
+ally a Stage IV Abomination, sitting contorted 
+with its limbs folded up over its torso. The “hel-
+met” is, in fact, its bulbous head. It has been 
+holed up and hibernating here for decades, 
+huddled by the reactor. The Abomination is 
+passive (see page 85 of the core rulebook) and 
+if the PCs move quietly in here (MOBILITY roll), 
+they can avoid waking the Abomination up. If 
+they start cleaning the room, they awaken it 
+immediately. If the PCs flee, the Abomination 
+starts stalking them on the ship.
+ T RADIATION: Due to reactor leaks, the entire 
+room is covered by strong radiation (1 Rad 
+per Turn, see page 110 of the core rulebook). 
+Firing weapons in the reactor room is dan-
+gerous—it can cause a critical build up in 
+the engines. For any shot with a firearm in 
+here that misses its target, roll a Stress Die. 
+A roll of  causes critical damage to the 
+reactor relay and triggers the total destruc -
+tion of the Cronus after ten minutes (Mother 
+starts counting down). The damage can be 
+repaired with a Turn of work and a HEAVY 
+MACHINERY  roll.
+ T SELF-DESTRUCT: The ship’s emergency de-
+struct system—which involves shutting off 
+the cooling unit so that the reactor builds 
+towards critical mass—is also located in this 
+room. Once activated (with a COMTECH  roll 
+and a Turn of work), the reactor begins a 
+ten-minute countdown to overload. Stop-
+ping the countdown requires another COM-
+TECH roll, but can be done in a single Round. 
+After five minutes (another Turn), the pro-
+cess is irreversible.
+AIRLOCK
+LADDER ACCESS
+RESTRICTED AREA
+VACC SUIT STORAGE
+MED KIT STORAGE
+WORKSHOP/ENGINEERING
+INTERCOM
+ACCESS TERMINAL POWER SYSTEM
+WEAPON SYSTEM
+MEDLAB
+MAINFRAME
+OBSERVATION AREA
+CPT´S QUARTERS
+BARRACKS
+CRYOSLEEP PODS ELEVATOR
+ESCAPE POD
+RADIOACTIVE
+AIRLOCK
+LADDER ACCESS
+RESTRICTED AREA
+VACC SUIT STORAGE
+MED KIT STORAGE
+WORKSHOP/ENGINEERING
+INTERCOM
+ACCESS TERMINAL POWER SYSTEM
+WEAPON SYSTEM
+MEDLAB
+MAINFRAME
+OBSERVATION AREA
+CPT´S QUARTERS
+BARRACKS
+CRYOSLEEP PODS ELEVATOR
+ESCAPE POD
+RADIOACTIVE
+AIRLOCK
+LADDER ACCESS
+RESTRICTED AREA
+VACC SUIT STORAGE
+MED KIT STORAGE
+WORKSHOP/ENGINEERING
+INTERCOM
+ACCESS TERMINAL POWER SYSTEM
+WEAPON SYSTEM
+MEDLAB
+MAINFRAME
+OBSERVATION AREA
+CPT´S QUARTERS
+BARRACKS
+CRYOSLEEP PODS ELEVATOR
+ESCAPE POD
+RADIOACTIVE
+ 27
+CHARIOT OF THE GODS
