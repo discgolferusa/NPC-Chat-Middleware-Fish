@@ -297,6 +297,18 @@ THE INSURGENT COMPOUND
     assert "Fort Nebraska" in names
     assert "Spaceport" in names
     assert "Oblivion Bar" in names
+    # Map labels must not become the campaign title/id before the Destroyer fallback.
+    assert result["campaign"]["name"] == "Destroyer of Worlds"
+    assert result["campaign"]["campaign_id"] == "destroyer_of_worlds"
+
+
+def test_guess_campaign_title_skips_leading_moonside_map_labels():
+    text = "FORT NEBRASKA\nSPACEPORT\nARIARCUS\nMOONSIDE LOCATIONS\nTHE GATE: A fence\n"
+    assert content_import._guess_campaign_title(text) == "Destroyer of Worlds"
+    assert (
+        content_import._guess_campaign_title("FORT NEBRASKA\nSPACEPORT\nARIARCUS COLONY\n")
+        == "Destroyer of Worlds"
+    )
 
 
 def test_destroyer_colon_rooms_harvest_under_spaceport():
@@ -729,7 +741,7 @@ def test_truncate_preserving_npc_section_keeps_document_head_for_title():
     assert "CHARIOT OF THE GODS" in trimmed
     assert "USCSS Cronus" in trimmed
     assert "FULL NAME: Albert Johns" in trimmed
-    assert content_import._guess_campaign_title(trimmed) == "Chariot Of The Gods"
+    assert content_import._guess_campaign_title(trimmed) == "Chariot of the Gods"
     prepared = content_import._prepare_outline_document_text(trimmed, [])
     assert "CHARIOT OF THE GODS" in prepared
     assert "Albert Johns" in prepared

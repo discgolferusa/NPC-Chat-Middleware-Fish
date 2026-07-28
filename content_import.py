@@ -939,16 +939,38 @@ def _guess_campaign_title(text: str) -> str | None:
     # Doctor Who / Cubicle 7 style titles often arrive letter-spaced: "Cat s Ey E".
     if re.search(r"(?i)c\s*a\s*t\s*['’]?\s*s\s*e\s*y\s*e", head):
         return "Cat's Eye"
-    # Prefer an explicit scenario title near the top of the extract.
-    for pattern in (
-        r"(?is)\b(DESTROYER\s+OF\s+THE\s+WORLDS|DESTROYER\s+OF\s+WORLDS)\b",
-        r"(?is)\b(CHARIOT\s+OF\s+THE\s+GODS)\b",
-        r"(?is)\b(CAT'?S\s+EYE)\b",
-        r"(?m)^\s*([A-Z0-9][A-Z0-9' \-]{2,48})\s*$",
+
+    # Named scenario titles before any generic ALL-CAPS line match — moonside
+    # extracts open with map labels (FORT NEBRASKA, SPACEPORT, ARIARCUS) that
+    # would otherwise become the campaign title/id.
+    for pattern, title in (
+        (r"(?is)\bDESTROYER\s+OF\s+(?:THE\s+)?WORLDS\b", "Destroyer of Worlds"),
+        (r"(?is)\bCHARIOT\s+OF\s+THE\s+GODS\b", "Chariot of the Gods"),
+        (r"(?is)\bCAT'?S\s+EYE\b", "Cat's Eye"),
     ):
+        if re.search(pattern, collapsed_head) or re.search(pattern, full_scan):
+            return title
+        if "CAT" in pattern and re.search(pattern, head, flags=re.IGNORECASE):
+            return title
+
+    if _MOONSIDE_LOCATIONS_HEADER.search(full_scan) or re.search(
+        r"\bariarcus\b", full_scan, re.IGNORECASE
+    ):
+        return "Destroyer of Worlds"
+
+    skip_titles = {
+        "scenario",
+        "contents",
+        "introduction",
+        "non-player characters",
+        "credits",
+        "moonside locations",
+        "ariarcus",
+        "ariarcus colony",
+        *(name.casefold() for _, name, _ in _ALIEN_MAJOR_SITE_PATTERNS),
+    }
+    for pattern in (r"(?m)^\s*([A-Z0-9][A-Z0-9' \-]{2,48})\s*$",):
         match = re.search(pattern, collapsed_head) or re.search(pattern, full_scan)
-        if not match:
-            match = re.search(pattern, head, flags=re.IGNORECASE) if "CAT" in pattern else None
         if not match:
             continue
         title = re.sub(r"\s+", " ", match.group(1)).strip(" :-")
@@ -957,28 +979,12 @@ def _guess_campaign_title(text: str) -> str | None:
         words = title.split()
         if len(words) > 8:
             continue
-        if title.casefold() in {
-            "scenario",
-            "contents",
-            "introduction",
-            "non-player characters",
-            "credits",
-            "moonside locations",
-            "ariarcus colony",
-        }:
+        if title.casefold() in skip_titles:
             continue
-        if "destroyer" in title.casefold() and "world" in title.casefold():
-            return "Destroyer of Worlds"
-        if "cat" in title.casefold() and "eye" in title.casefold():
-            return "Cat's Eye"
         if title.isupper() and len(words) >= 2:
             return title.title()
         if title.isupper() and len(words) == 1 and len(title) >= 4:
             return title.title()
-    if _MOONSIDE_LOCATIONS_HEADER.search(full_scan) or re.search(
-        r"\bariarcus\b", full_scan, re.IGNORECASE
-    ):
-        return "Destroyer of Worlds"
     return None
 
 
