@@ -248,15 +248,7 @@ def test_destroyer_moonside_seeds_major_location_sites(monkeypatch):
     assert content_import._document_has_recoverable_location_sites(text)
 
     def fake_call_llm_json(*args, **kwargs):
-        return {
-            "campaign": {
-                "campaign_id": "destroyer_of_worlds",
-                "name": "Destroyer of Worlds",
-                "description": "Ariarcus under siege.",
-            },
-            "locations": [],
-            "npcs": [],
-        }
+        raise AssertionError("locations-chapter outline must skip the LLM")
 
     monkeypatch.setattr(content_import, "_call_llm_json", fake_call_llm_json)
     result = content_import.outline_campaign_document(text, "create_new")
@@ -276,6 +268,47 @@ def test_destroyer_moonside_seeds_major_location_sites(monkeypatch):
     assert "The Gate" not in names
     assert "Landing Pad A" not in names
     assert any("moonside" in w.lower() or "location site" in w.lower() for w in result["warnings"])
+    assert any("skipping llm outline" in w.lower() for w in result["warnings"])
+    assert "destroyer" in str(result["campaign"].get("name") or "").casefold()
+
+
+def test_destroyer_moonside_map_labels_seed_without_colon_rooms(monkeypatch):
+    """Major sites must still seed when PLACE: room lines are missing from the extract."""
+    text = """
+MOONSIDE LOCATIONS
+
+ARIARCUS COLONY
+FORT NEBRASKA
+SAN ROCCO MEDICAL FACILITY
+MARSHAL STATION
+OBLIVION BAR
+SPACEPORT
+OIL REFINERY
+THE INSURGENT COMPOUND
+"""
+    assert content_import._document_has_recoverable_location_sites(text)
+    monkeypatch.setattr(
+        content_import,
+        "_call_llm_json",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("no LLM")),
+    )
+    result = content_import.outline_campaign_document(text, "create_new")
+    names = {loc["name"] for loc in result["locations"]}
+    assert "Fort Nebraska" in names
+    assert "Spaceport" in names
+    assert "Oblivion Bar" in names
+    # Map labels must not become the campaign title/id before the Destroyer fallback.
+    assert result["campaign"]["name"] == "Destroyer of Worlds"
+    assert result["campaign"]["campaign_id"] == "destroyer_of_worlds"
+
+
+def test_guess_campaign_title_skips_leading_moonside_map_labels():
+    text = "FORT NEBRASKA\nSPACEPORT\nARIARCUS\nMOONSIDE LOCATIONS\nTHE GATE: A fence\n"
+    assert content_import._guess_campaign_title(text) == "Destroyer of Worlds"
+    assert (
+        content_import._guess_campaign_title("FORT NEBRASKA\nSPACEPORT\nARIARCUS COLONY\n")
+        == "Destroyer of Worlds"
+    )
 
 
 def test_destroyer_colon_rooms_harvest_under_spaceport():
@@ -708,7 +741,7 @@ def test_truncate_preserving_npc_section_keeps_document_head_for_title():
     assert "CHARIOT OF THE GODS" in trimmed
     assert "USCSS Cronus" in trimmed
     assert "FULL NAME: Albert Johns" in trimmed
-    assert content_import._guess_campaign_title(trimmed) == "Chariot Of The Gods"
+    assert content_import._guess_campaign_title(trimmed) == "Chariot of the Gods"
     prepared = content_import._prepare_outline_document_text(trimmed, [])
     assert "CHARIOT OF THE GODS" in prepared
     assert "Albert Johns" in prepared
