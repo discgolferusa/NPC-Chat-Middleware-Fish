@@ -761,6 +761,9 @@ def _truncate_preserving_npc_section(text: str, max_chars: int) -> str:
     """Shrink long documents but keep the NON-PLAYER CHARACTERS section when present.
 
     Must not exceed ``max_chars`` — that budget is the Groq/local outline limit.
+    Leftover budget keeps leading document text (titles, locations) from the
+    original extract head — not the bounded pre-header window, which often holds
+    TOC/sidebar false-positive names.
     """
     if len(text) <= max_chars:
         return text
@@ -768,16 +771,37 @@ def _truncate_preserving_npc_section(text: str, max_chars: int) -> str:
     sliced = _bounded_text_for_npc_operations(text, max_chars)
     collapsed = _collapse_spaced_caps(sliced)
     span = _find_npc_section_span(collapsed)
-    if span is not None:
-        start, end = span
-        section = collapsed[start:end].strip()
-        if len(section) >= max_chars:
-            return section[:max_chars]
-        return section
+    if span is None:
+        if len(collapsed) <= max_chars:
+            return collapsed
+        return collapsed[:max_chars]
 
-    if len(collapsed) <= max_chars:
-        return collapsed
-    return collapsed[:max_chars]
+    start, end = span
+    section = collapsed[start:end].strip()
+    separator = "\n\n--- NON-PLAYER CHARACTERS (priority excerpt) ---\n\n"
+    # Always reserve some head room for titles/locations, even when the NPC
+    # span has no hard end and would otherwise consume the whole budget.
+    head_reserve = min(2500, max(0, max_chars // 4))
+    section_budget = max(max_chars - head_reserve - len(separator), max_chars // 2)
+    if len(section) > section_budget:
+        section = section[:section_budget]
+
+    intro_budget = max_chars - len(section) - len(separator)
+    if intro_budget <= 0:
+        return section[:max_chars]
+
+    # Prefer the original document head for titles/location context.
+    header_off = _find_best_npc_section_header_offset(text)
+    head_end = header_off if header_off is not None else len(text)
+    # Collapse only the head window needed for the intro budget.
+    head_window = text[: min(head_end, intro_budget + 4000)]
+    head_source = _collapse_spaced_caps(head_window)
+    head_span = _find_npc_section_span(head_source)
+    if head_span is not None:
+        head_source = head_source[: head_span[0]]
+    intro = head_source[:intro_budget].strip()
+    combined = f"{intro}{separator}{section}" if intro else section
+    return combined[:max_chars]
 
 
 def _document_has_recoverable_stat_blocks(text: str) -> bool:

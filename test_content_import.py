@@ -537,6 +537,42 @@ def test_truncate_preserving_npc_section_keeps_stat_blocks():
     assert "FULL NAME: Micky Horton" in trimmed
     assert "Captain Miller" not in trimmed
 
+
+def test_truncate_preserving_npc_section_keeps_document_head_for_title():
+    """Leftover budget must keep the document head so title/location callers still work."""
+    head = (
+        "CHARIOT OF THE GODS\n"
+        "A scenario for ALIEN RPG\n"
+        "USCSS Cronus is the primary location.\n"
+    )
+    filler = "Z" * 70_000
+    npc = (
+        "NON-PLAYER\n"
+        "CHARACTERS\n"
+        "JOHNS, OFFICER\n"
+        "FULL NAME: Albert Johns\n"
+        "PERSONALITY: Submissive\n"
+        "REID, COLONIAL MARINE\n"
+        "FULL NAME: Valerie Reid\n"
+        "PERSONALITY: On Edge\n"
+        "FLYNN, MEDIC\n"
+        "FULL NAME: Liam Flynn\n"
+        "PERSONALITY: Fearful\n"
+    )
+    # Mid-document NPC section with oversized post-header tail (no hard end).
+    tail = "T" * 70_000
+    text = f"{head}\n{filler}\n{npc}\n{tail}"
+    max_chars = 12_000
+    trimmed = content_import._truncate_preserving_npc_section(text, max_chars)
+    assert len(trimmed) <= max_chars
+    assert "CHARIOT OF THE GODS" in trimmed
+    assert "USCSS Cronus" in trimmed
+    assert "FULL NAME: Albert Johns" in trimmed
+    assert content_import._guess_campaign_title(trimmed) == "Chariot Of The Gods"
+    prepared = content_import._prepare_outline_document_text(trimmed, [])
+    assert "CHARIOT OF THE GODS" in prepared
+    assert "Albert Johns" in prepared
+
 def test_chariot_regression_replaces_movie_quote_outline_npcs(monkeypatch):
     """LLM outline picked Miller / David 8 / Vickers; stat blocks should win."""
     text = _load_chariot_fixture()
