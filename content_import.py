@@ -47,6 +47,7 @@ MAX_LOCATIONS_PER_BATCH = 1
 MAX_NPCS_PER_BATCH = 1
 IMPORT_TEMPERATURE = 0.15
 IMPORT_MAX_TOKENS = 6144
+OUTLINE_MAX_TOKENS = 2048
 # NPCNarrator writeups put the name in a header, then many blocks after it.
 # Bias the window forward so Knows/Hides/Memory/Finale are kept.
 EXCERPT_WINDOW_BEFORE = 400
@@ -62,6 +63,10 @@ _EXCERPT_STOPWORDS = frozenset(
 # Published module headers (PDFs often space letters: N O N - P L A Y E R).
 _NPC_SECTION_PATTERN = re.compile(
     r"non\s*[- ]?\s*player[\s\n]+characters?",
+    re.IGNORECASE,
+)
+_TOC_NPC_HEADER_LINE = re.compile(
+    r"\.{2,}|\s+\d{1,4}\s*$",
     re.IGNORECASE,
 )
 _NPC_SECTION_END_PATTERN = re.compile(
@@ -249,16 +254,30 @@ def _collapse_spaced_caps(text: str) -> str:
     return "\n".join(lines)
 
 
-def _find_npc_section_span(collapsed_text: str) -> tuple[int, int] | None:
-    """Return [start, end) slice of the authoritative NPC section when present.
+def _npc_section_header_line(collapsed_text: str, match: re.Match[str]) -> str:
+    line_start = collapsed_text.rfind("\n", 0, match.start()) + 1
+    line_end = collapsed_text.find("\n", match.start())
+    if line_end < 0:
+        line_end = len(collapsed_text)
+    return collapsed_text[line_start:line_end].strip()
 
-    ``collapsed_text`` should already be passed through ``_collapse_spaced_caps``.
-    """
-    if not collapsed_text:
-        return None
-    match = _NPC_SECTION_PATTERN.search(collapsed_text)
-    if not match:
-        return None
+
+def _looks_like_toc_npc_section_hit(collapsed_text: str, match: re.Match[str]) -> bool:
+    """Docnet/PDFium TOCs often put 'Non-Player Characters ........ 12' before the real section."""
+    line = _npc_section_header_line(collapsed_text, match)
+    if not line:
+        return False
+    if _TOC_NPC_HEADER_LINE.search(line):
+        return True
+    if len(line) <= 48 and re.search(r"\bpage\s+\d+\b", line, re.IGNORECASE):
+        return True
+    return False
+
+
+def _npc_section_span_from_match(
+    collapsed_text: str,
+    match: re.Match[str],
+) -> tuple[int, int]:
     start = match.start()
     remainder = collapsed_text[match.end() :]
     end = len(collapsed_text)
@@ -269,8 +288,6 @@ def _find_npc_section_span(collapsed_text: str) -> tuple[int, int] | None:
         hard_end = match.end() + end_match.start()
         end = hard_end
 
-    # Only treat APPENDIX/INDEX/MAPS as section ends when the entire line is that
-    # header — not mid-sentence references like "Appendix I on page 38".
     for header_match in _NPC_SECTION_HEADER_END_PATTERN.finditer(remainder):
         abs_pos = match.end() + header_match.start()
         if abs_pos >= end:
@@ -280,31 +297,50 @@ def _find_npc_section_span(collapsed_text: str) -> tuple[int, int] | None:
         if line_end < 0:
             line_end = len(collapsed_text)
         line = collapsed_text[line_start:line_end].strip()
-        # Regex already requires a whole-line header; keep the length guard as a
-        # belt-and-suspenders check against odd whitespace collapses.
         if line and len(line) <= 40 and _NPC_SECTION_HEADER_END_PATTERN.match(line):
             end = min(end, line_start)
             break
 
     section = collapsed_text[start:end]
-    # PdfPig two-column glue can trip an early false end after the first NPC.
-    # If we see too few FULL NAME markers, extend only to the next *hard* end
-    # (deck plans / auxiliary vehicles). Never blow past a known hard boundary
-    # with a blind start+20_000 window — that swallows following chapters when
-    # a legitimate module simply has fewer than three FULL NAME rows.
     if len(_FULL_NAME_ANY.findall(section)) < 3:
         hard = _NPC_SECTION_END_PATTERN.search(collapsed_text, start)
         if hard is not None:
             hard_pos = hard.start()
             if hard_pos > end:
                 end = hard_pos
-            # else: already at/before the hard end — keep it
         elif hard_end is None:
-            # No hard boundary in the document; allow a bounded look-ahead only
-            # when we have not already locked onto deck-plans / auxiliary vehicles.
             end = min(len(collapsed_text), max(end, start + 20_000))
 
     return start, end
+
+
+def _find_npc_section_span(collapsed_text: str) -> tuple[int, int] | None:
+    """Return [start, end) slice of the authoritative NPC section when present.
+
+    ``collapsed_text`` should already be passed through ``_collapse_spaced_caps``.
+    """
+    if not collapsed_text:
+        return None
+
+    best_span: tuple[int, int] | None = None
+    best_full_names = -1
+    for match in _NPC_SECTION_PATTERN.finditer(collapsed_text):
+        if _looks_like_toc_npc_section_hit(collapsed_text, match):
+            continue
+        start, end = _npc_section_span_from_match(collapsed_text, match)
+        full_name_count = len(_FULL_NAME_ANY.findall(collapsed_text[start:end]))
+        if full_name_count > best_full_names:
+            best_full_names = full_name_count
+            best_span = (start, end)
+
+    if best_span is not None and best_full_names > 0:
+        return best_span
+
+    # Fallback: first header even if it looked TOC-like (unusual layouts).
+    match = _NPC_SECTION_PATTERN.search(collapsed_text)
+    if not match:
+        return None
+    return _npc_section_span_from_match(collapsed_text, match)
 
 
 def _iter_stat_block_headings(line: str) -> list[tuple[str, str]]:
@@ -3630,7 +3666,7 @@ def _call_llm_json(
     raw = generate_llm_response(
         messages,
         purpose="content_creation",
-        max_tokens=IMPORT_MAX_TOKENS,
+        max_tokens=OUTLINE_MAX_TOKENS if step == "outline" else IMPORT_MAX_TOKENS,
         temperature=IMPORT_TEMPERATURE,
     )
     try:

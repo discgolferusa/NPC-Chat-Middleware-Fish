@@ -204,6 +204,22 @@ def test_chariot_pdfpig_extract_finds_all_stat_block_npcs():
     assert "Micky Horton take the ship" not in names
 
 
+def test_docnet_toc_npc_header_does_not_block_stat_block_fast_path():
+    """PDFium/Docnet TOCs put dotted 'Non-Player Characters ... 12' before the real section."""
+    text = (
+        "Table of Contents\n"
+        "Non-Player Characters ........ 12\n"
+        "Deck Plans ........ 24\n\n"
+        + _load_chariot_pdfpig_fixture()
+    )
+    assert content_import._document_has_recoverable_stat_blocks(text)
+    result = content_import.outline_campaign_document(text, "create_new")
+    names = {npc["name"] for npc in result["npcs"]}
+    assert len(names) >= 5
+    assert "Albert Johns" in names
+    assert any("stat block" in w.lower() for w in result.get("warnings") or [])
+
+
 def test_chariot_pdfpig_analyze_imports_all_npcs(monkeypatch):
     """PdfPig extract skips outline but still runs location/NPC detail sweeps."""
     text = _load_chariot_pdfpig_fixture()
