@@ -935,16 +935,18 @@ def _guess_campaign_title(text: str) -> str | None:
     """Best-effort title from the document head when the LLM returns an empty campaign."""
     head = (text or "")[:3500]
     collapsed_head = _collapse_spaced_caps(head)
+    full_scan = _collapse_spaced_caps((text or "")[:20_000])
     # Doctor Who / Cubicle 7 style titles often arrive letter-spaced: "Cat s Ey E".
     if re.search(r"(?i)c\s*a\s*t\s*['’]?\s*s\s*e\s*y\s*e", head):
         return "Cat's Eye"
     # Prefer an explicit scenario title near the top of the extract.
     for pattern in (
+        r"(?is)\b(DESTROYER\s+OF\s+THE\s+WORLDS|DESTROYER\s+OF\s+WORLDS)\b",
         r"(?is)\b(CHARIOT\s+OF\s+THE\s+GODS)\b",
         r"(?is)\b(CAT'?S\s+EYE)\b",
         r"(?m)^\s*([A-Z0-9][A-Z0-9' \-]{2,48})\s*$",
     ):
-        match = re.search(pattern, collapsed_head)
+        match = re.search(pattern, collapsed_head) or re.search(pattern, full_scan)
         if not match:
             match = re.search(pattern, head, flags=re.IGNORECASE) if "CAT" in pattern else None
         if not match:
@@ -955,14 +957,28 @@ def _guess_campaign_title(text: str) -> str | None:
         words = title.split()
         if len(words) > 8:
             continue
-        if title.casefold() in {"scenario", "contents", "introduction", "non-player characters", "credits"}:
+        if title.casefold() in {
+            "scenario",
+            "contents",
+            "introduction",
+            "non-player characters",
+            "credits",
+            "moonside locations",
+            "ariarcus colony",
+        }:
             continue
+        if "destroyer" in title.casefold() and "world" in title.casefold():
+            return "Destroyer of Worlds"
         if "cat" in title.casefold() and "eye" in title.casefold():
             return "Cat's Eye"
         if title.isupper() and len(words) >= 2:
             return title.title()
         if title.isupper() and len(words) == 1 and len(title) >= 4:
             return title.title()
+    if _MOONSIDE_LOCATIONS_HEADER.search(full_scan) or re.search(
+        r"\bariarcus\b", full_scan, re.IGNORECASE
+    ):
+        return "Destroyer of Worlds"
     return None
 
 
@@ -1180,9 +1196,19 @@ def _document_has_recoverable_location_sites(text: str) -> bool:
     scan = _normalize_alien_location_scan_text(text or "")
     if not scan.strip():
         return False
-    if _MOONSIDE_LOCATIONS_HEADER.search(scan):
-        return _count_colon_place_headers(scan) >= 4
-    return _count_colon_place_headers(scan) >= 8
+    colon_count = _count_colon_place_headers(scan)
+    has_moonside = bool(_MOONSIDE_LOCATIONS_HEADER.search(scan))
+    if has_moonside and colon_count >= 4:
+        return True
+    if not has_moonside and colon_count >= 8:
+        return True
+    # Map labels can survive when PdfPig mangles ``PLACE: prose`` room lines.
+    site_count = len(_extract_alien_location_site_stubs(text))
+    if has_moonside and site_count >= 2:
+        return True
+    if re.search(r"\bariarcus\b", scan, re.IGNORECASE) and site_count >= 3:
+        return True
+    return False
 
 
 def _is_alien_room_scale_place_name(name: str) -> bool:
@@ -5120,8 +5146,13 @@ def outline_campaign_document(
         bounded_text = text
 
     use_stat_block_fast_path = _document_has_recoverable_stat_blocks(bounded_text)
+    use_location_site_fast_path = (
+        not use_stat_block_fast_path
+        and _document_has_recoverable_location_sites(bounded_text)
+        and len(_extract_alien_location_site_stubs(bounded_text)) >= 2
+    )
     document_for_deterministic_merge = bounded_text
-    if use_stat_block_fast_path:
+    if use_stat_block_fast_path or use_location_site_fast_path:
         full_document_text = bounded_text
     else:
         # Further shrink the already-bounded text to the LLM TPM budget.
@@ -5135,6 +5166,12 @@ def outline_campaign_document(
         warnings.append(
             "Published NON-PLAYER CHARACTERS stat blocks detected; skipping LLM outline "
             "and seeding NPC stubs from FULL NAME blocks (detail sweep still runs)."
+        )
+        outline_raw = {"campaign": {}, "locations": [], "npcs": []}
+    elif use_location_site_fast_path:
+        warnings.append(
+            "Alien moonside / locations chapter detected; skipping LLM outline "
+            "and seeding major location site stubs (detail sweep still runs)."
         )
         outline_raw = {"campaign": {}, "locations": [], "npcs": []}
     else:
