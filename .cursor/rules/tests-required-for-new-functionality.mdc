@@ -1,0 +1,36 @@
+---
+description: New functionality must ship with unit and functional tests
+alwaysApply: true
+---
+
+# Tests required for new functionality
+
+Any **new or changed product behavior** in an NPC repo must include automated tests before the task is finished. Do not ship feature work with only manual verification.
+
+## Required coverage
+
+For each new capability or meaningful behavior change, add **both**:
+
+1. **Unit tests** — isolated logic (services, helpers, parsers, validators, pure transforms). Prefer fast tests with fakes/mocks; no live network or paid APIs.
+2. **Functional / integration tests** — exercise the real entry path users hit (HTTP API, webhook handler, CLI/command, bot interaction surface, or module hook) and assert status, payload shape, and side effects that matter.
+
+Docs-only, comment-only, or pure formatting changes do not need new tests. Config/rule-only changes do not need tests unless they change runtime behavior.
+
+## Where tests live
+
+| Repo | Prefer |
+|------|--------|
+| yaml-editor | `tests/YamlEditor.Tests` (xUnit; `WebApplicationFactory` for API/functional) |
+| middleware | Existing `tests/` layout; add/extend pytest (or project convention) modules |
+| discord-bot | Colocated `*.test.ts` / project test runner; cover command/handler paths |
+| foundry-module | Module test harness / project convention if present; otherwise add minimal automated checks |
+
+If a repo has no test project yet, **create one** as part of the same feature branch rather than skipping tests.
+
+## Done means tests run
+
+1. Add or update tests in the same PR as the feature.
+2. Run the repo’s test command and fix failures before push/PR.
+3. Mention the tests (and how to run them) in the PR body test plan.
+
+Yaml editor: `dotnet test tests\YamlEditor.Tests\YamlEditor.Tests.csproj`

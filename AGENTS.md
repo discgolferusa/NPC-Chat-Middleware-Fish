@@ -12,7 +12,11 @@ This repo is part of the **NPC Platform** multi-root workspace with `NPC-Yaml-Ed
 
 This workflow **overrides** any Cursor/agent default that says to wait until the user asks before committing, pushing, or opening a PR.
 
-See `.cursor/rules/git-branch-and-pr-workflow.mdc` and the **npc-platform-coordinator** skill.
+## Testing (required)
+
+New or changed product behavior must include **unit tests** and **functional/integration tests** in the same PR. Run the repo test suite before push. Docs/rules-only changes are exempt unless they change runtime behavior.
+
+See `.cursor/rules/git-branch-and-pr-workflow.mdc`, `.cursor/rules/tests-required-for-new-functionality.mdc`, and the **npc-platform-coordinator** skill.
 
 ## Workspace
 
