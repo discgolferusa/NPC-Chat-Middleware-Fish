@@ -1,0 +1,295 @@
+"""Functional coverage for the selected game API routes (mocked LLM/TTS/STT)."""
+
+from __future__ import annotations
+
+import io
+import json
+
+import pytest
+
+
+def test_session_status(api):
+    client, _, headers = api
+    response = client.get("/session/status", headers=headers)
+    assert response.status_code == 200
+    body = response.get_json()
+    assert "campaign_id" in body
+    assert "scene" in body
+
+
+def test_party_select(api):
+    client, _, headers = api
+    response = client.post(
+        "/party/select",
+        headers=headers,
+        json={"player_id": "player_alden", "party_id": "default_party"},
+    )
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["status"] == "selected"
+    assert body.get("player_id") == "player_alden" or body.get("speaking_member")
+
+
+def test_scene_time_and_sub_location(api):
+    client, _, headers = api
+
+    set_time = client.post("/scene/time", headers=headers, json={"time_of_day": "Evening"})
+    assert set_time.status_code == 200
+    assert set_time.get_json().get("time_of_day") == "Evening"
+
+    clear_time = client.post("/scene/time/clear", headers=headers, json={})
+    assert clear_time.status_code == 200
+
+    set_sub = client.post(
+        "/scene/sub-location",
+        headers=headers,
+        json={"location_id": "greyhaven", "important_location_name": "Old Aqueduct"},
+    )
+    assert set_sub.status_code == 200
+    sub = set_sub.get_json().get("sub_location") or set_sub.get_json()
+    assert "Aqueduct" in json.dumps(sub)
+
+    clear_sub = client.post("/scene/sub-location/clear", headers=headers, json={})
+    assert clear_sub.status_code == 200
+
+    options = client.get("/scene/sub-locations?location_id=greyhaven", headers=headers)
+    assert options.status_code == 200
+    assert "options" in options.get_json() or "important_locations" in options.get_json() or isinstance(
+        options.get_json(), dict
+    )
+
+
+def test_npcs_and_voices(api):
+    client, _, headers = api
+
+    npcs = client.get("/npcs", headers=headers)
+    assert npcs.status_code == 200
+    payload = npcs.get_json()
+    assert "npcs" in payload
+    assert any(n.get("id") == "captain_varra" for n in payload["npcs"])
+
+    voices = client.get("/voices", headers=headers)
+    assert voices.status_code == 200
+    body = voices.get_json()
+    assert body.get("voice_enabled") is True
+    assert len(body.get("voices") or []) >= 1
+
+
+def test_npc_preload_and_npc_turn(api):
+    client, _, headers = api
+
+    preload = client.post(
+        "/npc-preload",
+        headers=headers,
+        json={"npc_id": "captain_varra", "scene": "Watch barracks at night"},
+    )
+    assert preload.status_code == 200
+    assert preload.get_json()["status"] == "preloaded"
+    assert preload.get_json()["npc_id"] == "captain_varra"
+
+    turn = client.post(
+        "/npc-turn",
+        headers=headers,
+        json={
+            "npc_id": "captain_varra",
+            "text": "Any news from the aqueduct?",
+            "scene": {"description": "Rainy barracks"},
+            "history": [],
+            "player_id": "player_alden",
+        },
+    )
+    assert turn.status_code == 200
+    body = turn.get_json()
+    assert "request_id" in body
+    # Response shape varies slightly; accept common reply fields.
+    reply = body.get("npc_text") or body.get("text") or body.get("reply") or body.get("spoken_text")
+    assert reply
+    assert "watch" in reply.lower() or "firm" in reply.lower()
+
+
+def test_npc_voice_turn(api):
+    client, server, headers = api
+    data = {
+        "npc_id": "captain_varra",
+        "scene": "Barracks",
+        "player_id": "player_alden",
+    }
+    # Larger than the empty/short-upload guard in save_uploaded_audio.
+    audio = (io.BytesIO(b"RIFF" + (b"\x00" * 2048)), "clip.wav")
+    response = client.post(
+        "/npc-voice-turn",
+        headers=headers,
+        data={**data, "audio": audio},
+        content_type="multipart/form-data",
+    )
+    assert response.status_code == 200
+    assert response.mimetype == "audio/wav"
+    assert response.headers.get("X-Turn-Request-Id")
+    assert response.headers.get("X-Player-Transcript")
+    assert response.headers.get("X-Npc-Text")
+
+    import base64
+
+    def _decode_header(value: str) -> str:
+        padded = value + ("=" * (-len(value) % 4))
+        return base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+
+    assert _decode_header(response.headers["X-Player-Transcript"]) == "Hello captain."
+    npc_text = _decode_header(response.headers["X-Npc-Text"])
+    assert "watch" in npc_text.lower() or "firm" in npc_text.lower()
+
+
+def test_dm_channel_endpoints(api):
+    client, _, headers = api
+    npc = "captain_varra"
+    player = "player_alden"
+    qs = f"npc_id={npc}&player_id={player}"
+
+    status = client.get(f"/dm/status?{qs}", headers=headers)
+    assert status.status_code == 200
+    assert status.get_json()["npc_id"] == npc
+
+    detect = client.post("/dm/detect", headers=headers, json={"text": "Yes, that is correct."})
+    assert detect.status_code == 200
+    assert detect.get_json()["detection"]["verdict"] == "confirmed"
+
+    msg = client.post(
+        "/dm/message",
+        headers=headers,
+        json={
+            "npc_id": npc,
+            "player_id": player,
+            "text": "Yes, the door is unlocked.",
+            "auto_respond": False,
+            "include_audio": False,
+        },
+    )
+    assert msg.status_code == 200
+    assert msg.get_json()["status"] == "saved"
+
+    messages = client.get(f"/dm/messages?{qs}", headers=headers)
+    assert messages.status_code == 200
+    assert isinstance(messages.get_json()["messages"], list)
+    assert len(messages.get_json()["messages"]) >= 1
+
+    ruling = client.post(
+        "/dm/ruling",
+        headers=headers,
+        json={
+            "npc_id": npc,
+            "player_id": player,
+            "claim_summary": "party has the mayor's writ",
+            "verdict": "confirmed",
+            "notes": "Granted for this scene.",
+            "auto_respond": False,
+            "include_audio": False,
+        },
+    )
+    assert ruling.status_code == 200
+
+    pending = client.get(f"/dm/pending?{qs}", headers=headers)
+    assert pending.status_code == 200
+    assert "pending_checks" in pending.get_json()
+
+    rulings = client.get(f"/dm/rulings?{qs}", headers=headers)
+    assert rulings.status_code == 200
+    assert isinstance(rulings.get_json()["rulings"], list)
+    assert len(rulings.get_json()["rulings"]) >= 1
+
+    speak = client.post(
+        "/dm/speak",
+        headers=headers,
+        json={
+            "npc_id": npc,
+            "player_id": player,
+            "text": "Stand aside.",
+            "include_audio": False,
+            "save_history": True,
+        },
+    )
+    assert speak.status_code == 200
+    assert speak.get_json()["status"] == "spoken"
+
+
+def test_content_pack_install(api):
+    client, _, headers = api
+    response = client.post(
+        "/content/pack",
+        headers={
+            **headers,
+            "X-Campaign-Owner-User-Id": "owner-test-1",
+        },
+        json={
+            "owner_user_id": "owner-test-1",
+            "campaign_id": "test_campaign",
+            "files": [
+                {
+                    "kind": "npc",
+                    "filename": "scout_mira.yaml",
+                    "content": "id: scout_mira\nname: Scout Mira\nrole: scout\n",
+                }
+            ],
+        },
+    )
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["status"] == "installed"
+
+    # Tenant-scoped /npcs should see pack content when owner/campaign headers are present.
+    listed = client.get(
+        "/npcs",
+        headers={
+            **headers,
+            "X-Campaign-Owner-User-Id": "owner-test-1",
+            "X-Campaign-Id": "test_campaign",
+        },
+    )
+    assert listed.status_code == 200
+    ids = [n.get("id") for n in listed.get_json().get("npcs") or []]
+    assert "scout_mira" in ids
+
+
+def test_content_import_routes(api):
+    client, _, headers = api
+    sample = "Chapter 1\nThe outpost holds against the fog."
+
+    analyze = client.post(
+        "/content/import/analyze",
+        headers=headers,
+        json={"text": sample, "mode": "create_new"},
+    )
+    assert analyze.status_code == 200
+    assert analyze.get_json()["campaign"]["id"] == "test_campaign"
+
+    outline = client.post(
+        "/content/import/outline",
+        headers=headers,
+        json={"text": sample, "mode": "create_new"},
+    )
+    assert outline.status_code == 200
+    assert "campaign" in outline.get_json()
+
+    loc = client.post(
+        "/content/import/location-details",
+        headers=headers,
+        json={
+            "text": sample,
+            "campaign": {"id": "test_campaign", "name": "Test"},
+            "locations": [{"id": "loc_1", "name": "Outpost"}],
+        },
+    )
+    assert loc.status_code == 200
+    assert loc.get_json()["locations"]
+
+    npc = client.post(
+        "/content/import/npc-details",
+        headers=headers,
+        json={
+            "text": sample,
+            "campaign": {"id": "test_campaign", "name": "Test"},
+            "npcs": [{"id": "npc_1", "name": "Guard"}],
+        },
+    )
+    assert npc.status_code == 200
+    assert npc.get_json()["npcs"]
+
