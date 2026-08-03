@@ -5,7 +5,61 @@ from __future__ import annotations
 import io
 import json
 
-import pytest
+import party_campaign
+import scene_state
+
+
+def test_api_fixture_isolates_on_disk_paths(api):
+    client, server, headers = api
+
+    assert server.MEMORY_DB.resolve() != (server.BASE_DIR / "npc_memory.db").resolve()
+    assert server.UPLOAD_DIR.resolve() != (server.BASE_DIR / "uploads").resolve()
+    assert server.OUTPUT_DIR.resolve() != (server.BASE_DIR / "outputs").resolve()
+    assert scene_state.SCENE_RUNTIME_CONFIG_FILE.resolve().parent != server.BASE_DIR.resolve()
+    assert party_campaign.SESSION_RUNTIME_CONFIG_FILE.resolve().parent != server.BASE_DIR.resolve()
+
+    repo_scene = server.BASE_DIR / "scene_runtime_config.json"
+    repo_session = server.BASE_DIR / "session_runtime_config.json"
+    scene_before = repo_scene.read_bytes() if repo_scene.exists() else None
+    session_before = repo_session.read_bytes() if repo_session.exists() else None
+    upload_before = {
+        p.name for p in (server.BASE_DIR / "uploads").glob("*")
+    } if (server.BASE_DIR / "uploads").is_dir() else set()
+
+    assert client.post(
+        "/scene/time", headers=headers, json={"time_of_day": "Evening"}
+    ).status_code == 200
+    assert client.post(
+        "/party/select",
+        headers=headers,
+        json={"player_id": "player_alden", "party_id": "default_party"},
+    ).status_code == 200
+    voice = client.post(
+        "/npc-voice-turn",
+        headers=headers,
+        data={
+            "npc_id": "captain_varra",
+            "scene": "Barracks",
+            "player_id": "player_alden",
+            "audio": (io.BytesIO(b"RIFF" + (b"\x00" * 2048)), "clip.wav"),
+        },
+        content_type="multipart/form-data",
+    )
+    assert voice.status_code == 200
+
+    assert scene_state.SCENE_RUNTIME_CONFIG_FILE.exists()
+    assert party_campaign.SESSION_RUNTIME_CONFIG_FILE.exists()
+    assert any(server.UPLOAD_DIR.iterdir())
+
+    scene_after = repo_scene.read_bytes() if repo_scene.exists() else None
+    session_after = repo_session.read_bytes() if repo_session.exists() else None
+    upload_after = {
+        p.name for p in (server.BASE_DIR / "uploads").glob("*")
+    } if (server.BASE_DIR / "uploads").is_dir() else set()
+
+    assert scene_after == scene_before
+    assert session_after == session_before
+    assert upload_after == upload_before
 
 
 def test_session_status(api):
