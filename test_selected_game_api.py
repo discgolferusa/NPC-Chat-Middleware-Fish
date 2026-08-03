@@ -54,8 +54,14 @@ def test_scene_time_and_sub_location(api):
 
     options = client.get("/scene/sub-locations?location_id=greyhaven", headers=headers)
     assert options.status_code == 200
-    assert "options" in options.get_json() or "important_locations" in options.get_json() or isinstance(
-        options.get_json(), dict
+    options_body = options.get_json()
+    assert options_body["location_id"] == "greyhaven"
+    assert options_body.get("location_name")
+    important = options_body.get("important_locations")
+    assert isinstance(important, list)
+    assert any(
+        isinstance(item, dict) and item.get("name") == "Old Aqueduct"
+        for item in important
     )
 
 
