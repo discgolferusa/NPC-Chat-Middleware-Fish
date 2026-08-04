@@ -1568,6 +1568,7 @@ def _wav_peak_value(audio_path: Path) -> int | None:
 
 
 # Whisper often invents these on near-silence / truncated clips.
+# Do not list allowlisted replies here (ok/okay/yes/…) — allowlist wins first.
 _SHORT_CLIP_HALLUCINATIONS = frozenset(
     {
         "you",
@@ -1578,8 +1579,6 @@ _SHORT_CLIP_HALLUCINATIONS = frozenset(
         "thank you for watching",
         "subscribe",
         "bye",
-        "okay",
-        "ok",
         "um",
         "uh",
         "the",
@@ -1630,6 +1629,7 @@ def _is_stt_hallucination(
     """
     Detect common Whisper garbage (especially when silence/truncation biases output).
     Examples: 'No. No. No. No.', 'Thank you. Thank you.', or bare 'You' on a 1s clip.
+    Allowlisted short replies (ok/okay/yes/…) are kept even on short/weak clips.
     """
     cleaned = re.sub(r"[^\w\s]", " ", (text or "").strip(), flags=re.IGNORECASE)
     words = [w.lower() for w in cleaned.split() if w]
@@ -1643,11 +1643,17 @@ def _is_stt_hallucination(
     if len(words) >= 4 and len(unique) <= 2 and max(words.count(w) for w in unique) >= 3:
         return True
 
+    # Allowlist before hallucination rejection so short ok/okay are not dropped.
+    if normalized in _SHORT_CLIP_ALLOWLIST or (
+        len(words) == 1 and words[0] in _SHORT_CLIP_ALLOWLIST
+    ):
+        return False
+
     short = duration_seconds is not None and duration_seconds < 1.6
     weak = peak is not None and peak < 2500
     if (short or weak) and normalized in _SHORT_CLIP_HALLUCINATIONS:
         return True
-    if short and weak and len(words) == 1 and words[0] not in _SHORT_CLIP_ALLOWLIST:
+    if short and weak and len(words) == 1:
         return True
     return False
 
