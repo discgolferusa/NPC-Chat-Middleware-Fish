@@ -1546,20 +1546,114 @@ def _wav_peak_stats(audio_path: Path) -> str:
         return f"stats_unavailable error={ex!r}"
 
 
-def _is_stt_hallucination(text: str) -> bool:
+def _wav_peak_value(audio_path: Path) -> int | None:
+    """Return absolute PCM16 peak, or None when unavailable."""
+    try:
+        with wave.open(str(audio_path), "rb") as wav_file:
+            frames = wav_file.getnframes()
+            channels = wav_file.getnchannels() or 1
+            sample_width = wav_file.getsampwidth()
+            raw = wav_file.readframes(frames)
+        if sample_width != 2 or not raw:
+            return None
+        samples = array.array("h")
+        samples.frombytes(raw)
+        if channels > 1:
+            samples = samples[::channels]
+        if not samples:
+            return 0
+        return max(abs(s) for s in samples)
+    except Exception:
+        return None
+
+
+# Whisper often invents these on near-silence / truncated clips.
+# Do not list allowlisted replies here (ok/okay/yes/…) — allowlist wins first.
+_SHORT_CLIP_HALLUCINATIONS = frozenset(
+    {
+        "you",
+        "yeah",
+        "thank you",
+        "thanks",
+        "thanks for watching",
+        "thank you for watching",
+        "subscribe",
+        "bye",
+        "um",
+        "uh",
+        "the",
+        "a",
+        "i",
+        "oh",
+        "hmm",
+        "mb",
+        "www",
+    }
+)
+
+# One-word replies we still accept on short clips.
+_SHORT_CLIP_ALLOWLIST = frozenset(
+    {
+        "yes",
+        "no",
+        "ok",
+        "okay",
+        "go",
+        "hi",
+        "hey",
+        "stop",
+        "help",
+        "wait",
+        "look",
+        "run",
+        "attack",
+        "cast",
+        "open",
+        "close",
+        "take",
+        "give",
+        "talk",
+        "leave",
+        "stay",
+        "hide",
+    }
+)
+
+
+def _is_stt_hallucination(
+    text: str,
+    *,
+    duration_seconds: float | None = None,
+    peak: int | None = None,
+) -> bool:
     """
-    Detect common Whisper garbage (especially when initial_prompt or silence biases output).
-    Examples: 'No. No. No. No.' or 'Thank you. Thank you.'
+    Detect common Whisper garbage (especially when silence/truncation biases output).
+    Examples: 'No. No. No. No.', 'Thank you. Thank you.', or bare 'You' on a 1s clip.
+    Allowlisted short replies (ok/okay/yes/…) are kept even on short/weak clips.
     """
     cleaned = re.sub(r"[^\w\s]", " ", (text or "").strip(), flags=re.IGNORECASE)
     words = [w.lower() for w in cleaned.split() if w]
-    if len(words) < 3:
-        return False
-    # Same token repeated (allowing a short filler like "no no no")
+    if not words:
+        return True
+
+    normalized = " ".join(words)
     unique = set(words)
-    if len(unique) == 1 and len(words) >= 3:
+    if len(words) >= 3 and len(unique) == 1:
         return True
     if len(words) >= 4 and len(unique) <= 2 and max(words.count(w) for w in unique) >= 3:
+        return True
+
+    # Allowlist before hallucination rejection so short ok/okay are not dropped.
+    if normalized in _SHORT_CLIP_ALLOWLIST or (
+        len(words) == 1 and words[0] in _SHORT_CLIP_ALLOWLIST
+    ):
+        return False
+
+    short = duration_seconds is not None and duration_seconds < 1.6
+    weak = peak is not None and peak < 2500
+    if (short or weak) and normalized in _SHORT_CLIP_HALLUCINATIONS:
+        return True
+    if short and weak and len(words) == 1:
         return True
     return False
 
@@ -1569,9 +1663,16 @@ def transcribe_audio(audio_path: Path) -> str:
     Transcribe player/DM mic audio, optimized for short replies (yes/ok/go).
     Skips VAD on short clips, pads brief audio, and retries with looser thresholds.
     """
+    raw_duration = _wav_duration_seconds(audio_path)
+    raw_peak = _wav_peak_value(audio_path)
+    print(
+        f"[PLAYER-AUDIO] stt_raw duration={raw_duration:.2f}s peak={raw_peak} path={audio_path}",
+        flush=True,
+    )
     stt_path = _pad_wav_for_short_speech(audio_path)
     stats = _wav_peak_stats(stt_path)
     duration = _wav_duration_seconds(stt_path)
+    peak = _wav_peak_value(stt_path)
     print(f"[PLAYER-AUDIO] stt_input path={stt_path} {stats}", flush=True)
 
     def _run(*, vad_filter: bool, beam_size: int, no_speech_threshold: float) -> str:
@@ -1601,7 +1702,7 @@ def transcribe_audio(audio_path: Path) -> str:
         return joined
 
     # Short clips: skip VAD first — Silero often eats one-word replies.
-    prefer_no_vad = duration < 3.0
+    prefer_no_vad = (raw_duration or duration) < 3.0
     attempts = []
     if prefer_no_vad:
         attempts.append(dict(vad_filter=False, beam_size=5, no_speech_threshold=0.35))
@@ -1612,13 +1713,29 @@ def transcribe_audio(audio_path: Path) -> str:
         attempts.append(dict(vad_filter=False, beam_size=5, no_speech_threshold=0.35))
         attempts.append(dict(vad_filter=False, beam_size=5, no_speech_threshold=0.2))
 
+    # Judge hallucinations against the unpadded clip — padding can hide how short it was.
+    judge_duration = raw_duration if raw_duration > 0 else duration
+    judge_peak = raw_peak if raw_peak is not None else peak
+
     text = ""
     for attempt in attempts:
         text = _run(**attempt)
-        if text and not _is_stt_hallucination(text):
+        if text and not _is_stt_hallucination(
+            text,
+            duration_seconds=judge_duration,
+            peak=judge_peak,
+        ):
             break
-        if text and _is_stt_hallucination(text):
-            print(f"[PLAYER-AUDIO] stt_hallucination rejected text={text[:120]!r}", flush=True)
+        if text and _is_stt_hallucination(
+            text,
+            duration_seconds=judge_duration,
+            peak=judge_peak,
+        ):
+            print(
+                f"[PLAYER-AUDIO] stt_hallucination rejected text={text[:120]!r} "
+                f"raw_duration={judge_duration:.2f}s peak={judge_peak}",
+                flush=True,
+            )
             text = ""
 
     return text
