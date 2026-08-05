@@ -4127,6 +4127,27 @@ def preview_voice():
         raw_path.unlink(missing_ok=True)
 
 
+@app.post("/transcribe")
+def transcribe_only():
+    """STT-only endpoint for Discord wake-word gating (no NPC turn)."""
+    upload = request.files.get("audio") or request.files.get("file")
+    if upload is None:
+        return jsonify({"error": "audio is required."}), 400
+
+    request_id = f"transcribe-{uuid.uuid4().hex}"
+    try:
+        # Same normalize path as /npc-voice-turn (webm/ogg/opus → WAV).
+        wav_path = save_uploaded_audio(upload, request_id)
+        transcript = (transcribe_audio(wav_path) or "").strip()
+        return jsonify({"transcript": transcript})
+    except Exception as ex:
+        print(f"[TRANSCRIBE] failed: {ex!r}", flush=True)
+        return jsonify({"error": f"Transcription failed: {ex}"}), 500
+    finally:
+        for leftover in UPLOAD_DIR.glob(f"{request_id}*"):
+            leftover.unlink(missing_ok=True)
+
+
 @app.get("/health")
 def health():
     return jsonify({"status": "ok"})
