@@ -596,13 +596,9 @@ def build_party_context(player_id: str | None = None, party_id: str | None = Non
 
     party_members = []
     for member in members:
-        cleaned = {
-            k: v for k, v in dict(member).items()
-            if k not in ("discord_user_id", "discord_handle")
-        }
         party_members.append({
-            **cleaned,
-            "is_speaking": cleaned.get("player_id") == speaking_member.get("player_id"),
+            **member,
+            "is_speaking": member.get("player_id") == speaking_member.get("player_id"),
         })
 
     if speaking_member.get("player_id") == DEFAULT_PLAYER_ID and not any(

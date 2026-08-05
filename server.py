@@ -4134,18 +4134,18 @@ def transcribe_only():
     if upload is None:
         return jsonify({"error": "audio is required."}), 400
 
-    suffix = Path(upload.filename or "clip.wav").suffix or ".wav"
-    request_id = uuid.uuid4().hex
-    raw_path = UPLOAD_DIR / f"transcribe-{request_id}{suffix}"
+    request_id = f"transcribe-{uuid.uuid4().hex}"
     try:
-        upload.save(raw_path)
-        transcript = (transcribe_audio(raw_path) or "").strip()
+        # Same normalize path as /npc-voice-turn (webm/ogg/opus → WAV).
+        wav_path = save_uploaded_audio(upload, request_id)
+        transcript = (transcribe_audio(wav_path) or "").strip()
         return jsonify({"transcript": transcript})
     except Exception as ex:
         print(f"[TRANSCRIBE] failed: {ex!r}", flush=True)
         return jsonify({"error": f"Transcription failed: {ex}"}), 500
     finally:
-        raw_path.unlink(missing_ok=True)
+        for leftover in UPLOAD_DIR.glob(f"{request_id}*"):
+            leftover.unlink(missing_ok=True)
 
 
 @app.get("/health")
