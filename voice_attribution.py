@@ -26,7 +26,7 @@ def try_read_model_card(directory: Path) -> str | None:
             continue
         try:
             return path.read_text(encoding="utf-8")
-        except OSError:
+        except (OSError, UnicodeDecodeError):
             continue
 
     # Case-insensitive scan for MODEL_CARD* / modelcard* on case-sensitive filesystems.
@@ -38,7 +38,7 @@ def try_read_model_card(directory: Path) -> str | None:
             if lower.startswith("model_card") or lower.startswith("modelcard"):
                 try:
                     return path.read_text(encoding="utf-8")
-                except OSError:
+                except (OSError, UnicodeDecodeError):
                     continue
     except OSError:
         return None
@@ -89,7 +89,7 @@ def build_voice_attributions(
             used_root = True
         else:
             text = "(No MODEL_CARD found for this voice.)"
-            used_root = True
+            used_root = False
 
         rows.append(
             {

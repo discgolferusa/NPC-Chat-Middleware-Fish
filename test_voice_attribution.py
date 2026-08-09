@@ -37,6 +37,36 @@ def test_build_voice_attributions_local_then_root_fallback(tmp_path: Path):
     assert by_id["en/villain/villain.onnx"]["used_root_fallback"] is True
 
 
+def test_build_voice_attributions_placeholder_does_not_set_root_fallback(tmp_path: Path):
+    nested = tmp_path / "en" / "orphan"
+    nested.mkdir(parents=True)
+    (nested / "orphan.onnx").write_bytes(b"onnx")
+
+    rows = build_voice_attributions(tmp_path)
+    assert len(rows) == 1
+    assert rows[0]["used_root_fallback"] is False
+    assert "No MODEL_CARD" in rows[0]["attribution_text"]
+
+
+def test_try_read_model_card_skips_invalid_utf8(tmp_path: Path):
+    (tmp_path / "MODEL_CARD").write_bytes(b"\xff\xfe bad")
+    (tmp_path / "MODEL_CARD.md").write_text("GOOD", encoding="utf-8")
+    assert try_read_model_card(tmp_path) == "GOOD"
+
+
+def test_build_voice_attributions_invalid_utf8_card_falls_through(tmp_path: Path):
+    nested = tmp_path / "en" / "hero"
+    nested.mkdir(parents=True)
+    (nested / "hero.onnx").write_bytes(b"onnx")
+    (nested / "MODEL_CARD").write_bytes(b"\xff\xfe")
+    (tmp_path / "MODEL_CARD").write_text("ROOT OK", encoding="utf-8")
+
+    rows = build_voice_attributions(tmp_path)
+    assert len(rows) == 1
+    assert rows[0]["attribution_text"] == "ROOT OK"
+    assert rows[0]["used_root_fallback"] is True
+
+
 def test_build_voice_attributions_missing_dir_returns_empty(tmp_path: Path):
     assert build_voice_attributions(tmp_path / "missing") == []
 
