@@ -4063,6 +4063,28 @@ def list_voices():
     })
 
 
+@app.get("/voices/attribution")
+def list_voice_attributions():
+    """Public-facing MODEL_CARD credits for each Piper model under VOICES_DIR."""
+    from voice_attribution import build_voice_attributions
+
+    started = time.perf_counter()
+    force_refresh = (request.args.get("refresh") or "").strip().lower() in ("1", "true", "yes")
+    voices = refresh_voice_inventory(force=force_refresh)
+    rows = build_voice_attributions(VOICES_DIR, voices)
+    print(
+        f"[VOICES] GET /voices/attribution {len(rows)} model(s) in "
+        f"{time.perf_counter() - started:.3f}s (force_refresh={force_refresh})",
+        flush=True,
+    )
+    return jsonify({
+        "voices": rows,
+        "voice_enabled": True,
+        "voices_dir": str(VOICES_DIR),
+        "cached": not force_refresh,
+    })
+
+
 @app.post("/voices/preview")
 def preview_voice():
     started = time.perf_counter()
