@@ -8,12 +8,57 @@ import pytest
 
 pytest.importorskip("flask")
 
-from voice_attribution import build_voice_attributions, try_read_model_card
+from voice_attribution import (
+    _card_search_dirs,
+    build_voice_attributions,
+    try_read_model_card,
+)
+import voice_attribution
 
 
 def test_try_read_model_card_prefers_named_file(tmp_path: Path):
     (tmp_path / "MODEL_CARD.md").write_text("FROM MD", encoding="utf-8")
     assert try_read_model_card(tmp_path) == "FROM MD"
+
+
+def test_card_search_dirs_uses_logical_parents_not_resolve(tmp_path: Path):
+    """Walk must stay under voices_dir even when resolve() would escape via junction."""
+    licensed = tmp_path / "licensed"
+    nested = licensed / "en" / "hero"
+    nested.mkdir(parents=True)
+
+    dirs = _card_search_dirs(nested, tmp_path)
+    assert dirs == [
+        nested,
+        licensed / "en",
+        licensed,
+        tmp_path,
+    ]
+    for directory in dirs:
+        directory.relative_to(tmp_path)
+
+
+def test_build_voice_attributions_caches_parent_card_reads(tmp_path: Path, monkeypatch):
+    licensed = tmp_path / "licensed"
+    for name in ("a", "b", "c"):
+        folder = licensed / name
+        folder.mkdir(parents=True)
+        (folder / f"{name}.onnx").write_bytes(b"onnx")
+    (licensed / "MODEL_CARD").write_text("PACK CARD", encoding="utf-8")
+
+    reads = {"n": 0}
+    real = try_read_model_card
+
+    def counting(directory: Path):
+        reads["n"] += 1
+        return real(directory)
+
+    monkeypatch.setattr(voice_attribution, "try_read_model_card", counting)
+    rows = build_voice_attributions(tmp_path)
+    assert len(rows) == 3
+    assert all(r["attribution_text"] == "PACK CARD" for r in rows)
+    # Unique dirs checked: a, b, c, licensed (root never reached once pack card hits).
+    assert reads["n"] == 4
 
 
 def test_build_voice_attributions_local_then_root_fallback(tmp_path: Path):
