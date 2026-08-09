@@ -46,6 +46,54 @@ def try_read_model_card(directory: Path) -> str | None:
     return None
 
 
+def _card_search_dirs(voice_folder: Path, voices_dir: Path) -> list[Path]:
+    """Directories from the voice folder up through voices_dir (closest first)."""
+    try:
+        root = voices_dir.resolve()
+    except OSError:
+        root = voices_dir
+    try:
+        current = voice_folder.resolve()
+    except OSError:
+        current = voice_folder
+
+    dirs: list[Path] = []
+    while True:
+        dirs.append(current)
+        if current == root:
+            break
+        try:
+            current.relative_to(root)
+        except ValueError:
+            # Left the voices tree — stop without including outsiders.
+            break
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    return dirs
+
+
+def resolve_model_card_text(
+    voice_folder: Path,
+    voices_dir: Path,
+) -> tuple[str | None, bool]:
+    """
+    Find MODEL_CARD for a voice.
+
+    Search order: voice folder, then each parent up to and including ``voices_dir``
+    (so a card in a licensed/pack parent folder applies to nested models).
+
+    Returns ``(text, used_ancestor_fallback)``. The fallback flag is True when the
+    card came from a parent of the voice folder (including the voices root).
+    """
+    for index, directory in enumerate(_card_search_dirs(voice_folder, voices_dir)):
+        card = try_read_model_card(directory)
+        if card and card.strip():
+            return card.strip(), index > 0
+    return None, False
+
+
 def build_voice_attributions(
     voices_dir: Path,
     voices: list[dict[str, Any]] | None = None,
@@ -53,14 +101,14 @@ def build_voice_attributions(
     """
     Build attribution rows for each Piper *.onnx under voices_dir.
 
-    Prefer a MODEL_CARD beside the model; otherwise use the voices root card.
+    Prefer a MODEL_CARD beside the model; otherwise walk parent folders up to the
+    voices root (e.g. ``licensed/MODEL_CARD`` for models under ``licensed/...``).
     When ``voices`` is provided (inventory rows with relative ``path``), use that
     order; otherwise scan the tree for *.onnx.
     """
     if not voices_dir.exists():
         return []
 
-    root_card = try_read_model_card(voices_dir)
     rows: list[dict[str, Any]] = []
 
     if voices is None:
@@ -80,23 +128,18 @@ def build_voice_attributions(
 
     for rel in rel_paths:
         folder = (voices_dir / rel).parent
-        local = try_read_model_card(folder)
-        if local and local.strip():
-            text = local.strip()
-            used_root = False
-        elif root_card and root_card.strip():
-            text = root_card.strip()
-            used_root = True
-        else:
+        text, used_ancestor = resolve_model_card_text(folder, voices_dir)
+        if not text:
             text = "(No MODEL_CARD found for this voice.)"
-            used_root = False
+            used_ancestor = False
 
         rows.append(
             {
                 "voice_id": rel,
                 "name": Path(rel).name,
                 "attribution_text": text,
-                "used_root_fallback": used_root,
+                # Kept for API compatibility: true when card is from any parent folder.
+                "used_root_fallback": used_ancestor,
             }
         )
 

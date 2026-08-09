@@ -37,6 +37,35 @@ def test_build_voice_attributions_local_then_root_fallback(tmp_path: Path):
     assert by_id["en/villain/villain.onnx"]["used_root_fallback"] is True
 
 
+def test_build_voice_attributions_uses_licensed_parent_model_card(tmp_path: Path):
+    """MODEL_CARD in an intermediate pack folder (e.g. licensed/) applies to nested onnx."""
+    licensed = tmp_path / "licensed"
+    nested = licensed / "en" / "en_US" / "ryan" / "medium"
+    nested.mkdir(parents=True)
+    (nested / "en_US-ryan-medium.onnx").write_bytes(b"onnx")
+    (licensed / "MODEL_CARD").write_text("LICENSED PACK CARD", encoding="utf-8")
+
+    rows = build_voice_attributions(tmp_path)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["attribution_text"] == "LICENSED PACK CARD"
+    assert row["used_root_fallback"] is True
+    assert "No MODEL_CARD" not in row["attribution_text"]
+
+
+def test_build_voice_attributions_prefers_closer_parent_over_root(tmp_path: Path):
+    licensed = tmp_path / "licensed"
+    nested = licensed / "en" / "hero"
+    nested.mkdir(parents=True)
+    (nested / "hero.onnx").write_bytes(b"onnx")
+    (licensed / "MODEL_CARD").write_text("PACK CARD", encoding="utf-8")
+    (tmp_path / "MODEL_CARD").write_text("ROOT CARD", encoding="utf-8")
+
+    rows = build_voice_attributions(tmp_path)
+    assert rows[0]["attribution_text"] == "PACK CARD"
+    assert rows[0]["used_root_fallback"] is True
+
+
 def test_build_voice_attributions_placeholder_does_not_set_root_fallback(tmp_path: Path):
     nested = tmp_path / "en" / "orphan"
     nested.mkdir(parents=True)
