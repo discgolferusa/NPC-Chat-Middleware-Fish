@@ -2513,9 +2513,6 @@ def npc_turn():
             npc_response=npc_response,
         )
 
-        set_turn_progress(request_id, "finishing")
-        complete_turn_progress(request_id)
-
         include_audio = _json_body_flag(body.get("include_audio"), False)
         narration_text = ""
         dialogue_text = ""
@@ -2523,6 +2520,8 @@ def npc_turn():
         audio_clips: list[dict[str, str]] = []
 
         if include_audio:
+            # Keep progress in_progress through TTS, then complete once. Completing
+            # before synthesize + reopening left clients polling forever after playback.
             set_turn_progress(request_id, "synthesizing_speech")
             clip_result = synthesize_segmented_speech_clips(
                 npc_text=npc_text,
@@ -2538,10 +2537,14 @@ def npc_turn():
             elif clip_result.get("narration_path"):
                 audio_url = turn_audio_url(request_id, "narration")
             step_start = log_timing(request_id, "synthesize text-turn speech clips", step_start)
+            set_turn_progress(request_id, "finishing", clips=audio_clips)
         else:
             tts_segments = split_narration_and_dialogue(npc_text)
             narration_text = " ".join(s["text"] for s in tts_segments if s["type"] == "narrator").strip()
             dialogue_text = " ".join(s["text"] for s in tts_segments if s["type"] == "npc").strip()
+            set_turn_progress(request_id, "finishing")
+
+        complete_turn_progress(request_id)
 
         payload = {
             "request_id": request_id,
