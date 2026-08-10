@@ -137,6 +137,19 @@ On the live SmarterASP site: sign in → DM console → session status and campa
 - Rotate `GAME_API_KEY` if the Funnel URL leaks.
 - Optional: restrict Funnel in Tailscale ACL admin.
 
+## Docker (all-in-one VPS)
+
+Production all-in-one layout (editor + this middleware + Discord bot) lives in the
+**NPC-Platform** workspace under `deploy/` (Compose + bootstrap scripts).
+
+This repo provides a `Dockerfile` and `requirements.txt`. Piper resolution order:
+
+1. `PIPER_EXE` env
+2. `piper` on `PATH`
+3. Legacy Windows `C:\AI\npc-server\.venv\Scripts\piper.exe` (local Funnel/dev)
+
+Local `start-middleware.ps1` + Funnel workflow is unchanged.
+
 ## Authentication
 
 When `GAME_API_KEY` is set, all routes except `/health` require:

@@ -55,6 +55,7 @@ from dm_channel import (
     save_dm_message,
     strip_dm_check_tag,
 )
+import dm_channel
 from party_campaign import (
     DEFAULT_PLAYER_ID,
     build_party_context,
@@ -123,15 +124,19 @@ from tts_processing import (
     options_from_request_and_npc,
     resolve_tts_options,
 )
+from piper_paths import LEGACY_WINDOWS_PIPER_EXE, resolve_piper_exe
+from db_paths import MEMORY_DB as _SHARED_MEMORY_DB
+from db_paths import refresh_memory_db, resolve_memory_db
 
 BASE_DIR = Path(__file__).resolve().parent
 
 NPC_DIR = BASE_DIR / "npcs"
 LOCATION_DIR = BASE_DIR / "locations"
-UPLOAD_DIR = BASE_DIR / "uploads"
-OUTPUT_DIR = BASE_DIR / "outputs"
+UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", str(BASE_DIR / "uploads")))
+OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", str(BASE_DIR / "outputs")))
 
-MEMORY_DB = BASE_DIR / "npc_memory.db"
+# Kept in sync with dm_channel.MEMORY_DB (see refresh after game_api.env load).
+MEMORY_DB = _SHARED_MEMORY_DB
 
 PARTIES_DIR = BASE_DIR / "parties"
 CAMPAIGNS_DIR = BASE_DIR / "campaigns"
@@ -144,7 +149,7 @@ CAMPAIGNS_DIR.mkdir(exist_ok=True)
 UPLOAD_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-PIPER_EXE = Path(r"C:\AI\npc-server\.venv\Scripts\piper.exe")
+# Resolved after game_api.env load (see PIPER_EXE assignment below).
 DEFAULT_VOICE_MODEL = Path(r"C:\AI\Voices\en\en_US\ryan\medium\en_US-ryan-medium.onnx")
 VOICE_PREVIEW_TEXT = os.environ.get(
     "VOICE_PREVIEW_TEXT",
@@ -231,6 +236,18 @@ def _load_game_api_env_file() -> None:
 
 
 _load_game_api_env_file()
+
+# Re-bind after game_api.env so MEMORY_DB from the file applies to NPC + DM tables.
+MEMORY_DB = refresh_memory_db()
+dm_channel.MEMORY_DB = MEMORY_DB
+
+# Prefer PIPER_EXE / PATH; fall back to legacy Windows path for local Funnel/dev.
+try:
+    PIPER_EXE = resolve_piper_exe()
+except FileNotFoundError:
+    # Allow the process to start (health/LLM) even if TTS is not installed yet.
+    # synthesize_speech() re-resolves and raises a clear error when TTS is used.
+    PIPER_EXE = Path(os.environ.get("PIPER_EXE") or LEGACY_WINDOWS_PIPER_EXE)
 
 
 def _secret_fingerprint(value: str) -> str:
@@ -2238,14 +2255,13 @@ def synthesize_speech(
     # Same resolution as /voices/preview so UNC/partial/editor paths work at runtime.
     model_path = resolve_voice_model_path(voice_model)
 
-    if not PIPER_EXE.exists():
-        raise FileNotFoundError(f"Piper executable not found: {PIPER_EXE}")
+    piper_exe = resolve_piper_exe()
 
     if not model_path.exists():
         raise FileNotFoundError(f"Piper voice model not found: {model_path}")
 
     cmd = [
-        str(PIPER_EXE),
+        str(piper_exe),
         "--model", str(model_path),
         "--length_scale", str(length_scale),
         "--noise_scale", str(noise_scale),

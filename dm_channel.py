@@ -10,8 +10,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-BASE_DIR = Path(__file__).resolve().parent
-MEMORY_DB = BASE_DIR / "npc_memory.db"
+import db_paths
+
+# Reassigned by server.py after game_api.env load; tests may monkeypatch this.
+MEMORY_DB = db_paths.MEMORY_DB
 
 # Existing unscoped rows are attributed to this campaign on first migration.
 LEGACY_CAMPAIGN_BACKFILL_ID = "greyhaven_intro"
