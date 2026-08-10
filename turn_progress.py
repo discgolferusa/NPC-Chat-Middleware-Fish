@@ -42,6 +42,7 @@ TEXT_TURN_STEPS: tuple[dict[str, Any], ...] = (
     {"key": "waiting_llm", "message": "Waiting for the NPC to think of a reply..."},
     {"key": "processing_response", "message": "Shaping the NPC's response..."},
     {"key": "text_ready", "message": "Reply text ready..."},
+    {"key": "synthesizing_speech", "message": "Synthesizing speech..."},
     {"key": "finishing", "message": "Almost ready — finishing up..."},
     {"key": "complete", "message": "Response ready."},
 )
@@ -162,6 +163,11 @@ def set_turn_progress(
         entry = _PROGRESS.get(request_id)
         if not entry:
             return None
+
+        # Terminal turns must stay terminal. Re-opening after complete caused player UI
+        # to keep polling "Synthesizing speech..." forever after audio already played.
+        if entry.get("status") in ("complete", "error", "failed"):
+            return public_progress(entry)
 
         mode = entry.get("mode") or "text"
         step = STEP_LOOKUP.get(mode, STEP_LOOKUP["text"]).get(step_key)

@@ -167,6 +167,35 @@ def test_npc_preload_and_npc_turn(api):
     assert "watch" in reply.lower() or "firm" in reply.lower()
 
 
+def test_npc_turn_with_audio_completes_progress_after_tts(api):
+    """include_audio must not leave progress stuck on synthesizing_speech after complete."""
+    client, _, headers = api
+    request_id = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+
+    turn = client.post(
+        "/npc-turn",
+        headers=headers,
+        json={
+            "npc_id": "captain_varra",
+            "text": "Any news from the aqueduct?",
+            "scene": {"description": "Rainy barracks"},
+            "history": [],
+            "player_id": "player_alden",
+            "include_audio": True,
+            "request_id": request_id,
+        },
+    )
+    assert turn.status_code == 200
+    body = turn.get_json()
+    assert body.get("audio_clips") or body.get("audio_url")
+
+    progress = client.get(f"/turn/progress/{request_id}", headers=headers)
+    assert progress.status_code == 200
+    progress_body = progress.get_json()
+    assert progress_body["status"] == "complete"
+    assert progress_body["step"] == "complete"
+
+
 def test_npc_voice_turn(api):
     client, server, headers = api
     data = {

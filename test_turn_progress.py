@@ -45,3 +45,21 @@ def test_fail_turn_progress():
 
 def test_set_unknown_request_returns_none():
     assert tp.set_turn_progress("cccccccccccccccccccccccccccccccc", "received") is None
+
+
+def test_set_after_complete_does_not_reopen():
+    rid = "dddddddddddddddddddddddddddddddd"
+    tp.register_turn_progress(rid, route="/npc-turn", mode="text")
+    tp.complete_turn_progress(rid)
+
+    reopened = tp.set_turn_progress(rid, "synthesizing_speech")
+    assert reopened is not None
+    assert reopened["status"] == "complete"
+    assert reopened["step"] == "complete"
+
+
+def test_text_steps_include_synthesizing_speech():
+    keys = [step["key"] for step in tp.TEXT_TURN_STEPS]
+    assert "synthesizing_speech" in keys
+    assert keys.index("synthesizing_speech") < keys.index("finishing")
+    assert keys.index("finishing") < keys.index("complete")
