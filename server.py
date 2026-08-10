@@ -55,6 +55,7 @@ from dm_channel import (
     save_dm_message,
     strip_dm_check_tag,
 )
+import dm_channel
 from party_campaign import (
     DEFAULT_PLAYER_ID,
     build_party_context,
@@ -124,6 +125,8 @@ from tts_processing import (
     resolve_tts_options,
 )
 from piper_paths import LEGACY_WINDOWS_PIPER_EXE, resolve_piper_exe
+from db_paths import MEMORY_DB as _SHARED_MEMORY_DB
+from db_paths import refresh_memory_db, resolve_memory_db
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -132,7 +135,8 @@ LOCATION_DIR = BASE_DIR / "locations"
 UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", str(BASE_DIR / "uploads")))
 OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", str(BASE_DIR / "outputs")))
 
-MEMORY_DB = Path(os.environ.get("MEMORY_DB", str(BASE_DIR / "npc_memory.db")))
+# Kept in sync with dm_channel.MEMORY_DB (see refresh after game_api.env load).
+MEMORY_DB = _SHARED_MEMORY_DB
 
 PARTIES_DIR = BASE_DIR / "parties"
 CAMPAIGNS_DIR = BASE_DIR / "campaigns"
@@ -232,6 +236,10 @@ def _load_game_api_env_file() -> None:
 
 
 _load_game_api_env_file()
+
+# Re-bind after game_api.env so MEMORY_DB from the file applies to NPC + DM tables.
+MEMORY_DB = refresh_memory_db()
+dm_channel.MEMORY_DB = MEMORY_DB
 
 # Prefer PIPER_EXE / PATH; fall back to legacy Windows path for local Funnel/dev.
 try:
