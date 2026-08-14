@@ -113,6 +113,8 @@ from prompt_caps import get_prompt_caps, save_prompt_caps, DEFAULT_PROMPT_CAPS
 from npc_pronouns import get_npc_pronoun_context
 from peer_context import build_peer_location_prompt_sections
 from tts_processing import (
+    DEFAULT_DENOISE_NF,
+    DEFAULT_DENOISE_NR,
     DEFAULT_FX_PRESET,
     DEFAULT_LENGTH_SCALE,
     DEFAULT_NOISE_SCALE,
@@ -1852,6 +1854,8 @@ def convert_wav_to_standard_format(
     pitch_semitones: float = 0.0,
     fx_preset: str = DEFAULT_FX_PRESET,
     trim_silence: bool = True,
+    denoise_nr: float | None = None,
+    denoise_nf: float | None = None,
 ) -> None:
     """
     Convert a WAV file to standard Piper-friendly PCM with clarity post-processing.
@@ -1865,6 +1869,8 @@ def convert_wav_to_standard_format(
         fx_preset=fx_preset,
         trim_silence=trim_silence,
         sample_rate=STANDARD_WAV_SAMPLE_RATE,
+        denoise_nr=DEFAULT_DENOISE_NR if denoise_nr is None else denoise_nr,
+        denoise_nf=DEFAULT_DENOISE_NF if denoise_nf is None else denoise_nf,
     )
 
     subprocess.run(
@@ -2062,6 +2068,8 @@ def synthesize_segmented_speech_clips(
             "tts_speaker_id": narrator_tts.get("speaker_id"),
             "tts_pitch_semitones": narrator_tts.get("pitch_semitones"),
             "tts_fx": narrator_tts.get("fx_preset"),
+            "tts_denoise_nr": narrator_tts.get("denoise_nr"),
+            "tts_denoise_nf": narrator_tts.get("denoise_nf"),
         },
         length_scale=narrator_tts.get("length_scale"),
         noise_scale=narrator_tts.get("noise_scale"),
@@ -2070,6 +2078,8 @@ def synthesize_segmented_speech_clips(
         speaker_id=narrator_tts.get("speaker_id"),
         pitch_semitones=narrator_tts.get("pitch_semitones"),
         fx_preset=narrator_tts.get("fx_preset") or "clarity",
+        denoise_nr=narrator_tts.get("denoise_nr"),
+        denoise_nf=narrator_tts.get("denoise_nf"),
     )
 
     narration_path: Path | None = None
@@ -2106,6 +2116,8 @@ def synthesize_segmented_speech_clips(
                 out_path,
                 pitch_semitones=float(opts.get("pitch_semitones") or 0.0),
                 fx_preset=str(opts.get("fx_preset") or DEFAULT_FX_PRESET),
+                denoise_nr=opts.get("denoise_nr"),
+                denoise_nf=opts.get("denoise_nf"),
             )
 
             # Keep legacy first-of-type paths for older consumers.
@@ -2220,6 +2232,8 @@ def _tts_request_values_from_mapping(mapping: Any) -> dict[str, Any]:
         "tts_speaker_id": ("tts_speaker_id", "speaker_id"),
         "tts_pitch_semitones": ("tts_pitch_semitones", "pitch_semitones"),
         "tts_fx": ("tts_fx", "fx_preset"),
+        "tts_denoise_nr": ("tts_denoise_nr", "denoise_nr"),
+        "tts_denoise_nf": ("tts_denoise_nf", "denoise_nf"),
     }
     out: dict[str, Any] = {}
     get = mapping.get if hasattr(mapping, "get") else None
@@ -4144,6 +4158,8 @@ def preview_voice():
             output_path,
             pitch_semitones=float(opts.get("pitch_semitones") or 0.0),
             fx_preset=str(opts.get("fx_preset") or DEFAULT_FX_PRESET),
+            denoise_nr=opts.get("denoise_nr"),
+            denoise_nf=opts.get("denoise_nf"),
         )
         print(
             f"[VOICE] preview ok resolve={resolve_elapsed:.3f}s "

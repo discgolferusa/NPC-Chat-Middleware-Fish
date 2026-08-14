@@ -80,11 +80,31 @@ def test_af_filter_includes_clarity_baseline():
     assert "areverse" in af
 
 
-def test_af_filter_always_includes_denoise():
+def test_af_filter_always_includes_denoise_by_default():
     af = build_af_filter(fx_preset="none", trim_silence=False)
-    assert "afftdn=" in af
+    assert "afftdn=nr=12.00:nf=-25.00" in af
     assert af.index("highpass=") < af.index("afftdn=")
     assert af.index("afftdn=") < af.index("equalizer=")
+
+
+def test_af_filter_denoise_severity_is_tunable():
+    mild = build_af_filter(denoise_nr=6, denoise_nf=-20, trim_silence=False)
+    strong = build_af_filter(denoise_nr=20, denoise_nf=-35, trim_silence=False)
+    assert "afftdn=nr=6.00:nf=-20.00" in mild
+    assert "afftdn=nr=20.00:nf=-35.00" in strong
+
+
+def test_af_filter_denoise_disabled_when_nr_zero():
+    af = build_af_filter(denoise_nr=0, denoise_nf=-25, trim_silence=False)
+    assert "afftdn=" not in af
+
+
+def test_resolve_reads_denoise_from_yaml():
+    opts = resolve_tts_options(
+        {"tts_denoise_nr": 8, "tts_denoise_nf": -22},
+    )
+    assert opts["denoise_nr"] == 8
+    assert opts["denoise_nf"] == -22
 
 
 def test_af_filter_trim_still_removes_edges_only():
