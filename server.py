@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, send_file, make_response, g
+from flask import Flask, request, jsonify, send_file, make_response
 import os
 import hashlib
 import secrets
