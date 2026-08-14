@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, send_file, make_response
+from flask import Flask, request, jsonify, send_file, make_response, g
 import os
 import hashlib
 import secrets
@@ -18,6 +18,7 @@ import threading
 import time
 import shutil
 
+from request_timing import attach_timing_headers, begin_request_timing, log_timing
 from faster_whisper import WhisperModel
 
 from llm_router import (
@@ -565,12 +566,6 @@ else:
 def _clear_content_owner(_exc=None):
     clear_request_context()
     clear_request_owner()
-
-
-def log_timing(request_id: str, label: str, start_time: float):
-    elapsed = time.perf_counter() - start_time
-    print(f"[TIMING] {request_id} {label}: {elapsed:.3f}s", flush=True)
-    return time.perf_counter()
 
 
 def _header_b64(value: str | None, *, max_chars: int = 6000) -> str:
@@ -2416,6 +2411,7 @@ def npc_turn():
     party_context = session["party_context"]
 
     request_id = new_request_id(body.get("request_id"))
+    begin_request_timing()
     total_start = time.perf_counter()
     step_start = total_start
 
@@ -2587,7 +2583,7 @@ def npc_turn():
             payload["audio_url"] = audio_url
             payload["audio_clips"] = audio_clips
 
-        return jsonify(payload)
+        return attach_timing_headers(jsonify(payload), request_id)
 
     except Exception as ex:
         fail_turn_progress(request_id, "turn_failed")
@@ -2599,11 +2595,12 @@ def npc_turn():
             stage="error",
         )
         print(f"[NPC-TURN] failed request_id={request_id}: {ex!r}", flush=True)
-        return jsonify({
+        err = jsonify({
             "error": "Internal server error",
             "request_id": request_id,
             "npc_id": npc_id,
-        }), 500
+        })
+        return attach_timing_headers(err, request_id), 500
 
 
 @app.post("/npc-voice-turn")
@@ -2622,6 +2619,7 @@ def npc_voice_turn():
         return jsonify({"error": "Missing audio file field named 'audio'"}), 400
 
     request_id = new_request_id(request.form.get("request_id"))
+    begin_request_timing()
     total_start = time.perf_counter()
     step_start = total_start
 
@@ -2888,7 +2886,7 @@ def npc_voice_turn():
             response.headers["X-Narration-Audio-Url"] = turn_audio_url(request_id, "narration")
         if speech_path:
             response.headers["X-Speech-Audio-Url"] = turn_audio_url(request_id, "speech")
-        return response
+        return attach_timing_headers(response, request_id)
 
     except Exception as ex:
         total_elapsed = time.perf_counter() - total_start
@@ -2902,11 +2900,12 @@ def npc_voice_turn():
         )
         print(f"[DM] route=/npc-voice-turn stage=error request_id={request_id} error={ex!r}", flush=True)
         fail_turn_progress(request_id, "turn_failed")
-        return jsonify({
+        err = jsonify({
             "error": "Internal server error",
             "request_id": request_id,
             "npc_id": npc_id
-        }), 500
+        })
+        return attach_timing_headers(err, request_id), 500
 
 
 @app.post("/npc-voice-turn-debug")
