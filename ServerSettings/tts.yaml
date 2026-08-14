@@ -1,9 +1,10 @@
 narrator:
-  voice_model: C:\AI\Voices\en\en_US\amy\medium\en_US-amy-medium.onnx
+  voice_model: en/en_US/Licensed/libritts/en_US-libritts-high.onnx
   length_scale: 1.15
   noise_scale: 0.667
   noise_w: 0.8
   sentence_silence: 0.2
-  speaker_id: 0
+  speaker_id: 3
+  speaker_name: Dylan Howard
   pitch_semitones: 0.0
   fx_preset: none

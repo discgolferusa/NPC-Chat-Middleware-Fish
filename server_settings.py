@@ -19,12 +19,15 @@ SERVER_SETTINGS_DIR = BASE_DIR / "ServerSettings"
 DEFAULT_LLM_RULES_FILE = SERVER_SETTINGS_DIR / "llm_rules.yaml"
 DEFAULT_TTS_SETTINGS_FILE = SERVER_SETTINGS_DIR / "tts.yaml"
 
-_DEFAULT_NARRATOR_VOICE_MODEL = r"C:\AI\Voices\en\en_US\amy\medium\en_US-amy-medium.onnx"
+# Relative to VOICES_DIR (Z:\voices locally / C:\AI\Voices on server).
+_DEFAULT_NARRATOR_VOICE_MODEL = "en/en_US/Licensed/libritts/en_US-libritts-high.onnx"
 _DEFAULT_NARRATOR_LENGTH_SCALE = 1.15
 _DEFAULT_NARRATOR_NOISE_SCALE = 0.667
 _DEFAULT_NARRATOR_NOISE_W = 0.8
 _DEFAULT_NARRATOR_SENTENCE_SILENCE = 0.2
-_DEFAULT_NARRATOR_SPEAKER_ID = 0
+# Piper speaker_id_map entry "Dylan Howard" on en_US-libritts-high.
+_DEFAULT_NARRATOR_SPEAKER_ID = 3
+_DEFAULT_NARRATOR_SPEAKER_NAME = "Dylan Howard"
 _DEFAULT_NARRATOR_PITCH_SEMITONES = 0.0
 _DEFAULT_NARRATOR_FX = "none"
 
@@ -116,6 +119,20 @@ def _as_optional_int(value: Any) -> int | None:
         return None
 
 
+def _normalize_voice_key(path: str) -> str:
+    """Compare voice paths across absolute/relative and slash styles."""
+    normalized = str(path or "").replace("\\", "/").strip().lower()
+    for marker in ("/voices/",):
+        idx = normalized.find(marker)
+        if idx >= 0:
+            normalized = normalized[idx + len(marker) :]
+    return normalized.lstrip("/")
+
+
+def _is_default_narrator_voice(path: str) -> bool:
+    return _normalize_voice_key(path) == _normalize_voice_key(_DEFAULT_NARRATOR_VOICE_MODEL)
+
+
 def _default_tts_settings() -> dict[str, Any]:
     return {
         "narrator": {
@@ -125,6 +142,7 @@ def _default_tts_settings() -> dict[str, Any]:
             "noise_w": _DEFAULT_NARRATOR_NOISE_W,
             "sentence_silence": _DEFAULT_NARRATOR_SENTENCE_SILENCE,
             "speaker_id": _DEFAULT_NARRATOR_SPEAKER_ID,
+            "speaker_name": _DEFAULT_NARRATOR_SPEAKER_NAME,
             "pitch_semitones": _DEFAULT_NARRATOR_PITCH_SEMITONES,
             "fx_preset": _DEFAULT_NARRATOR_FX,
         }
@@ -168,9 +186,10 @@ def get_narrator_tts_settings(path: Path | None = None) -> dict[str, Any]:
     data = pack_tts if isinstance(pack_tts, dict) else load_tts_settings(path)
     narrator = data.get("narrator") if isinstance(data.get("narrator"), dict) else {}
 
-    voice_model = str(
-        narrator.get("voice_model") or _DEFAULT_NARRATOR_VOICE_MODEL
-    ).strip()
+    configured_voice = str(narrator.get("voice_model") or "").strip()
+    voice_model = configured_voice or _DEFAULT_NARRATOR_VOICE_MODEL
+    using_default_voice = (not configured_voice) or _is_default_narrator_voice(voice_model)
+
     length_scale = _as_float(
         narrator.get("length_scale", narrator.get("tts_length_scale")),
         _DEFAULT_NARRATOR_LENGTH_SCALE,
@@ -190,8 +209,19 @@ def get_narrator_tts_settings(path: Path | None = None) -> dict[str, Any]:
     speaker_id = _as_optional_int(
         narrator.get("speaker_id", narrator.get("tts_speaker_id"))
     )
+    speaker_id_missing = speaker_id is None
+    speaker_name = str(
+        narrator.get("speaker_name") or narrator.get("tts_speaker_name") or ""
+    ).strip()
+    # LibriTTS Dylan Howard (id 3) only when on the default narrator voice.
+    # Overridden single-speaker models (e.g. Amy) omit speaker_id → use 0.
     if speaker_id is None:
-        speaker_id = _DEFAULT_NARRATOR_SPEAKER_ID
+        speaker_id = (
+            _DEFAULT_NARRATOR_SPEAKER_ID if using_default_voice else 0
+        )
+    # Never invent a display name for packs that only set speaker_id.
+    if not speaker_name and speaker_id_missing and using_default_voice:
+        speaker_name = _DEFAULT_NARRATOR_SPEAKER_NAME
     pitch_semitones = _as_float(
         narrator.get("pitch_semitones", narrator.get("tts_pitch_semitones")),
         _DEFAULT_NARRATOR_PITCH_SEMITONES,
@@ -207,6 +237,7 @@ def get_narrator_tts_settings(path: Path | None = None) -> dict[str, Any]:
         "noise_w": noise_w,
         "sentence_silence": sentence_silence,
         "speaker_id": speaker_id,
+        "speaker_name": speaker_name,
         "pitch_semitones": pitch_semitones,
         "fx_preset": fx_preset,
         "resolved_voice_model": voice_model,

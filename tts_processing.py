@@ -402,6 +402,9 @@ def build_af_filter(
 
     # Always-on clarity baseline (ElevenLabs-ish speaker boost / loudness feel).
     filters.append("highpass=f=80")
+    # Light spectral denoise before EQ/dynamics so Piper hiss is not amplified.
+    # Permanent for now; can be made optional later if it dulls consonants too much.
+    filters.append("afftdn=nr=12:nf=-25")
     filters.append("equalizer=f=3000:t=q:w=1.2:g=2.5")
     filters.append("acompressor=threshold=-18dB:ratio=2.5:attack=10:release=80:makeup=2")
     filters.append("alimiter=limit=0.95")
