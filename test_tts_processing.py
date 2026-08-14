@@ -72,11 +72,19 @@ def test_resolve_prefers_yaml_override():
 def test_af_filter_includes_clarity_baseline():
     af = build_af_filter(fx_preset="cave", pitch_semitones=1)
     assert "dynaudnorm" in af
+    assert "afftdn=" in af
     assert "aecho" in af
     assert "asetrate" in af
     # Mid-sentence pauses must not be treated as clip end.
     assert "stop_periods" not in af
     assert "areverse" in af
+
+
+def test_af_filter_always_includes_denoise():
+    af = build_af_filter(fx_preset="none", trim_silence=False)
+    assert "afftdn=" in af
+    assert af.index("highpass=") < af.index("afftdn=")
+    assert af.index("afftdn=") < af.index("equalizer=")
 
 
 def test_af_filter_trim_still_removes_edges_only():
