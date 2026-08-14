@@ -30,7 +30,9 @@ DENOISE_NR_MIN, DENOISE_NR_MAX = 0.0, 30.0
 # FFmpeg afftdn nf is documented/validated as [-80, -20].
 DENOISE_NF_MIN, DENOISE_NF_MAX = -80.0, -20.0
 
-VALID_FX_PRESETS = frozenset({"none", "clarity", "cave", "radio", "grit"})
+VALID_FX_PRESETS = frozenset(
+    {"none", "clarity", "cave", "radio", "grit", "underwater", "robot", "whisper"}
+)
 
 # Global pronunciation glossary (fiction / common RPG terms). Per-NPC overrides win.
 DEFAULT_PRONUNCIATION: dict[str, str] = {
@@ -458,6 +460,26 @@ def build_af_filter(
     elif preset == "clarity":
         # Extra presence on top of the baseline.
         filters.append("equalizer=f=4500:t=q:w=1:g=2")
+    elif preset == "underwater":
+        # Muffled lows/mids + short watery echoes.
+        filters.append("lowpass=f=900")
+        filters.append("highpass=f=100")
+        filters.append("aecho=0.6:0.7:40|90:0.28|0.18")
+        filters.append("equalizer=f=380:t=q:w=1:g=2.5")
+    elif preset == "robot":
+        # Narrow band + vibrato + hard compression for a synthetic edge.
+        filters.append("highpass=f=280")
+        filters.append("lowpass=f=3400")
+        filters.append("vibrato=f=8.5:d=0.35")
+        filters.append("equalizer=f=2200:t=q:w=1.4:g=5")
+        filters.append("acompressor=threshold=-16dB:ratio=6:attack=3:release=40:makeup=4")
+    elif preset == "whisper":
+        # Thin, quieter presence (FX approximation — not true whisper synthesis).
+        filters.append("highpass=f=350")
+        filters.append("equalizer=f=220:t=q:w=1:g=-7")
+        filters.append("equalizer=f=5500:t=q:w=1.2:g=3")
+        filters.append("volume=0.72")
+        filters.append("acompressor=threshold=-22dB:ratio=1.8:attack=15:release=120:makeup=1")
 
     pitch = _clamp(float(pitch_semitones or 0.0), PITCH_SEMITONES_MIN, PITCH_SEMITONES_MAX)
     if abs(pitch) >= 0.05:

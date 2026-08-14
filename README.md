@@ -189,7 +189,7 @@ Preview request body:
 
 `voice_path` / YAML `voice_model` must be **relative to `VOICES_DIR`** (posix separators). Absolute/UNC paths are rejected; legacy absolutes may still resolve by basename via the voice inventory.
 
-`fx_preset` values: `none`, `clarity`, `cave`, `radio`, `grit`.
+`fx_preset` values: `none`, `clarity`, `cave`, `radio`, `grit`, `underwater`, `robot`, `whisper`.
 
 Returns `audio/wav` (22050 Hz mono PCM16 after ffmpeg loudness/EQ normalization).
 
