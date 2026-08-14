@@ -80,6 +80,25 @@ def test_af_filter_includes_clarity_baseline():
     assert "areverse" in af
 
 
+def test_af_filter_underwater_robot_whisper_presets():
+    underwater = build_af_filter(fx_preset="underwater", trim_silence=False)
+    robot = build_af_filter(fx_preset="robot", trim_silence=False)
+    whisper = build_af_filter(fx_preset="whisper", trim_silence=False)
+    assert "lowpass=f=900" in underwater
+    assert "aecho=" in underwater
+    assert "vibrato=" in robot
+    assert "equalizer=f=2200" in robot
+    assert "highpass=f=350" in whisper
+    assert "volume=0.72" in whisper
+
+
+def test_resolve_accepts_new_fx_presets():
+    for preset in ("underwater", "robot", "whisper"):
+        opts = resolve_tts_options({"tts_fx": preset})
+        assert opts["fx_preset"] == preset
+    assert resolve_tts_options({"tts_fx": "not-a-real-fx"})["fx_preset"] == "none"
+
+
 def test_af_filter_always_includes_denoise_by_default():
     af = build_af_filter(fx_preset="none", trim_silence=False)
     assert "afftdn=nr=12.00:nf=-25.00" in af
