@@ -2657,10 +2657,11 @@ def npc_voice_turn():
                 flush=True,
             )
             fail_turn_progress(request_id, "Couldn't catch that — try again")
-            return jsonify({
+            err = jsonify({
                 "error": "Couldn't catch that. Speak a bit clearer or hold a moment longer, then try again.",
                 "request_id": request_id,
-            }), 400
+            })
+            return attach_timing_headers(err, request_id), 400
 
         log_dm_turn(
             request_id=request_id,
