@@ -9,6 +9,7 @@ from tts_processing import (
     infer_dataset_name,
     infer_quality_tier,
     load_piper_model_meta,
+    options_from_request_and_npc,
     resolve_tts_options,
 )
 
@@ -107,6 +108,23 @@ def test_resolve_clamps_denoise_nf_to_ffmpeg_range():
     assert opts["denoise_nf"] == -20
     opts_low = resolve_tts_options({"tts_denoise_nf": -100})
     assert opts_low["denoise_nf"] == -80
+
+
+def test_resolve_uses_default_denoise_when_request_omits_knobs():
+    opts = resolve_tts_options({})
+    assert opts["denoise_nr"] == 12
+    assert opts["denoise_nf"] == -25
+
+
+def test_options_from_request_treat_null_denoise_as_default():
+    # Preview proxy used to forward denoise_nr: null; resolve must keep defaults.
+    opts = options_from_request_and_npc(
+        {"tts_length_scale": 1.2, "tts_denoise_nr": None, "tts_denoise_nf": None},
+        None,
+    )
+    assert opts["length_scale"] == 1.2
+    assert opts["denoise_nr"] == 12
+    assert opts["denoise_nf"] == -25
 
 
 def test_af_filter_denoise_disabled_when_nr_zero():
