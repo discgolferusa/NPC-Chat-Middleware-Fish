@@ -16,6 +16,9 @@ DEFAULT_NOISE_W = 0.8
 DEFAULT_SENTENCE_SILENCE = 0.2
 DEFAULT_PITCH_SEMITONES = 0.0
 DEFAULT_FX_PRESET = "none"
+# FFmpeg afftdn defaults (nr=0 skips the denoise stage).
+DEFAULT_DENOISE_NR = 12.0
+DEFAULT_DENOISE_NF = -25.0
 
 # Clamp ranges for request / YAML overrides.
 LENGTH_SCALE_MIN, LENGTH_SCALE_MAX = 0.5, 2.0
@@ -23,6 +26,9 @@ NOISE_SCALE_MIN, NOISE_SCALE_MAX = 0.0, 1.5
 NOISE_W_MIN, NOISE_W_MAX = 0.0, 2.0
 SENTENCE_SILENCE_MIN, SENTENCE_SILENCE_MAX = 0.0, 2.0
 PITCH_SEMITONES_MIN, PITCH_SEMITONES_MAX = -6.0, 6.0
+DENOISE_NR_MIN, DENOISE_NR_MAX = 0.0, 30.0
+# FFmpeg afftdn nf is documented/validated as [-80, -20].
+DENOISE_NF_MIN, DENOISE_NF_MAX = -80.0, -20.0
 
 VALID_FX_PRESETS = frozenset({"none", "clarity", "cave", "radio", "grit"})
 
@@ -308,6 +314,8 @@ def resolve_tts_options(
     speaker_id: Any = None,
     pitch_semitones: Any = None,
     fx_preset: Any = None,
+    denoise_nr: Any = None,
+    denoise_nf: Any = None,
     pronunciation: Any = None,
     quality_hint: str | None = None,
 ) -> dict[str, Any]:
@@ -355,6 +363,24 @@ def resolve_tts_options(
         raw_fx = npc.get("tts_fx")
     fx = _as_fx_preset(raw_fx)
 
+    raw_nr = denoise_nr
+    if raw_nr is None or str(raw_nr).strip() == "":
+        raw_nr = npc.get("tts_denoise_nr", npc.get("denoise_nr"))
+    opts_nr = _clamp(
+        _as_float(raw_nr, DEFAULT_DENOISE_NR),
+        DENOISE_NR_MIN,
+        DENOISE_NR_MAX,
+    )
+
+    raw_nf = denoise_nf
+    if raw_nf is None or str(raw_nf).strip() == "":
+        raw_nf = npc.get("tts_denoise_nf", npc.get("denoise_nf"))
+    opts_nf = _clamp(
+        _as_float(raw_nf, DEFAULT_DENOISE_NF),
+        DENOISE_NF_MIN,
+        DENOISE_NF_MAX,
+    )
+
     gloss = dict(DEFAULT_PRONUNCIATION)
     gloss.update(_as_pronunciation_map(npc.get("tts_pronunciation")))
     if pronunciation is not None:
@@ -368,6 +394,8 @@ def resolve_tts_options(
         "speaker_id": sid,
         "pitch_semitones": pitch,
         "fx_preset": fx,
+        "denoise_nr": opts_nr,
+        "denoise_nf": opts_nf,
         "pronunciation": gloss,
         "quality": quality,
     }
@@ -379,6 +407,8 @@ def build_af_filter(
     fx_preset: str = "none",
     trim_silence: bool = True,
     sample_rate: int = 22050,
+    denoise_nr: float = DEFAULT_DENOISE_NR,
+    denoise_nf: float = DEFAULT_DENOISE_NF,
 ) -> str:
     """
     Build an FFmpeg -af chain: optional silence trim, clarity EQ/dynamics,
@@ -402,9 +432,11 @@ def build_af_filter(
 
     # Always-on clarity baseline (ElevenLabs-ish speaker boost / loudness feel).
     filters.append("highpass=f=80")
-    # Light spectral denoise before EQ/dynamics so Piper hiss is not amplified.
-    # Permanent for now; can be made optional later if it dulls consonants too much.
-    filters.append("afftdn=nr=12:nf=-25")
+    nr = _clamp(float(denoise_nr if denoise_nr is not None else DEFAULT_DENOISE_NR), DENOISE_NR_MIN, DENOISE_NR_MAX)
+    nf = _clamp(float(denoise_nf if denoise_nf is not None else DEFAULT_DENOISE_NF), DENOISE_NF_MIN, DENOISE_NF_MAX)
+    # nr=0 disables spectral denoise (useful when comparing or if speech dulls).
+    if nr > 0.05:
+        filters.append(f"afftdn=nr={nr:.2f}:nf={nf:.2f}")
     filters.append("equalizer=f=3000:t=q:w=1.2:g=2.5")
     filters.append("acompressor=threshold=-18dB:ratio=2.5:attack=10:release=80:makeup=2")
     filters.append("alimiter=limit=0.95")
@@ -451,5 +483,7 @@ def options_from_request_and_npc(
         speaker_id=rv.get("tts_speaker_id", rv.get("speaker_id")),
         pitch_semitones=rv.get("tts_pitch_semitones", rv.get("pitch_semitones")),
         fx_preset=rv.get("tts_fx", rv.get("fx_preset")),
+        denoise_nr=rv.get("tts_denoise_nr", rv.get("denoise_nr")),
+        denoise_nf=rv.get("tts_denoise_nf", rv.get("denoise_nf")),
         pronunciation=rv.get("tts_pronunciation", rv.get("pronunciation")),
     )

@@ -30,6 +30,8 @@ _DEFAULT_NARRATOR_SPEAKER_ID = 3
 _DEFAULT_NARRATOR_SPEAKER_NAME = "Dylan Howard"
 _DEFAULT_NARRATOR_PITCH_SEMITONES = 0.0
 _DEFAULT_NARRATOR_FX = "none"
+_DEFAULT_NARRATOR_DENOISE_NR = 12.0
+_DEFAULT_NARRATOR_DENOISE_NF = -25.0
 
 _CACHE_LOCK = threading.Lock()
 _LLM_RULES_CACHE: dict[str, Any] = {}
@@ -145,6 +147,8 @@ def _default_tts_settings() -> dict[str, Any]:
             "speaker_name": _DEFAULT_NARRATOR_SPEAKER_NAME,
             "pitch_semitones": _DEFAULT_NARRATOR_PITCH_SEMITONES,
             "fx_preset": _DEFAULT_NARRATOR_FX,
+            "denoise_nr": _DEFAULT_NARRATOR_DENOISE_NR,
+            "denoise_nf": _DEFAULT_NARRATOR_DENOISE_NF,
         }
     }
 
@@ -229,6 +233,14 @@ def get_narrator_tts_settings(path: Path | None = None) -> dict[str, Any]:
     fx_preset = str(
         narrator.get("fx_preset") or narrator.get("tts_fx") or _DEFAULT_NARRATOR_FX
     ).strip().lower() or _DEFAULT_NARRATOR_FX
+    denoise_nr = _as_float(
+        narrator.get("denoise_nr", narrator.get("tts_denoise_nr")),
+        _DEFAULT_NARRATOR_DENOISE_NR,
+    )
+    denoise_nf = _as_float(
+        narrator.get("denoise_nf", narrator.get("tts_denoise_nf")),
+        _DEFAULT_NARRATOR_DENOISE_NF,
+    )
 
     return {
         "voice_model": voice_model,
@@ -240,6 +252,8 @@ def get_narrator_tts_settings(path: Path | None = None) -> dict[str, Any]:
         "speaker_name": speaker_name,
         "pitch_semitones": pitch_semitones,
         "fx_preset": fx_preset,
+        "denoise_nr": denoise_nr,
+        "denoise_nf": denoise_nf,
         "resolved_voice_model": voice_model,
     }
 
