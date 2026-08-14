@@ -27,7 +27,8 @@ NOISE_W_MIN, NOISE_W_MAX = 0.0, 2.0
 SENTENCE_SILENCE_MIN, SENTENCE_SILENCE_MAX = 0.0, 2.0
 PITCH_SEMITONES_MIN, PITCH_SEMITONES_MAX = -6.0, 6.0
 DENOISE_NR_MIN, DENOISE_NR_MAX = 0.0, 30.0
-DENOISE_NF_MIN, DENOISE_NF_MAX = -50.0, -5.0
+# FFmpeg afftdn nf is documented/validated as [-80, -20].
+DENOISE_NF_MIN, DENOISE_NF_MAX = -80.0, -20.0
 
 VALID_FX_PRESETS = frozenset({"none", "clarity", "cave", "radio", "grit"})
 

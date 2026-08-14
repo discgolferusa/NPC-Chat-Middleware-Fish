@@ -94,6 +94,21 @@ def test_af_filter_denoise_severity_is_tunable():
     assert "afftdn=nr=20.00:nf=-35.00" in strong
 
 
+def test_af_filter_clamps_nf_to_ffmpeg_afftdn_range():
+    # Values above -20 (e.g. -5) must not reach FFmpeg — afftdn rejects them.
+    mild = build_af_filter(denoise_nr=12, denoise_nf=-5, trim_silence=False)
+    deep = build_af_filter(denoise_nr=12, denoise_nf=-90, trim_silence=False)
+    assert "afftdn=nr=12.00:nf=-20.00" in mild
+    assert "afftdn=nr=12.00:nf=-80.00" in deep
+
+
+def test_resolve_clamps_denoise_nf_to_ffmpeg_range():
+    opts = resolve_tts_options({"tts_denoise_nf": -10})
+    assert opts["denoise_nf"] == -20
+    opts_low = resolve_tts_options({"tts_denoise_nf": -100})
+    assert opts_low["denoise_nf"] == -80
+
+
 def test_af_filter_denoise_disabled_when_nr_zero():
     af = build_af_filter(denoise_nr=0, denoise_nf=-25, trim_silence=False)
     assert "afftdn=" not in af
