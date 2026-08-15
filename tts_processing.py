@@ -157,9 +157,119 @@ def infer_dataset_name(model_path: Path | str) -> str:
     return stem or filename
 
 
+def speaker_annotation_sidecar_path(model_path: Path) -> Path:
+    """Sidecar next to the ONNX: ``model.onnx.speakers.json``."""
+    return Path(str(model_path) + ".speakers.json")
+
+
+def _annotation_text_from_entry(entry: Any) -> str:
+    if entry is None:
+        return ""
+    if isinstance(entry, str):
+        return entry.strip()
+    if isinstance(entry, dict):
+        for key in ("annotation", "descriptors", "description", "text"):
+            value = entry.get(key)
+            if value is not None and str(value).strip():
+                return str(value).strip()
+    return ""
+
+
+def _display_name_from_entry(entry: Any) -> str:
+    if not isinstance(entry, dict):
+        return ""
+    for key in ("name", "friendly_name", "display_name"):
+        value = entry.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return ""
+
+
+def load_speaker_annotation_sidecar(model_path: Path) -> dict[int, dict[str, str]]:
+    """
+    Load optional human annotation overlay for multi-speaker Piper models.
+
+    Expected shape::
+
+        {
+          "speakers": {
+            "0": {"name": "Benjamin Parker", "annotation": "masculine, calm, ..."},
+            "1": "feminine, soft, ..."
+          }
+        }
+
+    Keys may be string or int speaker ids. Annotation-only string values are allowed.
+    """
+    path = speaker_annotation_sidecar_path(model_path)
+    if not path.is_file():
+        return {}
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+    raw = data.get("speakers") if isinstance(data, dict) else None
+    if not isinstance(raw, dict):
+        return {}
+
+    out: dict[int, dict[str, str]] = {}
+    for key, entry in raw.items():
+        try:
+            sid = int(key)
+        except (TypeError, ValueError):
+            continue
+        annotation = _annotation_text_from_entry(entry)
+        name = _display_name_from_entry(entry)
+        if not annotation and not name:
+            continue
+        payload: dict[str, str] = {}
+        if name:
+            payload["name"] = name
+        if annotation:
+            payload["annotation"] = annotation
+        out[sid] = payload
+    return out
+
+
+def apply_speaker_annotation_sidecar(
+    speakers: list[dict[str, Any]],
+    sidecar: dict[int, dict[str, str]],
+) -> list[dict[str, Any]]:
+    """
+    Merge sidecar name/annotation onto existing inventory speaker rows (by id).
+
+    Sidecar ids that are not already in ``speakers`` are ignored so /voices never
+    lists speakers Piper cannot synthesize.
+    """
+    if not sidecar or not speakers:
+        return speakers
+
+    merged: list[dict[str, Any]] = []
+    for row in speakers:
+        try:
+            sid = int(row.get("id"))
+        except (TypeError, ValueError):
+            merged.append(dict(row))
+            continue
+        out = dict(row)
+        overlay = sidecar.get(sid)
+        if overlay:
+            if overlay.get("name"):
+                # Prefer sidecar friendly name only when current name is generic.
+                current = str(out.get("name") or "").strip()
+                if not current or re.match(r"^speaker_\d+$", current, re.I):
+                    out["name"] = overlay["name"]
+            if overlay.get("annotation"):
+                out["annotation"] = overlay["annotation"]
+        merged.append(out)
+    return merged
+
+
 def load_piper_model_meta(model_path: Path) -> dict[str, Any]:
     """
     Read companion .onnx.json for speaker map / recommended defaults when present.
+    Optional ``*.onnx.speakers.json`` sidecar adds annotation text for dropdowns.
     """
     meta: dict[str, Any] = {
         "dataset": infer_dataset_name(model_path),
@@ -179,6 +289,7 @@ def load_piper_model_meta(model_path: Path) -> dict[str, Any]:
         if sibling.exists():
             config_path = sibling
         else:
+            # Sidecar alone must not invent a speaker inventory.
             return meta
 
     try:
@@ -220,6 +331,11 @@ def load_piper_model_meta(model_path: Path) -> dict[str, Any]:
         meta["recommended_length_scale"] = _as_float(
             inference.get("length_scale"), DEFAULT_LENGTH_SCALE
         )
+
+    sidecar = load_speaker_annotation_sidecar(model_path)
+    if sidecar:
+        # Annotate only; never expand speakers / num_speakers beyond the model.
+        meta["speakers"] = apply_speaker_annotation_sidecar(meta["speakers"], sidecar)
 
     return meta
 
