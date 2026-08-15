@@ -202,6 +202,30 @@ names: `voice_model`, `length_scale`, `noise_scale`, `noise_w`, `sentence_silenc
 
 Env: `VOICES_DIR` overrides the scan root for `/voices`. By default the server scans **`../Voices`** (sibling of the middleware repo folder), then falls back to the `Voices` segment in the default Ryan model path (e.g. `C:\AI\Voices`).
 
+### Speaker annotation sidecars
+
+Optional file beside a multi-speaker model: ``<model>.onnx.speakers.json``.
+
+Example path: `.../Clean 100/medium/clean100.onnx.speakers.json`
+
+```json
+{
+  "version": 1,
+  "speakers": {
+    "0": { "name": "Benjamin Parker", "annotation": "masculine, calm, kind" },
+    "1": "feminine, soft, sincere"
+  }
+}
+```
+
+Middleware merges `annotation` onto `/voices` → `speakers[]`. The Yaml Editor dropdown shows `Name (annotation)`.
+
+Build from a LibriTTS-P style XLSX (Annotator 3 → 1 → 2 priority):
+
+```bash
+python scripts/build_speaker_annotation_sidecar.py --xlsx clean100_voice_descriptors.xlsx --onnx-json "Z:/Voices/.../clean100.onnx.json"
+```
+
 ## Related documentation
 
 - Yaml Editor: `docs/MIDDLEWARE_INTEGRATION.md` (Funnel + proxy contract)

@@ -62,6 +62,69 @@ def test_load_model_meta_exposes_dataset_and_named_speakers(tmp_path):
     ]
 
 
+def test_load_model_meta_merges_speaker_annotation_sidecar(tmp_path):
+    model_dir = tmp_path / "Clean 100" / "medium"
+    model_dir.mkdir(parents=True)
+    model = model_dir / "clean100.onnx"
+    model.touch()
+    (model_dir / "clean100.onnx.json").write_text(
+        json.dumps(
+            {
+                "dataset": "clean100",
+                "num_speakers": 2,
+                "speaker_id_map": {"Benjamin Parker": 0, "Teresa Richardson": 1},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (model_dir / "clean100.onnx.speakers.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "speakers": {
+                    "0": {
+                        "name": "Benjamin Parker",
+                        "annotation": "masculine, adult-like, cool, sincere",
+                    },
+                    "1": "feminine, soft, kind",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    meta = load_piper_model_meta(model)
+    assert meta["speakers"] == [
+        {
+            "id": 0,
+            "name": "Benjamin Parker",
+            "annotation": "masculine, adult-like, cool, sincere",
+        },
+        {
+            "id": 1,
+            "name": "Teresa Richardson",
+            "annotation": "feminine, soft, kind",
+        },
+    ]
+
+
+def test_build_speaker_annotation_sidecar_priority():
+    import importlib.util
+    from pathlib import Path
+
+    script = Path(__file__).resolve().parent / "scripts" / "build_speaker_annotation_sidecar.py"
+    spec = importlib.util.spec_from_file_location("build_speaker_annotation_sidecar", script)
+    mod = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(mod)
+
+    idx = {"Annotator 1": 0, "Annotator 2": 1, "Annotator 3": 2}
+    assert mod.pick_annotation(("a1", "a2", "a3"), idx) == "a3"
+    assert mod.pick_annotation(("a1", "a2", ""), idx) == "a1"
+    assert mod.pick_annotation(("", "a2", None), idx) == "a2"
+    assert mod.pick_annotation(("", "", ""), idx) == ""
+
+
 def test_resolve_prefers_yaml_override():
     opts = resolve_tts_options(
         {"voice_model": r"C:\x\low\a.onnx", "tts_noise_scale": 0.2},
