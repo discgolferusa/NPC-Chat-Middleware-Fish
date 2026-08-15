@@ -236,25 +236,34 @@ def apply_speaker_annotation_sidecar(
     speakers: list[dict[str, Any]],
     sidecar: dict[int, dict[str, str]],
 ) -> list[dict[str, Any]]:
-    """Merge sidecar name/annotation onto inventory speaker rows (by id)."""
-    if not sidecar:
+    """
+    Merge sidecar name/annotation onto existing inventory speaker rows (by id).
+
+    Sidecar ids that are not already in ``speakers`` are ignored so /voices never
+    lists speakers Piper cannot synthesize.
+    """
+    if not sidecar or not speakers:
         return speakers
 
-    by_id = {int(row.get("id")): dict(row) for row in speakers if row.get("id") is not None}
-    for sid, overlay in sidecar.items():
-        row = by_id.get(sid)
-        if row is None:
-            row = {"id": sid, "name": f"speaker_{sid}"}
-            by_id[sid] = row
-        if overlay.get("name"):
-            # Prefer sidecar friendly name only when current name is generic.
-            current = str(row.get("name") or "").strip()
-            if not current or re.match(r"^speaker_\d+$", current, re.I):
-                row["name"] = overlay["name"]
-        if overlay.get("annotation"):
-            row["annotation"] = overlay["annotation"]
-
-    return [by_id[sid] for sid in sorted(by_id)]
+    merged: list[dict[str, Any]] = []
+    for row in speakers:
+        try:
+            sid = int(row.get("id"))
+        except (TypeError, ValueError):
+            merged.append(dict(row))
+            continue
+        out = dict(row)
+        overlay = sidecar.get(sid)
+        if overlay:
+            if overlay.get("name"):
+                # Prefer sidecar friendly name only when current name is generic.
+                current = str(out.get("name") or "").strip()
+                if not current or re.match(r"^speaker_\d+$", current, re.I):
+                    out["name"] = overlay["name"]
+            if overlay.get("annotation"):
+                out["annotation"] = overlay["annotation"]
+        merged.append(out)
+    return merged
 
 
 def load_piper_model_meta(model_path: Path) -> dict[str, Any]:
@@ -280,10 +289,7 @@ def load_piper_model_meta(model_path: Path) -> dict[str, Any]:
         if sibling.exists():
             config_path = sibling
         else:
-            sidecar_only = load_speaker_annotation_sidecar(model_path)
-            if sidecar_only:
-                meta["speakers"] = apply_speaker_annotation_sidecar([], sidecar_only)
-                meta["num_speakers"] = max(len(meta["speakers"]), 1)
+            # Sidecar alone must not invent a speaker inventory.
             return meta
 
     try:
@@ -328,8 +334,8 @@ def load_piper_model_meta(model_path: Path) -> dict[str, Any]:
 
     sidecar = load_speaker_annotation_sidecar(model_path)
     if sidecar:
+        # Annotate only; never expand speakers / num_speakers beyond the model.
         meta["speakers"] = apply_speaker_annotation_sidecar(meta["speakers"], sidecar)
-        meta["num_speakers"] = max(meta["num_speakers"], len(meta["speakers"]))
 
     return meta
 

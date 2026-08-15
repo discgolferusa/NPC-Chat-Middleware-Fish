@@ -106,6 +106,85 @@ def test_load_model_meta_merges_speaker_annotation_sidecar(tmp_path):
             "annotation": "feminine, soft, kind",
         },
     ]
+    assert meta["num_speakers"] == 2
+
+
+def test_sidecar_does_not_invent_speakers_missing_from_model(tmp_path):
+    model_dir = tmp_path / "Clean 100" / "medium"
+    model_dir.mkdir(parents=True)
+    model = model_dir / "clean100.onnx"
+    model.touch()
+    (model_dir / "clean100.onnx.json").write_text(
+        json.dumps(
+            {
+                "dataset": "clean100",
+                "num_speakers": 2,
+                "speaker_id_map": {"Benjamin Parker": 0, "Teresa Richardson": 1},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (model_dir / "clean100.onnx.speakers.json").write_text(
+        json.dumps(
+            {
+                "speakers": {
+                    "0": {"annotation": "cool"},
+                    "99": {"name": "Ghost", "annotation": "should not appear"},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    meta = load_piper_model_meta(model)
+    assert [s["id"] for s in meta["speakers"]] == [0, 1]
+    assert meta["num_speakers"] == 2
+    assert meta["speakers"][0]["annotation"] == "cool"
+    assert all(s["id"] != 99 for s in meta["speakers"])
+
+
+def test_build_speaker_annotation_sidecar_skips_unknown_ids(tmp_path):
+    import importlib.util
+    from pathlib import Path
+
+    try:
+        import openpyxl
+    except ImportError:
+        import pytest
+
+        pytest.skip("openpyxl not installed")
+
+    onnx_json = tmp_path / "model.onnx.json"
+    onnx_json.write_text(
+        json.dumps({"speaker_id_map": {"Alice": 0, "Bob": 1}}),
+        encoding="utf-8",
+    )
+    xlsx = tmp_path / "desc.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(
+        [
+            "Filename",
+            "Friendly Name",
+            "Piper Speaker ID",
+            "Annotator 1",
+            "Annotator 2",
+            "Annotator 3",
+        ]
+    )
+    ws.append(["a", "Alice", 0, "", "", "calm"])
+    ws.append(["ghost", "Ghost", 99, "", "", "nope"])
+    wb.save(xlsx)
+
+    script = Path(__file__).resolve().parent / "scripts" / "build_speaker_annotation_sidecar.py"
+    spec = importlib.util.spec_from_file_location("build_speaker_annotation_sidecar", script)
+    mod = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(mod)
+
+    payload = mod.build_sidecar(xlsx, onnx_json)
+    assert set(payload["speakers"].keys()) == {"0"}
+    assert payload["speakers"]["0"]["annotation"] == "calm"
 
 
 def test_build_speaker_annotation_sidecar_priority():

@@ -86,15 +86,20 @@ def build_sidecar(xlsx: Path, onnx_json: Path) -> dict:
 
     speakers: dict[str, dict[str, str]] = {}
     mismatches: list[str] = []
+    skipped_unknown: list[int] = []
     for row in rows[1:]:
         sid_raw = row[idx["Piper Speaker ID"]]
         if sid_raw is None or str(sid_raw).strip() == "":
             continue
         sid = int(sid_raw)
+        if sid not in by_id:
+            # XLSX rows for ids the model cannot synthesize must not enter the sidecar.
+            skipped_unknown.append(sid)
+            continue
         friendly = _cell(row, idx, "Friendly Name")
         annotation = pick_annotation(row, idx)
-        json_name = by_id.get(sid, "")
-        if json_name and friendly and json_name != friendly:
+        json_name = by_id[sid]
+        if friendly and json_name != friendly:
             mismatches.append(f"id={sid} xlsx={friendly!r} json={json_name!r}")
         entry: dict[str, str] = {
             "name": json_name or friendly or f"speaker_{sid}",
@@ -102,6 +107,13 @@ def build_sidecar(xlsx: Path, onnx_json: Path) -> dict:
         if annotation:
             entry["annotation"] = annotation
         speakers[str(sid)] = entry
+
+    if skipped_unknown:
+        print(
+            f"WARNING: skipped {len(skipped_unknown)} XLSX id(s) not in speaker_id_map "
+            f"(examples: {skipped_unknown[:10]})",
+            file=sys.stderr,
+        )
 
     if mismatches:
         print(f"WARNING: {len(mismatches)} name mismatches vs onnx.json", file=sys.stderr)

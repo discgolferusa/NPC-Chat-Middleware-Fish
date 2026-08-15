@@ -218,7 +218,7 @@ Example path: `.../Clean 100/medium/clean100.onnx.speakers.json`
 }
 ```
 
-Middleware merges `annotation` onto `/voices` → `speakers[]`. The Yaml Editor dropdown shows `Name (annotation)`.
+Middleware merges `annotation` onto `/voices` → `speakers[]` **only for ids already in the model** (`speaker_id_map` / `num_speakers`). Sidecar ids that Piper cannot synthesize are ignored. The Yaml Editor dropdown shows `Name (annotation)`.
 
 Build from a LibriTTS-P style XLSX (Annotator 3 → 1 → 2 priority):
 
