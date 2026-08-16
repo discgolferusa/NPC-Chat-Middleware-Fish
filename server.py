@@ -45,6 +45,7 @@ from dm_channel import (
     clear_dm_data,
     create_manual_ruling,
     detect_ruling,
+    dismiss_pending_check,
     ensure_campaign_id_column,
     format_dm_context_for_prompt,
     get_dm_context,
@@ -77,6 +78,7 @@ from party_campaign import (
     load_campaign,
     load_party,
     get_active_session_ids,
+    resolve_member,
     resolve_request_session,
     select_campaign,
     select_character,
@@ -1236,6 +1238,33 @@ def build_npc_llm_messages(
         })
 
     return messages
+
+
+def _enrich_pending_check_display(item: dict | None) -> dict:
+    """Attach human-readable player/NPC names for the DM console."""
+    row = dict(item or {})
+    npc_id = (row.get("npc_id") or "").strip()
+    player_id = (row.get("player_id") or "").strip()
+
+    npc_name = npc_id
+    if npc_id:
+        try:
+            npc = load_npc(npc_id)
+            npc_name = (npc.get("name") or npc_id).strip() or npc_id
+        except Exception:
+            npc_name = npc_id
+
+    player_name = player_id
+    if player_id:
+        try:
+            member = resolve_member(player_id)
+            player_name = (member.get("name") or player_id).strip() or player_id
+        except Exception:
+            player_name = player_id
+
+    row["npc_name"] = npc_name
+    row["player_name"] = player_name
+    return row
 
 
 def _json_body_flag(value, default: bool = True) -> bool:
@@ -3970,12 +3999,15 @@ def dm_pending():
     campaign_id = session["campaign_id"]
     status = request.args.get("status", "pending")
 
-    checks = load_pending_checks_for_dm(
-        campaign_id=campaign_id,
-        npc_id=npc_id or None,
-        status=status or None,
-        limit=50,
-    )
+    checks = [
+        _enrich_pending_check_display(item)
+        for item in load_pending_checks_for_dm(
+            campaign_id=campaign_id,
+            npc_id=npc_id or None,
+            status=status or None,
+            limit=50,
+        )
+    ]
     return jsonify({
         "npc_id": npc_id or None,
         "player_id": session["player_id"],
@@ -3984,6 +4016,67 @@ def dm_pending():
         "pending_checks": checks,
         # Alias used by older DM console clients.
         "pending": checks,
+    })
+
+
+@app.post("/dm/pending/dismiss")
+def dm_pending_dismiss():
+    """Ignore/delete a pending check without creating a confirm/deny ruling."""
+    body = request.get_json(force=True, silent=True) or {}
+    session = resolve_request_session(body=body)
+    campaign_id = session["campaign_id"]
+
+    pending_raw = body.get("pending_check_id", body.get("check_id"))
+    try:
+        pending_check_id = int(pending_raw)
+    except (TypeError, ValueError):
+        return jsonify({"error": "Missing or invalid pending_check_id"}), 400
+
+    pending = load_pending_check_by_id(pending_check_id)
+    if not pending:
+        return jsonify({"error": "Pending check not found"}), 404
+
+    pending_campaign = normalize_campaign_id(pending.get("campaign_id"))
+    if campaign_id and pending_campaign and pending_campaign != campaign_id:
+        return jsonify({"error": "Pending check belongs to a different campaign"}), 400
+
+    try:
+        updated = dismiss_pending_check(pending_check_id)
+    except LookupError:
+        return jsonify({"error": "Pending check not found"}), 404
+    except ValueError as ex:
+        current = load_pending_check_by_id(pending_check_id)
+        return jsonify({
+            "error": str(ex),
+            "status": (current or {}).get("status"),
+            "pending_check_id": pending_check_id,
+            "check": _enrich_pending_check_display(current) if current else None,
+        }), 409
+
+    if (updated.get("status") or "").strip().lower() != "ignored":
+        return jsonify({
+            "error": "Pending check could not be ignored",
+            "status": updated.get("status"),
+            "pending_check_id": pending_check_id,
+            "check": _enrich_pending_check_display(updated),
+        }), 409
+
+    remaining = [
+        _enrich_pending_check_display(item)
+        for item in load_pending_checks_for_dm(
+            campaign_id=pending_campaign or campaign_id,
+            npc_id=None,
+            status="pending",
+            limit=50,
+        )
+    ]
+    return jsonify({
+        "status": "ignored",
+        "pending_check_id": pending_check_id,
+        "check": _enrich_pending_check_display(updated),
+        "campaign_id": pending_campaign or campaign_id,
+        "pending_checks": remaining,
+        "pending": remaining,
     })
 
 
@@ -4093,12 +4186,15 @@ def dm_ruling_post():
                     campaign_id=campaign_id,
                 )
 
-        pending_list = load_pending_checks_for_dm(
-            campaign_id=campaign_id,
-            npc_id=None,
-            status="pending",
-            limit=10,
-        )
+        pending_list = [
+            _enrich_pending_check_display(item)
+            for item in load_pending_checks_for_dm(
+                campaign_id=campaign_id,
+                npc_id=None,
+                status="pending",
+                limit=10,
+            )
+        ]
         rulings_list = load_rulings_for_dm(
             campaign_id=campaign_id,
             npc_id=None,
