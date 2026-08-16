@@ -11,22 +11,67 @@ from __future__ import annotations
 import re
 from typing import Any, Callable
 
-ONLY_UNDERSTANDS_PATTERN = re.compile(
-    r"only\s+understands?\s+(?:the\s+)?(?:language\s+)?(?P<lang>[A-Za-z][\w'-]*(?:\s+[A-Za-z][\w'-]*){0,3})",
+# Require an explicit Language <Name> form so ordinary phrasing like
+# "only understands that…" / "only understands the situation…" never matches.
+ONLY_UNDERSTANDS_LANGUAGE_PATTERN = re.compile(
+    r"only\s+understands?\s+language\s+(?P<lang>[A-Za-z][\w'-]*(?:\s+[A-Za-z][\w'-]*){0,2})",
     re.IGNORECASE,
 )
 
-DOES_NOT_UNDERSTAND_COMMON_PATTERN = re.compile(
-    r"do(?:es)?\s+not\s+understand\s+(?:common(?:/english)?|english)",
-    re.IGNORECASE,
+# Secondary explicit forms used in authored rules / DM CHECK templates.
+EXPLICIT_LANGUAGE_NAME_PATTERNS = (
+    re.compile(
+        r"\bknow(?:s)?\s+language\s+(?P<lang>[A-Za-z][\w'-]*(?:\s+[A-Za-z][\w'-]*){0,2})",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\[DM CHECK:\s*does this speaker know language\s+(?P<lang>[A-Za-z][\w'-]*(?:\s+[A-Za-z][\w'-]*){0,2})\s*\]",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bspeaks?\s+only\s+language\s+(?P<lang>[A-Za-z][\w'-]*(?:\s+[A-Za-z][\w'-]*){0,2})",
+        re.IGNORECASE,
+    ),
+)
+
+# Stopwords that are never valid fantasy language names when captured alone.
+_LANGUAGE_NAME_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "the",
+        "that",
+        "this",
+        "these",
+        "those",
+        "them",
+        "they",
+        "their",
+        "and",
+        "or",
+        "but",
+        "not",
+        "only",
+        "common",
+        "english",
+        "words",
+        "speech",
+        "dialogue",
+        "requests",
+        "meaning",
+        "speaker",
+        "speakers",
+        "player",
+        "party",
+    }
 )
 
 STAGE_DIRECTION_PATTERN = re.compile(r"\*([^*]{1,800})\*")
 
-# Loose match for DM rulings about the speaker knowing/speaking a language.
-LANGUAGE_RULING_HINT = re.compile(
-    r"\b(know|knows|knew|understand|understands|speak|speaks|language)\b",
-    re.IGNORECASE,
+# Require knowledge/speech framing around the language name in DM rulings.
+_LANGUAGE_KNOWLEDGE_VERBS = (
+    r"know|knows|knew|understand|understands|understood|speak|speaks|spoke|spoken|"
+    r"fluent|fluency|comprehend|comprehends"
 )
 
 
@@ -50,48 +95,85 @@ def _npc_rules_blob(npc: dict[str, Any] | None) -> str:
     return str(raw)
 
 
+def _normalize_language_name(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    cleaned = re.sub(r"[^\w\s'-]+", " ", str(raw), flags=re.UNICODE)
+    parts = [part for part in cleaned.split() if part]
+    if not parts:
+        return None
+
+    filtered: list[str] = []
+    for part in parts:
+        if part.lower() in _LANGUAGE_NAME_STOPWORDS:
+            # Stop at trailing filler ("Slaadi They do…") rather than inventing a name.
+            break
+        filtered.append(part)
+    if not filtered:
+        return None
+
+    display = " ".join(part.capitalize() for part in filtered)
+    if display.lower() in _LANGUAGE_NAME_STOPWORDS:
+        return None
+    return display
+
+
+def _extract_explicit_language(blob: str) -> str | None:
+    for pattern in (ONLY_UNDERSTANDS_LANGUAGE_PATTERN, *EXPLICIT_LANGUAGE_NAME_PATTERNS):
+        match = pattern.search(blob)
+        if not match:
+            continue
+        language = _normalize_language_name(match.group("lang"))
+        if language:
+            return language
+    return None
+
+
 def detect_language_barrier(npc: dict[str, Any] | None) -> dict[str, str] | None:
     """
-    Return {language, claim} when NPC rules declare a single understood language,
-    otherwise None.
+    Return {language, claim} when NPC rules explicitly name the only understood
+    language (``Language <Name>``), otherwise None.
+
+    Does not default to any fantasy language. ``does not understand Common`` alone
+    is not enough without a parseable language name elsewhere in the rules.
     """
     blob = _npc_rules_blob(npc)
     if not blob.strip():
         return None
 
-    match = ONLY_UNDERSTANDS_PATTERN.search(blob)
-    if not match and not DOES_NOT_UNDERSTAND_COMMON_PATTERN.search(blob):
+    language = _extract_explicit_language(blob)
+    if not language:
         return None
 
-    language = (match.group("lang") if match else "Slaadi").strip()
-    # Drop trailing filler words that sometimes appear in freeform rules.
-    language = re.sub(
-        r"\b(they|and|do|does|not|never|only|common|english)\b.*$",
-        "",
-        language,
-        flags=re.IGNORECASE,
-    ).strip(" .,-")
-    if not language:
-        language = "Slaadi"
-
-    # Title-case multi-word fantasy language names without shouting acronyms.
-    display = " ".join(part.capitalize() for part in language.split())
     return {
-        "language": display,
-        "claim": f"does this speaker know Language {display}",
+        "language": language,
+        "claim": f"does this speaker know Language {language}",
     }
 
 
 def _ruling_mentions_language(text: str, language: str) -> bool:
-    blob = (text or "").lower()
-    lang = (language or "").lower().strip()
+    """
+    True only when the ruling both names the language and frames it as
+    knowledge/speech of that language (not a coincidental race/creature word).
+    """
+    blob = (text or "").strip()
+    lang = (language or "").strip()
     if not blob or not lang:
         return False
-    if lang in blob:
-        return True
-    # "Language Slaadi" / "know Slaadi" style claims without repeating "Language".
-    return LANGUAGE_RULING_HINT.search(blob) is not None and any(
-        token and token in blob for token in lang.split()
+
+    lang_pattern = re.escape(lang)
+    # Allow optional "Language " prefix before the name.
+    name_group = rf"(?:language\s+)?{lang_pattern}"
+
+    knowledge_patterns = (
+        rf"\b(?:{_LANGUAGE_KNOWLEDGE_VERBS})\b.{{0,40}}\b{name_group}\b",
+        rf"\b{name_group}\b.{{0,40}}\b(?:{_LANGUAGE_KNOWLEDGE_VERBS})\b",
+        rf"\bdoes this speaker know\s+{name_group}\b",
+        rf"\bspeaker know(?:s)?\s+{name_group}\b",
+    )
+    return any(
+        re.search(pattern, blob, flags=re.IGNORECASE | re.DOTALL)
+        for pattern in knowledge_patterns
     )
 
 
