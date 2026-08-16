@@ -614,6 +614,74 @@ def test_dm_ruling_auto_respond_uses_pending_player_party_context(api, monkeypat
     assert (captured.get("party_context") or {}).get("speaking_member", {}).get("player_id") == "player_alden"
 
 
+def test_dm_ruling_auto_respond_does_not_reopen_pending_check(api, monkeypatch):
+    """Confirm + auto_respond must not recreate the same pending check from follow-up tags."""
+    client, server, headers = api
+    import dm_channel
+
+    monkeypatch.setattr(
+        server,
+        "ask_llm",
+        lambda _messages: (
+            "Very well, you may pass.\n"
+            "[DM CHECK: player claims official authority or permission]"
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "load_npc",
+        lambda _id: {
+            "id": "captain_varra",
+            "name": "Captain Varra",
+            "role": "watch captain",
+            "llm_rules": [
+                "[DM CHECK: player claims official authority or permission]",
+            ],
+        },
+    )
+
+    pending_id = dm_channel.save_pending_check(
+        npc_id="captain_varra",
+        player_id="player_alden",
+        claim_summary="player claims official authority or permission",
+        player_text="Captain let us pass",
+        npc_text="I need confirmation.",
+        source="npc",
+        campaign_id="greyhaven_intro",
+    )
+    assert pending_id
+
+    ruling = client.post(
+        "/dm/ruling",
+        headers=headers,
+        json={
+            "campaign_id": "greyhaven_intro",
+            "check_id": pending_id,
+            "verdict": "confirm",
+            "text": "Yes, that is approved.",
+            "auto_respond": True,
+            "include_audio": False,
+        },
+    )
+    assert ruling.status_code == 200, ruling.get_json()
+    body = ruling.get_json()
+    assert body.get("status") == "saved"
+    assert body.get("verdict") == "confirmed"
+    auto = body.get("auto_response") or {}
+    assert auto.get("generated") is True
+    assert "may pass" in (auto.get("npc_text") or "").lower()
+    assert "[DM CHECK:" not in (auto.get("npc_text") or "")
+
+    remaining = client.get(
+        "/dm/pending?campaign_id=greyhaven_intro",
+        headers=headers,
+    )
+    assert remaining.status_code == 200
+    checks = remaining.get_json().get("pending_checks") or []
+    assert checks == []
+    assert all(item.get("id") != pending_id for item in checks)
+
+
 def test_dm_pending_includes_display_names_and_can_be_dismissed(api, monkeypatch):
     client, server, headers = api
     import dm_channel

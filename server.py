@@ -1322,7 +1322,8 @@ def build_dm_followup_messages(
             f"DM said: {ruling_text}\n\n"
             f"{action_hint} Respond now as the NPC to continue the scene from your last exchange. "
             "Keep the reply concise and suitable for spoken dialogue. "
-            "Do not mention the DM, pending checks, or game mechanics."
+            "Do not mention the DM, pending checks, or game mechanics. "
+            "Do not emit [DM CHECK] tags — this claim was already ruled."
         ),
     })
 
@@ -1380,10 +1381,20 @@ def run_dm_ruling_auto_response(
         )
 
         npc_text_raw = generate_npc_reply_text(
-            npc, dm_context, messages, ask_llm, player_text=None
+            npc,
+            dm_context,
+            messages,
+            ask_llm,
+            player_text=None,
+            enforce_required_dm_checks=False,
         )
         npc_response = process_npc_response(
-            npc_id, player_id, "", npc_text_raw, campaign_id=campaign_id
+            npc_id,
+            player_id,
+            "",
+            npc_text_raw,
+            campaign_id=campaign_id,
+            create_pending_checks=False,
         )
         npc_text = npc_response["spoken_text"]
 

@@ -510,6 +510,23 @@ def update_pending_check(
     return pending_check_id
 
 
+def _claim_has_active_ruling(
+    npc_id: str,
+    player_id: str,
+    claim_summary: str,
+    *,
+    campaign_id: str = "",
+) -> bool:
+    """True when a confirmed/denied ruling already covers this claim."""
+    for ruling in load_rulings(npc_id, player_id, limit=50, campaign_id=campaign_id):
+        verdict = (ruling.get("verdict") or "").strip().lower()
+        if verdict not in ("confirmed", "denied"):
+            continue
+        if _claims_match(claim_summary, ruling.get("claim_summary") or ""):
+            return True
+    return False
+
+
 def save_pending_check(
     *,
     npc_id: str,
@@ -526,6 +543,16 @@ def save_pending_check(
     if not claim_summary:
         return None
 
+    if _claim_has_active_ruling(
+        npc_id, player_id, claim_summary, campaign_id=campaign_id
+    ):
+        print(
+            f"[DM] skip pending check (already ruled) npc={npc_id} player={player_id} "
+            f"campaign={campaign_id or '(none)'} source={source} claim={claim_summary[:120]!r}",
+            flush=True,
+        )
+        return None
+
     if merge_pending_id is not None:
         existing = next(
             (
@@ -536,23 +563,25 @@ def save_pending_check(
             ),
             None,
         )
-        merged_source = source
-        if existing and existing.get("source") and existing["source"] != source:
-            merged_source = f"{existing['source']}+{source}"
+        if existing:
+            merged_source = source
+            if existing.get("source") and existing["source"] != source:
+                merged_source = f"{existing['source']}+{source}"
 
-        update_pending_check(
-            merge_pending_id,
-            claim_summary=claim_summary,
-            player_text=player_text,
-            npc_text=npc_text,
-            source=merged_source,
-        )
-        print(
-            f"[DM] merged pending check #{merge_pending_id} npc={npc_id} player={player_id} "
-            f"campaign={campaign_id or '(none)'} source={source} claim={claim_summary[:120]!r}",
-            flush=True,
-        )
-        return merge_pending_id
+            update_pending_check(
+                merge_pending_id,
+                claim_summary=claim_summary,
+                player_text=player_text,
+                npc_text=npc_text,
+                source=merged_source,
+            )
+            print(
+                f"[DM] merged pending check #{merge_pending_id} npc={npc_id} player={player_id} "
+                f"campaign={campaign_id or '(none)'} source={source} claim={claim_summary[:120]!r}",
+                flush=True,
+            )
+            return merge_pending_id
+        # Resolved/ignored merge targets must not be rewritten; fall through to normal insert.
 
     for pending in load_pending_checks(
         npc_id, player_id, status="pending", campaign_id=campaign_id
@@ -1133,6 +1162,7 @@ def process_npc_response(
     *,
     player_pending_id: int | None = None,
     campaign_id: str = "",
+    create_pending_checks: bool = True,
 ) -> dict[str, Any]:
     spoken_text, dm_check_claims = extract_dm_check_tags(npc_text)
     pending_id = None
@@ -1141,7 +1171,7 @@ def process_npc_response(
     merge_pending_id = player_pending_id
     all_claims = list(dm_check_claims)
 
-    if dm_check_claims:
+    if create_pending_checks and dm_check_claims:
         for index, claim in enumerate(dm_check_claims):
             created_id = save_pending_check(
                 npc_id=npc_id,
@@ -1160,31 +1190,32 @@ def process_npc_response(
 
     # Situational / heuristic deferral still runs even when other tags were present,
     # so an authority claim is not dropped just because a different [DM CHECK] fired.
-    deferral = detect_npc_deferral(npc_text) or detect_npc_deferral(spoken_text)
-    player_claim = detect_player_claim(player_text)
-    auth_exchange = _looks_like_authorization_exchange(player_text)
-    if deferral and (player_claim or auth_exchange):
-        claim_summary = infer_claim_summary(player_text, spoken_text)
-        already = any(_claims_match(claim_summary, existing) for existing in all_claims)
-        if claim_summary and not already:
-            created_id = save_pending_check(
-                npc_id=npc_id,
-                player_id=player_id,
-                claim_summary=claim_summary,
-                player_text=player_text,
-                npc_text=spoken_text,
-                source="npc_deferral",
-                merge_pending_id=merge_pending_id if not pending_ids else None,
-                campaign_id=campaign_id,
-            )
-            if created_id is not None:
-                pending_ids.append(created_id)
-                pending_id = created_id
-                all_claims.append(claim_summary)
-                if pending_source is None:
-                    pending_source = "npc_deferral"
-                elif "deferral" not in pending_source:
-                    pending_source = f"{pending_source}+npc_deferral"
+    if create_pending_checks:
+        deferral = detect_npc_deferral(npc_text) or detect_npc_deferral(spoken_text)
+        player_claim = detect_player_claim(player_text)
+        auth_exchange = _looks_like_authorization_exchange(player_text)
+        if deferral and (player_claim or auth_exchange):
+            claim_summary = infer_claim_summary(player_text, spoken_text)
+            already = any(_claims_match(claim_summary, existing) for existing in all_claims)
+            if claim_summary and not already:
+                created_id = save_pending_check(
+                    npc_id=npc_id,
+                    player_id=player_id,
+                    claim_summary=claim_summary,
+                    player_text=player_text,
+                    npc_text=spoken_text,
+                    source="npc_deferral",
+                    merge_pending_id=merge_pending_id if not pending_ids else None,
+                    campaign_id=campaign_id,
+                )
+                if created_id is not None:
+                    pending_ids.append(created_id)
+                    pending_id = created_id
+                    all_claims.append(claim_summary)
+                    if pending_source is None:
+                        pending_source = "npc_deferral"
+                    elif "deferral" not in pending_source:
+                        pending_source = f"{pending_source}+npc_deferral"
 
     return {
         "spoken_text": spoken_text,

@@ -260,3 +260,16 @@ def test_generate_still_enforces_authored_template():
     assert "Confused stare." in text
     assert "[DM CHECK:" in text
     assert "necessary language" in text.lower()
+
+
+def test_generate_can_skip_required_dm_check_enforcement():
+    npc = {"llm_rules": LANGUAGE_RULES}
+    text = generate_npc_reply_text(
+        npc,
+        {"rulings": []},
+        [],
+        lambda _m: "Very well.",
+        enforce_required_dm_checks=False,
+    )
+    assert text == "Very well."
+    assert "[DM CHECK:" not in text

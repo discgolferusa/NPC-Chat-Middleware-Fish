@@ -263,14 +263,20 @@ def generate_npc_reply_text(
     ask_llm_fn: Callable[[list[dict[str, str]]], str],
     *,
     player_text: str | None = None,
+    enforce_required_dm_checks: bool = True,
 ) -> str:
     """
     Call the LLM, then ensure NPC-authored required DM CHECK tags are present.
 
     ``player_text`` is accepted for call-site compatibility; intent classification is
     left to the model via global/NPC llm_rules.
+
+    Set ``enforce_required_dm_checks=False`` for post-ruling auto-replies so a just-
+    resolved claim is not force-appended again.
     """
     del player_text  # LLM decides; we only enforce authored templates.
     log_llm_prompt_to_console(messages)
     raw = ask_llm_fn(messages)
+    if not enforce_required_dm_checks:
+        return raw
     return ensure_required_dm_check_tags(npc, dm_context, raw)
