@@ -212,6 +212,25 @@ def ensure_required_dm_check_tags(
     return suffix
 
 
+def log_llm_prompt_to_console(messages: list[dict[str, str]] | None) -> None:
+    """Print the full NPC-reply prompt to the middleware process console."""
+    msgs = messages or []
+    total_chars = sum(len((m or {}).get("content") or "") for m in msgs)
+    print(
+        f"[LLM-PROMPT] npc-reply messages={len(msgs)} chars={total_chars}",
+        flush=True,
+    )
+    for index, message in enumerate(msgs):
+        role = (message or {}).get("role") or "?"
+        content = (message or {}).get("content") or ""
+        print(
+            f"[LLM-PROMPT] --- [{index}] role={role} chars={len(content)} ---",
+            flush=True,
+        )
+        print(content, flush=True)
+    print("[LLM-PROMPT] === end ===", flush=True)
+
+
 def generate_npc_reply_text(
     npc: dict[str, Any] | None,
     dm_context: dict[str, Any] | None,
@@ -227,5 +246,6 @@ def generate_npc_reply_text(
     left to the model via global/NPC llm_rules.
     """
     del player_text  # LLM decides; we only enforce authored templates.
+    log_llm_prompt_to_console(messages)
     raw = ask_llm_fn(messages)
     return ensure_required_dm_check_tags(npc, dm_context, raw)
