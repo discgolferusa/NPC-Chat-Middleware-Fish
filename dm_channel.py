@@ -447,6 +447,13 @@ def _find_related_open_pending(
     *,
     campaign_id: str = "",
 ) -> dict[str, Any] | None:
+    """
+    Find an open pending that is the same claim exchange.
+
+    Same player_text alone is not enough — multiple [DM CHECK] templates from one
+    player turn must stay as separate pendings. Use merge_pending_id when a player
+    claim and NPC tag intentionally refer to one exchange.
+    """
     pending_items = load_pending_checks(
         npc_id, player_id, status="pending", campaign_id=campaign_id
     )
@@ -460,10 +467,6 @@ def _find_related_open_pending(
             player_text=player_text or item.get("player_text"),
         ):
             return item
-
-        if player_text and item.get("player_text"):
-            if _normalize_claim(item["player_text"]) == _normalize_claim(player_text):
-                return item
 
     return None
 
