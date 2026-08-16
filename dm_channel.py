@@ -65,9 +65,15 @@ def ensure_campaign_id_column(
         f"ON {table} (campaign_id, npc_id, player_id)"
     )
 
+# Prefer an end-anchored tag; fall back to the last tag anywhere in the reply so
+# trailing punctuation / stage notes do not silently drop pending DM checks.
 DM_CHECK_TAG_PATTERN = re.compile(
     r"\[DM CHECK:\s*(.+?)\]\s*$",
     re.IGNORECASE | re.DOTALL,
+)
+DM_CHECK_TAG_ANYWHERE_PATTERN = re.compile(
+    r"\[DM CHECK:\s*([^\]]+?)\]",
+    re.IGNORECASE,
 )
 
 POSITIVE_RULING_PATTERNS = [
@@ -214,9 +220,12 @@ def strip_dm_check_tag(text: str) -> tuple[str, str | None]:
     raw = (text or "").strip()
     match = DM_CHECK_TAG_PATTERN.search(raw)
     if not match:
+        matches = list(DM_CHECK_TAG_ANYWHERE_PATTERN.finditer(raw))
+        match = matches[-1] if matches else None
+    if not match:
         return raw, None
 
-    spoken = raw[: match.start()].strip()
+    spoken = (raw[: match.start()] + raw[match.end() :]).strip()
     claim = match.group(1).strip()
     return spoken, claim or None
 

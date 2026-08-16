@@ -26,6 +26,16 @@ def test_strip_dm_check_tag_without_tag():
     assert claim is None
 
 
+def test_strip_dm_check_tag_mid_reply_still_extracts():
+    spoken, claim = strip_dm_check_tag(
+        "*Looks confused.* [DM CHECK: does this speaker know Language Slaadi] ..."
+    )
+    assert claim is not None
+    assert "slaadi" in claim.lower()
+    assert "Looks confused" in spoken
+    assert "[DM CHECK:" not in spoken
+
+
 def test_detect_ruling_confirmed():
     result = detect_ruling("Yes, that is correct.")
     assert result["verdict"] == "confirmed"
