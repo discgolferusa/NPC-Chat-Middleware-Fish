@@ -132,6 +132,27 @@ def test_vague_authority_directive_detected():
     assert not npc_has_dm_deferral_directive({"llm_rules": ["Stay stern and brief."]})
 
 
+def test_explicit_template_rules_are_not_vague_directives():
+    """Mode-1 [DM CHECK] scaffolding must not unlock situational authority checks."""
+    assert not npc_has_dm_deferral_directive({"llm_rules": LANGUAGE_RULES})
+
+
+def test_required_tag_alone_does_not_invent_authority_check():
+    npc = {"llm_rules": LANGUAGE_RULES}
+    raw = (
+        "Krah?\n"
+        "[DM CHECK: Does the speaker know the necessary language to talk to the NPC]"
+    )
+    out = ensure_situational_dm_check_tag(
+        npc,
+        {"rulings": []},
+        raw,
+        "We have a letter from the mayor allowing us to enter.",
+    )
+    assert out == raw
+    assert out.count("[DM CHECK:") == 1
+
+
 def test_situational_appends_dm_check_for_authority_claim():
     npc = {
         "name": "Varra",

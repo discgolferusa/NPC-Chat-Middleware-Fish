@@ -147,7 +147,6 @@ NPC_DEFERRAL_PATTERNS = [
         r"\bwithout\s+(?:proof|confirmation|verification|the dm)\b",
         r"\bnot until i (?:see|have)\b.+\b(proof|writ|write|letter|document|authorization|permission)\b",
         r"\b(?:can't|cannot)\s+verify\b.+\b(valid|authentic|legitimate|real|genuine|writ|write|letter)\b",
-        r"\[DM CHECK:",
     )
 ]
 
@@ -328,7 +327,9 @@ def detect_player_claim(text: str) -> dict[str, Any] | None:
 
 
 def detect_npc_deferral(text: str) -> dict[str, Any] | None:
-    content = (text or "").strip()
+    # Strip machine tags so a literal [DM CHECK:…] never counts as deferral speech.
+    content = DM_CHECK_TAG_ANYWHERE_PATTERN.sub(" ", text or "")
+    content = re.sub(r"\s+", " ", content).strip()
     if not content:
         return None
 

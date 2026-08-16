@@ -19,19 +19,21 @@ DM_CHECK_IN_RULES_PATTERN = re.compile(
 )
 
 # Vague authored directives that mean "don't settle this yourself — ask the DM".
+# Keep these specific: bare "until the DM" / "official authority" overlap explicit
+# [DM CHECK] template scaffolding (e.g. "Until the DM rules…") and must not match.
 DM_DEFERRAL_DIRECTIVE_PATTERNS = [
     re.compile(p, re.IGNORECASE)
     for p in (
         r"defer to (?:the )?(?:dm|dungeon master|gm)",
-        r"(?:ask|prompt|need|needs|require|requires)\s+(?:the )?(?:dm|dungeon master|gm)\b",
-        r"until (?:the )?(?:dm|dungeon master|gm)\b",
         r"rather than accepting (?:it )?yourself",
         r"do not (?:simply )?accept .{0,40}\byourself\b",
         r"withhold (?:final )?approval",
-        r"claims? (?:official )?authority",
-        r"official authority",
+        r"if someone claims (?:official )?authority",
+        r"claims? (?:official )?authority.{0,120}(?:defer|dm|gm|dungeon master)",
         r"do not (?:grant|accept|believe) .{0,60}\b(?:on their word|without (?:the )?dm|alone)\b",
         r"let (?:the )?(?:dm|gm) (?:confirm|verify|rule|decide)",
+        r"(?:ask|prompt)\s+(?:the )?(?:dm|dungeon master|gm)\s+to\s+(?:confirm|verify|rule)",
+        r"need(?:s)?\s+(?:the )?(?:dm|dungeon master|gm)\s+to\s+(?:confirm|verify|rule)",
     )
 ]
 
@@ -83,6 +85,9 @@ def npc_has_dm_deferral_directive(npc: dict[str, Any] | None) -> bool:
     blob = _npc_rules_blob(npc)
     if not blob.strip():
         return False
+    # Ignore machine tags / ruling labels so template scaffolding cannot qualify.
+    blob = DM_CHECK_IN_RULES_PATTERN.sub(" ", blob)
+    blob = re.sub(r"\[DM Ruling:\s*[^\]]*\]", " ", blob, flags=re.IGNORECASE)
     return any(pattern.search(blob) for pattern in DM_DEFERRAL_DIRECTIVE_PATTERNS)
 
 
@@ -228,7 +233,9 @@ def ensure_situational_dm_check_tag(
         return raw_text
 
     # Fire when NPC rules defer vaguely, or the spoken reply already defers.
-    if not (npc_has_dm_deferral_directive(npc) or detect_npc_deferral(raw_text or "")):
+    # Inspect speech only — required [DM CHECK] tags must not count as deferral.
+    speech_only = DM_CHECK_IN_RULES_PATTERN.sub(" ", raw_text or "")
+    if not (npc_has_dm_deferral_directive(npc) or detect_npc_deferral(speech_only)):
         return raw_text
 
     claim = infer_claim_summary(player_text or "", raw_text)
