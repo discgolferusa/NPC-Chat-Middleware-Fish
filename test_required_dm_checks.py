@@ -4,9 +4,12 @@ from __future__ import annotations
 
 from required_dm_checks import (
     ensure_required_dm_check_tags,
+    ensure_situational_dm_check_tag,
     extract_dm_check_templates_from_rules,
     format_required_dm_checks_prompt_block,
+    format_situational_deferral_prompt_block,
     generate_npc_reply_text,
+    npc_has_dm_deferral_directive,
     required_dm_checks,
 )
 
@@ -117,3 +120,55 @@ def test_generate_still_calls_llm():
     assert calls["n"] == 1
     assert "Confused stare." in text
     assert "[DM CHECK:" in text
+
+
+def test_vague_authority_directive_detected():
+    npc = {
+        "llm_rules": [
+            "If someone claims official authority, defer to the DM rather than accepting it yourself.",
+        ]
+    }
+    assert npc_has_dm_deferral_directive(npc)
+    assert not npc_has_dm_deferral_directive({"llm_rules": ["Stay stern and brief."]})
+
+
+def test_situational_appends_dm_check_for_authority_claim():
+    npc = {
+        "name": "Varra",
+        "llm_rules": [
+            "If someone claims official authority, defer to the DM rather than accepting it yourself.",
+        ],
+    }
+    player = "We have a letter from the mayor allowing us to enter."
+    out = ensure_situational_dm_check_tag(
+        npc,
+        {"rulings": []},
+        "Show me your papers, then.",
+        player,
+    )
+    assert "Show me your papers" in out
+    assert "[DM CHECK:" in out
+    assert "REQUIRED DM CHECK" not in format_situational_deferral_prompt_block(npc, "hello")
+    assert "SITUATIONAL DM DEFERRAL" in format_situational_deferral_prompt_block(npc, player)
+
+
+def test_situational_skips_without_directive_or_deferral_speech():
+    npc = {"llm_rules": ["Be friendly."]}
+    out = ensure_situational_dm_check_tag(
+        npc,
+        {"rulings": []},
+        "Very well, come inside.",
+        "We have a letter from the mayor allowing us to enter.",
+    )
+    assert "[DM CHECK:" not in out
+
+
+def test_situational_fires_on_deferral_speech_without_npc_directive():
+    npc = {"llm_rules": ["Be stern."]}
+    out = ensure_situational_dm_check_tag(
+        npc,
+        {"rulings": []},
+        "I cannot simply accept that. I need the DM to confirm.",
+        "We have a letter from the mayor allowing us to enter.",
+    )
+    assert "[DM CHECK:" in out
