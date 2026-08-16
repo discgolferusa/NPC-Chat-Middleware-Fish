@@ -48,6 +48,37 @@ def test_not_required_after_matching_ruling():
     assert format_required_dm_checks_prompt_block(npc, dm_context) == ""
 
 
+def test_unrelated_short_ruling_text_does_not_cover_claim():
+    """``No`` must not match inside ``know`` via substring ruling_text matching."""
+    npc = {"llm_rules": LANGUAGE_RULES}
+    dm_context = {
+        "rulings": [
+            {
+                "verdict": "denied",
+                "claim_summary": "party has the mayor's writ",
+                "ruling_text": "No",
+            }
+        ]
+    }
+    pending = required_dm_checks(npc, dm_context)
+    assert len(pending) == 1
+    assert "necessary language" in pending[0].lower()
+
+
+def test_ensure_appends_all_missing_templates():
+    npc = {
+        "llm_rules": [
+            "[DM CHECK: door is unlocked]",
+            "[DM CHECK: Does the speaker know the necessary language to talk to the NPC]",
+        ]
+    }
+    out = ensure_required_dm_check_tags(npc, {"rulings": []}, "Wait.")
+    assert out.startswith("Wait.")
+    assert out.count("[DM CHECK:") == 2
+    assert "door is unlocked" in out
+    assert "necessary language" in out.lower()
+
+
 def test_ensure_appends_missing_tag_without_rewriting_speech():
     npc = {"llm_rules": LANGUAGE_RULES}
     raw = "*Tilts its head.* Krah-vesh?"

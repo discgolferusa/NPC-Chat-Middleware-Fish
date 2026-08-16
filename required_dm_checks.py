@@ -60,26 +60,35 @@ def extract_dm_check_templates_from_rules(npc: dict[str, Any] | None) -> list[st
 
 
 def _claim_matches(rule_claim: str, other: str) -> bool:
+    """
+    Match a rule template to a DM claim_summary.
+
+    Equality always matches. Substring matches require both sides to look like
+    real claim text (not short verdict notes like ``No`` / ``Yes``), so ``no``
+    cannot match inside ``know``.
+    """
     a = _normalize_claim(rule_claim)
     b = _normalize_claim(other)
     if not a or not b:
         return False
     if a == b:
         return True
-    # Allow light wording drift between rule template and DM claim_summary.
-    if len(a) >= 12 and (a in b or b in a):
-        return True
-    return False
+
+    shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
+    # Short strings are verdict crumbs / single words — never substring-match them.
+    if len(shorter) < 20:
+        return False
+    return shorter in longer
 
 
 def _ruling_covers_claim(dm_context: dict[str, Any] | None, claim: str) -> bool:
+    """A ruling covers a template only via claim_summary identity, not ruling_text."""
     for ruling in (dm_context or {}).get("rulings") or []:
         verdict = str(ruling.get("verdict") or "").strip().lower()
         if verdict not in ("confirmed", "denied"):
             continue
         summary = str(ruling.get("claim_summary") or "")
-        notes = str(ruling.get("ruling_text") or "")
-        if _claim_matches(claim, summary) or _claim_matches(claim, notes):
+        if _claim_matches(claim, summary):
             return True
     return False
 

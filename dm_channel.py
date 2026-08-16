@@ -216,18 +216,40 @@ def init_dm_tables() -> None:
         conn.commit()
 
 
-def strip_dm_check_tag(text: str) -> tuple[str, str | None]:
-    raw = (text or "").strip()
-    match = DM_CHECK_TAG_PATTERN.search(raw)
-    if not match:
-        matches = list(DM_CHECK_TAG_ANYWHERE_PATTERN.finditer(raw))
-        match = matches[-1] if matches else None
-    if not match:
-        return raw, None
+def extract_dm_check_tags(text: str) -> tuple[str, list[str]]:
+    """
+    Remove every ``[DM CHECK: …]`` tag from NPC text.
 
-    spoken = (raw[: match.start()] + raw[match.end() :]).strip()
-    claim = match.group(1).strip()
-    return spoken, claim or None
+    Returns (spoken_text, claims) preserving claim order. All tags are stripped
+    from spoken output so multi-check replies do not leak machine tags into TTS.
+    """
+    raw = (text or "").strip()
+    matches = list(DM_CHECK_TAG_ANYWHERE_PATTERN.finditer(raw))
+    if not matches:
+        return raw, []
+
+    claims: list[str] = []
+    parts: list[str] = []
+    cursor = 0
+    for match in matches:
+        parts.append(raw[cursor:match.start()])
+        claim = match.group(1).strip()
+        if claim:
+            claims.append(claim)
+        cursor = match.end()
+    parts.append(raw[cursor:])
+
+    spoken = "".join(parts)
+    spoken = re.sub(r"[ \t]+\n", "\n", spoken)
+    spoken = re.sub(r"\n{3,}", "\n\n", spoken)
+    spoken = re.sub(r"[ \t]{2,}", " ", spoken).strip()
+    return spoken, claims
+
+
+def strip_dm_check_tag(text: str) -> tuple[str, str | None]:
+    """Backward-compatible helper: spoken text plus the last DM CHECK claim."""
+    spoken, claims = extract_dm_check_tags(text)
+    return spoken, claims[-1] if claims else None
 
 
 def detect_ruling(text: str) -> dict[str, Any]:
@@ -986,22 +1008,27 @@ def process_npc_response(
     player_pending_id: int | None = None,
     campaign_id: str = "",
 ) -> dict[str, Any]:
-    spoken_text, dm_check_claim = strip_dm_check_tag(npc_text)
+    spoken_text, dm_check_claims = extract_dm_check_tags(npc_text)
     pending_id = None
+    pending_ids: list[int] = []
     pending_source = None
     merge_pending_id = player_pending_id
 
-    if dm_check_claim:
-        pending_id = save_pending_check(
-            npc_id=npc_id,
-            player_id=player_id,
-            claim_summary=dm_check_claim,
-            player_text=player_text,
-            npc_text=spoken_text,
-            source="npc",
-            merge_pending_id=merge_pending_id,
-            campaign_id=campaign_id,
-        )
+    if dm_check_claims:
+        for index, claim in enumerate(dm_check_claims):
+            created_id = save_pending_check(
+                npc_id=npc_id,
+                player_id=player_id,
+                claim_summary=claim,
+                player_text=player_text,
+                npc_text=spoken_text,
+                source="npc",
+                merge_pending_id=merge_pending_id if index == 0 else None,
+                campaign_id=campaign_id,
+            )
+            if created_id is not None:
+                pending_ids.append(created_id)
+                pending_id = created_id
         pending_source = "npc_tag"
     else:
         deferral = detect_npc_deferral(npc_text)
@@ -1018,13 +1045,19 @@ def process_npc_response(
                 merge_pending_id=merge_pending_id,
                 campaign_id=campaign_id,
             )
+            if pending_id is not None:
+                pending_ids.append(pending_id)
             pending_source = "npc_deferral"
+
+    dm_check_claim = dm_check_claims[-1] if dm_check_claims else None
 
     return {
         "spoken_text": spoken_text,
         "raw_text": npc_text,
         "dm_check_claim": dm_check_claim,
+        "dm_check_claims": dm_check_claims,
         "pending_check_id": pending_id,
+        "pending_check_ids": pending_ids,
         "pending_source": pending_source,
         "merged_player_pending_id": player_pending_id if pending_id == player_pending_id else None,
         "npc_deferral_detected": bool(detect_npc_deferral(npc_text)),

@@ -7,6 +7,7 @@ from dm_channel import (
     detect_npc_deferral,
     detect_player_claim,
     detect_ruling,
+    extract_dm_check_tags,
     format_dm_context_for_prompt,
     infer_claim_summary,
     strip_dm_check_tag,
@@ -33,6 +34,19 @@ def test_strip_dm_check_tag_mid_reply_still_extracts():
     assert claim is not None
     assert "slaadi" in claim.lower()
     assert "Looks confused" in spoken
+    assert "[DM CHECK:" not in spoken
+
+
+def test_extract_dm_check_tags_strips_all_and_keeps_order():
+    spoken, claims = extract_dm_check_tags(
+        "Wait.\n"
+        "[DM CHECK: door is unlocked]\n"
+        "[DM CHECK: Does the speaker know the necessary language to talk to the NPC]\n"
+    )
+    assert spoken == "Wait."
+    assert len(claims) == 2
+    assert "door is unlocked" in claims[0]
+    assert "necessary language" in claims[1].lower()
     assert "[DM CHECK:" not in spoken
 
 

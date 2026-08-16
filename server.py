@@ -2595,7 +2595,9 @@ def npc_turn():
             "saved_memories": saved_memories,
             "memory_extraction_mode": memory_extraction_mode,
             "dm_check_claim": npc_response.get("dm_check_claim"),
+            "dm_check_claims": npc_response.get("dm_check_claims"),
             "dm_pending_check_id": npc_response.get("pending_check_id"),
+            "dm_pending_check_ids": npc_response.get("pending_check_ids"),
             "detected_player_claim": player_claim,
             "dm_pending": load_pending_checks(npc_id, player_id, status="pending", limit=5, campaign_id=campaign_id),
         }
@@ -3125,7 +3127,9 @@ def npc_voice_turn_debug():
             "audio_file": str(output_path),
             "total_seconds": round(total_elapsed, 3),
             "dm_check_claim": npc_response.get("dm_check_claim"),
+            "dm_check_claims": npc_response.get("dm_check_claims"),
             "dm_pending_check_id": npc_response.get("pending_check_id"),
+            "dm_pending_check_ids": npc_response.get("pending_check_ids"),
             "detected_player_claim": player_claim,
             "dm_pending": load_pending_checks(npc_id, player_id, status="pending", limit=5, campaign_id=campaign_id),
         })
