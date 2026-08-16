@@ -147,3 +147,65 @@ def test_process_npc_response_keeps_distinct_dm_checks(tmp_path, monkeypatch):
     assert any("door is unlocked" in s for s in summaries)
     assert any("necessary language" in s for s in summaries)
     assert len(pending) >= 2
+
+
+def test_dm_console_loaders_are_campaign_wide_across_players(tmp_path, monkeypatch):
+    """DM console must see every player's pending checks / rulings in a campaign."""
+    import dm_channel
+
+    mem_db = tmp_path / "dm_console_scope.db"
+    monkeypatch.setattr(dm_channel, "MEMORY_DB", mem_db)
+    dm_channel.init_dm_tables()
+
+    first = dm_channel.save_pending_check(
+        npc_id="captain_varra",
+        player_id="player_alden",
+        claim_summary="player claims official authority",
+        player_text="Let us pass",
+        npc_text="I need confirmation.",
+        source="npc",
+        campaign_id="greyhaven_intro",
+    )
+    second = dm_channel.save_pending_check(
+        npc_id="captain_varra",
+        player_id="player_mira",
+        claim_summary="party has a sealed letter",
+        player_text="We carry a letter",
+        npc_text="Show me.",
+        source="npc",
+        campaign_id="greyhaven_intro",
+    )
+    assert first and second
+
+    pending = dm_channel.load_pending_checks_for_dm(
+        campaign_id="greyhaven_intro",
+        status="pending",
+        limit=20,
+    )
+    player_ids = {row["player_id"] for row in pending}
+    assert "player_alden" in player_ids
+    assert "player_mira" in player_ids
+
+    # Player-scoped loader must not pretend the DM default party owns these rows.
+    scoped = dm_channel.load_pending_checks(
+        "captain_varra",
+        "default_party",
+        status="pending",
+        campaign_id="greyhaven_intro",
+    )
+    assert scoped == []
+
+    ruling = dm_channel.create_manual_ruling(
+        npc_id="captain_varra",
+        player_id="player_alden",
+        claim_summary="player claims official authority",
+        verdict="confirmed",
+        notes="Approved.",
+        pending_check_id=first,
+        campaign_id="greyhaven_intro",
+    )
+    assert ruling["ruling_id"]
+
+    rulings = dm_channel.load_rulings_for_dm(campaign_id="greyhaven_intro", limit=20)
+    assert any(row["id"] == ruling["ruling_id"] for row in rulings)
+    assert any(row["player_id"] == "player_alden" for row in rulings)

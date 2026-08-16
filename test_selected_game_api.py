@@ -495,3 +495,121 @@ def test_npc_turn_without_authored_template_does_not_invent_check(api, monkeypat
     assert body.get("dm_check_claim") is None
     assert "cannot simply take your word" in (body.get("npc_text") or "").lower()
 
+
+def test_dm_pending_and_ruling_are_campaign_wide_without_player_id(api, monkeypatch):
+    """DM console proxies strip player_id; pending/rulings must still resolve by campaign."""
+    client, server, headers = api
+    import dm_channel
+
+    monkeypatch.setattr(server, "ask_llm", lambda _messages: "Hold.")
+    monkeypatch.setattr(
+        server,
+        "run_dm_ruling_auto_response",
+        lambda *args, **kwargs: None,
+    )
+
+    pending_id = dm_channel.save_pending_check(
+        npc_id="captain_varra",
+        player_id="player_alden",
+        claim_summary="player claims official authority or permission",
+        player_text="Captain let us pass",
+        npc_text="I need the DM.",
+        source="npc",
+        campaign_id="greyhaven_intro",
+    )
+    assert pending_id
+
+    listed = client.get(
+        "/dm/pending?campaign_id=greyhaven_intro",
+        headers=headers,
+    )
+    assert listed.status_code == 200
+    body = listed.get_json()
+    checks = body.get("pending_checks") or []
+    assert any(item.get("id") == pending_id for item in checks)
+    assert body.get("pending") == checks
+
+    ruling = client.post(
+        "/dm/ruling",
+        headers=headers,
+        json={
+            "campaign_id": "greyhaven_intro",
+            "check_id": pending_id,
+            "verdict": "confirm",
+            "text": "Yes, that is approved.",
+            "auto_respond": False,
+            "include_audio": False,
+        },
+    )
+    assert ruling.status_code == 200, ruling.get_json()
+    saved = ruling.get_json()
+    assert saved.get("status") == "saved"
+    assert saved.get("verdict") == "confirmed"
+    assert saved.get("claim_summary")
+    assert "official authority" in saved["claim_summary"].lower()
+
+    history = client.get(
+        "/dm/rulings?campaign_id=greyhaven_intro",
+        headers=headers,
+    )
+    assert history.status_code == 200
+    rulings = history.get_json().get("rulings") or []
+    assert any(row.get("id") == saved.get("ruling_id") for row in rulings)
+    assert any("official authority" in str(row.get("claim_summary", "")).lower() for row in rulings)
+
+    remaining = client.get(
+        "/dm/pending?campaign_id=greyhaven_intro",
+        headers=headers,
+    )
+    assert remaining.status_code == 200
+    still_open = remaining.get_json().get("pending_checks") or []
+    assert all(item.get("id") != pending_id for item in still_open)
+
+
+def test_dm_ruling_auto_respond_uses_pending_player_party_context(api, monkeypatch):
+    """After check_id override, auto_respond must use the pending claim's player speaker."""
+    client, server, headers = api
+    import dm_channel
+
+    captured = {}
+
+    def _auto(npc_id, player_id, ruling, **kwargs):
+        captured["npc_id"] = npc_id
+        captured["player_id"] = player_id
+        captured["party_context"] = kwargs.get("party_context")
+        return {"status": "spoken", "player_id": player_id}
+
+    monkeypatch.setattr(server, "run_dm_ruling_auto_response", _auto)
+
+    # Without a selected character the DM proxy session speaker is DEFAULT_PLAYER_ID,
+    # which must not leak into auto_respond after pending-row player override.
+    pending_id = dm_channel.save_pending_check(
+        npc_id="captain_varra",
+        player_id="player_alden",
+        claim_summary="player claims official authority or permission",
+        player_text="Captain let us pass",
+        npc_text="I need the DM.",
+        source="npc",
+        campaign_id="greyhaven_intro",
+    )
+    assert pending_id
+
+    ruling = client.post(
+        "/dm/ruling",
+        headers=headers,
+        json={
+            "campaign_id": "greyhaven_intro",
+            "check_id": pending_id,
+            "verdict": "confirm",
+            "auto_respond": True,
+            "include_audio": False,
+        },
+    )
+    assert ruling.status_code == 200, ruling.get_json()
+    body = ruling.get_json()
+    assert body.get("player_id") == "player_alden"
+    assert (body.get("speaking_member") or {}).get("player_id") == "player_alden"
+    assert captured.get("player_id") == "player_alden"
+    assert (captured.get("party_context") or {}).get("player_id") == "player_alden"
+    assert (captured.get("party_context") or {}).get("speaking_member", {}).get("player_id") == "player_alden"
+

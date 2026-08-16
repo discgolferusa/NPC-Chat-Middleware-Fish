@@ -50,9 +50,12 @@ from dm_channel import (
     get_dm_context,
     init_dm_tables,
     load_dm_messages,
+    load_pending_check_by_id,
     load_pending_checks,
+    load_pending_checks_for_dm,
     load_ruling_by_id,
     load_rulings,
+    load_rulings_for_dm,
     log_dm_turn,
     normalize_campaign_id,
     process_npc_response,
@@ -3961,18 +3964,21 @@ def dm_message_post():
 
 @app.get("/dm/pending")
 def dm_pending():
-    npc_id = request.args.get("npc_id", "captain_varra")
+    # Empty npc_id = all NPCs in the campaign (DM console "All NPCs" filter).
+    npc_id = (request.args.get("npc_id") or "").strip()
     session = resolve_request_session(args=request.args)
-    player_id = session["player_id"]
     campaign_id = session["campaign_id"]
     status = request.args.get("status", "pending")
 
-    checks = load_pending_checks(
-        npc_id, player_id, status=status or None, limit=50, campaign_id=campaign_id
+    checks = load_pending_checks_for_dm(
+        campaign_id=campaign_id,
+        npc_id=npc_id or None,
+        status=status or None,
+        limit=50,
     )
     return jsonify({
-        "npc_id": npc_id,
-        "player_id": player_id,
+        "npc_id": npc_id or None,
+        "player_id": session["player_id"],
         "party_id": session["party_id"],
         "campaign_id": session["campaign_id"],
         "pending_checks": checks,
@@ -3983,21 +3989,25 @@ def dm_pending():
 
 @app.get("/dm/rulings")
 def dm_rulings():
-    npc_id = request.args.get("npc_id", "captain_varra")
+    npc_id = (request.args.get("npc_id") or "").strip()
     session = resolve_request_session(args=request.args)
-    player_id = session["player_id"]
     campaign_id = session["campaign_id"]
     try:
         limit = max(1, min(int(request.args.get("limit", 20)), 100))
     except (TypeError, ValueError):
         limit = 20
 
+    rulings = load_rulings_for_dm(
+        campaign_id=campaign_id,
+        npc_id=npc_id or None,
+        limit=limit,
+    )
     return jsonify({
-        "npc_id": npc_id,
-        "player_id": player_id,
+        "npc_id": npc_id or None,
+        "player_id": session["player_id"],
         "party_id": session["party_id"],
         "campaign_id": session["campaign_id"],
-        "rulings": load_rulings(npc_id, player_id, limit=limit, campaign_id=campaign_id),
+        "rulings": rulings,
     })
 
 
@@ -4005,14 +4015,50 @@ def dm_rulings():
 def dm_ruling_post():
     body = request.get_json(force=True, silent=True) or {}
 
-    npc_id = body.get("npc_id", "captain_varra")
     session = resolve_request_session(body=body)
-    player_id = session["player_id"]
     campaign_id = session["campaign_id"]
+    npc_id = (body.get("npc_id") or "").strip() or "captain_varra"
+    player_id = session["player_id"]
     claim_summary = (body.get("claim_summary") or body.get("claim") or "").strip()
-    verdict = (body.get("verdict") or "").strip().lower()
+    raw_verdict = (body.get("verdict") or "").strip().lower()
+    verdict_aliases = {
+        "confirm": "confirmed",
+        "confirmed": "confirmed",
+        "deny": "denied",
+        "denied": "denied",
+    }
+    verdict = verdict_aliases.get(raw_verdict, raw_verdict)
     notes = (body.get("notes") or body.get("text") or "").strip()
-    pending_check_id = body.get("pending_check_id")
+
+    pending_raw = body.get("pending_check_id", body.get("check_id"))
+    pending_check_id = None
+    try:
+        if pending_raw is not None and str(pending_raw).strip() != "":
+            pending_check_id = int(pending_raw)
+    except (TypeError, ValueError):
+        pending_check_id = None
+
+    if pending_check_id is not None:
+        pending = load_pending_check_by_id(pending_check_id)
+        if pending:
+            # Prefer the pending row's identity so rulings match the original turn.
+            npc_id = (pending.get("npc_id") or npc_id).strip() or npc_id
+            player_id = (pending.get("player_id") or player_id).strip() or player_id
+            if not claim_summary:
+                claim_summary = (pending.get("claim_summary") or "").strip()
+            pending_campaign = normalize_campaign_id(pending.get("campaign_id"))
+            if pending_campaign:
+                campaign_id = pending_campaign
+
+    # Proxy strips player_id; rebuild speaker context for the claim's player.
+    party_context = build_party_context(
+        player_id=player_id,
+        party_id=session["party_id"],
+    )
+    if campaign_id:
+        party_context["campaign_id"] = campaign_id
+        if not party_context.get("campaign"):
+            party_context["campaign"] = load_campaign(campaign_id)
 
     if not claim_summary:
         return jsonify({"error": "Missing claim_summary"}), 400
@@ -4027,8 +4073,8 @@ def dm_ruling_post():
             verdict=verdict,
             notes=notes,
             pending_check_id=pending_check_id,
-                campaign_id=campaign_id,
-            )
+            campaign_id=campaign_id,
+        )
 
         auto_response = None
         if _json_body_flag(body.get("auto_respond"), True) and result.get("ruling_id"):
@@ -4040,24 +4086,36 @@ def dm_ruling_post():
                     ruling,
                     include_audio=_json_body_flag(body.get("include_audio"), True),
                     scene_description=(body.get("scene") or "").strip(),
-                    party_context=session["party_context"],
+                    party_context=party_context,
                     voice_model=(body.get("voice_model") or "").strip() or None,
                     tts_length_scale=body.get("tts_length_scale"),
                     tts_options=_tts_request_values_from_mapping(body),
                     campaign_id=campaign_id,
                 )
 
+        pending_list = load_pending_checks_for_dm(
+            campaign_id=campaign_id,
+            npc_id=None,
+            status="pending",
+            limit=10,
+        )
+        rulings_list = load_rulings_for_dm(
+            campaign_id=campaign_id,
+            npc_id=None,
+            limit=10,
+        )
         return jsonify({
             "status": "saved",
             "npc_id": npc_id,
             "player_id": player_id,
             "party_id": session["party_id"],
-            "campaign_id": session["campaign_id"],
-            "speaking_member": session["party_context"].get("speaking_member"),
+            "campaign_id": campaign_id,
+            "speaking_member": party_context.get("speaking_member"),
             **result,
             "auto_response": auto_response,
-            "pending": load_pending_checks(npc_id, player_id, status="pending", limit=10, campaign_id=campaign_id),
-            "rulings": load_rulings(npc_id, player_id, limit=10, campaign_id=campaign_id),
+            "pending": pending_list,
+            "pending_checks": pending_list,
+            "rulings": rulings_list,
         })
     except ValueError as ex:
         return _client_error(ex, 400)

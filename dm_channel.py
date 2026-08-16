@@ -809,7 +809,8 @@ def load_pending_checks(
 ) -> list[dict[str, Any]]:
     campaign_id = normalize_campaign_id(campaign_id)
     query = """
-        SELECT id, claim_summary, player_text, npc_text, source, status, ruling_id, created_at, resolved_at
+        SELECT id, campaign_id, npc_id, player_id, claim_summary, player_text, npc_text,
+               source, status, ruling_id, created_at, resolved_at
         FROM dm_pending_checks
         WHERE campaign_id = ?
           AND npc_id = ?
@@ -827,21 +828,66 @@ def load_pending_checks(
     with get_db() as conn:
         rows = conn.execute(query, params).fetchall()
 
-    items = [
-        {
-            "id": row["id"],
-            "claim_summary": row["claim_summary"],
-            "player_text": row["player_text"],
-            "npc_text": row["npc_text"],
-            "source": row["source"],
-            "status": row["status"],
-            "ruling_id": row["ruling_id"],
-            "created_at": row["created_at"],
-            "resolved_at": row["resolved_at"],
-        }
-        for row in rows
-    ]
-    return list(reversed(items))
+    return [_pending_row_to_dict(row) for row in reversed(rows)]
+
+
+def load_pending_checks_for_dm(
+    *,
+    campaign_id: str,
+    npc_id: str | None = None,
+    status: str | None = "pending",
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """Campaign-scoped pending list for the DM console (all players)."""
+    campaign_id = normalize_campaign_id(campaign_id)
+    query = """
+        SELECT id, campaign_id, npc_id, player_id, claim_summary, player_text, npc_text,
+               source, status, ruling_id, created_at, resolved_at
+        FROM dm_pending_checks
+        WHERE campaign_id = ?
+    """
+    params: list[Any] = [campaign_id]
+    npc_id = (npc_id or "").strip()
+    if npc_id:
+        query += " AND npc_id = ?"
+        params.append(npc_id)
+    if status:
+        query += " AND status = ?"
+        params.append(status)
+    query += " ORDER BY id DESC LIMIT ?"
+    params.append(limit)
+
+    with get_db() as conn:
+        rows = conn.execute(query, params).fetchall()
+    return [_pending_row_to_dict(row) for row in reversed(rows)]
+
+
+def load_pending_check_by_id(pending_id: int) -> dict[str, Any] | None:
+    with get_db() as conn:
+        row = conn.execute("""
+            SELECT id, campaign_id, npc_id, player_id, claim_summary, player_text, npc_text,
+                   source, status, ruling_id, created_at, resolved_at
+            FROM dm_pending_checks
+            WHERE id = ?
+        """, (int(pending_id),)).fetchone()
+    return _pending_row_to_dict(row) if row else None
+
+
+def _pending_row_to_dict(row: Any) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "campaign_id": row["campaign_id"] if "campaign_id" in row.keys() else "",
+        "npc_id": row["npc_id"] if "npc_id" in row.keys() else "",
+        "player_id": row["player_id"] if "player_id" in row.keys() else "",
+        "claim_summary": row["claim_summary"],
+        "player_text": row["player_text"],
+        "npc_text": row["npc_text"],
+        "source": row["source"],
+        "status": row["status"],
+        "ruling_id": row["ruling_id"],
+        "created_at": row["created_at"],
+        "resolved_at": row["resolved_at"],
+    }
 
 
 def load_rulings(
@@ -854,7 +900,8 @@ def load_rulings(
     campaign_id = normalize_campaign_id(campaign_id)
     with get_db() as conn:
         rows = conn.execute("""
-            SELECT id, claim_summary, verdict, ruling_text, source, pending_check_id, created_at
+            SELECT id, campaign_id, npc_id, player_id, claim_summary, verdict, ruling_text,
+                   source, pending_check_id, created_at
             FROM dm_rulings
             WHERE campaign_id = ?
               AND npc_id = ?
@@ -863,18 +910,49 @@ def load_rulings(
             LIMIT ?
         """, (campaign_id, npc_id, player_id, limit)).fetchall()
 
-    return [
-        {
-            "id": row["id"],
-            "claim_summary": row["claim_summary"],
-            "verdict": row["verdict"],
-            "ruling_text": row["ruling_text"],
-            "source": row["source"],
-            "pending_check_id": row["pending_check_id"],
-            "created_at": row["created_at"],
-        }
-        for row in reversed(rows)
-    ]
+    return [_ruling_row_to_dict(row) for row in reversed(rows)]
+
+
+def load_rulings_for_dm(
+    *,
+    campaign_id: str,
+    npc_id: str | None = None,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    """Campaign-scoped rulings for the DM console (all players)."""
+    campaign_id = normalize_campaign_id(campaign_id)
+    query = """
+        SELECT id, campaign_id, npc_id, player_id, claim_summary, verdict, ruling_text,
+               source, pending_check_id, created_at
+        FROM dm_rulings
+        WHERE campaign_id = ?
+    """
+    params: list[Any] = [campaign_id]
+    npc_id = (npc_id or "").strip()
+    if npc_id:
+        query += " AND npc_id = ?"
+        params.append(npc_id)
+    query += " ORDER BY id DESC LIMIT ?"
+    params.append(limit)
+
+    with get_db() as conn:
+        rows = conn.execute(query, params).fetchall()
+    return [_ruling_row_to_dict(row) for row in reversed(rows)]
+
+
+def _ruling_row_to_dict(row: Any) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "campaign_id": row["campaign_id"] if "campaign_id" in row.keys() else "",
+        "npc_id": row["npc_id"] if "npc_id" in row.keys() else "",
+        "player_id": row["player_id"] if "player_id" in row.keys() else "",
+        "claim_summary": row["claim_summary"],
+        "verdict": row["verdict"],
+        "ruling_text": row["ruling_text"],
+        "source": row["source"],
+        "pending_check_id": row["pending_check_id"],
+        "created_at": row["created_at"],
+    }
 
 
 def load_ruling_by_id(ruling_id: int) -> dict[str, Any] | None:
