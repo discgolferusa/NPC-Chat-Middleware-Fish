@@ -20,9 +20,9 @@ def yaml_list_item_as_text(item: Any) -> str:
     """
     Coerce a YAML list item to text.
 
-    Unquoted strings containing ``: `` (e.g. ``[DM CHECK: …]``) are parsed by
-    PyYAML/YamlDotNet as a one-entry mapping. Rejoin ``key: value`` so authored
-    tags survive load.
+    Unquoted ``[DM CHECK: …]`` / ``[DM Ruling: …]`` scalars are parsed as a
+    one-entry mapping because of the ``: `` after ``[DM …``. Rejoin
+    ``key: value`` when that happens so authors never need ``>-``.
     """
     if item is None:
         return ""
@@ -31,8 +31,11 @@ def yaml_list_item_as_text(item: Any) -> str:
     if isinstance(item, dict):
         if len(item) == 1:
             key, value = next(iter(item.items()))
-            return f"{key}: {value}"
-        return "\n".join(f"{k}: {v}" for k, v in item.items())
+            return f"{key}: {'' if value is None else value}"
+        return "\n".join(
+            f"{k}: {'' if v is None else v}"
+            for k, v in item.items()
+        )
     return str(item)
 
 
