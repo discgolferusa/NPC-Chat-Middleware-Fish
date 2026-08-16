@@ -58,6 +58,19 @@ def test_set_after_complete_does_not_reopen():
     assert reopened["step"] == "complete"
 
 
+def test_complete_after_fail_stays_error():
+    rid = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    tp.register_turn_progress(rid, route="/npc-voice-turn", mode="voice")
+    failed = tp.fail_turn_progress(rid, "handler_failed")
+    assert failed is not None
+    assert failed["status"] == "error"
+
+    flipped = tp.complete_turn_progress(rid)
+    assert flipped is not None
+    assert flipped["status"] == "error"
+    assert "handler_failed" in (flipped.get("error") or "")
+
+
 def test_text_steps_include_synthesizing_speech():
     keys = [step["key"] for step in tp.TEXT_TURN_STEPS]
     assert "synthesizing_speech" in keys

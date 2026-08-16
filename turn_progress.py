@@ -219,6 +219,11 @@ def _finish_turn_progress(
         if not entry:
             return None
 
+        # Terminal turns must stay terminal. A background TTS stream must not
+        # flip an HTTP-path fail_turn_progress("error") back to "complete".
+        if entry.get("status") in ("complete", "error", "failed"):
+            return public_progress(entry)
+
         mode = entry.get("mode") or "text"
         if status == "error":
             entry["step"] = step_key
