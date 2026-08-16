@@ -2043,12 +2043,19 @@ def synthesize_segmented_speech_clips(
     npc_tts_options: dict[str, Any] | None = None,
     on_clip_ready: Any = None,
     on_narration_ready: Any = None,
+    *,
+    return_after_first_clip: bool = False,
+    on_stream_complete: Any = None,
 ) -> dict[str, Any]:
     """
     Synthesize ordered narrator/NPC segments as separate WAV files (no concatenation).
 
     Each segment is written and published via on_clip_ready as soon as Piper finishes,
     so the editor can start SignalR playback while later segments are still generating.
+
+    When ``return_after_first_clip`` is true and more segments remain, returns after the
+    first clip with ``pending=True`` and continues remaining segments on a background
+    thread (progress + ``on_stream_complete``).
     """
     npc_opts = npc_tts_options or resolve_tts_options(
         {},
@@ -2088,24 +2095,25 @@ def synthesize_segmented_speech_clips(
         denoise_nf=narrator_tts.get("denoise_nf"),
     )
 
-    narration_path: Path | None = None
-    speech_path: Path | None = None
-    clips: list[dict[str, Any]] = []
-    temp_raw: list[Path] = []
+    state: dict[str, Any] = {
+        "narration_path": None,
+        "speech_path": None,
+        "clips": [],
+        "lock": threading.Lock(),
+    }
 
-    try:
-        for index, segment in enumerate(segments):
-            raw_path = OUTPUT_DIR / f"{request_id}_raw_{index:02d}_{segment['type']}.wav"
-            temp_raw.append(raw_path)
-            out_path = turn_audio_path(request_id, index)
-            clip_type = "narration" if segment["type"] == "narrator" else "speech"
-            opts = narrator_opts if segment["type"] == "narrator" else npc_opts
-            voice = (
-                narrator_tts["resolved_voice_model"]
-                if segment["type"] == "narrator"
-                else npc_voice_model
-            )
+    def _synthesize_one(index: int, segment: dict[str, Any]) -> dict[str, Any]:
+        raw_path = OUTPUT_DIR / f"{request_id}_raw_{index:02d}_{segment['type']}.wav"
+        out_path = turn_audio_path(request_id, index)
+        clip_type = "narration" if segment["type"] == "narrator" else "speech"
+        opts = narrator_opts if segment["type"] == "narrator" else npc_opts
+        voice = (
+            narrator_tts["resolved_voice_model"]
+            if segment["type"] == "narrator"
+            else npc_voice_model
+        )
 
+        try:
             synthesize_speech(
                 segment["text"],
                 voice,
@@ -2125,16 +2133,21 @@ def synthesize_segmented_speech_clips(
                 denoise_nr=opts.get("denoise_nr"),
                 denoise_nf=opts.get("denoise_nf"),
             )
+        finally:
+            try:
+                raw_path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
-            # Keep legacy first-of-type paths for older consumers.
-            if clip_type == "narration" and narration_path is None:
+        with state["lock"]:
+            if clip_type == "narration" and state["narration_path"] is None:
                 legacy = turn_audio_path(request_id, "narration")
                 legacy.write_bytes(out_path.read_bytes())
-                narration_path = legacy
+                state["narration_path"] = legacy
             if clip_type == "speech":
                 legacy = turn_audio_path(request_id, "speech")
                 legacy.write_bytes(out_path.read_bytes())
-                speech_path = legacy
+                state["speech_path"] = legacy
 
             clip = {
                 "type": clip_type,
@@ -2142,18 +2155,26 @@ def synthesize_segmented_speech_clips(
                 "url": turn_audio_url(request_id, index),
                 "text": segment["text"],
             }
-            clips.append(clip)
-            print(
-                f"[PLAYER-AUDIO] clip_ready request_id={request_id} index={index} "
-                f"type={clip_type} chars={len(segment['text'])} path={out_path}",
-                flush=True,
-            )
+            state["clips"].append(clip)
+            clips_snapshot = list(state["clips"])
 
-            if callable(on_clip_ready):
-                on_clip_ready(clip, list(clips))
-            if clip_type == "narration" and callable(on_narration_ready):
-                on_narration_ready(out_path, segment["text"], list(clips))
+        print(
+            f"[PLAYER-AUDIO] clip_ready request_id={request_id} index={index} "
+            f"type={clip_type} chars={len(segment['text'])} path={out_path}",
+            flush=True,
+        )
 
+        if callable(on_clip_ready):
+            on_clip_ready(clip, clips_snapshot)
+        if clip_type == "narration" and callable(on_narration_ready):
+            on_narration_ready(out_path, segment["text"], clips_snapshot)
+        return clip
+
+    def _result(*, pending: bool) -> dict[str, Any]:
+        with state["lock"]:
+            clips = list(state["clips"])
+            narration_path = state["narration_path"]
+            speech_path = state["speech_path"]
         return {
             "segments": segments,
             "narration_text": narration_text,
@@ -2161,13 +2182,53 @@ def synthesize_segmented_speech_clips(
             "narration_path": narration_path,
             "speech_path": speech_path,
             "clips": clips,
+            "pending": pending,
         }
-    finally:
-        for raw_path in temp_raw:
+
+    # Always synthesize the first clip on the request thread.
+    _synthesize_one(0, segments[0])
+
+    if return_after_first_clip and len(segments) > 1:
+        remaining = list(enumerate(segments[1:], start=1))
+
+        def _continue_remaining() -> None:
+            error: BaseException | None = None
             try:
-                raw_path.unlink(missing_ok=True)
-            except Exception:
-                pass
+                for index, segment in remaining:
+                    _synthesize_one(index, segment)
+            except BaseException as ex:
+                error = ex
+                print(
+                    f"[PLAYER-AUDIO] stream_tts_failed request_id={request_id} error={ex!r}",
+                    flush=True,
+                )
+            finally:
+                if callable(on_stream_complete):
+                    try:
+                        on_stream_complete(_result(pending=False), error)
+                    except Exception as cb_ex:
+                        print(
+                            f"[PLAYER-AUDIO] on_stream_complete failed "
+                            f"request_id={request_id} error={cb_ex!r}",
+                            flush=True,
+                        )
+
+        threading.Thread(
+            target=_continue_remaining,
+            name=f"tts-stream-{request_id[:8]}",
+            daemon=True,
+        ).start()
+        print(
+            f"[PLAYER-AUDIO] stream_early_return request_id={request_id} "
+            f"first_of={len(segments)}",
+            flush=True,
+        )
+        return _result(pending=True)
+
+    for index, segment in enumerate(segments[1:], start=1):
+        _synthesize_one(index, segment)
+
+    return _result(pending=False)
 
 
 def synthesize_segmented_speech(
@@ -2803,6 +2864,12 @@ def npc_voice_turn():
 
         set_turn_progress(request_id, "generating_voice")
 
+        stream_clips = (request.form.get("stream_clips") or "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+
         def _on_clip_ready(clip, clips_so_far):
             step = "clip_ready"
             if clip.get("type") == "narration":
@@ -2823,6 +2890,26 @@ def npc_voice_turn():
                 message=f"Ready part {int(clip.get('index', 0)) + 1} of the response...",
             )
 
+        def _on_stream_complete(final_result: dict, error: BaseException | None) -> None:
+            if error is not None:
+                fail_turn_progress(request_id, "tts_stream_failed")
+                return
+            final_clips = final_result.get("clips") or []
+            set_turn_progress(
+                request_id,
+                "speech_ready" if any(c.get("type") == "speech" for c in final_clips) else "narration_ready",
+                player_text=player_text,
+                narration_text=final_result.get("narration_text") or "",
+                dialogue_text=final_result.get("dialogue_text") or "",
+                clips=final_clips,
+            )
+            set_turn_progress(request_id, "finishing", clips=final_clips)
+            complete_turn_progress(request_id)
+            print(
+                f"[PLAYER-AUDIO] stream_complete request_id={request_id} clips={len(final_clips)}",
+                flush=True,
+            )
+
         clip_result = synthesize_segmented_speech_clips(
             npc_text=npc_text,
             npc_voice_model=pick_npc_voice_model(
@@ -2835,6 +2922,8 @@ def npc_voice_turn():
                 _tts_request_values_from_mapping(request.form),
             ),
             on_clip_ready=_on_clip_ready,
+            return_after_first_clip=stream_clips,
+            on_stream_complete=_on_stream_complete if stream_clips else None,
         )
         step_start = log_timing(request_id, "piper segmented tts", step_start)
 
@@ -2843,6 +2932,7 @@ def npc_voice_turn():
         clips = clip_result["clips"]
         speech_path = clip_result.get("speech_path")
         narration_path = clip_result.get("narration_path")
+        streaming = bool(clip_result.get("pending"))
         # Prefer last segment as HTTP body; clients play via SignalR clip list.
         response_path = turn_audio_path(request_id, len(clips) - 1) if clips else (speech_path or narration_path or output_path)
 
@@ -2858,7 +2948,8 @@ def npc_voice_turn():
         total_elapsed = time.perf_counter() - total_start
         print(
             f"[TIMING] {request_id} TOTAL: {total_elapsed:.3f}s "
-            f"memory_mode={memory_extraction_mode} clips={len(clips)}",
+            f"memory_mode={memory_extraction_mode} clips={len(clips)} "
+            f"streaming={int(streaming)}",
             flush=True
         )
 
@@ -2868,14 +2959,15 @@ def npc_voice_turn():
             route="/npc-voice-turn",
             npc_id=npc_id,
             player_id=player_id,
-            stage="complete",
+            stage="complete" if not streaming else "streaming",
             player_text=player_text,
             player_claim=player_claim,
             npc_response=npc_response,
         )
 
-        set_turn_progress(request_id, "finishing", clips=clips)
-        complete_turn_progress(request_id)
+        if not streaming:
+            set_turn_progress(request_id, "finishing", clips=clips)
+            complete_turn_progress(request_id)
 
         response = make_response(send_file(
             response_path,
@@ -2884,6 +2976,8 @@ def npc_voice_turn():
             download_name="npc_response.wav"
         ))
         response.headers["X-Turn-Request-Id"] = request_id
+        if streaming:
+            response.headers["X-Turn-Streaming"] = "1"
         response.headers["X-DM-Pending-Count"] = str(len(pending_items))
         pending_id = npc_response.get("pending_check_id") or (
             player_claim.get("pending_check_id") if player_claim else None
