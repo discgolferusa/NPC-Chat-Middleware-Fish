@@ -64,16 +64,25 @@ def extract_dm_check_templates_from_rules(npc: dict[str, Any] | None) -> list[st
     blob = _npc_rules_blob(npc)
     claims: list[str] = []
     seen: set[str] = set()
-    for pattern in (DM_CHECK_IN_RULES_PATTERN, DM_CHECK_MANGLED_IN_RULES_PATTERN):
-        for match in pattern.finditer(blob):
-            claim = match.group(1).strip().strip("'\"")
-            if not claim:
-                continue
-            key = _normalize_claim(claim)
-            if not key or key in seen:
-                continue
-            seen.add(key)
-            claims.append(claim)
+
+    def _add_claim(claim: str) -> None:
+        claim = (claim or "").strip()
+        if not claim:
+            return
+        key = _normalize_claim(claim)
+        if not key or key in seen:
+            return
+        seen.add(key)
+        claims.append(claim)
+
+    for match in DM_CHECK_IN_RULES_PATTERN.finditer(blob):
+        # Preserve authored punctuation (possessives, trailing quotes in the claim).
+        _add_claim(match.group(1))
+
+    for match in DM_CHECK_MANGLED_IN_RULES_PATTERN.finditer(blob):
+        # Only mangled YAML fragments may wrap the claim in leftover ' / " chars.
+        _add_claim(match.group(1).strip().strip("'\""))
+
     return claims
 
 

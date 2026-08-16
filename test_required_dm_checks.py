@@ -27,6 +27,20 @@ def test_extract_dm_check_from_rules():
     assert "necessary language" in claims[0].lower()
 
 
+def test_extract_preserves_trailing_quotes_and_possessives():
+    """Normal [DM CHECK:…] claims must keep authored ' / \" at the ends."""
+    npc = {
+        "llm_rules": [
+            'End with [DM CHECK: confirm the mayor\'s "writ of passage"]',
+        ]
+    }
+    claims = extract_dm_check_templates_from_rules(npc)
+    assert len(claims) == 1
+    assert claims[0] == 'confirm the mayor\'s "writ of passage"'
+    out = ensure_required_dm_check_tags(npc, {"rulings": []}, "Hold.")
+    assert out.endswith('[DM CHECK: confirm the mayor\'s "writ of passage"]')
+
+
 def test_extract_finds_dm_even_when_yaml_split_mapping():
     """Look for [DM… even after YAML turns the tag into a one-key mapping."""
     import yaml
