@@ -209,3 +209,38 @@ def test_dm_console_loaders_are_campaign_wide_across_players(tmp_path, monkeypat
     rulings = dm_channel.load_rulings_for_dm(campaign_id="greyhaven_intro", limit=20)
     assert any(row["id"] == ruling["ruling_id"] for row in rulings)
     assert any(row["player_id"] == "player_alden" for row in rulings)
+
+
+def test_dismiss_pending_check_marks_ignored_without_ruling(tmp_path, monkeypatch):
+    import dm_channel
+
+    mem_db = tmp_path / "dm_dismiss.db"
+    monkeypatch.setattr(dm_channel, "MEMORY_DB", mem_db)
+    dm_channel.init_dm_tables()
+
+    pending_id = dm_channel.save_pending_check(
+        npc_id="captain_varra",
+        player_id="player_alden",
+        claim_summary="noise claim",
+        player_text="whatever",
+        npc_text="checking",
+        source="npc",
+        campaign_id="greyhaven_intro",
+    )
+    assert pending_id
+
+    updated = dm_channel.dismiss_pending_check(pending_id)
+    assert updated is not None
+    assert updated["status"] == "ignored"
+    assert updated["resolved_at"]
+
+    open_rows = dm_channel.load_pending_checks_for_dm(
+        campaign_id="greyhaven_intro",
+        status="pending",
+        limit=20,
+    )
+    assert all(row["id"] != pending_id for row in open_rows)
+
+    ignored = dm_channel.load_pending_check_by_id(pending_id)
+    assert ignored is not None
+    assert ignored["status"] == "ignored"

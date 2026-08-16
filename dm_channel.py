@@ -626,6 +626,33 @@ def resolve_pending_check(
         conn.commit()
 
 
+def dismiss_pending_check(pending_check_id: int) -> dict[str, Any] | None:
+    """Remove a pending check without recording a confirm/deny ruling."""
+    pending = load_pending_check_by_id(int(pending_check_id))
+    if not pending:
+        return None
+    if (pending.get("status") or "").strip().lower() != "pending":
+        return pending
+
+    with get_db() as conn:
+        conn.execute("""
+            UPDATE dm_pending_checks
+            SET status = ?, resolved_at = ?
+            WHERE id = ? AND status = 'pending'
+        """, ("ignored", _utc_now_iso(), int(pending_check_id)))
+        conn.commit()
+
+    updated = load_pending_check_by_id(int(pending_check_id))
+    print(
+        f"[DM] ignored pending check #{pending_check_id} "
+        f"npc={pending.get('npc_id')} player={pending.get('player_id')} "
+        f"campaign={pending.get('campaign_id') or '(none)'} "
+        f"claim={(pending.get('claim_summary') or '')[:120]!r}",
+        flush=True,
+    )
+    return updated
+
+
 def _find_matching_pending(
     npc_id: str,
     player_id: str,

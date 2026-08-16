@@ -613,3 +613,68 @@ def test_dm_ruling_auto_respond_uses_pending_player_party_context(api, monkeypat
     assert (captured.get("party_context") or {}).get("player_id") == "player_alden"
     assert (captured.get("party_context") or {}).get("speaking_member", {}).get("player_id") == "player_alden"
 
+
+def test_dm_pending_includes_display_names_and_can_be_dismissed(api, monkeypatch):
+    client, server, headers = api
+    import dm_channel
+
+    monkeypatch.setattr(
+        server,
+        "load_npc",
+        lambda npc_id: {"id": npc_id, "name": "Captain Varra"},
+    )
+    monkeypatch.setattr(
+        server,
+        "resolve_member",
+        lambda player_id, party_id=None: {
+            "player_id": player_id,
+            "name": "Alden",
+        },
+    )
+
+    pending_id = dm_channel.save_pending_check(
+        npc_id="captain_varra",
+        player_id="player_alden",
+        claim_summary="player claims official authority or permission",
+        player_text="Captain let us pass",
+        npc_text="I need the DM.",
+        source="npc",
+        campaign_id="greyhaven_intro",
+    )
+    assert pending_id
+
+    listed = client.get(
+        "/dm/pending?campaign_id=greyhaven_intro",
+        headers=headers,
+    )
+    assert listed.status_code == 200
+    checks = listed.get_json().get("pending_checks") or []
+    match = next(item for item in checks if item.get("id") == pending_id)
+    assert match.get("npc_name") == "Captain Varra"
+    assert match.get("player_name") == "Alden"
+    assert match.get("claim_summary")
+
+    dismissed = client.post(
+        "/dm/pending/dismiss",
+        headers=headers,
+        json={
+            "campaign_id": "greyhaven_intro",
+            "check_id": pending_id,
+        },
+    )
+    assert dismissed.status_code == 200, dismissed.get_json()
+    body = dismissed.get_json()
+    assert body.get("status") == "ignored"
+    assert body.get("pending_check_id") == pending_id
+    assert all(item.get("id") != pending_id for item in (body.get("pending_checks") or []))
+
+    remaining = client.get(
+        "/dm/pending?campaign_id=greyhaven_intro",
+        headers=headers,
+    )
+    assert remaining.status_code == 200
+    assert all(
+        item.get("id") != pending_id
+        for item in (remaining.get_json().get("pending_checks") or [])
+    )
+
