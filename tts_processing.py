@@ -584,18 +584,30 @@ def build_af_filter(
         filters.append("equalizer=f=380:t=q:w=1:g=2.5")
     elif preset == "robot":
         # Narrow band + vibrato + hard compression for a synthetic edge.
+        # Keep makeup/EQ modest — baseline already has dynaudnorm + limiter.
+        # alimiter level=disabled: default level=enabled multiplies by 1/limit
+        # and would undo the volume cut.
         filters.append("highpass=f=280")
         filters.append("lowpass=f=3400")
         filters.append("vibrato=f=8.5:d=0.35")
-        filters.append("equalizer=f=2200:t=q:w=1.4:g=5")
-        filters.append("acompressor=threshold=-16dB:ratio=6:attack=3:release=40:makeup=4")
+        filters.append("equalizer=f=2200:t=q:w=1.4:g=2.5")
+        filters.append("acompressor=threshold=-16dB:ratio=5:attack=3:release=40:makeup=1.2")
+        filters.append("volume=0.78")
+        filters.append("alimiter=limit=0.90:level=disabled")
     elif preset == "whisper":
-        # Thin, quieter presence (FX approximation — not true whisper synthesis).
-        filters.append("highpass=f=350")
-        filters.append("equalizer=f=220:t=q:w=1:g=-7")
-        filters.append("equalizer=f=5500:t=q:w=1.2:g=3")
-        filters.append("volume=0.72")
-        filters.append("acompressor=threshold=-22dB:ratio=1.8:attack=15:release=120:makeup=1")
+        # Thin, hush-soft presence (FX approximation — not true whisper synthesis).
+        # Applied after dynaudnorm so volume stays deliberately quiet.
+        # acompressor makeup must be >= 1 (FFmpeg range 1–64); use 1 = no boost.
+        # alimiter level=disabled keeps the soft ceiling from re-normalizing up.
+        filters.append("highpass=f=450")
+        filters.append("lowpass=f=4200")
+        filters.append("equalizer=f=180:t=q:w=1:g=-11")
+        filters.append("equalizer=f=900:t=q:w=1:g=-3")
+        filters.append("equalizer=f=3800:t=q:w=1.4:g=1.5")
+        filters.append("tremolo=f=5.5:d=0.12")
+        filters.append("volume=0.36")
+        filters.append("acompressor=threshold=-24dB:ratio=1.6:attack=20:release=150:makeup=1")
+        filters.append("alimiter=limit=0.55:level=disabled")
 
     pitch = _clamp(float(pitch_semitones or 0.0), PITCH_SEMITONES_MIN, PITCH_SEMITONES_MAX)
     if abs(pitch) >= 0.05:

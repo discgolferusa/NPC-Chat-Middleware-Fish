@@ -1,8 +1,14 @@
 """Unit tests for Piper TTS text prep and option resolution."""
 
 import json
+import re
+import shutil
+import subprocess
+
+import pytest
 
 from tts_processing import (
+    VALID_FX_PRESETS,
     build_af_filter,
     clean_for_tts,
     curated_defaults_for_quality,
@@ -231,8 +237,66 @@ def test_af_filter_underwater_robot_whisper_presets():
     assert "aecho=" in underwater
     assert "vibrato=" in robot
     assert "equalizer=f=2200" in robot
-    assert "highpass=f=350" in whisper
-    assert "volume=0.72" in whisper
+    assert "makeup=1.2" in robot
+    assert "volume=0.78" in robot
+    assert "alimiter=limit=0.90:level=disabled" in robot
+    assert "highpass=f=450" in whisper
+    assert "lowpass=f=4200" in whisper
+    assert "tremolo=" in whisper
+    assert "volume=0.36" in whisper
+    assert "makeup=1," in whisper
+    assert "alimiter=limit=0.55:level=disabled" in whisper
+
+
+def test_af_filter_acompressor_makeup_in_ffmpeg_range():
+    """FFmpeg acompressor makeup must be in [1, 64]; values <1 fail graph init."""
+    for preset in sorted(VALID_FX_PRESETS):
+        af = build_af_filter(fx_preset=preset, trim_silence=False)
+        for match in re.finditer(r"makeup=([0-9.]+)", af):
+            makeup = float(match.group(1))
+            assert 1.0 <= makeup <= 64.0, f"{preset}: makeup={makeup} out of range"
+
+
+def test_af_filter_preset_limiters_disable_auto_level():
+    """Default alimiter level=enabled multiplies by 1/limit and undoes volume cuts."""
+    for preset in ("robot", "whisper"):
+        af = build_af_filter(fx_preset=preset, trim_silence=False)
+        for match in re.finditer(r"alimiter=[^,]+", af):
+            stage = match.group(0)
+            if "limit=0.95" in stage:
+                continue  # shared baseline before dynaudnorm
+            assert "level=disabled" in stage, f"{preset}: {stage}"
+
+
+def test_af_filter_robot_whisper_ffmpeg_accepts_graph():
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        pytest.skip("ffmpeg not on PATH")
+    for preset in ("robot", "whisper"):
+        af = build_af_filter(fx_preset=preset, trim_silence=False)
+        proc = subprocess.run(
+            [
+                ffmpeg,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=r=22050:cl=mono",
+                "-t",
+                "0.05",
+                "-af",
+                af,
+                "-f",
+                "null",
+                "-",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc.returncode == 0, f"{preset} af rejected: {proc.stderr}"
 
 
 def test_resolve_accepts_new_fx_presets():
