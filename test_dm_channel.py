@@ -149,6 +149,107 @@ def test_process_npc_response_keeps_distinct_dm_checks(tmp_path, monkeypatch):
     assert len(pending) >= 2
 
 
+def test_save_pending_check_skips_when_claim_already_ruled(tmp_path, monkeypatch):
+    import dm_channel
+
+    mem_db = tmp_path / "dm_skip_ruled.db"
+    monkeypatch.setattr(dm_channel, "MEMORY_DB", mem_db)
+    dm_channel.init_dm_tables()
+
+    dm_channel.create_manual_ruling(
+        npc_id="captain_varra",
+        player_id="player_alden",
+        claim_summary="player claims official authority or permission",
+        verdict="confirmed",
+        notes="Approved.",
+        campaign_id="greyhaven_intro",
+    )
+
+    created = dm_channel.save_pending_check(
+        npc_id="captain_varra",
+        player_id="player_alden",
+        claim_summary="player claims official authority or permission that needs DM confirmation",
+        player_text="Let us pass",
+        npc_text="Hold.",
+        source="npc",
+        campaign_id="greyhaven_intro",
+    )
+    assert created is None
+    pending = dm_channel.load_pending_checks_for_dm(
+        campaign_id="greyhaven_intro",
+        status="pending",
+        limit=20,
+    )
+    assert pending == []
+
+
+def test_save_pending_check_allows_distinct_claim_after_unrelated_ruling(tmp_path, monkeypatch):
+    """Shared generic tokens must not suppress a different claim under strict coverage."""
+    import dm_channel
+
+    mem_db = tmp_path / "dm_distinct_claim.db"
+    monkeypatch.setattr(dm_channel, "MEMORY_DB", mem_db)
+    dm_channel.init_dm_tables()
+
+    dm_channel.create_manual_ruling(
+        npc_id="captain_varra",
+        player_id="player_alden",
+        claim_summary="player has permission to enter the aqueduct",
+        verdict="confirmed",
+        notes="Approved.",
+        campaign_id="greyhaven_intro",
+    )
+
+    # Loose _claims_match would overlap on player/has/permission/to; strict coverage must not.
+    assert dm_channel._claims_match(
+        "player has permission to enter the aqueduct",
+        "player has permission to speak Language Slaadi",
+    )
+
+    created = dm_channel.save_pending_check(
+        npc_id="captain_varra",
+        player_id="player_alden",
+        claim_summary="player has permission to speak Language Slaadi",
+        player_text="Can you understand me?",
+        npc_text="Krah?",
+        source="npc",
+        campaign_id="greyhaven_intro",
+    )
+    assert created is not None
+    pending = dm_channel.load_pending_checks_for_dm(
+        campaign_id="greyhaven_intro",
+        status="pending",
+        limit=20,
+    )
+    assert any(row["id"] == created for row in pending)
+    assert any("slaadi" in row["claim_summary"].lower() for row in pending)
+
+
+def test_process_npc_response_can_strip_tags_without_creating_pending(tmp_path, monkeypatch):
+    import dm_channel
+
+    mem_db = tmp_path / "dm_no_create.db"
+    monkeypatch.setattr(dm_channel, "MEMORY_DB", mem_db)
+    dm_channel.init_dm_tables()
+
+    result = dm_channel.process_npc_response(
+        "captain_varra",
+        "player_alden",
+        "",
+        "Very well.\n[DM CHECK: player claims official authority or permission]",
+        campaign_id="greyhaven_intro",
+        create_pending_checks=False,
+    )
+    assert "Very well" in result["spoken_text"]
+    assert "[DM CHECK:" not in result["spoken_text"]
+    assert result["pending_check_ids"] == []
+    assert dm_channel.load_pending_checks_for_dm(
+        campaign_id="greyhaven_intro",
+        status="pending",
+        limit=20,
+    ) == []
+
+
 def test_dm_console_loaders_are_campaign_wide_across_players(tmp_path, monkeypatch):
     """DM console must see every player's pending checks / rulings in a campaign."""
     import dm_channel
