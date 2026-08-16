@@ -42,6 +42,8 @@ def format_llm_rules(raw: Any) -> str:
     """
     Format llm_rules from YAML (list[str], multiline string, or dict with llm_rules key).
     """
+    from yaml_list_text import yaml_list_item_as_text
+
     if isinstance(raw, dict):
         raw = raw.get("llm_rules") or raw.get("rules")
 
@@ -53,7 +55,7 @@ def format_llm_rules(raw: Any) -> str:
         lines = [line.strip() for line in raw.strip().splitlines() if line.strip()]
     elif isinstance(raw, list):
         for item in raw:
-            text = str(item).strip()
+            text = yaml_list_item_as_text(item).strip()
             if not text:
                 continue
             if "\n" in text:

@@ -779,6 +779,11 @@ def load_yaml_file_cached(path: Path, cache: dict, cache_key: str) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
 
+    if isinstance(data, dict):
+        from yaml_list_text import repair_string_list_fields
+
+        repair_string_list_fields(data)
+
     with CACHE_LOCK:
         cache[cache_key] = {
             "modified_at": modified_at,
