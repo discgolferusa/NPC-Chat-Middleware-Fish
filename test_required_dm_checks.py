@@ -93,6 +93,18 @@ def test_ensure_accepts_near_match_without_duplicating():
     assert ensure_required_dm_check_tags(npc, {"rulings": []}, raw) == raw
 
 
+def test_claim_match_ignores_stopword_boilerplate_overlap():
+    from required_dm_checks import _claim_matches
+
+    language = "Does the speaker know the necessary language to talk to the NPC"
+    # Shares does/the/to/speaker/know boilerplate-ish tokens but is a different check.
+    authority = "Does the speaker know whether the party has the mayor writ to enter"
+    assert not _claim_matches(language, authority)
+
+    near = "does this speaker know the necessary language to talk to the NPC"
+    assert _claim_matches(language, near)
+
+
 def test_no_templates_means_no_forced_tag():
     npc = {"llm_rules": ["Stay stern.", "This NPC knows Language Elvish as well as Common."]}
     assert extract_dm_check_templates_from_rules(npc) == []

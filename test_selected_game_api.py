@@ -488,9 +488,8 @@ def test_npc_turn_without_authored_template_does_not_invent_check(api, monkeypat
     )
     assert turn.status_code == 200
     body = turn.get_json()
-    # Player-claim detection may still open a pending from process_player_message;
-    # the NPC reply itself must not get a force-appended [DM CHECK] in spoken text.
-    reply = body.get("npc_text") or body.get("text") or ""
-    assert "[DM CHECK:" not in reply
-    assert "cannot simply take your word" in reply.lower()
+    # spoken npc_text is always tag-stripped; invention shows up on claim fields.
+    assert body.get("dm_check_claims") in (None, [])
+    assert body.get("dm_check_claim") is None
+    assert "cannot simply take your word" in (body.get("npc_text") or "").lower()
 

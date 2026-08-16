@@ -62,12 +62,30 @@ def extract_dm_check_templates_from_rules(npc: dict[str, Any] | None) -> list[st
     return claims
 
 
+_CLAIM_STOPWORDS = frozenset(
+    {
+        "a", "an", "the", "to", "of", "and", "or", "for", "is", "are", "was", "were",
+        "be", "been", "being", "do", "does", "did", "this", "that", "these", "those",
+        "it", "its", "in", "on", "at", "as", "by", "with", "from", "into", "about",
+        "than", "then", "so", "if", "not", "no", "yes", "any", "all", "some",
+    }
+)
+
+
+def _content_claim_tokens(text: str) -> set[str]:
+    return {
+        w for w in _normalize_claim(text).split()
+        if len(w) >= 4 and w not in _CLAIM_STOPWORDS
+    }
+
+
 def _claim_matches(rule_claim: str, other: str) -> bool:
     """
-    Match an authored template to a DM claim_summary.
+    Match an authored template to a DM claim_summary / emitted tag.
 
-    Equality always matches. Substring matches require both sides to look like
-    real claim text (not short verdict notes like ``No`` / ``Yes``).
+    Equality and long substring only for exact-ish text. Near-paraphrase uses
+    content tokens (stopwords excluded) so boilerplate like ``the`` / ``does`` /
+    ``to`` cannot make unrelated checks look the same.
     """
     a = _normalize_claim(rule_claim)
     b = _normalize_claim(other)
@@ -80,15 +98,20 @@ def _claim_matches(rule_claim: str, other: str) -> bool:
     if len(shorter) >= 20 and shorter in longer:
         return True
 
-    a_words = set(a.split())
-    b_words = set(b.split())
-    if not a_words or not b_words:
+    ca = _content_claim_tokens(a)
+    cb = _content_claim_tokens(b)
+    if not ca or not cb:
         return False
-    overlap = len(a_words & b_words)
-    # Near-paraphrase of the same authored check (e.g. "the speaker" vs "this speaker").
-    if overlap >= 6 and overlap >= 0.75 * min(len(a_words), len(b_words)):
-        return True
-    return False
+
+    overlap = ca & cb
+    shorter_n = min(len(ca), len(cb))
+    # Almost all content tokens of the smaller claim must appear in the larger.
+    if len(overlap) < max(4, int(0.9 * shorter_n + 0.999)):
+        return False
+    # Require at least two distinctive (length >= 6) shared tokens.
+    if sum(1 for w in overlap if len(w) >= 6) < 2:
+        return False
+    return True
 
 
 def _ruling_covers_claim(dm_context: dict[str, Any] | None, claim: str) -> bool:
