@@ -517,14 +517,15 @@ def _claim_has_active_ruling(
     *,
     campaign_id: str = "",
 ) -> bool:
-    """True when a confirmed/denied ruling already covers this claim."""
-    for ruling in load_rulings(npc_id, player_id, limit=50, campaign_id=campaign_id):
-        verdict = (ruling.get("verdict") or "").strip().lower()
-        if verdict not in ("confirmed", "denied"):
-            continue
-        if _claims_match(claim_summary, ruling.get("claim_summary") or ""):
-            return True
-    return False
+    """True when a confirmed/denied ruling already covers this claim.
+
+    Uses the same strict matcher as required DM CHECK coverage so shared generic
+    tokens (e.g. player/claims/permission) do not suppress unrelated new checks.
+    """
+    from required_dm_checks import _ruling_covers_claim
+
+    rulings = load_rulings(npc_id, player_id, limit=50, campaign_id=campaign_id)
+    return _ruling_covers_claim({"rulings": rulings}, claim_summary)
 
 
 def save_pending_check(
