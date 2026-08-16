@@ -231,8 +231,13 @@ def test_af_filter_underwater_robot_whisper_presets():
     assert "aecho=" in underwater
     assert "vibrato=" in robot
     assert "equalizer=f=2200" in robot
-    assert "highpass=f=350" in whisper
-    assert "volume=0.72" in whisper
+    assert "makeup=1.2" in robot
+    assert "volume=0.78" in robot
+    assert "highpass=f=450" in whisper
+    assert "lowpass=f=4200" in whisper
+    assert "tremolo=" in whisper
+    assert "volume=0.36" in whisper
+    assert "alimiter=limit=0.55" in whisper
 
 
 def test_resolve_accepts_new_fx_presets():
