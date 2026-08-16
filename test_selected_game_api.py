@@ -383,13 +383,13 @@ def test_content_import_routes(api):
     assert npc.get_json()["npcs"]
 
 
-def test_npc_turn_language_barrier_forces_stage_and_dm_check(api, monkeypatch):
-    """NPC-only-understands-Language rules must skip spoken LLM dialogue and open a DM check."""
+def test_npc_turn_rule_dm_check_is_enforced(api, monkeypatch):
+    """Literal [DM CHECK:…] templates in llm_rules must open a pending check."""
     client, server, headers = api
-    npc_id = "slaad_xill"
+    npc_id = "language_gate_npc"
     player_id = "player_alden"
 
-    barrier_npc = {
+    rule_npc = {
         "id": npc_id,
         "name": "Xill",
         "role": "chaos beast",
@@ -400,10 +400,11 @@ def test_npc_turn_language_barrier_forces_stage_and_dm_check(api, monkeypatch):
         "secrets": [],
         "voice": ["rasping"],
         "llm_rules": [
-            "This NPC only understands Language Slaadi. They do not understand Common/English.",
-            "Never invent or speak fake Slaadi or gibberish.",
-            "Until the DM confirms the speaker knows Slaadi, end with "
-            "[DM CHECK: does this speaker know Language Slaadi]",
+            "Until the DM rules, do not treat the speaker as understood.",
+            "End unsettled replies with "
+            "[DM CHECK: Does the speaker know the necessary language to talk to the NPC]",
+            "[DM Ruling: Success] Respond to the speaker in English.",
+            "[DM Ruling: Failure] Show you cannot understand them.",
         ],
     }
 
@@ -411,9 +412,9 @@ def test_npc_turn_language_barrier_forces_stage_and_dm_check(api, monkeypatch):
 
     def _ask(_messages):
         llm_calls["n"] += 1
-        return "Of course I understand Common perfectly."
+        return "*Xill cocks its head.* Krah-vesh?"
 
-    monkeypatch.setattr(server, "load_npc", lambda _id: dict(barrier_npc))
+    monkeypatch.setattr(server, "load_npc", lambda _id: dict(rule_npc))
     monkeypatch.setattr(server, "ask_llm", _ask)
 
     turn = client.post(
@@ -431,11 +432,10 @@ def test_npc_turn_language_barrier_forces_stage_and_dm_check(api, monkeypatch):
     assert turn.status_code == 200
     body = turn.get_json()
     reply = body.get("npc_text") or body.get("text") or ""
-    assert llm_calls["n"] == 0
-    assert reply.startswith("*Xill")
-    assert "understand Common" not in reply
+    assert llm_calls["n"] == 1
+    assert "Krah-vesh" in reply
     assert body.get("dm_check_claim")
-    assert "slaadi" in str(body.get("dm_check_claim")).lower()
+    assert "necessary language" in str(body.get("dm_check_claim")).lower()
     assert body.get("dm_pending_check_id")
 
     pending = client.get(
@@ -444,5 +444,5 @@ def test_npc_turn_language_barrier_forces_stage_and_dm_check(api, monkeypatch):
     )
     assert pending.status_code == 200
     checks = pending.get_json().get("pending_checks") or []
-    assert any("slaadi" in str(item.get("claim_summary", "")).lower() for item in checks)
+    assert any("necessary language" in str(item.get("claim_summary", "")).lower() for item in checks)
 

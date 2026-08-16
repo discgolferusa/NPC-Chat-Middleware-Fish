@@ -36,7 +36,10 @@ from content_import import (
     detail_npc_batch,
     outline_campaign_document,
 )
-from language_barrier import generate_npc_reply_text, language_barrier_status
+from required_dm_checks import (
+    format_required_dm_checks_prompt_block,
+    generate_npc_reply_text,
+)
 from dm_channel import (
     build_dm_injection_messages,
     clear_dm_data,
@@ -1125,25 +1128,7 @@ def build_system_prompt(
 NPC-specific rules for {npc["name"]} (these override conflicting global rules):
 {npc_rules_text}"""
 
-    barrier = language_barrier_status(npc, dm_context)
-    language_barrier_block = ""
-    if barrier and barrier.get("status") != "confirmed":
-        lang = barrier["language"]
-        if barrier["status"] == "denied":
-            language_barrier_block = f"""
-
-HARD LANGUAGE BARRIER (authoritative; overrides spoken-dialogue rules):
-This NPC only understands Language {lang}. The DM denied that this speaker knows it.
-Reply with exactly one asterisk stage direction showing confusion and NO spoken dialogue.
-Do not invent alien/gibberish speech. Do not answer the player's meaning."""
-        else:
-            language_barrier_block = f"""
-
-HARD LANGUAGE BARRIER (authoritative; overrides spoken-dialogue rules):
-This NPC only understands Language {lang}. Until the DM confirms this speaker knows it,
-reply with exactly one asterisk stage direction showing confusion and NO spoken dialogue.
-Do not invent alien/gibberish speech. Do not answer the player's meaning.
-End with exactly: [DM CHECK: does this speaker know Language {lang}]"""
+    required_checks_block = format_required_dm_checks_prompt_block(npc, dm_context)
 
     return f"""
 You are portraying an NPC in a tabletop RPG.
@@ -1183,7 +1168,7 @@ Party and campaign context:
 
 DM channel context:
 {dm_context_text}
-{language_barrier_block}
+{required_checks_block}
 Rules:
 {global_rules_text}{npc_rules_block}
 """.strip()

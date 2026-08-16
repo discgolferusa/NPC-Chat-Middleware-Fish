@@ -79,7 +79,7 @@ DM_CHECK_TAG_ANYWHERE_PATTERN = re.compile(
 POSITIVE_RULING_PATTERNS = [
     re.compile(p, re.IGNORECASE)
     for p in (
-        r"^\s*(yes|yeah|yep|yup|correct|true|confirmed|granted|allowed|approved|affirmative)\b",
+        r"^\s*(yes|yeah|yep|yup|correct|true|confirmed|granted|allowed|approved|affirmative|success)\b",
         r"\b(that(?:'s| is) (?:true|correct|valid|accurate))\b",
         r"\b(they (?:do|indeed) have)\b",
         r"\b(the party (?:does|do) have)\b",
@@ -93,7 +93,7 @@ POSITIVE_RULING_PATTERNS = [
 NEGATIVE_RULING_PATTERNS = [
     re.compile(p, re.IGNORECASE)
     for p in (
-        r"^\s*(no|nope|nah|false|incorrect|denied|rejected|negative|invalid)\b",
+        r"^\s*(no|nope|nah|false|incorrect|denied|rejected|negative|invalid|failure|fail)\b",
         r"\b(that(?:'s| is) (?:not true|false|incorrect|wrong|invalid))\b",
         r"\b(they (?:do not|don't) have)\b",
         r"\b(the party (?:does not|doesn't|do not|don't) have)\b",
