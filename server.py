@@ -4050,6 +4050,16 @@ def dm_ruling_post():
             if pending_campaign:
                 campaign_id = pending_campaign
 
+    # Proxy strips player_id; rebuild speaker context for the claim's player.
+    party_context = build_party_context(
+        player_id=player_id,
+        party_id=session["party_id"],
+    )
+    if campaign_id:
+        party_context["campaign_id"] = campaign_id
+        if not party_context.get("campaign"):
+            party_context["campaign"] = load_campaign(campaign_id)
+
     if not claim_summary:
         return jsonify({"error": "Missing claim_summary"}), 400
     if verdict not in ("confirmed", "denied"):
@@ -4076,7 +4086,7 @@ def dm_ruling_post():
                     ruling,
                     include_audio=_json_body_flag(body.get("include_audio"), True),
                     scene_description=(body.get("scene") or "").strip(),
-                    party_context=session["party_context"],
+                    party_context=party_context,
                     voice_model=(body.get("voice_model") or "").strip() or None,
                     tts_length_scale=body.get("tts_length_scale"),
                     tts_options=_tts_request_values_from_mapping(body),
@@ -4100,7 +4110,7 @@ def dm_ruling_post():
             "player_id": player_id,
             "party_id": session["party_id"],
             "campaign_id": campaign_id,
-            "speaking_member": session["party_context"].get("speaking_member"),
+            "speaking_member": party_context.get("speaking_member"),
             **result,
             "auto_response": auto_response,
             "pending": pending_list,

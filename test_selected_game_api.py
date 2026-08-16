@@ -565,3 +565,51 @@ def test_dm_pending_and_ruling_are_campaign_wide_without_player_id(api, monkeypa
     still_open = remaining.get_json().get("pending_checks") or []
     assert all(item.get("id") != pending_id for item in still_open)
 
+
+def test_dm_ruling_auto_respond_uses_pending_player_party_context(api, monkeypatch):
+    """After check_id override, auto_respond must use the pending claim's player speaker."""
+    client, server, headers = api
+    import dm_channel
+
+    captured = {}
+
+    def _auto(npc_id, player_id, ruling, **kwargs):
+        captured["npc_id"] = npc_id
+        captured["player_id"] = player_id
+        captured["party_context"] = kwargs.get("party_context")
+        return {"status": "spoken", "player_id": player_id}
+
+    monkeypatch.setattr(server, "run_dm_ruling_auto_response", _auto)
+
+    # Without a selected character the DM proxy session speaker is DEFAULT_PLAYER_ID,
+    # which must not leak into auto_respond after pending-row player override.
+    pending_id = dm_channel.save_pending_check(
+        npc_id="captain_varra",
+        player_id="player_alden",
+        claim_summary="player claims official authority or permission",
+        player_text="Captain let us pass",
+        npc_text="I need the DM.",
+        source="npc",
+        campaign_id="greyhaven_intro",
+    )
+    assert pending_id
+
+    ruling = client.post(
+        "/dm/ruling",
+        headers=headers,
+        json={
+            "campaign_id": "greyhaven_intro",
+            "check_id": pending_id,
+            "verdict": "confirm",
+            "auto_respond": True,
+            "include_audio": False,
+        },
+    )
+    assert ruling.status_code == 200, ruling.get_json()
+    body = ruling.get_json()
+    assert body.get("player_id") == "player_alden"
+    assert (body.get("speaking_member") or {}).get("player_id") == "player_alden"
+    assert captured.get("player_id") == "player_alden"
+    assert (captured.get("party_context") or {}).get("player_id") == "player_alden"
+    assert (captured.get("party_context") or {}).get("speaking_member", {}).get("player_id") == "player_alden"
+
