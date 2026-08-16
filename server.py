@@ -38,6 +38,7 @@ from content_import import (
 )
 from required_dm_checks import (
     format_required_dm_checks_prompt_block,
+    format_situational_deferral_prompt_block,
     generate_npc_reply_text,
 )
 from dm_channel import (
@@ -1129,6 +1130,7 @@ NPC-specific rules for {npc["name"]} (these override conflicting global rules):
 {npc_rules_text}"""
 
     required_checks_block = format_required_dm_checks_prompt_block(npc, dm_context)
+    situational_block = format_situational_deferral_prompt_block(npc, player_text)
 
     return f"""
 You are portraying an NPC in a tabletop RPG.
@@ -1168,7 +1170,7 @@ Party and campaign context:
 
 DM channel context:
 {dm_context_text}
-{required_checks_block}
+{required_checks_block}{situational_block}
 Rules:
 {global_rules_text}{npc_rules_block}
 """.strip()
@@ -1342,7 +1344,9 @@ def run_dm_ruling_auto_response(
             scene_context=scene_context,
         )
 
-        npc_text_raw = generate_npc_reply_text(npc, dm_context, messages, ask_llm)
+        npc_text_raw = generate_npc_reply_text(
+            npc, dm_context, messages, ask_llm, player_text=None
+        )
         npc_response = process_npc_response(
             npc_id, player_id, "", npc_text_raw, campaign_id=campaign_id
         )
@@ -2549,7 +2553,9 @@ def npc_turn():
         step_start = log_timing(request_id, "build text prompt/messages", step_start)
 
         set_turn_progress(request_id, "waiting_llm")
-        npc_text_raw = generate_npc_reply_text(npc, dm_context, messages, ask_llm)
+        npc_text_raw = generate_npc_reply_text(
+            npc, dm_context, messages, ask_llm, player_text=player_text
+        )
         step_start = log_timing(request_id, "llm text npc response", step_start)
 
         set_turn_progress(request_id, "processing_response")
@@ -2790,7 +2796,9 @@ def npc_voice_turn():
         step_start = log_timing(request_id, "build prompt/messages", step_start)
 
         set_turn_progress(request_id, "waiting_llm")
-        npc_text_raw = generate_npc_reply_text(npc, dm_context, messages, ask_llm)
+        npc_text_raw = generate_npc_reply_text(
+            npc, dm_context, messages, ask_llm, player_text=player_text
+        )
         step_start = log_timing(request_id, "llm npc response", step_start)
 
         set_turn_progress(request_id, "processing_response")
@@ -3103,7 +3111,9 @@ def npc_voice_turn_debug():
         )
         step_start = log_timing(request_id, "debug build prompt/messages", step_start)
 
-        npc_text_raw = generate_npc_reply_text(npc, dm_context, messages, ask_llm)
+        npc_text_raw = generate_npc_reply_text(
+            npc, dm_context, messages, ask_llm, player_text=player_text
+        )
         step_start = log_timing(request_id, "debug llm npc response", step_start)
 
         npc_response = process_npc_response(

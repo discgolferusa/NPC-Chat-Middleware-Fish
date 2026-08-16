@@ -81,6 +81,15 @@ def test_detect_npc_deferral():
     assert result["matched_phrase"]
 
 
+def test_detect_npc_deferral_ignores_dm_check_tag_alone():
+    assert detect_npc_deferral(
+        "[DM CHECK: Does the speaker know the necessary language to talk to the NPC]"
+    ) is None
+    assert detect_npc_deferral(
+        "Krah?\n[DM CHECK: Does the speaker know the necessary language to talk to the NPC]"
+    ) is None
+
+
 def test_infer_claim_summary_fallback():
     summary = infer_claim_summary("Hello there")
     assert isinstance(summary, str)

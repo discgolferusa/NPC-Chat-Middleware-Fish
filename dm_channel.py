@@ -147,7 +147,6 @@ NPC_DEFERRAL_PATTERNS = [
         r"\bwithout\s+(?:proof|confirmation|verification|the dm)\b",
         r"\bnot until i (?:see|have)\b.+\b(proof|writ|write|letter|document|authorization|permission)\b",
         r"\b(?:can't|cannot)\s+verify\b.+\b(valid|authentic|legitimate|real|genuine|writ|write|letter)\b",
-        r"\[DM CHECK:",
     )
 ]
 
@@ -328,7 +327,9 @@ def detect_player_claim(text: str) -> dict[str, Any] | None:
 
 
 def detect_npc_deferral(text: str) -> dict[str, Any] | None:
-    content = (text or "").strip()
+    # Strip machine tags so a literal [DM CHECK:…] never counts as deferral speech.
+    content = DM_CHECK_TAG_ANYWHERE_PATTERN.sub(" ", text or "")
+    content = re.sub(r"\s+", " ", content).strip()
     if not content:
         return None
 
@@ -1016,6 +1017,7 @@ def process_npc_response(
     pending_ids: list[int] = []
     pending_source = None
     merge_pending_id = player_pending_id
+    all_claims = list(dm_check_claims)
 
     if dm_check_claims:
         for index, claim in enumerate(dm_check_claims):
@@ -1033,37 +1035,45 @@ def process_npc_response(
                 pending_ids.append(created_id)
                 pending_id = created_id
         pending_source = "npc_tag"
-    else:
-        deferral = detect_npc_deferral(npc_text)
-        player_claim = detect_player_claim(player_text)
-        if deferral and (player_claim or _looks_like_authorization_exchange(player_text)):
-            claim_summary = infer_claim_summary(player_text, spoken_text)
-            pending_id = save_pending_check(
+
+    # Situational / heuristic deferral still runs even when other tags were present,
+    # so an authority claim is not dropped just because a different [DM CHECK] fired.
+    deferral = detect_npc_deferral(npc_text) or detect_npc_deferral(spoken_text)
+    player_claim = detect_player_claim(player_text)
+    auth_exchange = _looks_like_authorization_exchange(player_text)
+    if deferral and (player_claim or auth_exchange):
+        claim_summary = infer_claim_summary(player_text, spoken_text)
+        already = any(_claims_match(claim_summary, existing) for existing in all_claims)
+        if claim_summary and not already:
+            created_id = save_pending_check(
                 npc_id=npc_id,
                 player_id=player_id,
                 claim_summary=claim_summary,
                 player_text=player_text,
                 npc_text=spoken_text,
                 source="npc_deferral",
-                merge_pending_id=merge_pending_id,
+                merge_pending_id=merge_pending_id if not pending_ids else None,
                 campaign_id=campaign_id,
             )
-            if pending_id is not None:
-                pending_ids.append(pending_id)
-            pending_source = "npc_deferral"
-
-    dm_check_claim = dm_check_claims[-1] if dm_check_claims else None
+            if created_id is not None:
+                pending_ids.append(created_id)
+                pending_id = created_id
+                all_claims.append(claim_summary)
+                if pending_source is None:
+                    pending_source = "npc_deferral"
+                elif "deferral" not in pending_source:
+                    pending_source = f"{pending_source}+npc_deferral"
 
     return {
         "spoken_text": spoken_text,
         "raw_text": npc_text,
-        "dm_check_claim": dm_check_claim,
-        "dm_check_claims": dm_check_claims,
+        "dm_check_claim": all_claims[-1] if all_claims else None,
+        "dm_check_claims": all_claims,
         "pending_check_id": pending_id,
         "pending_check_ids": pending_ids,
         "pending_source": pending_source,
         "merged_player_pending_id": player_pending_id if pending_id == player_pending_id else None,
-        "npc_deferral_detected": bool(detect_npc_deferral(npc_text)),
+        "npc_deferral_detected": bool(detect_npc_deferral(npc_text) or detect_npc_deferral(spoken_text)),
     }
 
 
@@ -1079,10 +1089,16 @@ def _looks_like_authorization_exchange(player_text: str) -> bool:
         "writ", "write", "warrant", "letter", "pass", "permit", "badge", "seal",
         "proof", "authorized", "permission", "mayor", "king", "queen", "lord",
         "captain", "guard", "enter", "access", "allow", "stand aside", "let us",
+        "authority", "official", "orders", "credentials",
     )
     lowered = content.lower()
     hits = sum(1 for word in authorization_words if word in lowered)
     return hits >= 2
+
+
+def looks_like_authorization_exchange(player_text: str) -> bool:
+    """Public alias for situational DM CHECK enforcement."""
+    return _looks_like_authorization_exchange(player_text)
 
 
 def create_manual_ruling(

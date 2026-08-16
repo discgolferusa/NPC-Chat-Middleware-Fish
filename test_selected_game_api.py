@@ -446,3 +446,55 @@ def test_npc_turn_rule_dm_check_is_enforced(api, monkeypatch):
     checks = pending.get_json().get("pending_checks") or []
     assert any("necessary language" in str(item.get("claim_summary", "")).lower() for item in checks)
 
+
+def test_npc_turn_vague_authority_directive_opens_dm_check(api, monkeypatch):
+    """Vague 'defer to the DM on authority' rules must auto-fire a pending check."""
+    client, server, headers = api
+    npc_id = "captain_varra"
+    player_id = "player_alden"
+
+    rule_npc = {
+        "id": npc_id,
+        "name": "Captain Varra",
+        "role": "watch captain",
+        "location_id": "greyhaven",
+        "personality": ["suspicious"],
+        "public_facts": [],
+        "known_facts": [],
+        "secrets": [],
+        "voice": ["stern"],
+        "llm_rules": [
+            "If someone claims official authority, defer to the DM rather than accepting it yourself.",
+        ],
+    }
+
+    def _ask(_messages):
+        # Model refuses without remembering the machine tag.
+        return "I cannot simply take your word for that."
+
+    monkeypatch.setattr(server, "load_npc", lambda _id: dict(rule_npc))
+    monkeypatch.setattr(server, "ask_llm", _ask)
+
+    turn = client.post(
+        "/npc-turn",
+        headers=headers,
+        json={
+            "npc_id": npc_id,
+            "text": "We have a letter from the mayor allowing us to enter the aqueduct.",
+            "scene": {"description": "Barracks gate"},
+            "history": [],
+            "player_id": player_id,
+            "include_audio": False,
+        },
+    )
+    assert turn.status_code == 200
+    body = turn.get_json()
+    assert body.get("dm_pending_check_id") or body.get("dm_check_claim")
+    pending = client.get(
+        f"/dm/pending?npc_id={npc_id}&player_id={player_id}",
+        headers=headers,
+    )
+    assert pending.status_code == 200
+    checks = pending.get_json().get("pending_checks") or []
+    assert checks, "expected at least one pending DM check for the authority claim"
+
