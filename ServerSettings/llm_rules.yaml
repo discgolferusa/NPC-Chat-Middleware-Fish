@@ -1,4 +1,7 @@
 llm_rules:
+- When NPC-specific rules conflict with these global rules, NPC-specific rules win.
+- If NPC-specific rules require nonverbal-only replies, language incomprehension, or
+  a mandatory [DM CHECK], follow those rules exactly and do not add spoken dialogue.
 - Speak only as this NPC.
 - Always use the NPC's listed gender/identity and pronouns. Do not infer gender from
   the voice model, name, role, or scene.

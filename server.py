@@ -36,6 +36,10 @@ from content_import import (
     detail_npc_batch,
     outline_campaign_document,
 )
+from required_dm_checks import (
+    format_required_dm_checks_prompt_block,
+    generate_npc_reply_text,
+)
 from dm_channel import (
     build_dm_injection_messages,
     clear_dm_data,
@@ -1121,8 +1125,10 @@ def build_system_prompt(
     if npc_rules_text:
         npc_rules_block = f"""
 
-NPC-specific rules for {npc["name"]}:
+NPC-specific rules for {npc["name"]} (these override conflicting global rules):
 {npc_rules_text}"""
+
+    required_checks_block = format_required_dm_checks_prompt_block(npc, dm_context)
 
     return f"""
 You are portraying an NPC in a tabletop RPG.
@@ -1162,7 +1168,7 @@ Party and campaign context:
 
 DM channel context:
 {dm_context_text}
-
+{required_checks_block}
 Rules:
 {global_rules_text}{npc_rules_block}
 """.strip()
@@ -1336,7 +1342,7 @@ def run_dm_ruling_auto_response(
             scene_context=scene_context,
         )
 
-        npc_text_raw = ask_llm(messages)
+        npc_text_raw = generate_npc_reply_text(npc, dm_context, messages, ask_llm)
         npc_response = process_npc_response(
             npc_id, player_id, "", npc_text_raw, campaign_id=campaign_id
         )
@@ -2482,7 +2488,7 @@ def npc_turn():
         step_start = log_timing(request_id, "build text prompt/messages", step_start)
 
         set_turn_progress(request_id, "waiting_llm")
-        npc_text_raw = ask_llm(messages)
+        npc_text_raw = generate_npc_reply_text(npc, dm_context, messages, ask_llm)
         step_start = log_timing(request_id, "llm text npc response", step_start)
 
         set_turn_progress(request_id, "processing_response")
@@ -2589,7 +2595,9 @@ def npc_turn():
             "saved_memories": saved_memories,
             "memory_extraction_mode": memory_extraction_mode,
             "dm_check_claim": npc_response.get("dm_check_claim"),
+            "dm_check_claims": npc_response.get("dm_check_claims"),
             "dm_pending_check_id": npc_response.get("pending_check_id"),
+            "dm_pending_check_ids": npc_response.get("pending_check_ids"),
             "detected_player_claim": player_claim,
             "dm_pending": load_pending_checks(npc_id, player_id, status="pending", limit=5, campaign_id=campaign_id),
         }
@@ -2721,7 +2729,7 @@ def npc_voice_turn():
         step_start = log_timing(request_id, "build prompt/messages", step_start)
 
         set_turn_progress(request_id, "waiting_llm")
-        npc_text_raw = ask_llm(messages)
+        npc_text_raw = generate_npc_reply_text(npc, dm_context, messages, ask_llm)
         step_start = log_timing(request_id, "llm npc response", step_start)
 
         set_turn_progress(request_id, "processing_response")
@@ -3001,7 +3009,7 @@ def npc_voice_turn_debug():
         )
         step_start = log_timing(request_id, "debug build prompt/messages", step_start)
 
-        npc_text_raw = ask_llm(messages)
+        npc_text_raw = generate_npc_reply_text(npc, dm_context, messages, ask_llm)
         step_start = log_timing(request_id, "debug llm npc response", step_start)
 
         npc_response = process_npc_response(
@@ -3119,7 +3127,9 @@ def npc_voice_turn_debug():
             "audio_file": str(output_path),
             "total_seconds": round(total_elapsed, 3),
             "dm_check_claim": npc_response.get("dm_check_claim"),
+            "dm_check_claims": npc_response.get("dm_check_claims"),
             "dm_pending_check_id": npc_response.get("pending_check_id"),
+            "dm_pending_check_ids": npc_response.get("pending_check_ids"),
             "detected_player_claim": player_claim,
             "dm_pending": load_pending_checks(npc_id, player_id, status="pending", limit=5, campaign_id=campaign_id),
         })

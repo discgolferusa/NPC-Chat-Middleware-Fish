@@ -382,3 +382,67 @@ def test_content_import_routes(api):
     assert npc.status_code == 200
     assert npc.get_json()["npcs"]
 
+
+def test_npc_turn_rule_dm_check_is_enforced(api, monkeypatch):
+    """Literal [DM CHECK:…] templates in llm_rules must open a pending check."""
+    client, server, headers = api
+    npc_id = "language_gate_npc"
+    player_id = "player_alden"
+
+    rule_npc = {
+        "id": npc_id,
+        "name": "Xill",
+        "role": "chaos beast",
+        "location_id": "greyhaven",
+        "personality": ["alien"],
+        "public_facts": [],
+        "known_facts": [],
+        "secrets": [],
+        "voice": ["rasping"],
+        "llm_rules": [
+            "Until the DM rules, do not treat the speaker as understood.",
+            "End unsettled replies with "
+            "[DM CHECK: Does the speaker know the necessary language to talk to the NPC]",
+            "[DM Ruling: Success] Respond to the speaker in English.",
+            "[DM Ruling: Failure] Show you cannot understand them.",
+        ],
+    }
+
+    llm_calls = {"n": 0}
+
+    def _ask(_messages):
+        llm_calls["n"] += 1
+        return "*Xill cocks its head.* Krah-vesh?"
+
+    monkeypatch.setattr(server, "load_npc", lambda _id: dict(rule_npc))
+    monkeypatch.setattr(server, "ask_llm", _ask)
+
+    turn = client.post(
+        "/npc-turn",
+        headers=headers,
+        json={
+            "npc_id": npc_id,
+            "text": "Hello, can you help us?",
+            "scene": {"description": "Cave mouth"},
+            "history": [],
+            "player_id": player_id,
+            "include_audio": False,
+        },
+    )
+    assert turn.status_code == 200
+    body = turn.get_json()
+    reply = body.get("npc_text") or body.get("text") or ""
+    assert llm_calls["n"] == 1
+    assert "Krah-vesh" in reply
+    assert body.get("dm_check_claim")
+    assert "necessary language" in str(body.get("dm_check_claim")).lower()
+    assert body.get("dm_pending_check_id")
+
+    pending = client.get(
+        f"/dm/pending?npc_id={npc_id}&player_id={player_id}",
+        headers=headers,
+    )
+    assert pending.status_code == 200
+    checks = pending.get_json().get("pending_checks") or []
+    assert any("necessary language" in str(item.get("claim_summary", "")).lower() for item in checks)
+
