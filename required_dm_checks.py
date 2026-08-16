@@ -84,8 +84,9 @@ def _claim_matches(rule_claim: str, other: str) -> bool:
     Match an authored template to a DM claim_summary / emitted tag.
 
     Equality and long substring only for exact-ish text. Near-paraphrase uses
-    content tokens (stopwords excluded) so boilerplate like ``the`` / ``does`` /
-    ``to`` cannot make unrelated checks look the same.
+    content tokens (stopwords excluded). Overlap thresholds scale with claim
+    length so short templates (e.g. secrets probing — three content tokens)
+    can still match slight rewordings.
     """
     a = _normalize_claim(rule_claim)
     b = _normalize_claim(other)
@@ -105,11 +106,20 @@ def _claim_matches(rule_claim: str, other: str) -> bool:
 
     overlap = ca & cb
     shorter_n = min(len(ca), len(cb))
-    # Almost all content tokens of the smaller claim must appear in the larger.
-    if len(overlap) < max(4, int(0.9 * shorter_n + 0.999)):
+    # Scale: short claims need (almost) all tokens; long ones need ~90% with a floor.
+    if shorter_n <= 3:
+        needed = shorter_n
+        distinctive_needed = 1
+    elif shorter_n <= 5:
+        needed = max(3, int(0.9 * shorter_n + 0.999))
+        distinctive_needed = 2
+    else:
+        needed = max(4, int(0.9 * shorter_n + 0.999))
+        distinctive_needed = 2
+
+    if len(overlap) < needed:
         return False
-    # Require at least two distinctive (length >= 6) shared tokens.
-    if sum(1 for w in overlap if len(w) >= 6) < 2:
+    if sum(1 for w in overlap if len(w) >= 6) < distinctive_needed:
         return False
     return True
 

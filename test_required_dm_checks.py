@@ -105,6 +105,46 @@ def test_claim_match_ignores_stopword_boilerplate_overlap():
     assert _claim_matches(language, near)
 
 
+def test_claim_match_short_secrets_template_near_paraphrase():
+    """Auto-seeded secrets check has few content tokens; paraphrases must still match."""
+    from required_dm_checks import _claim_matches, _content_claim_tokens, required_dm_checks
+
+    template = "the player is probing one of this NPC's secrets"
+    assert len(_content_claim_tokens(template)) == 3
+
+    paraphrase = "player is probing one of the NPC secrets"
+    assert _claim_matches(template, paraphrase)
+
+    npc = {
+        "llm_rules": [
+            "If asked about secrets, end with "
+            "[DM CHECK: the player is probing one of this NPC's secrets]"
+        ]
+    }
+    dm_context = {
+        "rulings": [
+            {
+                "verdict": "denied",
+                "claim_summary": "player is probing one of the NPC secrets",
+                "ruling_text": "No",
+            }
+        ]
+    }
+    assert required_dm_checks(npc, dm_context) == []
+
+    # Unrelated short claim must not clear the secrets template.
+    bad_context = {
+        "rulings": [
+            {
+                "verdict": "confirmed",
+                "claim_summary": "player is probing the locked door",
+                "ruling_text": "Yes",
+            }
+        ]
+    }
+    assert required_dm_checks(npc, bad_context)
+
+
 def test_no_templates_means_no_forced_tag():
     npc = {"llm_rules": ["Stay stern.", "This NPC knows Language Elvish as well as Common."]}
     assert extract_dm_check_templates_from_rules(npc) == []
