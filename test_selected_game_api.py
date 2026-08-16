@@ -448,7 +448,7 @@ def test_npc_turn_rule_dm_check_is_enforced(api, monkeypatch):
 
 
 def test_npc_turn_vague_authority_directive_opens_dm_check(api, monkeypatch):
-    """Vague 'defer to the DM on authority' rules must auto-fire a pending check."""
+    """Server-level policy must auto-fire a pending check for authority claims."""
     client, server, headers = api
     npc_id = "captain_varra"
     player_id = "player_alden"
@@ -464,7 +464,7 @@ def test_npc_turn_vague_authority_directive_opens_dm_check(api, monkeypatch):
         "secrets": [],
         "voice": ["stern"],
         "llm_rules": [
-            "If someone claims official authority, defer to the DM rather than accepting it yourself.",
+            "Stay in character as the watch captain.",
         ],
     }
 
