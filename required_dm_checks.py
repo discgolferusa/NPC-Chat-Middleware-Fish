@@ -12,6 +12,7 @@ Enforcement is intentionally narrow:
 from __future__ import annotations
 
 import re
+import threading
 from typing import Any, Callable
 
 DM_CHECK_IN_RULES_PATTERN = re.compile(
@@ -228,6 +229,33 @@ def ensure_required_dm_check_tags(
     return suffix
 
 
+_LLM_PROMPT_LOG_LOCK = threading.Lock()
+
+
+def log_llm_prompt_to_console(messages: list[dict[str, str]] | None) -> None:
+    """
+    Print the full NPC-reply prompt to the middleware process console.
+
+    Emits one write under a lock so Flask ``threaded=True`` workers cannot
+    interleave headers/body lines from concurrent turns.
+    """
+    msgs = messages or []
+    total_chars = sum(len((m or {}).get("content") or "") for m in msgs)
+    parts = [
+        f"[LLM-PROMPT] npc-reply messages={len(msgs)} chars={total_chars}",
+    ]
+    for index, message in enumerate(msgs):
+        role = (message or {}).get("role") or "?"
+        content = (message or {}).get("content") or ""
+        parts.append(f"[LLM-PROMPT] --- [{index}] role={role} chars={len(content)} ---")
+        parts.append(content)
+    parts.append("[LLM-PROMPT] === end ===")
+    block = "\n".join(parts) + "\n"
+    with _LLM_PROMPT_LOG_LOCK:
+        # One print keeps the whole block contiguous in the console stream.
+        print(block, end="", flush=True)
+
+
 def generate_npc_reply_text(
     npc: dict[str, Any] | None,
     dm_context: dict[str, Any] | None,
@@ -243,5 +271,6 @@ def generate_npc_reply_text(
     left to the model via global/NPC llm_rules.
     """
     del player_text  # LLM decides; we only enforce authored templates.
+    log_llm_prompt_to_console(messages)
     raw = ask_llm_fn(messages)
     return ensure_required_dm_check_tags(npc, dm_context, raw)

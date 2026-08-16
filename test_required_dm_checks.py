@@ -7,6 +7,7 @@ from required_dm_checks import (
     extract_dm_check_templates_from_rules,
     format_required_dm_checks_prompt_block,
     generate_npc_reply_text,
+    log_llm_prompt_to_console,
     required_dm_checks,
 )
 
@@ -185,6 +186,45 @@ def test_no_templates_means_no_forced_tag():
     assert extract_dm_check_templates_from_rules(npc) == []
     assert required_dm_checks(npc, {"rulings": []}) == []
     assert ensure_required_dm_check_tags(npc, {"rulings": []}, "Hello.") == "Hello."
+
+
+def test_generate_logs_llm_prompt_to_console(capsys):
+    messages = [
+        {"role": "system", "content": "You are Captain Varra."},
+        {"role": "user", "content": "Here is the letter from the city council."},
+    ]
+    generate_npc_reply_text(
+        {"llm_rules": ["Be stern."]},
+        {"rulings": []},
+        messages,
+        lambda _m: "Stand aside.",
+    )
+    captured = capsys.readouterr().out
+    assert "[LLM-PROMPT] npc-reply messages=2" in captured
+    assert "You are Captain Varra." in captured
+    assert "Here is the letter from the city council." in captured
+    assert "[LLM-PROMPT] === end ===" in captured
+
+
+def test_log_llm_prompt_uses_single_print(monkeypatch):
+    """One print call so threaded Flask workers cannot interleave prompt lines."""
+    prints: list[str] = []
+
+    def _capture(text="", *args, **kwargs):
+        prints.append(text if isinstance(text, str) else str(text))
+
+    monkeypatch.setattr("builtins.print", _capture)
+    log_llm_prompt_to_console(
+        [
+            {"role": "system", "content": "System A"},
+            {"role": "user", "content": "User B"},
+        ]
+    )
+    assert len(prints) == 1
+    assert prints[0].startswith("[LLM-PROMPT] npc-reply messages=2")
+    assert "System A" in prints[0]
+    assert "User B" in prints[0]
+    assert prints[0].rstrip().endswith("[LLM-PROMPT] === end ===")
 
 
 def test_generate_does_not_invent_check_from_player_text():
