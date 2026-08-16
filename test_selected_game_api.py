@@ -383,7 +383,7 @@ def test_content_import_routes(api):
     assert npc.get_json()["npcs"]
 
 
-def test_npc_turn_rule_dm_check_is_enforced(api, monkeypatch):
+def test_npc_turn_authored_dm_check_is_enforced(api, monkeypatch):
     """Literal [DM CHECK:…] templates in llm_rules must open a pending check."""
     client, server, headers = api
     npc_id = "language_gate_npc"
@@ -447,8 +447,8 @@ def test_npc_turn_rule_dm_check_is_enforced(api, monkeypatch):
     assert any("necessary language" in str(item.get("claim_summary", "")).lower() for item in checks)
 
 
-def test_npc_turn_vague_authority_directive_opens_dm_check(api, monkeypatch):
-    """Vague 'defer to the DM on authority' rules must auto-fire a pending check."""
+def test_npc_turn_without_authored_template_does_not_invent_check(api, monkeypatch):
+    """Without an authored template, omitted tags are not force-appended from player text."""
     client, server, headers = api
     npc_id = "captain_varra"
     player_id = "player_alden"
@@ -464,12 +464,11 @@ def test_npc_turn_vague_authority_directive_opens_dm_check(api, monkeypatch):
         "secrets": [],
         "voice": ["stern"],
         "llm_rules": [
-            "If someone claims official authority, defer to the DM rather than accepting it yourself.",
+            "Stay in character as the watch captain.",
         ],
     }
 
     def _ask(_messages):
-        # Model refuses without remembering the machine tag.
         return "I cannot simply take your word for that."
 
     monkeypatch.setattr(server, "load_npc", lambda _id: dict(rule_npc))
@@ -489,12 +488,8 @@ def test_npc_turn_vague_authority_directive_opens_dm_check(api, monkeypatch):
     )
     assert turn.status_code == 200
     body = turn.get_json()
-    assert body.get("dm_pending_check_id") or body.get("dm_check_claim")
-    pending = client.get(
-        f"/dm/pending?npc_id={npc_id}&player_id={player_id}",
-        headers=headers,
-    )
-    assert pending.status_code == 200
-    checks = pending.get_json().get("pending_checks") or []
-    assert checks, "expected at least one pending DM check for the authority claim"
+    # spoken npc_text is always tag-stripped; invention shows up on claim fields.
+    assert body.get("dm_check_claims") in (None, [])
+    assert body.get("dm_check_claim") is None
+    assert "cannot simply take your word" in (body.get("npc_text") or "").lower()
 

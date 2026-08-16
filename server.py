@@ -38,7 +38,6 @@ from content_import import (
 )
 from required_dm_checks import (
     format_required_dm_checks_prompt_block,
-    format_situational_deferral_prompt_block,
     generate_npc_reply_text,
 )
 from dm_channel import (
@@ -1130,7 +1129,6 @@ NPC-specific rules for {npc["name"]} (these override conflicting global rules):
 {npc_rules_text}"""
 
     required_checks_block = format_required_dm_checks_prompt_block(npc, dm_context)
-    situational_block = format_situational_deferral_prompt_block(npc, player_text)
 
     return f"""
 You are portraying an NPC in a tabletop RPG.
@@ -1170,7 +1168,7 @@ Party and campaign context:
 
 DM channel context:
 {dm_context_text}
-{required_checks_block}{situational_block}
+{required_checks_block}
 Rules:
 {global_rules_text}{npc_rules_block}
 """.strip()

@@ -1,11 +1,12 @@
 """
-Generic DM CHECK enforcement from authored NPC llm_rules.
+DM CHECK handling: LLM judges; platform parses tags.
 
-Two modes:
-1. Literal ``[DM CHECK: …]`` templates stay required until a matching ruling.
-2. Vague deferral directives (e.g. "If someone claims official authority, defer to
-   the DM") trigger a situational ``[DM CHECK]`` when the player's latest message
-   looks like a claim that needs confirmation.
+Enforcement is intentionally narrow:
+1. Parse ``[DM CHECK: …]`` from model output (see dm_channel.extract_dm_check_tags).
+2. If NPC llm_rules author a literal ``[DM CHECK: …]`` template and no matching
+   DM ruling exists yet, ensure that exact tag is present on the reply.
+3. Do not regex-guess player intent to invent server-side checks — global llm_rules
+   tell the model when to emit tags.
 """
 
 from __future__ import annotations
@@ -17,25 +18,6 @@ DM_CHECK_IN_RULES_PATTERN = re.compile(
     r"\[DM CHECK:\s*([^\]]+?)\]",
     re.IGNORECASE,
 )
-
-# Vague authored directives that mean "don't settle this yourself — ask the DM".
-# Keep these specific: bare "until the DM" / "official authority" overlap explicit
-# [DM CHECK] template scaffolding (e.g. "Until the DM rules…") and must not match.
-DM_DEFERRAL_DIRECTIVE_PATTERNS = [
-    re.compile(p, re.IGNORECASE)
-    for p in (
-        r"defer to (?:the )?(?:dm|dungeon master|gm)",
-        r"rather than accepting (?:it )?yourself",
-        r"do not (?:simply )?accept .{0,40}\byourself\b",
-        r"withhold (?:final )?approval",
-        r"if someone claims (?:official )?authority",
-        r"claims? (?:official )?authority.{0,120}(?:defer|dm|gm|dungeon master)",
-        r"do not (?:grant|accept|believe) .{0,60}\b(?:on their word|without (?:the )?dm|alone)\b",
-        r"let (?:the )?(?:dm|gm) (?:confirm|verify|rule|decide)",
-        r"(?:ask|prompt)\s+(?:the )?(?:dm|dungeon master|gm)\s+to\s+(?:confirm|verify|rule)",
-        r"need(?:s)?\s+(?:the )?(?:dm|dungeon master|gm)\s+to\s+(?:confirm|verify|rule)",
-    )
-]
 
 
 def _npc_rules_blob(npc: dict[str, Any] | None) -> str:
@@ -64,7 +46,7 @@ def _normalize_claim(text: str) -> str:
 
 
 def extract_dm_check_templates_from_rules(npc: dict[str, Any] | None) -> list[str]:
-    """Unique DM CHECK claim strings authored inside llm_rules."""
+    """Unique DM CHECK claim strings authored inside NPC llm_rules."""
     blob = _npc_rules_blob(npc)
     claims: list[str] = []
     seen: set[str] = set()
@@ -80,24 +62,31 @@ def extract_dm_check_templates_from_rules(npc: dict[str, Any] | None) -> list[st
     return claims
 
 
-def npc_has_dm_deferral_directive(npc: dict[str, Any] | None) -> bool:
-    """True when llm_rules include a vague 'defer to the DM' style directive."""
-    blob = _npc_rules_blob(npc)
-    if not blob.strip():
-        return False
-    # Ignore machine tags / ruling labels so template scaffolding cannot qualify.
-    blob = DM_CHECK_IN_RULES_PATTERN.sub(" ", blob)
-    blob = re.sub(r"\[DM Ruling:\s*[^\]]*\]", " ", blob, flags=re.IGNORECASE)
-    return any(pattern.search(blob) for pattern in DM_DEFERRAL_DIRECTIVE_PATTERNS)
+_CLAIM_STOPWORDS = frozenset(
+    {
+        "a", "an", "the", "to", "of", "and", "or", "for", "is", "are", "was", "were",
+        "be", "been", "being", "do", "does", "did", "this", "that", "these", "those",
+        "it", "its", "in", "on", "at", "as", "by", "with", "from", "into", "about",
+        "than", "then", "so", "if", "not", "no", "yes", "any", "all", "some",
+    }
+)
+
+
+def _content_claim_tokens(text: str) -> set[str]:
+    return {
+        w for w in _normalize_claim(text).split()
+        if len(w) >= 4 and w not in _CLAIM_STOPWORDS
+    }
 
 
 def _claim_matches(rule_claim: str, other: str) -> bool:
     """
-    Match a rule template to a DM claim_summary.
+    Match an authored template to a DM claim_summary / emitted tag.
 
-    Equality always matches. Substring matches require both sides to look like
-    real claim text (not short verdict notes like ``No`` / ``Yes``), so ``no``
-    cannot match inside ``know``.
+    Equality and long substring only for exact-ish text. Near-paraphrase uses
+    content tokens (stopwords excluded). Overlap thresholds scale with claim
+    length so short templates (e.g. secrets probing — three content tokens)
+    can still match slight rewordings.
     """
     a = _normalize_claim(rule_claim)
     b = _normalize_claim(other)
@@ -107,10 +96,32 @@ def _claim_matches(rule_claim: str, other: str) -> bool:
         return True
 
     shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
-    # Short strings are verdict crumbs / single words — never substring-match them.
-    if len(shorter) < 20:
+    if len(shorter) >= 20 and shorter in longer:
+        return True
+
+    ca = _content_claim_tokens(a)
+    cb = _content_claim_tokens(b)
+    if not ca or not cb:
         return False
-    return shorter in longer
+
+    overlap = ca & cb
+    shorter_n = min(len(ca), len(cb))
+    # Scale: short claims need (almost) all tokens; long ones need ~90% with a floor.
+    if shorter_n <= 3:
+        needed = shorter_n
+        distinctive_needed = 1
+    elif shorter_n <= 5:
+        needed = max(3, int(0.9 * shorter_n + 0.999))
+        distinctive_needed = 2
+    else:
+        needed = max(4, int(0.9 * shorter_n + 0.999))
+        distinctive_needed = 2
+
+    if len(overlap) < needed:
+        return False
+    if sum(1 for w in overlap if len(w) >= 6) < distinctive_needed:
+        return False
+    return True
 
 
 def _ruling_covers_claim(dm_context: dict[str, Any] | None, claim: str) -> bool:
@@ -129,7 +140,7 @@ def required_dm_checks(
     npc: dict[str, Any] | None,
     dm_context: dict[str, Any] | None,
 ) -> list[str]:
-    """Rule-authored DM CHECK claims that still lack a matching DM ruling."""
+    """NPC-authored DM CHECK claims that still lack a matching DM ruling."""
     return [
         claim
         for claim in extract_dm_check_templates_from_rules(npc)
@@ -141,6 +152,7 @@ def format_required_dm_checks_prompt_block(
     npc: dict[str, Any] | None,
     dm_context: dict[str, Any] | None,
 ) -> str:
+    """Remind the model of NPC-authored tags that are still waiting on a ruling."""
     pending = required_dm_checks(npc, dm_context)
     if not pending:
         return ""
@@ -148,35 +160,14 @@ def format_required_dm_checks_prompt_block(
     lines = "\n".join(f"- [DM CHECK: {claim}]" for claim in pending)
     return f"""
 
-REQUIRED DM CHECK TAGS (authoritative until the DM rules):
-Your llm_rules declare the checks below. Until DM channel context shows a matching
-confirmed (Success) or denied (Failure) ruling for each claim, you MUST end your reply
-with those exact tags (one per line, after any spoken dialogue or stage directions).
-Follow your other NPC-specific rules for how to behave while waiting and after
-Success/Failure rulings. Do not invent DM rulings yourself.
+NPC-AUTHORED DM CHECK TAGS (still required until the DM rules):
+This NPC's llm_rules declare the exact checks below. Prefer these tag wordings over a
+global paraphrase for the same situation. Until DM channel context shows a matching
+confirmed (Success) or denied (Failure) ruling for each claim, end your reply with
+those exact tags (one per line, after spoken dialogue / stage directions). Follow any
+NPC [DM Ruling: Success] / [DM Ruling: Failure] instructions after a matching ruling.
+Do not invent DM rulings yourself.
 {lines}"""
-
-
-def format_situational_deferral_prompt_block(
-    npc: dict[str, Any] | None,
-    player_text: str | None,
-) -> str:
-    """Remind the model when vague deferral rules apply to this player turn."""
-    from dm_channel import detect_player_claim, looks_like_authorization_exchange
-
-    if not npc_has_dm_deferral_directive(npc):
-        return ""
-    if not (detect_player_claim(player_text) or looks_like_authorization_exchange(player_text)):
-        return ""
-
-    return """
-
-SITUATIONAL DM DEFERRAL (from your NPC-specific rules):
-The player's latest message looks like a claim of authority, proof, credentials, or
-permission. Your rules say to defer to the DM rather than accepting it yourself.
-Stay in character, do not grant the claim on their word, and end your reply with:
-[DM CHECK: brief summary of what the player claims needs DM confirmation]
-Do not invent a DM ruling."""
 
 
 def ensure_required_dm_check_tags(
@@ -185,9 +176,9 @@ def ensure_required_dm_check_tags(
     raw_text: str,
 ) -> str:
     """
-    Append any still-required rule DM CHECK tags the model omitted.
+    Append any still-required NPC-authored DM CHECK tags the model omitted.
 
-    Does not rewrite spoken content — success/failure behavior stays in llm_rules.
+    Does not invent new claims from player text — only exact templates from llm_rules.
     """
     pending = required_dm_checks(npc, dm_context)
     if not pending:
@@ -202,6 +193,7 @@ def ensure_required_dm_check_tags(
     missing = [
         claim for claim in pending
         if _normalize_claim(claim) not in existing
+        and not any(_claim_matches(claim, existing_claim) for existing_claim in existing)
     ]
     if not missing:
         return text
@@ -212,52 +204,6 @@ def ensure_required_dm_check_tags(
     return suffix
 
 
-def ensure_situational_dm_check_tag(
-    npc: dict[str, Any] | None,
-    dm_context: dict[str, Any] | None,
-    raw_text: str,
-    player_text: str | None,
-) -> str:
-    """
-    When vague deferral directives apply and the player made a claim-like request,
-    ensure a [DM CHECK] is present even if the model forgot the tag.
-    """
-    from dm_channel import (
-        detect_npc_deferral,
-        detect_player_claim,
-        infer_claim_summary,
-        looks_like_authorization_exchange,
-    )
-
-    if not (detect_player_claim(player_text) or looks_like_authorization_exchange(player_text)):
-        return raw_text
-
-    # Fire when NPC rules defer vaguely, or the spoken reply already defers.
-    # Inspect speech only — required [DM CHECK] tags must not count as deferral.
-    speech_only = DM_CHECK_IN_RULES_PATTERN.sub(" ", raw_text or "")
-    if not (npc_has_dm_deferral_directive(npc) or detect_npc_deferral(speech_only)):
-        return raw_text
-
-    claim = infer_claim_summary(player_text or "", raw_text)
-    if not claim:
-        return raw_text
-    if _ruling_covers_claim(dm_context, claim):
-        return raw_text
-
-    text = (raw_text or "").rstrip()
-    existing = [
-        m.group(1).strip()
-        for m in DM_CHECK_IN_RULES_PATTERN.finditer(text)
-    ]
-    if any(_claim_matches(claim, existing_claim) for existing_claim in existing):
-        return text
-
-    tag = f"[DM CHECK: {claim}]"
-    if text:
-        return f"{text}\n{tag}"
-    return tag
-
-
 def generate_npc_reply_text(
     npc: dict[str, Any] | None,
     dm_context: dict[str, Any] | None,
@@ -266,7 +212,12 @@ def generate_npc_reply_text(
     *,
     player_text: str | None = None,
 ) -> str:
-    """Call the LLM, then ensure required and situational DM CHECK tags are present."""
+    """
+    Call the LLM, then ensure NPC-authored required DM CHECK tags are present.
+
+    ``player_text`` is accepted for call-site compatibility; intent classification is
+    left to the model via global/NPC llm_rules.
+    """
+    del player_text  # LLM decides; we only enforce authored templates.
     raw = ask_llm_fn(messages)
-    raw = ensure_required_dm_check_tags(npc, dm_context, raw)
-    return ensure_situational_dm_check_tag(npc, dm_context, raw, player_text)
+    return ensure_required_dm_check_tags(npc, dm_context, raw)
