@@ -626,23 +626,40 @@ def resolve_pending_check(
         conn.commit()
 
 
-def dismiss_pending_check(pending_check_id: int) -> dict[str, Any] | None:
-    """Remove a pending check without recording a confirm/deny ruling."""
-    pending = load_pending_check_by_id(int(pending_check_id))
+def dismiss_pending_check(pending_check_id: int) -> dict[str, Any]:
+    """Mark a pending check ignored without recording a confirm/deny ruling.
+
+    Raises:
+        LookupError: check id does not exist
+        ValueError: check exists but is no longer pending (already ruled/ignored)
+    """
+    pending_check_id = int(pending_check_id)
+    pending = load_pending_check_by_id(pending_check_id)
     if not pending:
-        return None
-    if (pending.get("status") or "").strip().lower() != "pending":
-        return pending
+        raise LookupError("Pending check not found")
+
+    status = (pending.get("status") or "").strip().lower()
+    if status != "pending":
+        raise ValueError(f"Pending check is already {status or 'resolved'}")
 
     with get_db() as conn:
-        conn.execute("""
+        cur = conn.execute("""
             UPDATE dm_pending_checks
             SET status = ?, resolved_at = ?
             WHERE id = ? AND status = 'pending'
-        """, ("ignored", _utc_now_iso(), int(pending_check_id)))
+        """, ("ignored", _utc_now_iso(), pending_check_id))
         conn.commit()
+        if cur.rowcount != 1:
+            current = load_pending_check_by_id(pending_check_id)
+            current_status = ((current or {}).get("status") or "").strip().lower()
+            raise ValueError(
+                f"Pending check is already {current_status or 'resolved'}"
+            )
 
-    updated = load_pending_check_by_id(int(pending_check_id))
+    updated = load_pending_check_by_id(pending_check_id)
+    if not updated or (updated.get("status") or "").strip().lower() != "ignored":
+        raise ValueError("Pending check could not be ignored")
+
     print(
         f"[DM] ignored pending check #{pending_check_id} "
         f"npc={pending.get('npc_id')} player={pending.get('player_id')} "

@@ -678,3 +678,58 @@ def test_dm_pending_includes_display_names_and_can_be_dismissed(api, monkeypatch
         for item in (remaining.get_json().get("pending_checks") or [])
     )
 
+    # Second dismiss must not report success while status stays ignored.
+    again = client.post(
+        "/dm/pending/dismiss",
+        headers=headers,
+        json={
+            "campaign_id": "greyhaven_intro",
+            "check_id": pending_id,
+        },
+    )
+    assert again.status_code == 409
+    again_body = again.get_json()
+    assert again_body.get("status") == "ignored"
+    assert "already" in str(again_body.get("error") or "").lower()
+    assert (again_body.get("check") or {}).get("status") == "ignored"
+
+
+def test_dm_pending_dismiss_rejects_already_confirmed(api):
+    client, _, headers = api
+    import dm_channel
+
+    pending_id = dm_channel.save_pending_check(
+        npc_id="captain_varra",
+        player_id="player_alden",
+        claim_summary="already confirmed claim",
+        player_text="claim",
+        npc_text="defer",
+        source="npc",
+        campaign_id="greyhaven_intro",
+    )
+    assert pending_id
+
+    dm_channel.create_manual_ruling(
+        npc_id="captain_varra",
+        player_id="player_alden",
+        claim_summary="already confirmed claim",
+        verdict="confirmed",
+        notes="Approved.",
+        pending_check_id=pending_id,
+        campaign_id="greyhaven_intro",
+    )
+
+    response = client.post(
+        "/dm/pending/dismiss",
+        headers=headers,
+        json={
+            "campaign_id": "greyhaven_intro",
+            "check_id": pending_id,
+        },
+    )
+    assert response.status_code == 409
+    body = response.get_json()
+    assert body.get("status") == "confirmed"
+    assert "already confirmed" in str(body.get("error") or "").lower()
+    assert (body.get("check") or {}).get("status") == "confirmed"
+

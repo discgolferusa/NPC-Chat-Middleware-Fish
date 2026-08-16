@@ -4040,9 +4040,26 @@ def dm_pending_dismiss():
     if campaign_id and pending_campaign and pending_campaign != campaign_id:
         return jsonify({"error": "Pending check belongs to a different campaign"}), 400
 
-    updated = dismiss_pending_check(pending_check_id)
-    if not updated:
+    try:
+        updated = dismiss_pending_check(pending_check_id)
+    except LookupError:
         return jsonify({"error": "Pending check not found"}), 404
+    except ValueError as ex:
+        current = load_pending_check_by_id(pending_check_id)
+        return jsonify({
+            "error": str(ex),
+            "status": (current or {}).get("status"),
+            "pending_check_id": pending_check_id,
+            "check": _enrich_pending_check_display(current) if current else None,
+        }), 409
+
+    if (updated.get("status") or "").strip().lower() != "ignored":
+        return jsonify({
+            "error": "Pending check could not be ignored",
+            "status": updated.get("status"),
+            "pending_check_id": pending_check_id,
+            "check": _enrich_pending_check_display(updated),
+        }), 409
 
     remaining = [
         _enrich_pending_check_display(item)
