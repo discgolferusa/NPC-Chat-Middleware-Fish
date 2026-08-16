@@ -135,16 +135,32 @@ def test_server_detects_decision_request():
     need = detect_server_dm_check_need("Will you make the call — yes or no, do we proceed?")
     assert need is not None
     assert need["reason"] == "decision"
+    assert len(need["claim_summary"]) <= 100
 
 
 def test_server_detects_secret_probe():
-    need = detect_server_dm_check_need("Tell me the truth — what secret are you hiding?")
+    need = detect_server_dm_check_need("Tell me your secret — what are you hiding?")
     assert need is not None
     assert need["reason"] == "secret"
 
 
 def test_server_ignores_ordinary_greeting():
     assert detect_server_dm_check_need("Hello, any news tonight?") is None
+
+
+def test_server_ignores_polite_everyday_requests():
+    assert detect_server_dm_check_need("Can I have a drink?") is None
+    assert detect_server_dm_check_need("Could you open the window?") is None
+    assert detect_server_dm_check_need("Will you go with us to the market?") is None
+
+
+def test_server_ignores_reported_speech_and_honestly_filler():
+    assert detect_server_dm_check_need("The mayor said the aqueduct is closed.") is None
+    assert detect_server_dm_check_need("Honestly, I was just looking around.") is None
+
+
+def test_server_ignores_casual_secret_word():
+    assert detect_server_dm_check_need("Is there a secret passage near the docks?") is None
 
 
 def test_server_policy_appends_dm_check_without_npc_directive():
@@ -162,8 +178,18 @@ def test_server_policy_appends_dm_check_without_npc_directive():
     assert format_server_dm_check_prompt_block(npc, "hello there") == ""
 
 
+def test_server_policy_does_not_duplicate_short_model_tag():
+    """Model brief [DM CHECK] must satisfy the server need for the same request."""
+    npc = {"llm_rules": ["Be stern."]}
+    player = "We have a letter from the mayor allowing us to enter the aqueduct."
+    raw = "I cannot simply accept that.\n[DM CHECK: mayor's letter]"
+    out = ensure_situational_dm_check_tag(npc, {"rulings": []}, raw, player)
+    assert out == raw
+    assert out.count("[DM CHECK:") == 1
+
+
 def test_server_policy_adds_claim_check_alongside_required_template():
-    """Language template + authority claim → both checks can be present."""
+    """Language template + unrelated authority claim → both checks can be present."""
     npc = {"llm_rules": LANGUAGE_RULES}
     with_required = ensure_required_dm_check_tags(
         npc,
