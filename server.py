@@ -2613,6 +2613,7 @@ def npc_turn():
             player_text=player_text,
             player_claim=player_claim,
             npc_response=npc_response,
+            campaign_id=campaign_id,
         )
 
         include_audio = _json_body_flag(body.get("include_audio"), False)
@@ -2974,6 +2975,7 @@ def npc_voice_turn():
             player_text=player_text,
             player_claim=player_claim,
             npc_response=npc_response,
+            campaign_id=campaign_id,
         )
 
         if not streaming:
@@ -3208,6 +3210,7 @@ def npc_voice_turn_debug():
             player_text=player_text,
             player_claim=player_claim,
             npc_response=npc_response,
+            campaign_id=campaign_id,
         )
 
         return jsonify({
@@ -3964,12 +3967,17 @@ def dm_pending():
     campaign_id = session["campaign_id"]
     status = request.args.get("status", "pending")
 
+    checks = load_pending_checks(
+        npc_id, player_id, status=status or None, limit=50, campaign_id=campaign_id
+    )
     return jsonify({
         "npc_id": npc_id,
         "player_id": player_id,
         "party_id": session["party_id"],
         "campaign_id": session["campaign_id"],
-        "pending_checks": load_pending_checks(npc_id, player_id, status=status or None, limit=50, campaign_id=campaign_id),
+        "pending_checks": checks,
+        # Alias used by older DM console clients.
+        "pending": checks,
     })
 
 

@@ -278,7 +278,9 @@ def test_dm_channel_endpoints(api):
 
     pending = client.get(f"/dm/pending?{qs}", headers=headers)
     assert pending.status_code == 200
-    assert "pending_checks" in pending.get_json()
+    pending_body = pending.get_json()
+    assert "pending_checks" in pending_body
+    assert pending_body.get("pending") == pending_body.get("pending_checks")
 
     rulings = client.get(f"/dm/rulings?{qs}", headers=headers)
     assert rulings.status_code == 200

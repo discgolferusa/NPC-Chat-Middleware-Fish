@@ -4,11 +4,27 @@ from __future__ import annotations
 
 import importlib
 import sqlite3
+import sys
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
 pytest.importorskip("flask")
+
+# Voice STT is unused in these API tests; stub so hosts without the wheel still run.
+if "faster_whisper" not in sys.modules:
+    _fw = ModuleType("faster_whisper")
+
+    class WhisperModel:  # noqa: N801 — mirror package export name
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def transcribe(self, *args, **kwargs):
+            return [], None
+
+    _fw.WhisperModel = WhisperModel
+    sys.modules["faster_whisper"] = _fw
 
 
 @pytest.fixture()
