@@ -72,7 +72,9 @@ def _normalize_doc(data: Any, *, fallback_id: str = "") -> dict[str, Any]:
         data = parsed
     if not isinstance(data, dict):
         raise ValueError("Content pack document must be a YAML mapping or object")
-    doc = dict(data)
+    from yaml_list_text import repair_string_list_fields
+
+    doc = repair_string_list_fields(dict(data))
     if fallback_id and not (
         str(doc.get("id") or "").strip()
         or str(doc.get("campaign_id") or "").strip()

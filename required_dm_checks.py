@@ -21,6 +21,8 @@ DM_CHECK_IN_RULES_PATTERN = re.compile(
 
 
 def _npc_rules_blob(npc: dict[str, Any] | None) -> str:
+    from yaml_list_text import yaml_list_item_as_text
+
     npc = npc or {}
     raw = npc.get("llm_rules")
     if raw is None:
@@ -31,11 +33,17 @@ def _npc_rules_blob(npc: dict[str, Any] | None) -> str:
     if isinstance(raw, str):
         return raw
     if isinstance(raw, list):
-        return "\n".join(str(item) for item in raw if item is not None)
+        return "\n".join(
+            text for text in (yaml_list_item_as_text(item) for item in raw if item is not None) if text.strip()
+        )
     if isinstance(raw, dict):
         nested = raw.get("llm_rules") or raw.get("rules") or []
         if isinstance(nested, list):
-            return "\n".join(str(item) for item in nested if item is not None)
+            return "\n".join(
+                text
+                for text in (yaml_list_item_as_text(item) for item in nested if item is not None)
+                if text.strip()
+            )
         return str(nested)
     return str(raw)
 
