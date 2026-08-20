@@ -63,6 +63,8 @@ from dm_channel import (
     process_player_message,
     save_dm_message,
     strip_dm_check_tag,
+    assistant_history_text,
+    is_dm_wait_narration,
 )
 import dm_channel
 from party_campaign import (
@@ -108,14 +110,19 @@ from scene_state import (
     set_time_of_day,
 )
 from turn_progress import (
+    TurnInProgressError,
+    TurnSupersededError,
     complete_turn_progress,
+    ensure_turn_in_progress,
     fail_turn_progress,
+    get_active_turn_progress,
     get_turn_progress,
     get_turn_progress_catalog,
     new_request_id,
     normalize_client_request_id,
     register_turn_progress,
     set_turn_progress,
+    turn_is_in_progress,
 )
 from server_settings import format_llm_rules, get_narrator_tts_settings, load_global_llm_rules
 from prompt_caps import get_prompt_caps, save_prompt_caps, DEFAULT_PROMPT_CAPS
@@ -650,6 +657,29 @@ def save_turn(npc_id: str, player_id: str, role: str, content: str, campaign_id:
         conn.commit()
 
 
+def save_player_npc_conversation_turns(
+    npc_id: str,
+    player_id: str,
+    player_text: str,
+    npc_response: dict,
+    *,
+    campaign_id: str = "",
+    save_user: bool = True,
+) -> str:
+    """Persist the player line and in-character NPC draft, never wait-narration.
+
+    Callers that already saved the user utterance before a long LLM wait should pass
+    ``save_user=False`` so a force-displaced turn still leaves the player line in
+    history for DM auto-response follow-ups.
+    """
+    if save_user:
+        save_turn(npc_id, player_id, "user", player_text, campaign_id=campaign_id)
+    history_text = assistant_history_text(npc_response)
+    if history_text:
+        save_turn(npc_id, player_id, "assistant", history_text, campaign_id=campaign_id)
+    return history_text
+
+
 def load_recent_turns(npc_id: str, player_id: str, limit: int = 10, campaign_id: str = ""):
     campaign_id = normalize_campaign_id(campaign_id)
     with get_db() as conn:
@@ -661,9 +691,14 @@ def load_recent_turns(npc_id: str, player_id: str, limit: int = 10, campaign_id:
               AND player_id = ?
             ORDER BY id DESC
             LIMIT ?
-        """, (campaign_id, npc_id, player_id, limit)).fetchall()
+        """, (campaign_id, npc_id, player_id, max(limit * 3, 20))).fetchall()
 
-    return list(reversed(rows))
+    filtered = [
+        row
+        for row in reversed(rows)
+        if not is_dm_wait_narration(row["content"] if row["content"] is not None else "")
+    ]
+    return filtered[-limit:]
 
 
 def save_memory(npc_id: str, player_id: str, memory: str, campaign_id: str = ""):
@@ -1277,6 +1312,32 @@ def _json_body_flag(value, default: bool = True) -> bool:
     return bool(value)
 
 
+def _turn_busy_message(progress: dict) -> str:
+    route = (progress.get("route") or "").strip()
+    if route == "/dm-ruling-auto-response":
+        return (
+            progress.get("message")
+            or "The DM ruled — the NPC is responding to your last exchange. Please wait."
+        )
+    return progress.get("message") or "Wait for the current NPC response before sending another message."
+
+
+def _turn_in_progress_response(progress: dict):
+    return jsonify({
+        **progress,
+        "error": "turn_in_progress",
+        "message": _turn_busy_message(progress),
+    }), 409
+
+
+def _turn_superseded_response(request_id: str, progress: dict | None = None):
+    payload = dict(progress or {})
+    payload["request_id"] = request_id
+    payload["error"] = "superseded"
+    payload["message"] = payload.get("message") or "This response was replaced by a newer turn."
+    return jsonify(payload), 409
+
+
 def build_dm_followup_messages(
     npc: dict,
     scene: dict,
@@ -1351,11 +1412,28 @@ def run_dm_ruling_auto_response(
         }
 
     request_id = uuid.uuid4().hex
+    progress_started = False
 
     try:
         campaign_id = normalize_campaign_id(
             campaign_id or (party_context or {}).get("campaign_id") or ruling.get("campaign_id")
         )
+        register_turn_progress(
+            request_id,
+            route="/dm-ruling-auto-response",
+            npc_id=npc_id,
+            player_id=player_id,
+            mode="text",
+            campaign_id=campaign_id,
+            force=True,
+        )
+        progress_started = True
+        set_turn_progress(
+            request_id,
+            "waiting_llm",
+            message="The DM ruled — the NPC is responding to your last exchange...",
+        )
+
         context = get_npc_context(
             npc_id, player_id, party_context=party_context, campaign_id=campaign_id
         )
@@ -1388,6 +1466,7 @@ def run_dm_ruling_auto_response(
             player_text=None,
             enforce_required_dm_checks=False,
         )
+        set_turn_progress(request_id, "processing_response")
         npc_response = process_npc_response(
             npc_id,
             player_id,
@@ -1401,7 +1480,10 @@ def run_dm_ruling_auto_response(
         if not npc_text:
             npc_text = "Very well."
 
-        save_turn(npc_id, player_id, "assistant", npc_text, campaign_id=campaign_id)
+        ensure_turn_in_progress(request_id)
+        history_text = assistant_history_text(npc_response) or npc_text
+        if not is_dm_wait_narration(history_text):
+            save_turn(npc_id, player_id, "assistant", history_text, campaign_id=campaign_id)
 
         tts_segments = split_narration_and_dialogue(npc_text)
         tts_text = " ".join(segment["text"] for segment in tts_segments).strip()
@@ -1413,6 +1495,8 @@ def run_dm_ruling_auto_response(
         dialogue_text = ""
 
         if include_audio:
+            ensure_turn_in_progress(request_id)
+            set_turn_progress(request_id, "synthesizing_speech")
             request_tts = dict(tts_options or {})
             if tts_length_scale is not None and "tts_length_scale" not in request_tts:
                 request_tts["tts_length_scale"] = tts_length_scale
@@ -1439,6 +1523,9 @@ def run_dm_ruling_auto_response(
             flush=True,
         )
 
+        complete_turn_progress(request_id)
+        progress_started = False
+
         return {
             "generated": True,
             "request_id": request_id,
@@ -1457,7 +1544,34 @@ def run_dm_ruling_auto_response(
             "audio_clips": audio_clips,
         }
 
+    except TurnInProgressError as ex:
+        print(
+            f"[DM] auto-response blocked request_id={request_id} npc={npc_id} player={player_id} "
+            f"active={ex.progress.get('request_id')}",
+            flush=True,
+        )
+        return {
+            "generated": False,
+            "request_id": request_id,
+            "reason": "turn_in_progress",
+            "error": "turn_in_progress",
+            "active_turn": ex.progress,
+        }
+    except TurnSupersededError as ex:
+        print(
+            f"[DM] auto-response superseded request_id={request_id} npc={npc_id} player={player_id}",
+            flush=True,
+        )
+        return {
+            "generated": False,
+            "request_id": request_id,
+            "reason": "superseded",
+            "error": "superseded",
+            "progress": ex.progress,
+        }
     except Exception as ex:
+        if progress_started:
+            fail_turn_progress(request_id, "generation_failed")
         print(
             f"[DM] auto-response failed request_id={request_id} npc={npc_id} error={ex!r}",
             flush=True,
@@ -2152,7 +2266,14 @@ def synthesize_segmented_speech_clips(
         "lock": threading.Lock(),
     }
 
-    def _synthesize_one(index: int, segment: dict[str, Any]) -> dict[str, Any]:
+    def _synthesize_one(index: int, segment: dict[str, Any]) -> dict[str, Any] | None:
+        if not turn_is_in_progress(request_id):
+            print(
+                f"[PLAYER-AUDIO] clip_skipped_superseded request_id={request_id} index={index}",
+                flush=True,
+            )
+            return None
+
         raw_path = OUTPUT_DIR / f"{request_id}_raw_{index:02d}_{segment['type']}.wav"
         out_path = turn_audio_path(request_id, index)
         clip_type = "narration" if segment["type"] == "narrator" else "speech"
@@ -2236,7 +2357,11 @@ def synthesize_segmented_speech_clips(
         }
 
     # Always synthesize the first clip on the request thread.
-    _synthesize_one(0, segments[0])
+    if _synthesize_one(0, segments[0]) is None:
+        # Empty clips without raising used to make /npc-voice-turn send_file a
+        # missing {request_id}_response.wav (500). Surface supersede instead.
+        progress = get_turn_progress(request_id)
+        raise TurnSupersededError(progress)
 
     if return_after_first_clip and len(segments) > 1:
         remaining = list(enumerate(segments[1:], start=1))
@@ -2245,7 +2370,8 @@ def synthesize_segmented_speech_clips(
             error: BaseException | None = None
             try:
                 for index, segment in remaining:
-                    _synthesize_one(index, segment)
+                    if _synthesize_one(index, segment) is None:
+                        break
             except BaseException as ex:
                 error = ex
                 print(
@@ -2276,7 +2402,8 @@ def synthesize_segmented_speech_clips(
         return _result(pending=True)
 
     for index, segment in enumerate(segments[1:], start=1):
-        _synthesize_one(index, segment)
+        if _synthesize_one(index, segment) is None:
+            break
 
     return _result(pending=False)
 
@@ -2546,13 +2673,17 @@ def npc_turn():
     total_start = time.perf_counter()
     step_start = total_start
 
-    register_turn_progress(
-        request_id,
-        route="/npc-turn",
-        npc_id=npc_id,
-        player_id=player_id,
-        mode="text",
-    )
+    try:
+        register_turn_progress(
+            request_id,
+            route="/npc-turn",
+            npc_id=npc_id,
+            player_id=player_id,
+            mode="text",
+            campaign_id=campaign_id,
+        )
+    except TurnInProgressError as ex:
+        return _turn_in_progress_response(ex.progress)
     set_turn_progress(request_id, "received")
 
     try:
@@ -2576,6 +2707,10 @@ def npc_turn():
 
         player_claim = process_player_message(npc_id, player_id, player_text, campaign_id=campaign_id)
         dm_context = get_dm_context(npc_id, player_id, campaign_id=campaign_id)
+
+        # Persist the player line before the LLM wait so a DM Confirm/Deny that
+        # force-supersedes this turn still leaves the utterance in history.
+        save_turn(npc_id, player_id, "user", player_text, campaign_id=campaign_id)
 
         set_turn_progress(request_id, "preparing_prompt")
         messages = build_npc_llm_messages(
@@ -2604,6 +2739,7 @@ def npc_turn():
         )
         step_start = log_timing(request_id, "llm text npc response", step_start)
 
+        ensure_turn_in_progress(request_id)
         set_turn_progress(request_id, "processing_response")
         npc_response = process_npc_response(
             npc_id,
@@ -2615,31 +2751,39 @@ def npc_turn():
             )
         npc_text = npc_response["spoken_text"]
 
-        save_turn(npc_id, player_id, "user", player_text, campaign_id=campaign_id)
-        save_turn(npc_id, player_id, "assistant", npc_text, campaign_id=campaign_id)
+        ensure_turn_in_progress(request_id)
+        save_player_npc_conversation_turns(
+            npc_id,
+            player_id,
+            player_text,
+            npc_response,
+            campaign_id=campaign_id,
+            save_user=False,
+        )
+        history_npc_text = assistant_history_text(npc_response)
         step_start = log_timing(request_id, "save text conversation turns", step_start)
 
         saved_memories = []
         memory_extraction_mode = "disabled"
 
-        if AUTO_MEMORY_EXTRACTION_ENABLED and AUTO_MEMORY_EXTRACTION_ASYNC:
+        if history_npc_text and AUTO_MEMORY_EXTRACTION_ENABLED and AUTO_MEMORY_EXTRACTION_ASYNC:
             memory_extraction_mode = "async"
             run_memory_extraction_background(
                 npc=npc,
                 npc_id=npc_id,
                 player_id=player_id,
                 player_text=player_text,
-                npc_text=npc_text,
+                npc_text=history_npc_text,
                 campaign_id=campaign_id,
             )
-        elif AUTO_MEMORY_EXTRACTION_ENABLED:
+        elif history_npc_text and AUTO_MEMORY_EXTRACTION_ENABLED:
             memory_extraction_mode = "sync"
             saved_memories = save_extracted_memories(
                 npc=npc,
                 npc_id=npc_id,
                 player_id=player_id,
                 player_text=player_text,
-                npc_text=npc_text,
+                npc_text=history_npc_text,
                 campaign_id=campaign_id,
             )
             step_start = log_timing(request_id, "sync text memory extraction/save", step_start)
@@ -2666,6 +2810,7 @@ def npc_turn():
         audio_clips: list[dict[str, str]] = []
 
         if include_audio:
+            ensure_turn_in_progress(request_id)
             # Keep progress in_progress through TTS, then complete once. Completing
             # before synthesize + reopening left clients polling forever after playback.
             set_turn_progress(request_id, "synthesizing_speech")
@@ -2721,6 +2866,14 @@ def npc_turn():
 
         return attach_timing_headers(jsonify(payload), request_id)
 
+    except TurnSupersededError as ex:
+        print(
+            f"[NPC-TURN] superseded request_id={request_id} npc={npc_id}",
+            flush=True,
+        )
+        body, status = _turn_superseded_response(request_id, ex.progress)
+        return attach_timing_headers(body, request_id), status
+
     except Exception as ex:
         fail_turn_progress(request_id, "turn_failed")
         log_dm_turn(
@@ -2759,13 +2912,17 @@ def npc_voice_turn():
     total_start = time.perf_counter()
     step_start = total_start
 
-    register_turn_progress(
-        request_id,
-        route="/npc-voice-turn",
-        npc_id=npc_id,
-        player_id=player_id,
-        mode="voice",
-    )
+    try:
+        register_turn_progress(
+            request_id,
+            route="/npc-voice-turn",
+            npc_id=npc_id,
+            player_id=player_id,
+            mode="voice",
+            campaign_id=campaign_id,
+        )
+    except TurnInProgressError as ex:
+        return _turn_in_progress_response(ex.progress)
     set_turn_progress(request_id, "received")
 
     log_dm_turn(
@@ -2778,10 +2935,10 @@ def npc_voice_turn():
 
     output_path = OUTPUT_DIR / f"{request_id}_response.wav"
 
-    input_path = save_uploaded_audio(request.files["audio"], request_id)
-    step_start = log_timing(request_id, "save uploaded audio", step_start)
-
     try:
+        input_path = save_uploaded_audio(request.files["audio"], request_id)
+        step_start = log_timing(request_id, "save uploaded audio", step_start)
+
         set_turn_progress(request_id, "transcribing")
         player_text = transcribe_audio(input_path)
         step_start = log_timing(request_id, "speech-to-text", step_start)
@@ -2821,6 +2978,10 @@ def npc_voice_turn():
         player_claim = process_player_message(npc_id, player_id, player_text, campaign_id=campaign_id)
         dm_context = get_dm_context(npc_id, player_id, campaign_id=campaign_id)
 
+        # Persist the player line before the LLM wait so a DM Confirm/Deny that
+        # force-supersedes this turn still leaves the utterance in history.
+        save_turn(npc_id, player_id, "user", player_text, campaign_id=campaign_id)
+
         set_turn_progress(request_id, "preparing_prompt")
         messages = build_npc_llm_messages(
             npc,
@@ -2848,6 +3009,7 @@ def npc_voice_turn():
         )
         step_start = log_timing(request_id, "llm npc response", step_start)
 
+        ensure_turn_in_progress(request_id)
         set_turn_progress(request_id, "processing_response")
         npc_response = process_npc_response(
             npc_id,
@@ -2889,30 +3051,38 @@ def npc_voice_turn():
                 dialogue_text=tts_text,
             )
 
-        save_turn(npc_id, player_id, "user", player_text, campaign_id=campaign_id)
-        save_turn(npc_id, player_id, "assistant", npc_text, campaign_id=campaign_id)
+        ensure_turn_in_progress(request_id)
+        save_player_npc_conversation_turns(
+            npc_id,
+            player_id,
+            player_text,
+            npc_response,
+            campaign_id=campaign_id,
+            save_user=False,
+        )
         step_start = log_timing(request_id, "save conversation turns", step_start)
+        history_npc_text = assistant_history_text(npc_response)
 
         memory_extraction_mode = "disabled"
-        if AUTO_MEMORY_EXTRACTION_ENABLED and AUTO_MEMORY_EXTRACTION_ASYNC:
+        if history_npc_text and AUTO_MEMORY_EXTRACTION_ENABLED and AUTO_MEMORY_EXTRACTION_ASYNC:
             memory_extraction_mode = "async"
             run_memory_extraction_background(
                 npc=npc,
                 npc_id=npc_id,
                 player_id=player_id,
                 player_text=player_text,
-                npc_text=npc_text,
+                npc_text=history_npc_text,
                 campaign_id=campaign_id,
             )
             step_start = log_timing(request_id, "schedule async memory extraction", step_start)
-        elif AUTO_MEMORY_EXTRACTION_ENABLED:
+        elif history_npc_text and AUTO_MEMORY_EXTRACTION_ENABLED:
             memory_extraction_mode = "sync"
             save_extracted_memories(
                 npc=npc,
                 npc_id=npc_id,
                 player_id=player_id,
                 player_text=player_text,
-                npc_text=npc_text,
+                npc_text=history_npc_text,
                 campaign_id=campaign_id,
             )
             step_start = log_timing(request_id, "sync memory extraction/save", step_start)
@@ -2926,6 +3096,8 @@ def npc_voice_turn():
         )
 
         def _on_clip_ready(clip, clips_so_far):
+            if not turn_is_in_progress(request_id):
+                return
             step = "clip_ready"
             if clip.get("type") == "narration":
                 step = "narration_ready"
@@ -2946,6 +3118,8 @@ def npc_voice_turn():
             )
 
         def _on_stream_complete(final_result: dict, error: BaseException | None) -> None:
+            if not turn_is_in_progress(request_id):
+                return
             if error is not None:
                 fail_turn_progress(request_id, "tts_stream_failed")
                 return
@@ -2965,6 +3139,7 @@ def npc_voice_turn():
                 flush=True,
             )
 
+        ensure_turn_in_progress(request_id)
         clip_result = synthesize_segmented_speech_clips(
             npc_text=npc_text,
             npc_voice_model=pick_npc_voice_model(
@@ -2990,6 +3165,10 @@ def npc_voice_turn():
         streaming = bool(clip_result.get("pending"))
         # Prefer last segment as HTTP body; clients play via SignalR clip list.
         response_path = turn_audio_path(request_id, len(clips) - 1) if clips else (speech_path or narration_path or output_path)
+        if not clips or not Path(response_path).is_file():
+            # Race: superseded after synthesize returned, or missing WAV body.
+            ensure_turn_in_progress(request_id)
+            raise RuntimeError("TTS produced no playable audio for this turn")
 
         set_turn_progress(
             request_id,
@@ -3060,6 +3239,14 @@ def npc_voice_turn():
         if speech_path:
             response.headers["X-Speech-Audio-Url"] = turn_audio_url(request_id, "speech")
         return attach_timing_headers(response, request_id)
+
+    except TurnSupersededError as ex:
+        print(
+            f"[DM] route=/npc-voice-turn stage=superseded request_id={request_id}",
+            flush=True,
+        )
+        body, status = _turn_superseded_response(request_id, ex.progress)
+        return attach_timing_headers(body, request_id), status
 
     except Exception as ex:
         total_elapsed = time.perf_counter() - total_start
@@ -3189,31 +3376,37 @@ def npc_voice_turn_debug():
         )
         step_start = log_timing(request_id, "debug split tts segments", step_start)
 
-        save_turn(npc_id, player_id, "user", player_text, campaign_id=campaign_id)
-        save_turn(npc_id, player_id, "assistant", npc_text, campaign_id=campaign_id)
+        save_player_npc_conversation_turns(
+            npc_id,
+            player_id,
+            player_text,
+            npc_response,
+            campaign_id=campaign_id,
+        )
         step_start = log_timing(request_id, "debug save conversation turns", step_start)
+        history_npc_text = assistant_history_text(npc_response)
 
         saved_memories = []
         memory_extraction_mode = "disabled"
-        if AUTO_MEMORY_EXTRACTION_ENABLED and AUTO_MEMORY_EXTRACTION_ASYNC:
+        if history_npc_text and AUTO_MEMORY_EXTRACTION_ENABLED and AUTO_MEMORY_EXTRACTION_ASYNC:
             memory_extraction_mode = "async"
             run_memory_extraction_background(
                 npc=npc,
                 npc_id=npc_id,
                 player_id=player_id,
                 player_text=player_text,
-                npc_text=npc_text,
+                npc_text=history_npc_text,
                 campaign_id=campaign_id,
             )
             step_start = log_timing(request_id, "debug schedule async memory extraction", step_start)
-        elif AUTO_MEMORY_EXTRACTION_ENABLED:
+        elif history_npc_text and AUTO_MEMORY_EXTRACTION_ENABLED:
             memory_extraction_mode = "sync"
             saved_memories = save_extracted_memories(
                 npc=npc,
                 npc_id=npc_id,
                 player_id=player_id,
                 player_text=player_text,
-                npc_text=npc_text,
+                npc_text=history_npc_text,
                 campaign_id=campaign_id,
             )
             step_start = log_timing(request_id, "debug sync memory extraction/save", step_start)
@@ -3696,13 +3889,31 @@ def turn_progress_register():
     if mode not in ("voice", "text"):
         mode = "voice" if "voice" in route else "text"
 
-    return jsonify(register_turn_progress(
-        request_id,
-        route=route,
-        npc_id=npc_id,
-        player_id=player_id,
-        mode=mode,
-    ))
+    session = resolve_request_session(body=body)
+    campaign_id = session["campaign_id"]
+    try:
+        return jsonify(register_turn_progress(
+            request_id,
+            route=route,
+            npc_id=npc_id,
+            player_id=player_id,
+            mode=mode,
+            campaign_id=campaign_id,
+        ))
+    except TurnInProgressError as ex:
+        return _turn_in_progress_response(ex.progress)
+
+
+@app.get("/turn/progress/active")
+def turn_progress_active():
+    session = resolve_request_session(args=request.args)
+    campaign_id = session["campaign_id"]
+    npc_id = (request.args.get("npc_id") or "").strip()
+    player_id = session["player_id"]
+    active = get_active_turn_progress(campaign_id, npc_id, player_id)
+    if not active:
+        return jsonify({"status": "idle"})
+    return jsonify(active)
 
 
 @app.get("/turn/progress/<request_id>")

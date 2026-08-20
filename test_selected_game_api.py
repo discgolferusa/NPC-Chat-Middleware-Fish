@@ -228,6 +228,98 @@ def test_npc_voice_turn(api):
     assert "watch" in npc_text.lower() or "firm" in npc_text.lower()
 
 
+def test_npc_voice_turn_returns_409_when_tts_superseded_before_first_clip(api, monkeypatch):
+    """Confirm/Deny during narrator setup must not send_file a missing response WAV."""
+    client, server, headers = api
+    import turn_progress as tp
+
+    request_id = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    npc_id = "captain_varra"
+    player_id = "player_alden"
+    campaign_id = "greyhaven_intro"
+
+    def _supersede_on_tts(**_kwargs):
+        tp.register_turn_progress(
+            "ffffffffffffffffffffffffffffffff",
+            route="/dm-ruling-auto-response",
+            npc_id=npc_id,
+            player_id=player_id,
+            mode="text",
+            campaign_id=campaign_id,
+            force=True,
+        )
+        return {
+            "clips": [],
+            "narration_text": "",
+            "dialogue_text": "",
+            "speech_path": None,
+            "narration_path": None,
+            "pending": False,
+        }
+
+    monkeypatch.setattr(server, "synthesize_segmented_speech_clips", _supersede_on_tts)
+
+    audio = (io.BytesIO(b"RIFF" + (b"\x00" * 2048)), "clip.wav")
+    response = client.post(
+        "/npc-voice-turn",
+        headers=headers,
+        data={
+            "npc_id": npc_id,
+            "scene": "Barracks",
+            "player_id": player_id,
+            "campaign_id": campaign_id,
+            "request_id": request_id,
+            "audio": audio,
+        },
+        content_type="multipart/form-data",
+    )
+    assert response.status_code == 409
+    body = response.get_json()
+    assert body.get("error") == "superseded"
+    assert response.mimetype != "audio/wav"
+
+
+def test_npc_voice_turn_upload_failure_releases_lock(api, monkeypatch):
+    client, server, headers = api
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("convert failed")
+
+    monkeypatch.setattr(server, "save_uploaded_audio", _boom)
+    first = client.post(
+        "/npc-voice-turn",
+        headers=headers,
+        data={
+            "npc_id": "captain_varra",
+            "player_id": "player_alden",
+            "audio": (io.BytesIO(b"RIFF" + (b"\x00" * 2048)), "clip.wav"),
+        },
+        content_type="multipart/form-data",
+    )
+    assert first.status_code == 500
+
+    active = client.get(
+        "/turn/progress/active?npc_id=captain_varra&player_id=player_alden",
+        headers=headers,
+    )
+    assert active.status_code == 200
+    assert (active.get_json() or {}).get("status") == "idle"
+
+    text = client.post(
+        "/npc-turn",
+        headers=headers,
+        json={
+            "npc_id": "captain_varra",
+            "text": "Hello.",
+            "scene": {"description": "Barracks"},
+            "history": [],
+            "player_id": "player_alden",
+            "include_audio": False,
+        },
+    )
+    assert text.status_code != 409
+
+
 def test_dm_channel_endpoints(api):
     client, _, headers = api
     npc = "captain_varra"
@@ -434,8 +526,9 @@ def test_npc_turn_authored_dm_check_is_enforced(api, monkeypatch):
     assert turn.status_code == 200
     body = turn.get_json()
     reply = body.get("npc_text") or body.get("text") or ""
-    assert llm_calls["n"] == 1
-    assert "Krah-vesh" in reply
+    assert llm_calls["n"] == 0
+    assert "waiting on a dm decision" in reply.lower()
+    assert "Krah-vesh" not in reply
     assert body.get("dm_check_claim")
     assert "necessary language" in str(body.get("dm_check_claim")).lower()
     assert body.get("dm_pending_check_id")
@@ -499,9 +592,10 @@ def test_npc_turn_slaad_strips_english_when_language_check_unruled(api, monkeypa
     assert turn.status_code == 200
     body = turn.get_json()
     reply = body.get("npc_text") or body.get("text") or ""
-    assert llm_calls["n"] == 2
+    assert llm_calls["n"] == 0
+    assert "waiting on a dm decision" in reply.lower()
     assert "understand you" not in reply.lower()
-    assert "Krah-thok" in reply
+    assert "Krah-thok" not in reply
     assert body.get("dm_check_claim")
     assert "necessary language" in str(body.get("dm_check_claim")).lower()
 
@@ -527,7 +621,10 @@ def test_npc_turn_without_authored_template_does_not_invent_check(api, monkeypat
         ],
     }
 
+    llm_calls = {"n": 0}
+
     def _ask(_messages):
+        llm_calls["n"] += 1
         return "I cannot simply take your word for that."
 
     monkeypatch.setattr(server, "load_npc", lambda _id: dict(rule_npc))
@@ -548,9 +645,71 @@ def test_npc_turn_without_authored_template_does_not_invent_check(api, monkeypat
     assert turn.status_code == 200
     body = turn.get_json()
     # spoken npc_text is always tag-stripped; invention shows up on claim fields.
+    assert llm_calls["n"] == 1
     assert body.get("dm_check_claims") in (None, [])
     assert body.get("dm_check_claim") is None
-    assert "cannot simply take your word" in (body.get("npc_text") or "").lower()
+    assert "waiting on a dm decision" in (body.get("npc_text") or "").lower()
+    campaign_id = body.get("campaign_id") or "greyhaven_intro"
+    history = server.load_recent_turns(npc_id, player_id, campaign_id=campaign_id)
+    assistant = " ".join(
+        (row["content"] or "")
+        for row in history
+        if row["role"] == "assistant"
+    )
+    assert "cannot simply take your word" in assistant.lower()
+    assert "waiting on a dm decision" not in assistant.lower()
+
+
+def test_npc_turn_situational_template_greeting_still_speaks(api, monkeypatch):
+    """Secrets/writ templates must not mute ordinary greetings or invent a pending check."""
+    client, server, headers = api
+    npc_id = "keeper_npc"
+    player_id = "player_alden"
+
+    rule_npc = {
+        "id": npc_id,
+        "name": "Keeper",
+        "role": "archivist",
+        "location_id": "greyhaven",
+        "personality": ["guarded"],
+        "public_facts": [],
+        "known_facts": [],
+        "secrets": ["the vault combination"],
+        "voice": ["quiet"],
+        "llm_rules": [
+            "If asked about secrets, end with "
+            "[DM CHECK: the player is probing one of this NPC's secrets]",
+        ],
+    }
+
+    llm_calls = {"n": 0}
+
+    def _ask(_messages):
+        llm_calls["n"] += 1
+        return "Good day. The reading room is open."
+
+    monkeypatch.setattr(server, "load_npc", lambda _id: dict(rule_npc))
+    monkeypatch.setattr(server, "ask_llm", _ask)
+
+    turn = client.post(
+        "/npc-turn",
+        headers=headers,
+        json={
+            "npc_id": npc_id,
+            "text": "Hello there.",
+            "scene": {"description": "Archive"},
+            "history": [],
+            "player_id": player_id,
+            "include_audio": False,
+        },
+    )
+    assert turn.status_code == 200
+    body = turn.get_json()
+    assert llm_calls["n"] == 1
+    assert "reading room is open" in (body.get("npc_text") or "").lower()
+    assert "waiting on a dm decision" not in (body.get("npc_text") or "").lower()
+    assert body.get("dm_check_claim") is None
+    assert not body.get("dm_pending_check_id")
 
 
 def test_dm_pending_and_ruling_are_campaign_wide_without_player_id(api, monkeypatch):

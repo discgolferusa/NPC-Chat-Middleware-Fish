@@ -8,6 +8,7 @@ import turn_progress as tp
 def setup_function(_):
     with tp._PROGRESS_LOCK:
         tp._PROGRESS.clear()
+        tp._ACTIVE_TURNS.clear()
 
 
 def test_normalize_and_new_request_id():
@@ -76,3 +77,112 @@ def test_text_steps_include_synthesizing_speech():
     assert "synthesizing_speech" in keys
     assert keys.index("synthesizing_speech") < keys.index("finishing")
     assert keys.index("finishing") < keys.index("complete")
+
+
+def test_active_turn_blocks_second_register():
+    rid_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    rid_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    tp.register_turn_progress(
+        rid_a,
+        route="/npc-turn",
+        npc_id="bob",
+        player_id="alice",
+        mode="text",
+        campaign_id="camp-1",
+    )
+    active = tp.get_active_turn_progress("camp-1", "bob", "alice")
+    assert active is not None
+    assert active["request_id"] == rid_a
+
+    try:
+        tp.register_turn_progress(
+            rid_b,
+            route="/npc-turn",
+            npc_id="bob",
+            player_id="alice",
+            mode="text",
+            campaign_id="camp-1",
+        )
+        assert False, "expected TurnInProgressError"
+    except tp.TurnInProgressError as ex:
+        assert ex.progress["request_id"] == rid_a
+
+    tp.complete_turn_progress(rid_a)
+    assert tp.get_active_turn_progress("camp-1", "bob", "alice") is None
+
+    registered = tp.register_turn_progress(
+        rid_b,
+        route="/npc-turn",
+        npc_id="bob",
+        player_id="alice",
+        mode="text",
+        campaign_id="camp-1",
+    )
+    assert registered["request_id"] == rid_b
+
+
+def test_fail_turn_releases_active_slot():
+    rid = "cccccccccccccccccccccccccccccccc"
+    tp.register_turn_progress(
+        rid,
+        route="/dm-ruling-auto-response",
+        npc_id="bob",
+        player_id="alice",
+        mode="text",
+        campaign_id="camp-2",
+    )
+    tp.fail_turn_progress(rid, "boom")
+    assert tp.get_active_turn_progress("camp-2", "bob", "alice") is None
+
+
+def test_force_register_displaces_active_turn():
+    rid_a = "dddddddddddddddddddddddddddddddd"
+    rid_b = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    tp.register_turn_progress(
+        rid_a,
+        route="/npc-turn",
+        npc_id="bob",
+        player_id="alice",
+        mode="text",
+        campaign_id="camp-3",
+    )
+    displaced = tp.register_turn_progress(
+        rid_b,
+        route="/dm-ruling-auto-response",
+        npc_id="bob",
+        player_id="alice",
+        mode="text",
+        campaign_id="camp-3",
+        force=True,
+    )
+    assert displaced["request_id"] == rid_b
+    active = tp.get_active_turn_progress("camp-3", "bob", "alice")
+    assert active is not None
+    assert active["request_id"] == rid_b
+
+    old = tp.get_turn_progress(rid_a)
+    assert old is not None
+    assert old["status"] == "error"
+    assert old["error"] == "superseded"
+    assert tp.turn_is_in_progress(rid_a) is False
+    assert tp.turn_is_in_progress(rid_b) is True
+
+    try:
+        tp.ensure_turn_in_progress(rid_a)
+        assert False, "expected TurnSupersededError"
+    except tp.TurnSupersededError as ex:
+        assert ex.progress["request_id"] == rid_a
+        assert ex.progress["error"] == "superseded"
+
+    # Displaced turn must not reopen or reclaim the active slot.
+    assert tp.set_turn_progress(rid_a, "synthesizing_speech")["status"] == "error"
+    assert tp.complete_turn_progress(rid_a)["status"] == "error"
+    still_active = tp.get_active_turn_progress("camp-3", "bob", "alice")
+    assert still_active is not None
+    assert still_active["request_id"] == rid_b
+
+
+def test_turn_is_in_progress_allows_untracked_request_ids():
+    # Ad-hoc TTS helpers may synthesize without register_turn_progress.
+    assert tp.turn_is_in_progress("ffffffffffffffffffffffffffffffff") is True
+    assert tp.turn_is_in_progress("not-a-client-request-id") is True

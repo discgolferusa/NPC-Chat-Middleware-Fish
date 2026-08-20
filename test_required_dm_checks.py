@@ -68,7 +68,8 @@ def test_extract_preserves_trailing_quotes_and_possessives():
     assert len(claims) == 1
     assert claims[0] == 'confirm the mayor\'s "writ of passage"'
     out = ensure_required_dm_check_tags(npc, {"rulings": []}, "Hold.")
-    assert out.endswith('[DM CHECK: confirm the mayor\'s "writ of passage"]')
+    assert out == "Hold."
+    assert "[DM CHECK:" not in out
 
 
 def test_extract_finds_dm_even_when_yaml_split_mapping():
@@ -89,7 +90,8 @@ def test_extract_finds_dm_even_when_yaml_split_mapping():
     assert claims
     assert "official authority" in claims[0].lower() or "permission" in claims[0].lower()
     out = ensure_required_dm_check_tags(data, {"rulings": []}, "You may pass.")
-    assert "[DM CHECK:" in out
+    assert out == "You may pass."
+    assert "[DM CHECK:" not in out
 
 
 def test_required_until_ruled():
@@ -279,14 +281,22 @@ def test_generate_does_not_invent_check_from_player_text():
 
 def test_generate_still_enforces_authored_template():
     npc = {"llm_rules": LANGUAGE_RULES}
+    calls = {"n": 0}
+
+    def _ask(_messages):
+        calls["n"] += 1
+        return "Confused stare."
+
     text = generate_npc_reply_text(
         npc,
         {"rulings": []},
         [],
-        lambda _m: "Confused stare.",
+        _ask,
         player_text="Hello",
     )
-    assert "Confused stare." in text
+    assert calls["n"] == 0
+    assert "Confused stare." not in text
+    assert "Waiting on a DM decision" in text
     assert "[DM CHECK:" in text
     assert "necessary language" in text.lower()
 
@@ -384,10 +394,55 @@ def test_generate_rewrites_english_for_unruled_language_barrier():
         _ask,
         player_text="Hello, can you help us?",
     )
-    assert calls["n"] == 2
+    assert calls["n"] == 0
     assert "help you" not in text.lower()
-    assert "Krah-thok" in text
+    assert "Waiting on a DM decision" in text
     assert "[DM CHECK:" in text
+
+
+def test_generate_still_calls_llm_when_pending_is_situational():
+    calls = {"n": 0}
+
+    def _ask(_messages):
+        calls["n"] += 1
+        return "Sure, come on through."
+
+    text = generate_npc_reply_text(
+        {"llm_rules": ["Be stern."]},
+        {"pending_checks": [{"claim_summary": "player has a writ", "status": "pending"}]},
+        [],
+        _ask,
+        player_text="Let us pass.",
+    )
+    assert calls["n"] == 1
+    assert "come on through" in text.lower()
+    assert "Waiting on a DM decision" not in text
+
+
+def test_situational_template_does_not_skip_llm_on_greeting():
+    npc = {
+        "llm_rules": [
+            "If asked about secrets, end with "
+            "[DM CHECK: the player is probing one of this NPC's secrets]"
+        ]
+    }
+    calls = {"n": 0}
+
+    def _ask(_messages):
+        calls["n"] += 1
+        return "Hello there, traveler."
+
+    text = generate_npc_reply_text(
+        npc,
+        {"rulings": []},
+        [],
+        _ask,
+        player_text="Hello",
+    )
+    assert calls["n"] == 1
+    assert "Hello there, traveler." in text
+    assert "Waiting on a DM decision" not in text
+    assert "[DM CHECK:" not in text
 
 
 def test_generate_allows_english_after_language_success_ruling():
