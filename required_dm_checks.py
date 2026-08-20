@@ -26,6 +26,35 @@ DM_CHECK_MANGLED_IN_RULES_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+DM_RULING_FAILURE_PATTERN = re.compile(
+    r"\[DM\s*Ruling:\s*Failure\]\s*(.+)",
+    re.IGNORECASE,
+)
+
+_STAGE_DIRECTION_PATTERN = re.compile(r"^\*[^*]+\*\s*")
+
+_LANGUAGE_CLAIM_MARKERS = (
+    "language",
+    "understand",
+    "comprehend",
+    "talk to the npc",
+    "speak to the npc",
+)
+
+_ENGLISH_COMPREHENSION_WORDS = frozenset(
+    {
+        "i", "you", "we", "they", "he", "she", "it", "the", "a", "an", "is", "are", "was", "were",
+        "can", "could", "will", "would", "have", "has", "had", "do", "does", "did",
+        "yes", "no", "hello", "hi", "help", "please", "thank", "thanks", "what", "how", "why",
+        "who", "where", "when", "understand", "understood", "speak", "english", "sure", "of", "course",
+        "may", "might", "must", "shall", "should", "want", "need", "know", "think", "believe",
+        "your", "my", "our", "their", "this", "that", "these", "those", "here", "there",
+        "well", "very", "good", "great", "fine", "okay", "ok", "right", "indeed", "certainly",
+        "welcome", "sorry", "excuse", "pardon", "tell", "say", "said", "ask", "answer",
+        "perfectly", "clearly", "absolutely", "however", "perhaps", "maybe", "come", "go",
+    }
+)
+
 
 def _npc_rules_blob(npc: dict[str, Any] | None) -> str:
     from yaml_list_text import yaml_list_item_as_text
@@ -173,6 +202,94 @@ def required_dm_checks(
     ]
 
 
+def _is_language_comprehension_claim(claim: str) -> bool:
+    normalized = _normalize_claim(claim)
+    return any(marker in normalized for marker in _LANGUAGE_CLAIM_MARKERS)
+
+
+def _npc_has_language_barrier_rules(npc: dict[str, Any] | None) -> bool:
+    blob = _npc_rules_blob(npc).lower()
+    return (
+        "do not treat the speaker as understood" in blob
+        or "fantasy-language" in blob
+        or ("dm ruling: failure" in blob and "understand" in blob)
+    )
+
+
+def _extract_failure_ruling_hint(npc: dict[str, Any] | None) -> str:
+    for line in _npc_rules_blob(npc).splitlines():
+        match = DM_RULING_FAILURE_PATTERN.search(line)
+        if match:
+            return match.group(1).strip().strip("'\"")
+    return ""
+
+
+def _split_stage_direction(text: str) -> tuple[str, str]:
+    text = (text or "").strip()
+    match = _STAGE_DIRECTION_PATTERN.match(text)
+    if not match:
+        return "", text
+    return match.group(0).strip(), text[match.end():].strip()
+
+
+def _looks_like_english_comprehension(spoken: str) -> bool:
+    """Heuristic: did the NPC reply as if they understood English?"""
+    _stage, dialogue = _split_stage_direction(spoken)
+    check_text = (dialogue or spoken).strip()
+    if not check_text:
+        return False
+    words = re.findall(r"[a-zA-Z']+", check_text.lower())
+    if len(words) < 2:
+        return False
+    english_hits = sum(1 for word in words if word in _ENGLISH_COMPREHENSION_WORDS)
+    if english_hits >= 2:
+        return True
+    return len(words) >= 3 and english_hits >= 1 and len(words) <= 8
+
+
+def _default_fantasy_language_line(_npc: dict[str, Any] | None) -> str:
+    return "Skraa-vek?"
+
+
+def _rewrite_language_barrier_spoken(spoken: str, npc: dict[str, Any] | None) -> str:
+    stage, _dialogue = _split_stage_direction(spoken)
+    fantasy = _default_fantasy_language_line(npc)
+    if stage:
+        return f"{stage} {fantasy}".strip()
+    return fantasy
+
+
+def enforce_unruled_check_spoken_behavior(
+    npc: dict[str, Any] | None,
+    dm_context: dict[str, Any] | None,
+    raw_text: str,
+) -> str:
+    """
+    When a language-barrier DM CHECK is still unruled, strip English comprehension
+    dialogue the model may have added before/after the tag.
+    """
+    pending = required_dm_checks(npc, dm_context)
+    language_pending = [claim for claim in pending if _is_language_comprehension_claim(claim)]
+    if not language_pending or not _npc_has_language_barrier_rules(npc):
+        return raw_text
+
+    from dm_channel import extract_dm_check_tags
+
+    spoken, claims = extract_dm_check_tags(raw_text)
+    if not _looks_like_english_comprehension(spoken):
+        return raw_text
+
+    rewritten = _rewrite_language_barrier_spoken(spoken, npc)
+    result = rewritten.rstrip()
+    tag_claims = list(claims)
+    for claim in pending:
+        if not any(_claim_matches(claim, existing) for existing in tag_claims):
+            tag_claims.append(claim)
+    for claim in tag_claims:
+        result += f"\n[DM CHECK: {claim}]"
+    return result
+
+
 def format_required_dm_checks_prompt_block(
     npc: dict[str, Any] | None,
     dm_context: dict[str, Any] | None,
@@ -183,6 +300,16 @@ def format_required_dm_checks_prompt_block(
         return ""
 
     lines = "\n".join(f"- [DM CHECK: {claim}]" for claim in pending)
+    language_waiting = any(_is_language_comprehension_claim(claim) for claim in pending)
+    language_block = ""
+    if language_waiting and _npc_has_language_barrier_rules(npc):
+        failure_hint = _extract_failure_ruling_hint(npc)
+        failure_line = failure_hint or "Use a short fantasy-language line only; do not reply in English."
+        language_block = f"""
+
+LANGUAGE BARRIER (still waiting on DM ruling):
+Until a matching confirmed Success ruling exists, do NOT treat the speaker as understood.
+Do NOT respond in English. {failure_line}"""
     return f"""
 
 NPC-AUTHORED DM CHECK TAGS (still required until the DM rules):
@@ -191,7 +318,7 @@ global paraphrase for the same situation. Until DM channel context shows a match
 confirmed (Success) or denied (Failure) ruling for each claim, end your reply with
 those exact tags (one per line, after spoken dialogue / stage directions). Follow any
 NPC [DM Ruling: Success] / [DM Ruling: Failure] instructions after a matching ruling.
-Do not invent DM rulings yourself.
+Do not invent DM rulings yourself.{language_block}
 {lines}"""
 
 
@@ -279,4 +406,5 @@ def generate_npc_reply_text(
     raw = ask_llm_fn(messages)
     if not enforce_required_dm_checks:
         return raw
-    return ensure_required_dm_check_tags(npc, dm_context, raw)
+    tagged = ensure_required_dm_check_tags(npc, dm_context, raw)
+    return enforce_unruled_check_spoken_behavior(npc, dm_context, tagged)

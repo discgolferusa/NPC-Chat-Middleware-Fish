@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from required_dm_checks import (
     ensure_required_dm_check_tags,
+    enforce_unruled_check_spoken_behavior,
     extract_dm_check_templates_from_rules,
     format_required_dm_checks_prompt_block,
     generate_npc_reply_text,
@@ -19,6 +20,13 @@ LANGUAGE_RULES = [
     "[DM Ruling: Success] Respond to the speaker in English.",
     "[DM Ruling: Failure] You do not understand the speaker; answer only by showing "
     "you cannot understand them, using a short fantasy-language line.",
+]
+
+SLAAD_RULES = [
+    "Until the DM rules, do not treat the speaker as understood.",
+    "'End unsettled replies with [DM CHECK: Does the speaker know the necessary language to talk to the NPC]'",
+    "'[DM Ruling: Success] Respond to the speaker in English.'",
+    "'[DM Ruling: Failure] You do not understand them; reply only to show that, in a short fantasy-language line.'",
 ]
 
 
@@ -272,4 +280,63 @@ def test_generate_can_skip_required_dm_check_enforcement():
         enforce_required_dm_checks=False,
     )
     assert text == "Very well."
+    assert "[DM CHECK:" not in text
+
+
+def test_slaad_quoted_yaml_rules_extract_language_template():
+    npc = {"llm_rules": SLAAD_RULES}
+    claims = extract_dm_check_templates_from_rules(npc)
+    assert len(claims) == 1
+    assert "necessary language" in claims[0].lower()
+
+
+def test_format_includes_language_barrier_block_for_slaad():
+    npc = {"llm_rules": SLAAD_RULES}
+    block = format_required_dm_checks_prompt_block(npc, {"rulings": []})
+    assert "LANGUAGE BARRIER" in block
+    assert "Do NOT respond in English" in block
+
+
+def test_enforce_strips_english_comprehension_when_language_check_unruled():
+    npc = {"llm_rules": SLAAD_RULES}
+    raw = "*Snarls.* Yes, I understand you perfectly. How may I help?"
+    tagged = ensure_required_dm_check_tags(npc, {"rulings": []}, raw)
+    enforced = enforce_unruled_check_spoken_behavior(npc, {"rulings": []}, tagged)
+    assert "understand you" not in enforced.lower()
+    assert "Skraa-vek" in enforced
+    assert "[DM CHECK:" in enforced
+    assert "necessary language" in enforced.lower()
+
+
+def test_generate_rewrites_english_for_unruled_language_barrier():
+    npc = {"llm_rules": SLAAD_RULES}
+    text = generate_npc_reply_text(
+        npc,
+        {"rulings": []},
+        [],
+        lambda _m: "Hello, I can help you with that.",
+    )
+    assert "help you" not in text.lower()
+    assert "Skraa-vek" in text
+    assert "[DM CHECK:" in text
+
+
+def test_generate_allows_english_after_language_success_ruling():
+    npc = {"llm_rules": SLAAD_RULES}
+    dm_context = {
+        "rulings": [
+            {
+                "verdict": "confirmed",
+                "claim_summary": "Does the speaker know the necessary language to talk to the NPC",
+                "ruling_text": "Yes, they speak the language.",
+            }
+        ]
+    }
+    text = generate_npc_reply_text(
+        npc,
+        dm_context,
+        [],
+        lambda _m: "Welcome, traveler. What do you need?",
+    )
+    assert "Welcome, traveler" in text
     assert "[DM CHECK:" not in text
