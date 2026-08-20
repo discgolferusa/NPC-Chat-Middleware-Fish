@@ -396,8 +396,9 @@ def ensure_sentence_ending(text: str) -> str:
 
 
 # Nonverbal stage-direction cues (*Varra narrows her eyes.* / *Snarls.*).
-# Asterisk-wrapped spoken dialogue (fantasy language, denied claims, etc.) must
-# stay on the NPC voice — models often italicize those lines by mistake.
+# Asterisk bodies default to NPC speech; only a short, pure stage beat stays
+# on the narrator. A verb anywhere in mixed action+dialogue must not flip the
+# whole span to narrator.
 _NONVERBAL_STAGE_VERB_RE = re.compile(
     r"(?i)\b("
     r"narrows|cocks|snarls|glares|nods|shrugs|points|smiles|grins|frowns|sighs|"
@@ -407,20 +408,43 @@ _NONVERBAL_STAGE_VERB_RE = re.compile(
     r"freezes|blinks|winces|grimaces|sneers|scowls|beams|grunts"
     r")\b"
 )
+_SPEECH_FRAME_RE = re.compile(
+    r"(?i)\b("
+    r"says|said|asks|asked|tells|told|replies|replied|shouts|shouted|"
+    r"yells|yelled|answers|answered|speaks|spoke|speaking"
+    r")\b"
+)
+_FIRST_PERSON_OR_ADDRESS_RE = re.compile(
+    r"(?i)^(I|I'm|I'll|I'd|I've|We|We're|We'll|You|You're|You'll)\b"
+)
+_MAX_STAGE_WORDS = 8
 
 
 def is_nonverbal_stage_direction(text: str) -> bool:
-    """True when asterisk-inner text is a nonverbal beat, not spoken dialogue."""
+    """True only for a short pure nonverbal beat, not mixed/spoken asterisk text."""
     inner = (text or "").strip().strip("*").strip()
     if not inner:
         return False
     lowered = inner.lower()
     if "waiting on a decision from game master" in lowered or "waiting on a dm decision" in lowered:
         return True
-    # Spoken lines often ask/exclaim; stage beats usually do not.
+    # Spoken lines — questions, direct speech framing, first-person/address.
     if "?" in inner:
         return False
-    return bool(_NONVERBAL_STAGE_VERB_RE.search(inner))
+    if _SPEECH_FRAME_RE.search(inner):
+        return False
+    if _FIRST_PERSON_OR_ADDRESS_RE.match(inner):
+        return False
+    # Action + dialogue in one italics span ("Snarls. Leave now.") → NPC.
+    if re.search(r"[.!]+\s+\S", inner):
+        return False
+    words = re.findall(r"[A-Za-z0-9']+(?:-[A-Za-z0-9']+)?", inner)
+    if len(words) > _MAX_STAGE_WORDS:
+        return False
+    # Fantasy / dialogue-only lines with no stage verb stay on NPC.
+    if not _NONVERBAL_STAGE_VERB_RE.search(inner):
+        return False
+    return True
 
 
 def asterisk_body_tts_type(inner: str) -> str:

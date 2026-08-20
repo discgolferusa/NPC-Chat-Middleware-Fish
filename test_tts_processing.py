@@ -45,6 +45,18 @@ def test_asterisk_body_tts_type_puts_spoken_lines_on_npc():
     assert not is_nonverbal_stage_direction("Krah-vesh?")
 
 
+def test_asterisk_body_tts_type_rejects_mixed_action_and_dialogue():
+    # A stage verb anywhere must not force the whole italics span onto narrator.
+    assert asterisk_body_tts_type("Snarls. I will not open the gate.") == "npc"
+    assert asterisk_body_tts_type("He looks at you coldly. Leave now.") == "npc"
+    assert asterisk_body_tts_type("I raise my voice and refuse.") == "npc"
+    assert asterisk_body_tts_type("She turns away and says the vault stays sealed.") == "npc"
+    assert asterisk_body_tts_type("You shake the latch, but it holds.") == "npc"
+    assert asterisk_body_tts_type(
+        "He looks toward the door and refuses without another word."
+    ) == "npc"
+
+
 def test_curated_low_quality_is_less_noisy():
     low = curated_defaults_for_quality("low")
     medium = curated_defaults_for_quality("medium")

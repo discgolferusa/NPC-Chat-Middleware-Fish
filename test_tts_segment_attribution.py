@@ -39,6 +39,16 @@ def test_split_puts_italicized_denied_claim_dialogue_on_npc():
     assert "gate" in segments[0]["text"].lower()
 
 
+def test_split_puts_mixed_action_and_dialogue_italics_on_npc():
+    import server
+
+    segments = server.split_into_ordered_tts_segments(
+        "*Snarls. I will not open the gate.*"
+    )
+    assert len(segments) == 1
+    assert segments[0]["type"] == "npc"
+
+
 def test_split_keeps_wait_narration_on_narrator():
     import server
 
