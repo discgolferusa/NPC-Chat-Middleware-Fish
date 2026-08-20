@@ -1951,9 +1951,20 @@ def split_into_ordered_tts_segments(
 
     Asterisk-wrapped nonverbal stage directions become narrator clips. Spoken
     dialogue wrongly wrapped in asterisks (common after DM rulings / language
-    barriers) stays on the NPC voice.
+    barriers) stays on the NPC voice. Bare DM-wait copy (no asterisks) is still
+    narrator so Piper never voices the hold line as the NPC.
     """
     raw_text, _ = strip_dm_check_tag(text or "")
+
+    # Whole-turn wait lines often lose asterisks in transit; never NPC-voice them.
+    if is_dm_wait_narration(raw_text):
+        cleaned = clean_for_tts(
+            raw_text.strip().strip("*").strip(),
+            pronunciation=pronunciation,
+        )
+        if cleaned:
+            return [{"type": "narrator", "text": cleaned}]
+        return []
 
     segments: list[dict] = []
     pattern = re.compile(r"\*([^*]{1,800})\*")
@@ -1967,7 +1978,10 @@ def split_into_ordered_tts_segments(
     for match in pattern.finditer(raw_text):
         before = raw_text[last_end:match.start()].strip()
         if before:
-            _append("npc", before)
+            if is_dm_wait_narration(before):
+                _append("narrator", before)
+            else:
+                _append("npc", before)
 
         stage = match.group(1).strip()
         if stage:
@@ -1977,7 +1991,10 @@ def split_into_ordered_tts_segments(
 
     after = raw_text[last_end:].strip()
     if after:
-        _append("npc", after)
+        if is_dm_wait_narration(after):
+            _append("narrator", after)
+        else:
+            _append("npc", after)
 
     if not segments:
         fallback = clean_for_tts(raw_text, pronunciation=pronunciation)

@@ -573,15 +573,25 @@ def enforce_unruled_check_spoken_behavior(
     """
     When a language-barrier DM CHECK is still unruled (or Failure was ruled),
     strip English comprehension dialogue the model may have added before/after tags.
+
+    After a Failure ruling, also strip OOC wait narration the model may echo from
+    earlier held turns — that line must not play again without opening a new check.
     """
     barrier = _language_barrier_enforcement_context(npc, dm_context)
     if not barrier:
         return raw_text
 
-    from dm_channel import extract_dm_check_tags
+    from dm_channel import extract_dm_check_tags, is_dm_wait_narration
 
     spoken, claims = extract_dm_check_tags(raw_text)
-    if not _looks_like_english_comprehension(spoken):
+    needs_rewrite = _looks_like_english_comprehension(spoken)
+    spoken_for_rewrite = spoken
+    if barrier.get("mode") == "failure" and is_dm_wait_narration(spoken):
+        # Deny already settled the language question; never re-hold on wait copy,
+        # and never feed wait text back as a stage direction for the rewrite LLM.
+        needs_rewrite = True
+        spoken_for_rewrite = ""
+    if not needs_rewrite:
         return raw_text
 
     native_language = resolve_npc_native_language(
@@ -589,7 +599,7 @@ def enforce_unruled_check_spoken_behavior(
         language_claim=barrier["language_claim"],
     )
     rewritten = _rewrite_language_barrier_spoken(
-        spoken,
+        spoken_for_rewrite,
         npc,
         native_language=native_language,
         player_text=player_text,
