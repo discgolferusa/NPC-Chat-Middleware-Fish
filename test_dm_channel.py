@@ -283,6 +283,7 @@ def test_assistant_history_text_skips_wait_narration():
     import dm_channel
 
     assert dm_channel.is_dm_wait_narration(dm_channel.DM_PENDING_WAIT_NARRATION)
+    assert dm_channel.is_dm_wait_narration("*Waiting on a DM decision.*")
     assert dm_channel.assistant_history_text({
         "spoken_text": dm_channel.DM_PENDING_WAIT_NARRATION,
         "held_spoken_text": "The gate is open. Come through.",

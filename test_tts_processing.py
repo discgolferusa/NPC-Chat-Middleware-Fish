@@ -9,11 +9,13 @@ import pytest
 
 from tts_processing import (
     VALID_FX_PRESETS,
+    asterisk_body_tts_type,
     build_af_filter,
     clean_for_tts,
     curated_defaults_for_quality,
     infer_dataset_name,
     infer_quality_tier,
+    is_nonverbal_stage_direction,
     load_piper_model_meta,
     options_from_request_and_npc,
     resolve_tts_options,
@@ -25,6 +27,34 @@ def test_clean_for_tts_expands_and_pronounces():
     assert "Doctor" in text
     assert "go LAR ee un" in text
     assert text.endswith(".")
+
+
+def test_asterisk_body_tts_type_keeps_stage_beats_on_narrator():
+    assert is_nonverbal_stage_direction("Varra narrows her eyes.")
+    assert is_nonverbal_stage_direction("Snarls.")
+    assert is_nonverbal_stage_direction("Waiting on a decision from game master.")
+    assert is_nonverbal_stage_direction("Waiting on a DM decision.")
+    assert asterisk_body_tts_type("Xill cocks its head.") == "narrator"
+
+
+def test_asterisk_body_tts_type_puts_spoken_lines_on_npc():
+    # Language-barrier / denied-claim dialogue often arrives fully italicized.
+    assert asterisk_body_tts_type("Krah-vesh?") == "npc"
+    assert asterisk_body_tts_type("Skraa-vek krah.") == "npc"
+    assert asterisk_body_tts_type("I do not understand your tongue.") == "npc"
+    assert not is_nonverbal_stage_direction("Krah-vesh?")
+
+
+def test_asterisk_body_tts_type_rejects_mixed_action_and_dialogue():
+    # A stage verb anywhere must not force the whole italics span onto narrator.
+    assert asterisk_body_tts_type("Snarls. I will not open the gate.") == "npc"
+    assert asterisk_body_tts_type("He looks at you coldly. Leave now.") == "npc"
+    assert asterisk_body_tts_type("I raise my voice and refuse.") == "npc"
+    assert asterisk_body_tts_type("She turns away and says the vault stays sealed.") == "npc"
+    assert asterisk_body_tts_type("You shake the latch, but it holds.") == "npc"
+    assert asterisk_body_tts_type(
+        "He looks toward the door and refuses without another word."
+    ) == "npc"
 
 
 def test_curated_low_quality_is_less_noisy():

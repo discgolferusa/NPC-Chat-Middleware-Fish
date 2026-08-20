@@ -527,7 +527,7 @@ def test_npc_turn_authored_dm_check_is_enforced(api, monkeypatch):
     body = turn.get_json()
     reply = body.get("npc_text") or body.get("text") or ""
     assert llm_calls["n"] == 0
-    assert "waiting on a dm decision" in reply.lower()
+    assert "waiting on a decision from game master" in reply.lower()
     assert "Krah-vesh" not in reply
     assert body.get("dm_check_claim")
     assert "necessary language" in str(body.get("dm_check_claim")).lower()
@@ -593,7 +593,7 @@ def test_npc_turn_slaad_strips_english_when_language_check_unruled(api, monkeypa
     body = turn.get_json()
     reply = body.get("npc_text") or body.get("text") or ""
     assert llm_calls["n"] == 0
-    assert "waiting on a dm decision" in reply.lower()
+    assert "waiting on a decision from game master" in reply.lower()
     assert "understand you" not in reply.lower()
     assert "Krah-thok" not in reply
     assert body.get("dm_check_claim")
@@ -648,7 +648,7 @@ def test_npc_turn_without_authored_template_does_not_invent_check(api, monkeypat
     assert llm_calls["n"] == 1
     assert body.get("dm_check_claims") in (None, [])
     assert body.get("dm_check_claim") is None
-    assert "waiting on a dm decision" in (body.get("npc_text") or "").lower()
+    assert "waiting on a decision from game master" in (body.get("npc_text") or "").lower()
     campaign_id = body.get("campaign_id") or "greyhaven_intro"
     history = server.load_recent_turns(npc_id, player_id, campaign_id=campaign_id)
     assistant = " ".join(
@@ -657,7 +657,7 @@ def test_npc_turn_without_authored_template_does_not_invent_check(api, monkeypat
         if row["role"] == "assistant"
     )
     assert "cannot simply take your word" in assistant.lower()
-    assert "waiting on a dm decision" not in assistant.lower()
+    assert "waiting on a decision from game master" not in assistant.lower()
 
 
 def test_npc_turn_situational_template_greeting_still_speaks(api, monkeypatch):
@@ -707,7 +707,7 @@ def test_npc_turn_situational_template_greeting_still_speaks(api, monkeypatch):
     body = turn.get_json()
     assert llm_calls["n"] == 1
     assert "reading room is open" in (body.get("npc_text") or "").lower()
-    assert "waiting on a dm decision" not in (body.get("npc_text") or "").lower()
+    assert "waiting on a decision from game master" not in (body.get("npc_text") or "").lower()
     assert body.get("dm_check_claim") is None
     assert not body.get("dm_pending_check_id")
 

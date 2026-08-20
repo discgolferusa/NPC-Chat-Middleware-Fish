@@ -490,16 +490,22 @@ def _generate_native_language_barrier_reply(
     npc_name = (npc.get("name") or npc.get("id") or "The NPC").strip()
     player_line = (player_text or "").strip() or "(The player spoke, but you cannot understand them.)"
     stage_hint = (
-        f"Begin with this stage direction exactly: {stage_direction}"
+        f"You may begin with this nonverbal stage direction exactly: {stage_direction} "
+        "Then put spoken words in plain text (no asterisks around speech)."
         if stage_direction
-        else "You may begin with one short *stage direction*."
+        else (
+            "You may begin with one short nonverbal *stage direction* "
+            "(action only, like *cocks its head.*). "
+            "Put all spoken words in plain text after that — never wrap speech in asterisks."
+        )
     )
     messages = [
         {
             "role": "system",
             "content": (
                 "You write one brief in-character NPC line for a tabletop RPG. "
-                "Output spoken content only in the requested language — never English."
+                "Output spoken content only in the requested language — never English. "
+                "Asterisks are only for nonverbal stage directions, never for spoken words."
             ),
         },
         {
