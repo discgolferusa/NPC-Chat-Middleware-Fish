@@ -314,6 +314,36 @@ def test_generate_can_skip_required_dm_check_enforcement():
     assert "[DM CHECK:" not in text
 
 
+def test_generate_rewrites_english_on_denied_language_even_when_checks_not_enforced():
+    """Post-ruling auto-reply skips re-tagging but must not speak English after Failure."""
+    claim = "Does the speaker know the necessary language to talk to the NPC"
+    dm_context = {
+        "rulings": [
+            {"verdict": "denied", "claim_summary": claim},
+        ]
+    }
+    calls = {"n": 0}
+
+    def _ask(messages):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return "I refuse. You do not know my tongue."
+        return "*Snarls.* Krah-thok slaad-vek?"
+
+    text = generate_npc_reply_text(
+        SLAAD_NPC,
+        dm_context,
+        [{"role": "user", "content": "follow up"}],
+        _ask,
+        player_text="Open the gate.",
+        enforce_required_dm_checks=False,
+    )
+    assert "refuse" not in text.lower()
+    assert "tongue" not in text.lower()
+    assert "[DM CHECK:" not in text
+    assert "krah" in text.lower() or "skraa" in text.lower()
+
+
 def test_slaad_quoted_yaml_rules_extract_language_template():
     npc = {"llm_rules": SLAAD_RULES}
     claims = extract_dm_check_templates_from_rules(npc)

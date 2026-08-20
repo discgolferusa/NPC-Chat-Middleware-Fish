@@ -339,6 +339,11 @@ def _is_language_comprehension_claim(claim: str) -> bool:
     return False
 
 
+def is_language_comprehension_claim(claim: str) -> bool:
+    """Public alias for DM follow-up / auto-response language-barrier hints."""
+    return _is_language_comprehension_claim(claim)
+
+
 def _language_barrier_templates(npc: dict[str, Any] | None) -> list[str]:
     return [
         claim
@@ -762,7 +767,8 @@ def generate_npc_reply_text(
     left to the model via global/NPC llm_rules.
 
     Set ``enforce_required_dm_checks=False`` for post-ruling auto-replies so a just-
-    resolved claim is not force-appended again.
+    resolved claim is not force-appended again. Language-barrier **Failure** rewrites
+    still run so a Deny cannot leave the NPC speaking English.
     """
     if enforce_required_dm_checks and _should_skip_llm_for_pending_dm(npc, dm_context):
         from dm_channel import DM_PENDING_WAIT_NARRATION
@@ -772,6 +778,15 @@ def generate_npc_reply_text(
     log_llm_prompt_to_console(messages)
     raw = ask_llm_fn(messages)
     if not enforce_required_dm_checks:
+        barrier = _language_barrier_enforcement_context(npc, dm_context)
+        if barrier and barrier.get("mode") == "failure":
+            return enforce_unruled_check_spoken_behavior(
+                npc,
+                dm_context,
+                raw,
+                player_text=player_text,
+                ask_llm_fn=ask_llm_fn,
+            )
         return raw
     tagged = ensure_required_dm_check_tags(npc, dm_context, raw)
     return enforce_unruled_check_spoken_behavior(
