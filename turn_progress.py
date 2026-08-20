@@ -24,6 +24,14 @@ class TurnInProgressError(Exception):
         self.progress = progress
         super().__init__(progress.get("message") or "turn_in_progress")
 
+
+class TurnSupersededError(Exception):
+    """Raised when a turn was force-displaced and must not save history or synthesize audio."""
+
+    def __init__(self, progress: dict[str, Any] | None = None):
+        self.progress = progress or {}
+        super().__init__(self.progress.get("error") or "superseded")
+
 REQUEST_ID_RE = re.compile(r"^[a-f0-9]{32}$")
 PROGRESS_TTL_SECONDS = 60 * 30
 
@@ -94,6 +102,21 @@ def _release_active_turn(entry: dict[str, Any]) -> None:
         return
     if _ACTIVE_TURNS.get(key) == entry.get("request_id"):
         _ACTIVE_TURNS.pop(key, None)
+
+
+def _mark_turn_superseded_locked(entry: dict[str, Any]) -> None:
+    """Fail a displaced in-flight turn so its handler stops mutating history/TTS."""
+    if entry.get("status") in ("complete", "error", "failed"):
+        return
+    mode = entry.get("mode") or "text"
+    entry["status"] = "error"
+    entry["step"] = "error"
+    entry["message"] = "This response was replaced by a newer turn."
+    entry["error"] = "superseded"
+    entry["step_index"] = _step_count(mode)
+    entry["updated_at"] = _utc_now_iso()
+    entry["expires_at"] = time.time() + PROGRESS_TTL_SECONDS
+    _release_active_turn(entry)
 
 
 def _cleanup_expired() -> None:
@@ -207,11 +230,45 @@ def register_turn_progress(
                 if existing and existing.get("status") == "in_progress":
                     if not force:
                         raise TurnInProgressError(public_progress(existing))
-                    _release_active_turn(existing)
+                    # Stealing the slot alone is not enough: the displaced handler keeps
+                    # running unless we mark it terminal so save/TTS checkpoints bail out.
+                    _mark_turn_superseded_locked(existing)
             _ACTIVE_TURNS[key] = request_id
         _PROGRESS[request_id] = entry
 
     return public_progress(entry)
+
+
+def turn_is_in_progress(request_id: str) -> bool:
+    """
+    True when this request may continue side effects.
+
+    Missing or untracked request ids return True so ad-hoc TTS helpers without
+    register_turn_progress keep working. Registered turns that were completed,
+    failed, or force-superseded return False.
+    """
+    normalized = normalize_client_request_id(request_id)
+    if not normalized:
+        return True
+
+    with _PROGRESS_LOCK:
+        entry = _PROGRESS.get(normalized)
+        if not entry:
+            return True
+        return entry.get("status") == "in_progress"
+
+
+def ensure_turn_in_progress(request_id: str) -> dict[str, Any]:
+    """Raise TurnSupersededError when a registered turn is no longer active."""
+    request_id = normalize_client_request_id(request_id)
+    if not request_id:
+        raise TurnSupersededError()
+
+    with _PROGRESS_LOCK:
+        entry = _PROGRESS.get(request_id)
+        if not entry or entry.get("status") != "in_progress":
+            raise TurnSupersededError(public_progress(entry) if entry else None)
+        return public_progress(entry)
 
 
 def set_turn_progress(

@@ -111,7 +111,9 @@ from scene_state import (
 )
 from turn_progress import (
     TurnInProgressError,
+    TurnSupersededError,
     complete_turn_progress,
+    ensure_turn_in_progress,
     fail_turn_progress,
     get_active_turn_progress,
     get_turn_progress,
@@ -120,6 +122,7 @@ from turn_progress import (
     normalize_client_request_id,
     register_turn_progress,
     set_turn_progress,
+    turn_is_in_progress,
 )
 from server_settings import format_llm_rules, get_narrator_tts_settings, load_global_llm_rules
 from prompt_caps import get_prompt_caps, save_prompt_caps, DEFAULT_PROMPT_CAPS
@@ -1320,6 +1323,14 @@ def _turn_in_progress_response(progress: dict):
     }), 409
 
 
+def _turn_superseded_response(request_id: str, progress: dict | None = None):
+    payload = dict(progress or {})
+    payload["request_id"] = request_id
+    payload["error"] = "superseded"
+    payload["message"] = payload.get("message") or "This response was replaced by a newer turn."
+    return jsonify(payload), 409
+
+
 def build_dm_followup_messages(
     npc: dict,
     scene: dict,
@@ -1462,6 +1473,7 @@ def run_dm_ruling_auto_response(
         if not npc_text:
             npc_text = "Very well."
 
+        ensure_turn_in_progress(request_id)
         history_text = assistant_history_text(npc_response) or npc_text
         if not is_dm_wait_narration(history_text):
             save_turn(npc_id, player_id, "assistant", history_text, campaign_id=campaign_id)
@@ -1476,6 +1488,7 @@ def run_dm_ruling_auto_response(
         dialogue_text = ""
 
         if include_audio:
+            ensure_turn_in_progress(request_id)
             set_turn_progress(request_id, "synthesizing_speech")
             request_tts = dict(tts_options or {})
             if tts_length_scale is not None and "tts_length_scale" not in request_tts:
@@ -1536,6 +1549,18 @@ def run_dm_ruling_auto_response(
             "reason": "turn_in_progress",
             "error": "turn_in_progress",
             "active_turn": ex.progress,
+        }
+    except TurnSupersededError as ex:
+        print(
+            f"[DM] auto-response superseded request_id={request_id} npc={npc_id} player={player_id}",
+            flush=True,
+        )
+        return {
+            "generated": False,
+            "request_id": request_id,
+            "reason": "superseded",
+            "error": "superseded",
+            "progress": ex.progress,
         }
     except Exception as ex:
         if progress_started:
@@ -2234,7 +2259,14 @@ def synthesize_segmented_speech_clips(
         "lock": threading.Lock(),
     }
 
-    def _synthesize_one(index: int, segment: dict[str, Any]) -> dict[str, Any]:
+    def _synthesize_one(index: int, segment: dict[str, Any]) -> dict[str, Any] | None:
+        if not turn_is_in_progress(request_id):
+            print(
+                f"[PLAYER-AUDIO] clip_skipped_superseded request_id={request_id} index={index}",
+                flush=True,
+            )
+            return None
+
         raw_path = OUTPUT_DIR / f"{request_id}_raw_{index:02d}_{segment['type']}.wav"
         out_path = turn_audio_path(request_id, index)
         clip_type = "narration" if segment["type"] == "narrator" else "speech"
@@ -2318,7 +2350,8 @@ def synthesize_segmented_speech_clips(
         }
 
     # Always synthesize the first clip on the request thread.
-    _synthesize_one(0, segments[0])
+    if _synthesize_one(0, segments[0]) is None:
+        return _result(pending=False)
 
     if return_after_first_clip and len(segments) > 1:
         remaining = list(enumerate(segments[1:], start=1))
@@ -2327,7 +2360,8 @@ def synthesize_segmented_speech_clips(
             error: BaseException | None = None
             try:
                 for index, segment in remaining:
-                    _synthesize_one(index, segment)
+                    if _synthesize_one(index, segment) is None:
+                        break
             except BaseException as ex:
                 error = ex
                 print(
@@ -2358,7 +2392,8 @@ def synthesize_segmented_speech_clips(
         return _result(pending=True)
 
     for index, segment in enumerate(segments[1:], start=1):
-        _synthesize_one(index, segment)
+        if _synthesize_one(index, segment) is None:
+            break
 
     return _result(pending=False)
 
@@ -2690,6 +2725,7 @@ def npc_turn():
         )
         step_start = log_timing(request_id, "llm text npc response", step_start)
 
+        ensure_turn_in_progress(request_id)
         set_turn_progress(request_id, "processing_response")
         npc_response = process_npc_response(
             npc_id,
@@ -2701,6 +2737,7 @@ def npc_turn():
             )
         npc_text = npc_response["spoken_text"]
 
+        ensure_turn_in_progress(request_id)
         save_player_npc_conversation_turns(
             npc_id,
             player_id,
@@ -2758,6 +2795,7 @@ def npc_turn():
         audio_clips: list[dict[str, str]] = []
 
         if include_audio:
+            ensure_turn_in_progress(request_id)
             # Keep progress in_progress through TTS, then complete once. Completing
             # before synthesize + reopening left clients polling forever after playback.
             set_turn_progress(request_id, "synthesizing_speech")
@@ -2812,6 +2850,14 @@ def npc_turn():
             payload["audio_clips"] = audio_clips
 
         return attach_timing_headers(jsonify(payload), request_id)
+
+    except TurnSupersededError as ex:
+        print(
+            f"[NPC-TURN] superseded request_id={request_id} npc={npc_id}",
+            flush=True,
+        )
+        body, status = _turn_superseded_response(request_id, ex.progress)
+        return attach_timing_headers(body, request_id), status
 
     except Exception as ex:
         fail_turn_progress(request_id, "turn_failed")
@@ -2944,6 +2990,7 @@ def npc_voice_turn():
         )
         step_start = log_timing(request_id, "llm npc response", step_start)
 
+        ensure_turn_in_progress(request_id)
         set_turn_progress(request_id, "processing_response")
         npc_response = process_npc_response(
             npc_id,
@@ -2985,6 +3032,7 @@ def npc_voice_turn():
                 dialogue_text=tts_text,
             )
 
+        ensure_turn_in_progress(request_id)
         save_player_npc_conversation_turns(
             npc_id,
             player_id,
@@ -3028,6 +3076,8 @@ def npc_voice_turn():
         )
 
         def _on_clip_ready(clip, clips_so_far):
+            if not turn_is_in_progress(request_id):
+                return
             step = "clip_ready"
             if clip.get("type") == "narration":
                 step = "narration_ready"
@@ -3048,6 +3098,8 @@ def npc_voice_turn():
             )
 
         def _on_stream_complete(final_result: dict, error: BaseException | None) -> None:
+            if not turn_is_in_progress(request_id):
+                return
             if error is not None:
                 fail_turn_progress(request_id, "tts_stream_failed")
                 return
@@ -3067,6 +3119,7 @@ def npc_voice_turn():
                 flush=True,
             )
 
+        ensure_turn_in_progress(request_id)
         clip_result = synthesize_segmented_speech_clips(
             npc_text=npc_text,
             npc_voice_model=pick_npc_voice_model(
@@ -3162,6 +3215,14 @@ def npc_voice_turn():
         if speech_path:
             response.headers["X-Speech-Audio-Url"] = turn_audio_url(request_id, "speech")
         return attach_timing_headers(response, request_id)
+
+    except TurnSupersededError as ex:
+        print(
+            f"[DM] route=/npc-voice-turn stage=superseded request_id={request_id}",
+            flush=True,
+        )
+        body, status = _turn_superseded_response(request_id, ex.progress)
+        return attach_timing_headers(body, request_id), status
 
     except Exception as ex:
         total_elapsed = time.perf_counter() - total_start

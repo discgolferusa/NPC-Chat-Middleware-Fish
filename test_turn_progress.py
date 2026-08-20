@@ -159,3 +159,30 @@ def test_force_register_displaces_active_turn():
     active = tp.get_active_turn_progress("camp-3", "bob", "alice")
     assert active is not None
     assert active["request_id"] == rid_b
+
+    old = tp.get_turn_progress(rid_a)
+    assert old is not None
+    assert old["status"] == "error"
+    assert old["error"] == "superseded"
+    assert tp.turn_is_in_progress(rid_a) is False
+    assert tp.turn_is_in_progress(rid_b) is True
+
+    try:
+        tp.ensure_turn_in_progress(rid_a)
+        assert False, "expected TurnSupersededError"
+    except tp.TurnSupersededError as ex:
+        assert ex.progress["request_id"] == rid_a
+        assert ex.progress["error"] == "superseded"
+
+    # Displaced turn must not reopen or reclaim the active slot.
+    assert tp.set_turn_progress(rid_a, "synthesizing_speech")["status"] == "error"
+    assert tp.complete_turn_progress(rid_a)["status"] == "error"
+    still_active = tp.get_active_turn_progress("camp-3", "bob", "alice")
+    assert still_active is not None
+    assert still_active["request_id"] == rid_b
+
+
+def test_turn_is_in_progress_allows_untracked_request_ids():
+    # Ad-hoc TTS helpers may synthesize without register_turn_progress.
+    assert tp.turn_is_in_progress("ffffffffffffffffffffffffffffffff") is True
+    assert tp.turn_is_in_progress("not-a-client-request-id") is True
