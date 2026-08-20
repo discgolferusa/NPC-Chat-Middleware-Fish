@@ -340,3 +340,34 @@ def test_generate_allows_english_after_language_success_ruling():
     )
     assert "Welcome, traveler" in text
     assert "[DM CHECK:" not in text
+
+
+def test_language_comprehension_claim_rejects_generic_understand():
+    from required_dm_checks import _is_language_comprehension_claim
+
+    assert not _is_language_comprehension_claim("does the player understand the secret")
+    assert not _is_language_comprehension_claim("party understands the mayor's plan")
+    assert _is_language_comprehension_claim(
+        "Does the speaker know the necessary language to talk to the NPC"
+    )
+    assert _is_language_comprehension_claim(
+        "does this speaker know Language Slaadi"
+    )
+
+
+def test_generic_understand_npc_is_not_rewritten_to_fantasy_language():
+    """Failure + understand in rules must not trigger barrier rewrite without barrier setup."""
+    from required_dm_checks import enforce_unruled_check_spoken_behavior
+
+    npc = {
+        "llm_rules": [
+            "End unsettled replies with [DM CHECK: does the player understand the secret]",
+            "[DM Ruling: Success] Reveal the secret.",
+            "[DM Ruling: Failure] You do not understand what they mean.",
+        ],
+    }
+    raw = "Yes, I understand completely. Here is the answer."
+    tagged = ensure_required_dm_check_tags(npc, {"rulings": []}, raw)
+    enforced = enforce_unruled_check_spoken_behavior(npc, {"rulings": []}, tagged)
+    assert "Skraa-vek" not in enforced
+    assert "understand completely" in enforced.lower()

@@ -33,12 +33,22 @@ DM_RULING_FAILURE_PATTERN = re.compile(
 
 _STAGE_DIRECTION_PATTERN = re.compile(r"^\*[^*]+\*\s*")
 
-_LANGUAGE_CLAIM_MARKERS = (
-    "language",
-    "understand",
-    "comprehend",
-    "talk to the npc",
-    "speak to the npc",
+# Claim must be about speaking/comprehending a language — not generic "understand X".
+_LANGUAGE_BARRIER_CLAIM_PHRASES = (
+    "necessary language",
+    "know the language",
+    "knows the language",
+    "know language",
+    "speak the language",
+    "speaks the language",
+    "speak language",
+    "language to talk",
+    "language to speak",
+)
+
+_LANGUAGE_BARRIER_CLAIM_PATTERN = re.compile(
+    r"language\s+[a-z]{4,}",
+    re.IGNORECASE,
 )
 
 _ENGLISH_COMPREHENSION_WORDS = frozenset(
@@ -203,16 +213,37 @@ def required_dm_checks(
 
 
 def _is_language_comprehension_claim(claim: str) -> bool:
+    """True only for language-barrier checks, not generic 'does the player understand X'."""
     normalized = _normalize_claim(claim)
-    return any(marker in normalized for marker in _LANGUAGE_CLAIM_MARKERS)
+    if not normalized:
+        return False
+    if _LANGUAGE_BARRIER_CLAIM_PATTERN.search(normalized):
+        return True
+    if "language" not in normalized:
+        return False
+    if any(phrase in normalized for phrase in _LANGUAGE_BARRIER_CLAIM_PHRASES):
+        return True
+    # Authored template: "Does the speaker know the necessary language to talk to the NPC"
+    if "speaker" in normalized and "know" in normalized:
+        return True
+    return False
 
 
 def _npc_has_language_barrier_rules(npc: dict[str, Any] | None) -> bool:
     blob = _npc_rules_blob(npc).lower()
-    return (
-        "do not treat the speaker as understood" in blob
-        or "fantasy-language" in blob
-        or ("dm ruling: failure" in blob and "understand" in blob)
+    if "do not treat the speaker as understood" in blob:
+        return True
+    if "fantasy-language" in blob:
+        return True
+    failure_hint = _extract_failure_ruling_hint(npc).lower()
+    return bool(
+        failure_hint
+        and (
+            "fantasy-language" in failure_hint
+            or "do not understand them" in failure_hint
+            or "cannot understand them" in failure_hint
+            or "show you cannot understand" in failure_hint
+        )
     )
 
 
