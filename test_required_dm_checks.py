@@ -279,14 +279,22 @@ def test_generate_does_not_invent_check_from_player_text():
 
 def test_generate_still_enforces_authored_template():
     npc = {"llm_rules": LANGUAGE_RULES}
+    calls = {"n": 0}
+
+    def _ask(_messages):
+        calls["n"] += 1
+        return "Confused stare."
+
     text = generate_npc_reply_text(
         npc,
         {"rulings": []},
         [],
-        lambda _m: "Confused stare.",
+        _ask,
         player_text="Hello",
     )
-    assert "Confused stare." in text
+    assert calls["n"] == 0
+    assert "Confused stare." not in text
+    assert "Waiting on a DM decision" in text
     assert "[DM CHECK:" in text
     assert "necessary language" in text.lower()
 
@@ -384,10 +392,29 @@ def test_generate_rewrites_english_for_unruled_language_barrier():
         _ask,
         player_text="Hello, can you help us?",
     )
-    assert calls["n"] == 2
+    assert calls["n"] == 0
     assert "help you" not in text.lower()
-    assert "Krah-thok" in text
+    assert "Waiting on a DM decision" in text
     assert "[DM CHECK:" in text
+
+
+def test_generate_skips_llm_when_pending_check_already_in_context():
+    calls = {"n": 0}
+
+    def _ask(_messages):
+        calls["n"] += 1
+        return "Sure, come on through."
+
+    text = generate_npc_reply_text(
+        {"llm_rules": ["Be stern."]},
+        {"pending_checks": [{"claim_summary": "player has a writ", "status": "pending"}]},
+        [],
+        _ask,
+        player_text="Let us pass.",
+    )
+    assert calls["n"] == 0
+    assert "Waiting on a DM decision" in text
+    assert "come on through" not in text.lower()
 
 
 def test_generate_allows_english_after_language_success_ruling():

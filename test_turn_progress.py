@@ -8,6 +8,7 @@ import turn_progress as tp
 def setup_function(_):
     with tp._PROGRESS_LOCK:
         tp._PROGRESS.clear()
+        tp._ACTIVE_TURNS.clear()
 
 
 def test_normalize_and_new_request_id():
@@ -76,3 +77,59 @@ def test_text_steps_include_synthesizing_speech():
     assert "synthesizing_speech" in keys
     assert keys.index("synthesizing_speech") < keys.index("finishing")
     assert keys.index("finishing") < keys.index("complete")
+
+
+def test_active_turn_blocks_second_register():
+    rid_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    rid_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    tp.register_turn_progress(
+        rid_a,
+        route="/npc-turn",
+        npc_id="bob",
+        player_id="alice",
+        mode="text",
+        campaign_id="camp-1",
+    )
+    active = tp.get_active_turn_progress("camp-1", "bob", "alice")
+    assert active is not None
+    assert active["request_id"] == rid_a
+
+    try:
+        tp.register_turn_progress(
+            rid_b,
+            route="/npc-turn",
+            npc_id="bob",
+            player_id="alice",
+            mode="text",
+            campaign_id="camp-1",
+        )
+        assert False, "expected TurnInProgressError"
+    except tp.TurnInProgressError as ex:
+        assert ex.progress["request_id"] == rid_a
+
+    tp.complete_turn_progress(rid_a)
+    assert tp.get_active_turn_progress("camp-1", "bob", "alice") is None
+
+    registered = tp.register_turn_progress(
+        rid_b,
+        route="/npc-turn",
+        npc_id="bob",
+        player_id="alice",
+        mode="text",
+        campaign_id="camp-1",
+    )
+    assert registered["request_id"] == rid_b
+
+
+def test_fail_turn_releases_active_slot():
+    rid = "cccccccccccccccccccccccccccccccc"
+    tp.register_turn_progress(
+        rid,
+        route="/dm-ruling-auto-response",
+        npc_id="bob",
+        player_id="alice",
+        mode="text",
+        campaign_id="camp-2",
+    )
+    tp.fail_turn_progress(rid, "boom")
+    assert tp.get_active_turn_progress("camp-2", "bob", "alice") is None

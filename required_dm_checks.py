@@ -741,12 +741,21 @@ def generate_npc_reply_text(
     """
     Call the LLM, then ensure NPC-authored required DM CHECK tags are present.
 
+    When a required check is still unruled (or a pending check is already in
+    ``dm_context``), skip the NPC reply LLM and return narrator wait-copy plus
+    the required tags so the NPC does not speak before the DM rules.
+
     ``player_text`` is accepted for call-site compatibility; intent classification is
     left to the model via global/NPC llm_rules.
 
     Set ``enforce_required_dm_checks=False`` for post-ruling auto-replies so a just-
     resolved claim is not force-appended again.
     """
+    if enforce_required_dm_checks and _should_skip_llm_for_pending_dm(npc, dm_context):
+        from dm_channel import DM_PENDING_WAIT_NARRATION
+
+        return ensure_required_dm_check_tags(npc, dm_context, DM_PENDING_WAIT_NARRATION)
+
     log_llm_prompt_to_console(messages)
     raw = ask_llm_fn(messages)
     if not enforce_required_dm_checks:
@@ -759,3 +768,13 @@ def generate_npc_reply_text(
         player_text=player_text,
         ask_llm_fn=ask_llm_fn,
     )
+
+
+def _should_skip_llm_for_pending_dm(
+    npc: dict[str, Any] | None,
+    dm_context: dict[str, Any] | None,
+) -> bool:
+    if required_dm_checks(npc, dm_context):
+        return True
+    pending = (dm_context or {}).get("pending_checks") or []
+    return bool(pending)

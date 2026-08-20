@@ -18,6 +18,9 @@ MEMORY_DB = db_paths.MEMORY_DB
 # Existing unscoped rows are attributed to this campaign on first migration.
 LEGACY_CAMPAIGN_BACKFILL_ID = "greyhaven_intro"
 
+# Spoken while a DM CHECK is still unruled — narrator TTS, not NPC dialogue.
+DM_PENDING_WAIT_NARRATION = "*Waiting on a DM decision.*"
+
 _ALLOWED_SQL_TABLES = frozenset({
     "conversation_turns",
     "npc_memories",
@@ -1155,6 +1158,26 @@ def process_player_message(
     }
 
 
+def _should_hold_spoken_for_dm(
+    npc_id: str,
+    player_id: str,
+    *,
+    campaign_id: str = "",
+    pending_ids: list[int] | None = None,
+) -> bool:
+    """True when this speaker already has (or just created) an unruled DM check."""
+    if pending_ids:
+        return True
+    existing = load_pending_checks(
+        npc_id,
+        player_id,
+        status="pending",
+        campaign_id=campaign_id,
+        limit=20,
+    )
+    return bool(existing)
+
+
 def process_npc_response(
     npc_id: str,
     player_id: str,
@@ -1218,8 +1241,19 @@ def process_npc_response(
                     elif "deferral" not in pending_source:
                         pending_source = f"{pending_source}+npc_deferral"
 
+    held_spoken_text = ""
+    if create_pending_checks and _should_hold_spoken_for_dm(
+        npc_id,
+        player_id,
+        campaign_id=campaign_id,
+        pending_ids=pending_ids,
+    ):
+        held_spoken_text = spoken_text
+        spoken_text = DM_PENDING_WAIT_NARRATION
+
     return {
         "spoken_text": spoken_text,
+        "held_spoken_text": held_spoken_text,
         "raw_text": npc_text,
         "dm_check_claim": all_claims[-1] if all_claims else None,
         "dm_check_claims": all_claims,

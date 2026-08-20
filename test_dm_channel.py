@@ -135,7 +135,8 @@ def test_process_npc_response_keeps_distinct_dm_checks(tmp_path, monkeypatch):
         campaign_id="camp_1",
     )
 
-    assert result["spoken_text"] == "Wait."
+    assert result["spoken_text"] == dm_channel.DM_PENDING_WAIT_NARRATION
+    assert result["held_spoken_text"] == "Wait."
     assert len(result["dm_check_claims"]) == 2
     assert len(result["pending_check_ids"]) == 2
     assert len(set(result["pending_check_ids"])) == 2
@@ -241,6 +242,7 @@ def test_process_npc_response_can_strip_tags_without_creating_pending(tmp_path, 
         create_pending_checks=False,
     )
     assert "Very well" in result["spoken_text"]
+    assert result.get("held_spoken_text") == ""
     assert "[DM CHECK:" not in result["spoken_text"]
     assert result["pending_check_ids"] == []
     assert dm_channel.load_pending_checks_for_dm(
@@ -248,6 +250,33 @@ def test_process_npc_response_can_strip_tags_without_creating_pending(tmp_path, 
         status="pending",
         limit=20,
     ) == []
+
+
+def test_process_npc_response_holds_dialogue_while_existing_pending(tmp_path, monkeypatch):
+    import dm_channel
+
+    mem_db = tmp_path / "dm_hold_existing.db"
+    monkeypatch.setattr(dm_channel, "MEMORY_DB", mem_db)
+    dm_channel.init_dm_tables()
+    dm_channel.save_pending_check(
+        npc_id="captain_varra",
+        player_id="player_alden",
+        claim_summary="player has a writ of passage",
+        player_text="Let us pass",
+        source="player",
+        campaign_id="greyhaven_intro",
+    )
+
+    result = dm_channel.process_npc_response(
+        "captain_varra",
+        "player_alden",
+        "And also, nice weather.",
+        "The gate is open. Come through.",
+        campaign_id="greyhaven_intro",
+    )
+    assert result["spoken_text"] == dm_channel.DM_PENDING_WAIT_NARRATION
+    assert result["held_spoken_text"] == "The gate is open. Come through."
+    assert result["pending_check_ids"] == []
 
 
 def test_dm_console_loaders_are_campaign_wide_across_players(tmp_path, monkeypatch):

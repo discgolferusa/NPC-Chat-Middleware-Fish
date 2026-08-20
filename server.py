@@ -108,8 +108,10 @@ from scene_state import (
     set_time_of_day,
 )
 from turn_progress import (
+    TurnInProgressError,
     complete_turn_progress,
     fail_turn_progress,
+    get_active_turn_progress,
     get_turn_progress,
     get_turn_progress_catalog,
     new_request_id,
@@ -1277,6 +1279,24 @@ def _json_body_flag(value, default: bool = True) -> bool:
     return bool(value)
 
 
+def _turn_busy_message(progress: dict) -> str:
+    route = (progress.get("route") or "").strip()
+    if route == "/dm-ruling-auto-response":
+        return (
+            progress.get("message")
+            or "The DM ruled — the NPC is responding to your last exchange. Please wait."
+        )
+    return progress.get("message") or "Wait for the current NPC response before sending another message."
+
+
+def _turn_in_progress_response(progress: dict):
+    return jsonify({
+        **progress,
+        "error": "turn_in_progress",
+        "message": _turn_busy_message(progress),
+    }), 409
+
+
 def build_dm_followup_messages(
     npc: dict,
     scene: dict,
@@ -1351,11 +1371,27 @@ def run_dm_ruling_auto_response(
         }
 
     request_id = uuid.uuid4().hex
+    progress_started = False
 
     try:
         campaign_id = normalize_campaign_id(
             campaign_id or (party_context or {}).get("campaign_id") or ruling.get("campaign_id")
         )
+        register_turn_progress(
+            request_id,
+            route="/dm-ruling-auto-response",
+            npc_id=npc_id,
+            player_id=player_id,
+            mode="text",
+            campaign_id=campaign_id,
+        )
+        progress_started = True
+        set_turn_progress(
+            request_id,
+            "waiting_llm",
+            message="The DM ruled — the NPC is responding to your last exchange...",
+        )
+
         context = get_npc_context(
             npc_id, player_id, party_context=party_context, campaign_id=campaign_id
         )
@@ -1388,6 +1424,7 @@ def run_dm_ruling_auto_response(
             player_text=None,
             enforce_required_dm_checks=False,
         )
+        set_turn_progress(request_id, "processing_response")
         npc_response = process_npc_response(
             npc_id,
             player_id,
@@ -1413,6 +1450,7 @@ def run_dm_ruling_auto_response(
         dialogue_text = ""
 
         if include_audio:
+            set_turn_progress(request_id, "synthesizing_speech")
             request_tts = dict(tts_options or {})
             if tts_length_scale is not None and "tts_length_scale" not in request_tts:
                 request_tts["tts_length_scale"] = tts_length_scale
@@ -1439,6 +1477,9 @@ def run_dm_ruling_auto_response(
             flush=True,
         )
 
+        complete_turn_progress(request_id)
+        progress_started = False
+
         return {
             "generated": True,
             "request_id": request_id,
@@ -1457,7 +1498,22 @@ def run_dm_ruling_auto_response(
             "audio_clips": audio_clips,
         }
 
+    except TurnInProgressError as ex:
+        print(
+            f"[DM] auto-response blocked request_id={request_id} npc={npc_id} player={player_id} "
+            f"active={ex.progress.get('request_id')}",
+            flush=True,
+        )
+        return {
+            "generated": False,
+            "request_id": request_id,
+            "reason": "turn_in_progress",
+            "error": "turn_in_progress",
+            "active_turn": ex.progress,
+        }
     except Exception as ex:
+        if progress_started:
+            fail_turn_progress(request_id, "generation_failed")
         print(
             f"[DM] auto-response failed request_id={request_id} npc={npc_id} error={ex!r}",
             flush=True,
@@ -2546,13 +2602,17 @@ def npc_turn():
     total_start = time.perf_counter()
     step_start = total_start
 
-    register_turn_progress(
-        request_id,
-        route="/npc-turn",
-        npc_id=npc_id,
-        player_id=player_id,
-        mode="text",
-    )
+    try:
+        register_turn_progress(
+            request_id,
+            route="/npc-turn",
+            npc_id=npc_id,
+            player_id=player_id,
+            mode="text",
+            campaign_id=campaign_id,
+        )
+    except TurnInProgressError as ex:
+        return _turn_in_progress_response(ex.progress)
     set_turn_progress(request_id, "received")
 
     try:
@@ -2759,13 +2819,17 @@ def npc_voice_turn():
     total_start = time.perf_counter()
     step_start = total_start
 
-    register_turn_progress(
-        request_id,
-        route="/npc-voice-turn",
-        npc_id=npc_id,
-        player_id=player_id,
-        mode="voice",
-    )
+    try:
+        register_turn_progress(
+            request_id,
+            route="/npc-voice-turn",
+            npc_id=npc_id,
+            player_id=player_id,
+            mode="voice",
+            campaign_id=campaign_id,
+        )
+    except TurnInProgressError as ex:
+        return _turn_in_progress_response(ex.progress)
     set_turn_progress(request_id, "received")
 
     log_dm_turn(
@@ -3696,13 +3760,31 @@ def turn_progress_register():
     if mode not in ("voice", "text"):
         mode = "voice" if "voice" in route else "text"
 
-    return jsonify(register_turn_progress(
-        request_id,
-        route=route,
-        npc_id=npc_id,
-        player_id=player_id,
-        mode=mode,
-    ))
+    session = resolve_request_session(body=body)
+    campaign_id = session["campaign_id"]
+    try:
+        return jsonify(register_turn_progress(
+            request_id,
+            route=route,
+            npc_id=npc_id,
+            player_id=player_id,
+            mode=mode,
+            campaign_id=campaign_id,
+        ))
+    except TurnInProgressError as ex:
+        return _turn_in_progress_response(ex.progress)
+
+
+@app.get("/turn/progress/active")
+def turn_progress_active():
+    session = resolve_request_session(args=request.args)
+    campaign_id = session["campaign_id"]
+    npc_id = (request.args.get("npc_id") or "").strip()
+    player_id = session["player_id"]
+    active = get_active_turn_progress(campaign_id, npc_id, player_id)
+    if not active:
+        return jsonify({"status": "idle"})
+    return jsonify(active)
 
 
 @app.get("/turn/progress/<request_id>")
