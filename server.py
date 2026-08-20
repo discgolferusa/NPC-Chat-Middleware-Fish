@@ -136,6 +136,7 @@ from tts_processing import (
     DEFAULT_NOISE_SCALE,
     DEFAULT_NOISE_W,
     DEFAULT_SENTENCE_SILENCE,
+    asterisk_body_tts_type,
     build_af_filter,
     clean_for_tts,
     curated_defaults_for_quality,
@@ -1371,7 +1372,9 @@ def build_dm_followup_messages(
         )
     elif verdict == "DENIED":
         action_hint = (
-            "The DM denied the claim. Refuse the request in character without granting access or benefit."
+            "The DM denied the claim. Refuse the request in character without granting "
+            "access or benefit. Put spoken refusal/dialogue in plain text (NPC voice), "
+            "not inside *asterisks* — asterisks are only for one short nonverbal beat."
         )
     else:
         action_hint = "Apply the DM's guidance in character."
@@ -1932,9 +1935,9 @@ def split_into_ordered_tts_segments(
     """
     Split raw model output into ordered TTS segments, preserving document order.
 
-    Each asterisk-wrapped stage direction becomes its own narrator clip, and each
-    intervening dialogue run becomes its own NPC clip. Smaller clips start Piper
-    sooner and can be SignalR-distributed while later clips are still synthesizing.
+    Asterisk-wrapped nonverbal stage directions become narrator clips. Spoken
+    dialogue wrongly wrapped in asterisks (common after DM rulings / language
+    barriers) stays on the NPC voice.
     """
     raw_text, _ = strip_dm_check_tag(text or "")
 
@@ -1954,7 +1957,7 @@ def split_into_ordered_tts_segments(
 
         stage = match.group(1).strip()
         if stage:
-            _append("narrator", stage)
+            _append(asterisk_body_tts_type(stage), stage)
 
         last_end = match.end()
 

@@ -395,6 +395,45 @@ def ensure_sentence_ending(text: str) -> str:
     return text
 
 
+# Nonverbal stage-direction cues (*Varra narrows her eyes.* / *Snarls.*).
+# Asterisk-wrapped spoken dialogue (fantasy language, denied claims, etc.) must
+# stay on the NPC voice — models often italicize those lines by mistake.
+_NONVERBAL_STAGE_VERB_RE = re.compile(
+    r"(?i)\b("
+    r"narrows|cocks|snarls|glares|nods|shrugs|points|smiles|grins|frowns|sighs|"
+    r"growls|hisses|barks|tilts|raises|lowers|crosses|folds|leans|steps|turns|"
+    r"shakes|waves|gestures|pauses|stares|looks|watches|listens|snorts|bows|"
+    r"chuckles|laughs|whispers|mutters|spits|draws|sheathes|clenches|tenses|"
+    r"freezes|blinks|winces|grimaces|sneers|scowls|beams|grunts"
+    r")\b"
+)
+
+
+def is_nonverbal_stage_direction(text: str) -> bool:
+    """True when asterisk-inner text is a nonverbal beat, not spoken dialogue."""
+    inner = (text or "").strip().strip("*").strip()
+    if not inner:
+        return False
+    lowered = inner.lower()
+    if "waiting on a dm decision" in lowered:
+        return True
+    # Spoken lines often ask/exclaim; stage beats usually do not.
+    if "?" in inner:
+        return False
+    return bool(_NONVERBAL_STAGE_VERB_RE.search(inner))
+
+
+def asterisk_body_tts_type(inner: str) -> str:
+    """
+    Map asterisk-wrapped markup to a TTS speaker.
+
+    Global rules: only nonverbal stage directions use *asterisks*. Spoken NPC
+    dialogue (including post-ruling / language-barrier lines) must use the NPC
+    voice even when the model wraps them in italics.
+    """
+    return "narrator" if is_nonverbal_stage_direction(inner) else "npc"
+
+
 def clean_for_tts(text: str, pronunciation: dict[str, str] | None = None) -> str:
     """Normalize LLM output into Piper-friendly spoken text."""
     text = re.sub(r"\*([^*]{1,500})\*", r"\1", text)
