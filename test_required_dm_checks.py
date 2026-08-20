@@ -37,6 +37,19 @@ SLAAD_NPC = {
     "known_facts": ["Native language: Slaadi"],
 }
 
+USER_PROSE_SLAAD_NPC = {
+    "id": "slaad",
+    "name": "Slaad",
+    "llm_rules": [
+        "This NPC only understands Language Slaadi. They do not understand Common/English.",
+        "Until DM channel context confirms a speaker knows Slaadi, do NOT answer the meaning of their words.",
+        "Instead: a short confused reaction, gesture then end with [DM CHECK: does this speaker know Language Slaadi]",
+        "If the DM already ruled they know Slaadi, converse normally.",
+        "If the DM ruled they do not, keep failing to understand; never switch to Common.",
+    ],
+    "known_facts": ["Native language is Slaadi"],
+}
+
 
 def test_extract_dm_check_from_rules():
     claims = extract_dm_check_templates_from_rules({"llm_rules": LANGUAGE_RULES})
@@ -307,6 +320,9 @@ def test_format_includes_language_barrier_block_for_slaad():
 def test_resolve_native_language_from_known_facts_or_claim():
     assert resolve_npc_native_language(SLAAD_NPC) == "Slaadi"
     assert resolve_npc_native_language(
+        {"known_facts": ["Native language is Slaadi"]}
+    ) == "Slaadi"
+    assert resolve_npc_native_language(
         {"known_facts": ["Speaks only Infernal"]}
     ) == "Infernal"
     assert resolve_npc_native_language(
@@ -395,7 +411,7 @@ def test_generate_allows_english_after_language_success_ruling():
 
 
 def test_language_comprehension_claim_rejects_generic_understand():
-    from required_dm_checks import _is_language_comprehension_claim
+    from required_dm_checks import _is_language_comprehension_claim, resolve_npc_native_language
 
     assert not _is_language_comprehension_claim("does the player understand the secret")
     assert not _is_language_comprehension_claim("party understands the mayor's plan")
@@ -405,6 +421,20 @@ def test_language_comprehension_claim_rejects_generic_understand():
     assert _is_language_comprehension_claim(
         "does this speaker know Language Slaadi"
     )
+    assert _is_language_comprehension_claim(
+        "Does the speaker know the Slaadi language"
+    )
+    assert _is_language_comprehension_claim(
+        "Can the player speak the Common language"
+    )
+    assert resolve_npc_native_language(
+        {},
+        language_claim="Does the speaker know the Slaadi language",
+    ) == "Slaadi"
+    assert resolve_npc_native_language(
+        {},
+        language_claim="Can the player speak the Common language",
+    ) == "Common"
 
 
 def test_generic_understand_npc_is_not_rewritten_to_fantasy_language():
@@ -423,3 +453,48 @@ def test_generic_understand_npc_is_not_rewritten_to_fantasy_language():
     enforced = enforce_unruled_check_spoken_behavior(npc, {"rulings": []}, tagged)
     assert "Skraa-vek" not in enforced
     assert "understand completely" in enforced.lower()
+
+
+def test_prose_language_rules_trigger_barrier_enforcement():
+    raw = "*Snarls.* Yes, I understand you perfectly."
+    tagged = ensure_required_dm_check_tags(USER_PROSE_SLAAD_NPC, {"rulings": []}, raw)
+    enforced = enforce_unruled_check_spoken_behavior(USER_PROSE_SLAAD_NPC, {"rulings": []}, tagged)
+    assert "understand you" not in enforced.lower()
+    assert "Skraa-vek" in enforced
+    assert "[DM CHECK:" in enforced
+    assert "Language Slaadi" in enforced
+
+
+def test_denied_language_ruling_still_blocks_english_without_new_check():
+    dm_context = {
+        "rulings": [
+            {
+                "verdict": "denied",
+                "claim_summary": "does this speaker know Language Slaadi",
+            }
+        ]
+    }
+    raw = "Yes, I understand you perfectly."
+    enforced = enforce_unruled_check_spoken_behavior(
+        USER_PROSE_SLAAD_NPC,
+        dm_context,
+        raw,
+    )
+    assert "understand you" not in enforced.lower()
+    assert "Skraa-vek" in enforced
+    assert "[DM CHECK:" not in enforced
+
+
+def test_failure_language_barrier_prompt_block_without_pending_checks():
+    dm_context = {
+        "rulings": [
+            {
+                "verdict": "denied",
+                "claim_summary": "does this speaker know Language Slaadi",
+            }
+        ]
+    }
+    block = format_required_dm_checks_prompt_block(USER_PROSE_SLAAD_NPC, dm_context)
+    assert "LANGUAGE BARRIER" in block
+    assert "DM ruled Failure" in block
+    assert "Slaadi" in block
