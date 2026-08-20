@@ -425,9 +425,21 @@ def is_nonverbal_stage_direction(text: str) -> bool:
     inner = (text or "").strip().strip("*").strip()
     if not inner:
         return False
-    lowered = inner.lower()
-    if "waiting on a decision from game master" in lowered or "waiting on a dm decision" in lowered:
-        return True
+    # OOC DM-wait copy is always narrator — even when wording drifts or asterisks
+    # were stripped before the segment splitter runs.
+    try:
+        from dm_channel import is_dm_wait_narration
+    except ImportError:
+        is_dm_wait_narration = None  # type: ignore[assignment]
+    if is_dm_wait_narration is not None:
+        if is_dm_wait_narration(inner):
+            return True
+    else:
+        lowered = inner.lower()
+        if "waiting on a decision" in lowered and (
+            "game master" in lowered or "dm decision" in lowered or " dm " in f" {lowered} "
+        ):
+            return True
     # Spoken lines — questions, direct speech framing, first-person/address.
     if "?" in inner:
         return False

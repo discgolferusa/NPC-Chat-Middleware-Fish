@@ -57,3 +57,25 @@ def test_split_keeps_wait_narration_on_narrator():
     )
     assert len(segments) == 1
     assert segments[0]["type"] == "narrator"
+
+
+def test_split_keeps_bare_wait_narration_on_narrator():
+    """Asterisks can be lost before TTS — wait copy must never use the NPC voice."""
+    import server
+
+    segments = server.split_into_ordered_tts_segments(
+        "Waiting on a decision from game master."
+    )
+    assert len(segments) == 1
+    assert segments[0]["type"] == "narrator"
+    assert "waiting" in segments[0]["text"].lower()
+
+
+def test_split_keeps_wait_wording_variants_on_narrator():
+    import server
+
+    segments = server.split_into_ordered_tts_segments(
+        "*Waiting on a decision from the game master.*"
+    )
+    assert len(segments) == 1
+    assert segments[0]["type"] == "narrator"

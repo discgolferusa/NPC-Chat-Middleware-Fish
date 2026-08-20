@@ -344,6 +344,55 @@ def test_generate_rewrites_english_on_denied_language_even_when_checks_not_enfor
     assert "krah" in text.lower() or "skraa" in text.lower()
 
 
+def test_failure_mode_strips_wait_narration_instead_of_reholding():
+    """After Deny, echoed wait copy must become native speech — no new DM CHECK."""
+    claim = "Does the speaker know the necessary language to talk to the NPC"
+    dm_context = {
+        "rulings": [
+            {"verdict": "denied", "claim_summary": claim},
+        ]
+    }
+
+    text = enforce_unruled_check_spoken_behavior(
+        SLAAD_NPC,
+        dm_context,
+        "*Waiting on a decision from game master.*",
+        player_text="Hello again.",
+        ask_llm_fn=lambda _m: "Skraa-thok?",
+    )
+    assert "waiting" not in text.lower()
+    assert "[DM CHECK:" not in text
+    assert "skraa" in text.lower()
+
+
+def test_generate_after_deny_does_not_skip_to_wait_hold():
+    """Language Failure is settled — later turns must not return wait + DM CHECK."""
+    claim = "Does the speaker know the necessary language to talk to the NPC"
+    dm_context = {
+        "rulings": [
+            {"verdict": "denied", "claim_summary": claim},
+        ]
+    }
+    calls = {"n": 0}
+
+    def _ask(_messages):
+        calls["n"] += 1
+        return "*Cocks its head.* Krah-vesh?"
+
+    text = generate_npc_reply_text(
+        SLAAD_NPC,
+        dm_context,
+        [{"role": "user", "content": "Hello"}],
+        _ask,
+        player_text="Hello",
+        enforce_required_dm_checks=True,
+    )
+    assert calls["n"] >= 1
+    assert "waiting" not in text.lower()
+    assert "[DM CHECK:" not in text
+    assert "krah" in text.lower() or "skraa" in text.lower()
+
+
 def test_slaad_quoted_yaml_rules_extract_language_template():
     npc = {"llm_rules": SLAAD_RULES}
     claims = extract_dm_check_templates_from_rules(npc)

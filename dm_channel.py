@@ -23,13 +23,20 @@ DM_PENDING_WAIT_NARRATION = "*Waiting on a decision from game master.*"
 
 
 def is_dm_wait_narration(text: str) -> bool:
+    """True for OOC wait copy (with or without asterisks / light wording drift)."""
     stripped = (text or "").strip().strip("*").strip().lower()
     if not stripped:
         return False
-    return (
-        "waiting on a decision from game master" in stripped
-        or "waiting on a dm decision" in stripped
-    )
+    if "waiting on a dm decision" in stripped:
+        return True
+    if "waiting on a decision from game master" in stripped:
+        return True
+    # Model / older copy often drops "from" or inserts "the".
+    if "waiting on a decision" in stripped and "game master" in stripped:
+        return True
+    if "waiting on a decision" in stripped and " dm " in f" {stripped} ":
+        return True
+    return False
 
 
 def assistant_history_text(npc_response: dict[str, Any] | None) -> str:
