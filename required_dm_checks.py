@@ -674,11 +674,16 @@ def ensure_required_dm_check_tags(
     raw_text: str,
 ) -> str:
     """
-    Append any still-required NPC-authored DM CHECK tags the model omitted.
+    Append still-unruled language-barrier DM CHECK tags the model omitted.
 
-    Does not invent new claims from player text — only exact templates from llm_rules.
+    Situational templates (secrets, writs, authority) stay prompt guidance only.
+    Force-appending those on every turn would mute ordinary greetings.
     """
-    pending = required_dm_checks(npc, dm_context)
+    pending = [
+        claim
+        for claim in required_dm_checks(npc, dm_context)
+        if _is_language_comprehension_claim(claim)
+    ]
     if not pending:
         return raw_text
 
@@ -741,9 +746,11 @@ def generate_npc_reply_text(
     """
     Call the LLM, then ensure NPC-authored required DM CHECK tags are present.
 
-    When a required check is still unruled (or a pending check is already in
-    ``dm_context``), skip the NPC reply LLM and return narrator wait-copy plus
-    the required tags so the NPC does not speak before the DM rules.
+    When a language-barrier check is still unruled, skip the NPC reply LLM and
+    return narrator wait-copy so the NPC does not speak English before the DM
+    rules. Situational authored templates (secrets, writs) and already-open
+    pending rows do not skip the LLM on their own — ``process_npc_response``
+    still replaces spoken copy with wait narration when a check is pending.
 
     ``player_text`` is accepted for call-site compatibility; intent classification is
     left to the model via global/NPC llm_rules.
@@ -774,7 +781,10 @@ def _should_skip_llm_for_pending_dm(
     npc: dict[str, Any] | None,
     dm_context: dict[str, Any] | None,
 ) -> bool:
-    if required_dm_checks(npc, dm_context):
-        return True
-    pending = (dm_context or {}).get("pending_checks") or []
-    return bool(pending)
+    # Only language-barrier templates skip the LLM. A pending writ/secret/player
+    # claim still generates a held in-character draft; spoken wait copy is applied
+    # later in process_npc_response.
+    return any(
+        _is_language_comprehension_claim(claim)
+        for claim in required_dm_checks(npc, dm_context)
+    )

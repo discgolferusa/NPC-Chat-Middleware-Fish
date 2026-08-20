@@ -133,3 +133,29 @@ def test_fail_turn_releases_active_slot():
     )
     tp.fail_turn_progress(rid, "boom")
     assert tp.get_active_turn_progress("camp-2", "bob", "alice") is None
+
+
+def test_force_register_displaces_active_turn():
+    rid_a = "dddddddddddddddddddddddddddddddd"
+    rid_b = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    tp.register_turn_progress(
+        rid_a,
+        route="/npc-turn",
+        npc_id="bob",
+        player_id="alice",
+        mode="text",
+        campaign_id="camp-3",
+    )
+    displaced = tp.register_turn_progress(
+        rid_b,
+        route="/dm-ruling-auto-response",
+        npc_id="bob",
+        player_id="alice",
+        mode="text",
+        campaign_id="camp-3",
+        force=True,
+    )
+    assert displaced["request_id"] == rid_b
+    active = tp.get_active_turn_progress("camp-3", "bob", "alice")
+    assert active is not None
+    assert active["request_id"] == rid_b

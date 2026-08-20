@@ -21,6 +21,26 @@ LEGACY_CAMPAIGN_BACKFILL_ID = "greyhaven_intro"
 # Spoken while a DM CHECK is still unruled — narrator TTS, not NPC dialogue.
 DM_PENDING_WAIT_NARRATION = "*Waiting on a DM decision.*"
 
+
+def is_dm_wait_narration(text: str) -> bool:
+    stripped = (text or "").strip().strip("*").strip().lower()
+    if not stripped:
+        return False
+    return "waiting on a dm decision" in stripped
+
+
+def assistant_history_text(npc_response: dict[str, Any] | None) -> str:
+    """In-character text to persist; never the OOC wait narrator line."""
+    npc_response = npc_response or {}
+    held = str(npc_response.get("held_spoken_text") or "").strip()
+    spoken = str(npc_response.get("spoken_text") or "").strip()
+    if held and not is_dm_wait_narration(held):
+        return held
+    if spoken and not is_dm_wait_narration(spoken):
+        return spoken
+    return ""
+
+
 _ALLOWED_SQL_TABLES = frozenset({
     "conversation_turns",
     "npc_memories",

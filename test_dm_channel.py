@@ -279,6 +279,24 @@ def test_process_npc_response_holds_dialogue_while_existing_pending(tmp_path, mo
     assert result["pending_check_ids"] == []
 
 
+def test_assistant_history_text_skips_wait_narration():
+    import dm_channel
+
+    assert dm_channel.is_dm_wait_narration(dm_channel.DM_PENDING_WAIT_NARRATION)
+    assert dm_channel.assistant_history_text({
+        "spoken_text": dm_channel.DM_PENDING_WAIT_NARRATION,
+        "held_spoken_text": "The gate is open. Come through.",
+    }) == "The gate is open. Come through."
+    assert dm_channel.assistant_history_text({
+        "spoken_text": dm_channel.DM_PENDING_WAIT_NARRATION,
+        "held_spoken_text": dm_channel.DM_PENDING_WAIT_NARRATION,
+    }) == ""
+    assert dm_channel.assistant_history_text({
+        "spoken_text": "Very well.",
+        "held_spoken_text": "",
+    }) == "Very well."
+
+
 def test_dm_console_loaders_are_campaign_wide_across_players(tmp_path, monkeypatch):
     """DM console must see every player's pending checks / rulings in a campaign."""
     import dm_channel

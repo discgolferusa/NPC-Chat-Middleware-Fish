@@ -63,6 +63,8 @@ from dm_channel import (
     process_player_message,
     save_dm_message,
     strip_dm_check_tag,
+    assistant_history_text,
+    is_dm_wait_narration,
 )
 import dm_channel
 from party_campaign import (
@@ -652,6 +654,22 @@ def save_turn(npc_id: str, player_id: str, role: str, content: str, campaign_id:
         conn.commit()
 
 
+def save_player_npc_conversation_turns(
+    npc_id: str,
+    player_id: str,
+    player_text: str,
+    npc_response: dict,
+    *,
+    campaign_id: str = "",
+) -> str:
+    """Persist the player line and in-character NPC draft, never wait-narration."""
+    save_turn(npc_id, player_id, "user", player_text, campaign_id=campaign_id)
+    history_text = assistant_history_text(npc_response)
+    if history_text:
+        save_turn(npc_id, player_id, "assistant", history_text, campaign_id=campaign_id)
+    return history_text
+
+
 def load_recent_turns(npc_id: str, player_id: str, limit: int = 10, campaign_id: str = ""):
     campaign_id = normalize_campaign_id(campaign_id)
     with get_db() as conn:
@@ -663,9 +681,14 @@ def load_recent_turns(npc_id: str, player_id: str, limit: int = 10, campaign_id:
               AND player_id = ?
             ORDER BY id DESC
             LIMIT ?
-        """, (campaign_id, npc_id, player_id, limit)).fetchall()
+        """, (campaign_id, npc_id, player_id, max(limit * 3, 20))).fetchall()
 
-    return list(reversed(rows))
+    filtered = [
+        row
+        for row in reversed(rows)
+        if not is_dm_wait_narration(row["content"] if row["content"] is not None else "")
+    ]
+    return filtered[-limit:]
 
 
 def save_memory(npc_id: str, player_id: str, memory: str, campaign_id: str = ""):
@@ -1384,6 +1407,7 @@ def run_dm_ruling_auto_response(
             player_id=player_id,
             mode="text",
             campaign_id=campaign_id,
+            force=True,
         )
         progress_started = True
         set_turn_progress(
@@ -1438,7 +1462,9 @@ def run_dm_ruling_auto_response(
         if not npc_text:
             npc_text = "Very well."
 
-        save_turn(npc_id, player_id, "assistant", npc_text, campaign_id=campaign_id)
+        history_text = assistant_history_text(npc_response) or npc_text
+        if not is_dm_wait_narration(history_text):
+            save_turn(npc_id, player_id, "assistant", history_text, campaign_id=campaign_id)
 
         tts_segments = split_narration_and_dialogue(npc_text)
         tts_text = " ".join(segment["text"] for segment in tts_segments).strip()
@@ -2675,31 +2701,37 @@ def npc_turn():
             )
         npc_text = npc_response["spoken_text"]
 
-        save_turn(npc_id, player_id, "user", player_text, campaign_id=campaign_id)
-        save_turn(npc_id, player_id, "assistant", npc_text, campaign_id=campaign_id)
+        save_player_npc_conversation_turns(
+            npc_id,
+            player_id,
+            player_text,
+            npc_response,
+            campaign_id=campaign_id,
+        )
+        history_npc_text = assistant_history_text(npc_response)
         step_start = log_timing(request_id, "save text conversation turns", step_start)
 
         saved_memories = []
         memory_extraction_mode = "disabled"
 
-        if AUTO_MEMORY_EXTRACTION_ENABLED and AUTO_MEMORY_EXTRACTION_ASYNC:
+        if history_npc_text and AUTO_MEMORY_EXTRACTION_ENABLED and AUTO_MEMORY_EXTRACTION_ASYNC:
             memory_extraction_mode = "async"
             run_memory_extraction_background(
                 npc=npc,
                 npc_id=npc_id,
                 player_id=player_id,
                 player_text=player_text,
-                npc_text=npc_text,
+                npc_text=history_npc_text,
                 campaign_id=campaign_id,
             )
-        elif AUTO_MEMORY_EXTRACTION_ENABLED:
+        elif history_npc_text and AUTO_MEMORY_EXTRACTION_ENABLED:
             memory_extraction_mode = "sync"
             saved_memories = save_extracted_memories(
                 npc=npc,
                 npc_id=npc_id,
                 player_id=player_id,
                 player_text=player_text,
-                npc_text=npc_text,
+                npc_text=history_npc_text,
                 campaign_id=campaign_id,
             )
             step_start = log_timing(request_id, "sync text memory extraction/save", step_start)
@@ -2842,10 +2874,10 @@ def npc_voice_turn():
 
     output_path = OUTPUT_DIR / f"{request_id}_response.wav"
 
-    input_path = save_uploaded_audio(request.files["audio"], request_id)
-    step_start = log_timing(request_id, "save uploaded audio", step_start)
-
     try:
+        input_path = save_uploaded_audio(request.files["audio"], request_id)
+        step_start = log_timing(request_id, "save uploaded audio", step_start)
+
         set_turn_progress(request_id, "transcribing")
         player_text = transcribe_audio(input_path)
         step_start = log_timing(request_id, "speech-to-text", step_start)
@@ -2953,30 +2985,36 @@ def npc_voice_turn():
                 dialogue_text=tts_text,
             )
 
-        save_turn(npc_id, player_id, "user", player_text, campaign_id=campaign_id)
-        save_turn(npc_id, player_id, "assistant", npc_text, campaign_id=campaign_id)
+        save_player_npc_conversation_turns(
+            npc_id,
+            player_id,
+            player_text,
+            npc_response,
+            campaign_id=campaign_id,
+        )
         step_start = log_timing(request_id, "save conversation turns", step_start)
+        history_npc_text = assistant_history_text(npc_response)
 
         memory_extraction_mode = "disabled"
-        if AUTO_MEMORY_EXTRACTION_ENABLED and AUTO_MEMORY_EXTRACTION_ASYNC:
+        if history_npc_text and AUTO_MEMORY_EXTRACTION_ENABLED and AUTO_MEMORY_EXTRACTION_ASYNC:
             memory_extraction_mode = "async"
             run_memory_extraction_background(
                 npc=npc,
                 npc_id=npc_id,
                 player_id=player_id,
                 player_text=player_text,
-                npc_text=npc_text,
+                npc_text=history_npc_text,
                 campaign_id=campaign_id,
             )
             step_start = log_timing(request_id, "schedule async memory extraction", step_start)
-        elif AUTO_MEMORY_EXTRACTION_ENABLED:
+        elif history_npc_text and AUTO_MEMORY_EXTRACTION_ENABLED:
             memory_extraction_mode = "sync"
             save_extracted_memories(
                 npc=npc,
                 npc_id=npc_id,
                 player_id=player_id,
                 player_text=player_text,
-                npc_text=npc_text,
+                npc_text=history_npc_text,
                 campaign_id=campaign_id,
             )
             step_start = log_timing(request_id, "sync memory extraction/save", step_start)
@@ -3253,31 +3291,37 @@ def npc_voice_turn_debug():
         )
         step_start = log_timing(request_id, "debug split tts segments", step_start)
 
-        save_turn(npc_id, player_id, "user", player_text, campaign_id=campaign_id)
-        save_turn(npc_id, player_id, "assistant", npc_text, campaign_id=campaign_id)
+        save_player_npc_conversation_turns(
+            npc_id,
+            player_id,
+            player_text,
+            npc_response,
+            campaign_id=campaign_id,
+        )
         step_start = log_timing(request_id, "debug save conversation turns", step_start)
+        history_npc_text = assistant_history_text(npc_response)
 
         saved_memories = []
         memory_extraction_mode = "disabled"
-        if AUTO_MEMORY_EXTRACTION_ENABLED and AUTO_MEMORY_EXTRACTION_ASYNC:
+        if history_npc_text and AUTO_MEMORY_EXTRACTION_ENABLED and AUTO_MEMORY_EXTRACTION_ASYNC:
             memory_extraction_mode = "async"
             run_memory_extraction_background(
                 npc=npc,
                 npc_id=npc_id,
                 player_id=player_id,
                 player_text=player_text,
-                npc_text=npc_text,
+                npc_text=history_npc_text,
                 campaign_id=campaign_id,
             )
             step_start = log_timing(request_id, "debug schedule async memory extraction", step_start)
-        elif AUTO_MEMORY_EXTRACTION_ENABLED:
+        elif history_npc_text and AUTO_MEMORY_EXTRACTION_ENABLED:
             memory_extraction_mode = "sync"
             saved_memories = save_extracted_memories(
                 npc=npc,
                 npc_id=npc_id,
                 player_id=player_id,
                 player_text=player_text,
-                npc_text=npc_text,
+                npc_text=history_npc_text,
                 campaign_id=campaign_id,
             )
             step_start = log_timing(request_id, "debug sync memory extraction/save", step_start)
