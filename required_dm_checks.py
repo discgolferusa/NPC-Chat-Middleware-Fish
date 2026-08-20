@@ -26,6 +26,61 @@ DM_CHECK_MANGLED_IN_RULES_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+DM_RULING_FAILURE_PATTERN = re.compile(
+    r"\[DM\s*Ruling:\s*Failure\]\s*(.+)",
+    re.IGNORECASE,
+)
+
+_STAGE_DIRECTION_PATTERN = re.compile(r"^\*[^*]+\*\s*")
+
+# Claim must be about speaking/comprehending a language — not generic "understand X".
+_LANGUAGE_BARRIER_CLAIM_PHRASES = (
+    "necessary language",
+    "know the language",
+    "knows the language",
+    "know language",
+    "speak the language",
+    "speaks the language",
+    "speak language",
+    "language to talk",
+    "language to speak",
+)
+
+_LANGUAGE_BARRIER_CLAIM_PATTERN = re.compile(
+    r"language\s+([a-z][a-z\s-]{2,})",
+    re.IGNORECASE,
+)
+
+_NATIVE_LANGUAGE_PATTERNS = (
+    re.compile(r"native language[:\s]+([a-z][a-z\s-]{2,})", re.IGNORECASE),
+    re.compile(r"speaks only ([a-z][a-z\s-]{2,})", re.IGNORECASE),
+    re.compile(r"speak only ([a-z][a-z\s-]{2,})", re.IGNORECASE),
+    re.compile(r"only speaks ([a-z][a-z\s-]{2,})", re.IGNORECASE),
+    re.compile(r"language is ([a-z][a-z\s-]{2,})", re.IGNORECASE),
+)
+
+# Words that are not a creature language name when parsed from a claim.
+_LANGUAGE_NAME_STOPWORDS = frozenset(
+    {
+        "the", "to", "talk", "speak", "npc", "necessary", "required", "common",
+        "understood", "unknown", "player", "speaker", "party",
+    }
+)
+
+_ENGLISH_COMPREHENSION_WORDS = frozenset(
+    {
+        "i", "you", "we", "they", "he", "she", "it", "the", "a", "an", "is", "are", "was", "were",
+        "can", "could", "will", "would", "have", "has", "had", "do", "does", "did",
+        "yes", "no", "hello", "hi", "help", "please", "thank", "thanks", "what", "how", "why",
+        "who", "where", "when", "understand", "understood", "speak", "english", "sure", "of", "course",
+        "may", "might", "must", "shall", "should", "want", "need", "know", "think", "believe",
+        "your", "my", "our", "their", "this", "that", "these", "those", "here", "there",
+        "well", "very", "good", "great", "fine", "okay", "ok", "right", "indeed", "certainly",
+        "welcome", "sorry", "excuse", "pardon", "tell", "say", "said", "ask", "answer",
+        "perfectly", "clearly", "absolutely", "however", "perhaps", "maybe", "come", "go",
+    }
+)
+
 
 def _npc_rules_blob(npc: dict[str, Any] | None) -> str:
     from yaml_list_text import yaml_list_item_as_text
@@ -173,6 +228,257 @@ def required_dm_checks(
     ]
 
 
+def _clean_language_name(raw: str) -> str:
+    name = re.sub(r"\s+", " ", (raw or "").strip()).strip(" .'\"")
+    words = name.split()
+    if not words:
+        return ""
+    if words[0].lower() in _LANGUAGE_NAME_STOPWORDS:
+        return ""
+    if len(words) > 4:
+        return ""
+    return name
+
+
+def _language_from_claim(claim: str) -> str:
+    match = _LANGUAGE_BARRIER_CLAIM_PATTERN.search(claim or "")
+    if not match:
+        return ""
+    return _clean_language_name(match.group(1))
+
+
+def _language_from_text_blob(text: str) -> str:
+    for pattern in _NATIVE_LANGUAGE_PATTERNS:
+        match = pattern.search(text or "")
+        if match:
+            cleaned = _clean_language_name(match.group(1))
+            if cleaned:
+                return cleaned
+    return ""
+
+
+def resolve_npc_native_language(
+    npc: dict[str, Any] | None,
+    *,
+    language_claim: str | None = None,
+) -> str:
+    """
+    Resolve the NPC's native language for barrier replies.
+
+    Authors can set this via ``known_facts`` / ``public_facts`` (e.g. ``Native language:
+    Slaadi``), an explicit ``llm_rules`` line, or by naming the language in the DM CHECK
+    template (e.g. ``Language Slaadi``).
+    """
+    npc = npc or {}
+    from_facts: list[str] = []
+    for field in ("known_facts", "public_facts", "llm_rules", "npc_rules"):
+        raw = npc.get(field)
+        if isinstance(raw, list):
+            from_facts.extend(str(item) for item in raw if item is not None)
+        elif raw:
+            from_facts.append(str(raw))
+
+    for text in from_facts:
+        resolved = _language_from_text_blob(text)
+        if resolved:
+            return resolved
+
+    if language_claim:
+        resolved = _language_from_claim(language_claim)
+        if resolved:
+            return resolved
+
+    return ""
+
+
+def _is_language_comprehension_claim(claim: str) -> bool:
+    """True only for language-barrier checks, not generic 'does the player understand X'."""
+    normalized = _normalize_claim(claim)
+    if not normalized:
+        return False
+    if _language_from_claim(claim):
+        return True
+    if "language" not in normalized:
+        return False
+    if any(phrase in normalized for phrase in _LANGUAGE_BARRIER_CLAIM_PHRASES):
+        return True
+    # Authored template: "Does the speaker know the necessary language to talk to the NPC"
+    if "speaker" in normalized and "know" in normalized:
+        return True
+    return False
+
+
+def _npc_has_language_barrier_rules(npc: dict[str, Any] | None) -> bool:
+    blob = _npc_rules_blob(npc).lower()
+    if "do not treat the speaker as understood" in blob:
+        return True
+    if "fantasy-language" in blob:
+        return True
+    failure_hint = _extract_failure_ruling_hint(npc).lower()
+    return bool(
+        failure_hint
+        and (
+            "fantasy-language" in failure_hint
+            or "do not understand them" in failure_hint
+            or "cannot understand them" in failure_hint
+            or "show you cannot understand" in failure_hint
+        )
+    )
+
+
+def _extract_failure_ruling_hint(npc: dict[str, Any] | None) -> str:
+    for line in _npc_rules_blob(npc).splitlines():
+        match = DM_RULING_FAILURE_PATTERN.search(line)
+        if match:
+            return match.group(1).strip().strip("'\"")
+    return ""
+
+
+def _split_stage_direction(text: str) -> tuple[str, str]:
+    text = (text or "").strip()
+    match = _STAGE_DIRECTION_PATTERN.match(text)
+    if not match:
+        return "", text
+    return match.group(0).strip(), text[match.end():].strip()
+
+
+def _looks_like_english_comprehension(spoken: str) -> bool:
+    """Heuristic: did the NPC reply as if they understood English?"""
+    _stage, dialogue = _split_stage_direction(spoken)
+    check_text = (dialogue or spoken).strip()
+    if not check_text:
+        return False
+    words = re.findall(r"[a-zA-Z']+", check_text.lower())
+    if len(words) < 2:
+        return False
+    english_hits = sum(1 for word in words if word in _ENGLISH_COMPREHENSION_WORDS)
+    if english_hits >= 2:
+        return True
+    return len(words) >= 3 and english_hits >= 1 and len(words) <= 8
+
+
+def _default_fantasy_language_line(_npc: dict[str, Any] | None) -> str:
+    return "Skraa-vek?"
+
+
+def _generate_native_language_barrier_reply(
+    npc: dict[str, Any] | None,
+    *,
+    native_language: str,
+    player_text: str | None,
+    stage_direction: str,
+    ask_llm_fn: Callable[[list[dict[str, str]]], str],
+) -> str:
+    """Ask the LLM for a short reply in the NPC's native language only."""
+    npc = npc or {}
+    npc_name = (npc.get("name") or npc.get("id") or "The NPC").strip()
+    player_line = (player_text or "").strip() or "(The player spoke, but you cannot understand them.)"
+    stage_hint = (
+        f"Begin with this stage direction exactly: {stage_direction}"
+        if stage_direction
+        else "You may begin with one short *stage direction*."
+    )
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You write one brief in-character NPC line for a tabletop RPG. "
+                "Output spoken content only in the requested language — never English."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"NPC: {npc_name}\n"
+                f"Native language: {native_language}\n"
+                f"The player said (probably in English, which this NPC does NOT speak): "
+                f"{player_line}\n\n"
+                f"The NPC does not understand the player yet. Write ONE short reply showing "
+                f"confusion or that they cannot understand — using ONLY {native_language}. "
+                f"Invent appropriate words or sounds for {native_language}; do not translate into English.\n"
+                f"{stage_hint}\n"
+                "Do not include [DM CHECK] tags."
+            ),
+        },
+    ]
+    raw = (ask_llm_fn(messages) or "").strip()
+    from dm_channel import extract_dm_check_tags
+
+    spoken, _claims = extract_dm_check_tags(raw)
+    spoken = spoken.strip()
+    if spoken and not _looks_like_english_comprehension(spoken):
+        return spoken
+    # LLM still answered in English — fall back to generic gibberish.
+    return _rewrite_language_barrier_spoken(stage_direction or spoken, npc)
+
+
+def _rewrite_language_barrier_spoken(
+    spoken: str,
+    npc: dict[str, Any] | None,
+    *,
+    native_language: str = "",
+    player_text: str | None = None,
+    ask_llm_fn: Callable[[list[dict[str, str]]], str] | None = None,
+) -> str:
+    stage, _dialogue = _split_stage_direction(spoken)
+    if ask_llm_fn and native_language:
+        return _generate_native_language_barrier_reply(
+            npc,
+            native_language=native_language,
+            player_text=player_text,
+            stage_direction=stage,
+            ask_llm_fn=ask_llm_fn,
+        )
+    fantasy = _default_fantasy_language_line(npc)
+    if stage:
+        return f"{stage} {fantasy}".strip()
+    return fantasy
+
+
+def enforce_unruled_check_spoken_behavior(
+    npc: dict[str, Any] | None,
+    dm_context: dict[str, Any] | None,
+    raw_text: str,
+    *,
+    player_text: str | None = None,
+    ask_llm_fn: Callable[[list[dict[str, str]]], str] | None = None,
+) -> str:
+    """
+    When a language-barrier DM CHECK is still unruled, strip English comprehension
+    dialogue the model may have added before/after the tag.
+    """
+    pending = required_dm_checks(npc, dm_context)
+    language_pending = [claim for claim in pending if _is_language_comprehension_claim(claim)]
+    if not language_pending or not _npc_has_language_barrier_rules(npc):
+        return raw_text
+
+    from dm_channel import extract_dm_check_tags
+
+    spoken, claims = extract_dm_check_tags(raw_text)
+    if not _looks_like_english_comprehension(spoken):
+        return raw_text
+
+    native_language = resolve_npc_native_language(
+        npc,
+        language_claim=language_pending[0],
+    )
+    rewritten = _rewrite_language_barrier_spoken(
+        spoken,
+        npc,
+        native_language=native_language,
+        player_text=player_text,
+        ask_llm_fn=ask_llm_fn,
+    )
+    result = rewritten.rstrip()
+    tag_claims = list(claims)
+    for claim in pending:
+        if not any(_claim_matches(claim, existing) for existing in tag_claims):
+            tag_claims.append(claim)
+    for claim in tag_claims:
+        result += f"\n[DM CHECK: {claim}]"
+    return result
+
+
 def format_required_dm_checks_prompt_block(
     npc: dict[str, Any] | None,
     dm_context: dict[str, Any] | None,
@@ -183,6 +489,28 @@ def format_required_dm_checks_prompt_block(
         return ""
 
     lines = "\n".join(f"- [DM CHECK: {claim}]" for claim in pending)
+    language_waiting = any(_is_language_comprehension_claim(claim) for claim in pending)
+    language_block = ""
+    if language_waiting and _npc_has_language_barrier_rules(npc):
+        failure_hint = _extract_failure_ruling_hint(npc)
+        failure_line = failure_hint or "Use a short fantasy-language line only; do not reply in English."
+        native_language = resolve_npc_native_language(
+            npc,
+            language_claim=next(
+                (claim for claim in pending if _is_language_comprehension_claim(claim)),
+                "",
+            ),
+        )
+        native_line = (
+            f"This NPC's native language is {native_language}. Reply ONLY in {native_language}, never English."
+            if native_language
+            else "Reply only in this NPC's native language (see NPC facts/rules), never English."
+        )
+        language_block = f"""
+
+LANGUAGE BARRIER (still waiting on DM ruling):
+Until a matching confirmed Success ruling exists, do NOT treat the speaker as understood.
+{native_line} {failure_line}"""
     return f"""
 
 NPC-AUTHORED DM CHECK TAGS (still required until the DM rules):
@@ -191,7 +519,7 @@ global paraphrase for the same situation. Until DM channel context shows a match
 confirmed (Success) or denied (Failure) ruling for each claim, end your reply with
 those exact tags (one per line, after spoken dialogue / stage directions). Follow any
 NPC [DM Ruling: Success] / [DM Ruling: Failure] instructions after a matching ruling.
-Do not invent DM rulings yourself.
+Do not invent DM rulings yourself.{language_block}
 {lines}"""
 
 
@@ -274,9 +602,15 @@ def generate_npc_reply_text(
     Set ``enforce_required_dm_checks=False`` for post-ruling auto-replies so a just-
     resolved claim is not force-appended again.
     """
-    del player_text  # LLM decides; we only enforce authored templates.
     log_llm_prompt_to_console(messages)
     raw = ask_llm_fn(messages)
     if not enforce_required_dm_checks:
         return raw
-    return ensure_required_dm_check_tags(npc, dm_context, raw)
+    tagged = ensure_required_dm_check_tags(npc, dm_context, raw)
+    return enforce_unruled_check_spoken_behavior(
+        npc,
+        dm_context,
+        tagged,
+        player_text=player_text,
+        ask_llm_fn=ask_llm_fn,
+    )

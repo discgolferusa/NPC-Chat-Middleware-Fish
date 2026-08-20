@@ -449,6 +449,63 @@ def test_npc_turn_authored_dm_check_is_enforced(api, monkeypatch):
     assert any("necessary language" in str(item.get("claim_summary", "")).lower() for item in checks)
 
 
+def test_npc_turn_slaad_strips_english_when_language_check_unruled(api, monkeypatch):
+    """Slaad-style NPC must not speak comprehensible English before DM Success ruling."""
+    client, server, headers = api
+    npc_id = "slaad"
+    player_id = "player_alden"
+
+    rule_npc = {
+        "id": npc_id,
+        "name": "Slaad",
+        "role": "chaos beast",
+        "location_id": "demo",
+        "personality": ["aggressive"],
+        "public_facts": ["dislikes humans"],
+        "known_facts": ["Native language: Slaadi"],
+        "secrets": [],
+        "voice": [],
+        "llm_rules": [
+            "Until the DM rules, do not treat the speaker as understood.",
+            "'End unsettled replies with [DM CHECK: Does the speaker know the necessary language to talk to the NPC]'",
+            "'[DM Ruling: Success] Respond to the speaker in English.'",
+            "'[DM Ruling: Failure] You do not understand them; reply only to show that, in a short fantasy-language line.'",
+        ],
+    }
+
+    llm_calls = {"n": 0}
+
+    def _ask(_messages):
+        llm_calls["n"] += 1
+        if llm_calls["n"] == 1:
+            return "*Snarls.* Yes, I understand you. What do you want?"
+        return "*Snarls.* Krah-thok slaad-vek?"
+
+    monkeypatch.setattr(server, "load_npc", lambda _id: dict(rule_npc))
+    monkeypatch.setattr(server, "ask_llm", _ask)
+
+    turn = client.post(
+        "/npc-turn",
+        headers=headers,
+        json={
+            "npc_id": npc_id,
+            "text": "Hello, can you help us?",
+            "scene": {"description": "Cave"},
+            "history": [],
+            "player_id": player_id,
+            "include_audio": False,
+        },
+    )
+    assert turn.status_code == 200
+    body = turn.get_json()
+    reply = body.get("npc_text") or body.get("text") or ""
+    assert llm_calls["n"] == 2
+    assert "understand you" not in reply.lower()
+    assert "Krah-thok" in reply
+    assert body.get("dm_check_claim")
+    assert "necessary language" in str(body.get("dm_check_claim")).lower()
+
+
 def test_npc_turn_without_authored_template_does_not_invent_check(api, monkeypatch):
     """Without an authored template, omitted tags are not force-appended from player text."""
     client, server, headers = api

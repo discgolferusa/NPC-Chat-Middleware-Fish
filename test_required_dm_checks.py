@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from required_dm_checks import (
     ensure_required_dm_check_tags,
+    enforce_unruled_check_spoken_behavior,
     extract_dm_check_templates_from_rules,
     format_required_dm_checks_prompt_block,
     generate_npc_reply_text,
     log_llm_prompt_to_console,
     required_dm_checks,
+    resolve_npc_native_language,
 )
 
 
@@ -20,6 +22,20 @@ LANGUAGE_RULES = [
     "[DM Ruling: Failure] You do not understand the speaker; answer only by showing "
     "you cannot understand them, using a short fantasy-language line.",
 ]
+
+SLAAD_RULES = [
+    "Until the DM rules, do not treat the speaker as understood.",
+    "'End unsettled replies with [DM CHECK: Does the speaker know the necessary language to talk to the NPC]'",
+    "'[DM Ruling: Success] Respond to the speaker in English.'",
+    "'[DM Ruling: Failure] You do not understand them; reply only to show that, in a short fantasy-language line.'",
+]
+
+SLAAD_NPC = {
+    "id": "slaad",
+    "name": "Slaad",
+    "llm_rules": SLAAD_RULES,
+    "known_facts": ["Native language: Slaadi"],
+}
 
 
 def test_extract_dm_check_from_rules():
@@ -273,3 +289,137 @@ def test_generate_can_skip_required_dm_check_enforcement():
     )
     assert text == "Very well."
     assert "[DM CHECK:" not in text
+
+
+def test_slaad_quoted_yaml_rules_extract_language_template():
+    npc = {"llm_rules": SLAAD_RULES}
+    claims = extract_dm_check_templates_from_rules(npc)
+    assert len(claims) == 1
+    assert "necessary language" in claims[0].lower()
+
+
+def test_format_includes_language_barrier_block_for_slaad():
+    block = format_required_dm_checks_prompt_block(SLAAD_NPC, {"rulings": []})
+    assert "LANGUAGE BARRIER" in block
+    assert "native language is Slaadi" in block
+
+
+def test_resolve_native_language_from_known_facts_or_claim():
+    assert resolve_npc_native_language(SLAAD_NPC) == "Slaadi"
+    assert resolve_npc_native_language(
+        {"known_facts": ["Speaks only Infernal"]}
+    ) == "Infernal"
+    assert resolve_npc_native_language(
+        {},
+        language_claim="Does the speaker know Language Slaadi",
+    ) == "Slaadi"
+    assert resolve_npc_native_language(
+        {},
+        language_claim="Does the speaker know the necessary language to talk to the NPC",
+    ) == ""
+
+
+def test_enforce_strips_english_comprehension_when_language_check_unruled():
+    raw = "*Snarls.* Yes, I understand you perfectly. How may I help?"
+    tagged = ensure_required_dm_check_tags(SLAAD_NPC, {"rulings": []}, raw)
+    enforced = enforce_unruled_check_spoken_behavior(SLAAD_NPC, {"rulings": []}, tagged)
+    assert "understand you" not in enforced.lower()
+    assert "Skraa-vek" in enforced
+    assert "[DM CHECK:" in enforced
+    assert "necessary language" in enforced.lower()
+
+
+def test_enforce_uses_native_language_llm_rewrite():
+    calls: list[list[dict[str, str]]] = []
+
+    def _ask(messages):
+        calls.append(messages)
+        return "*Snarls.* Krah-thok slaad-vek?"
+
+    raw = "*Snarls.* Yes, I understand you perfectly."
+    tagged = ensure_required_dm_check_tags(SLAAD_NPC, {"rulings": []}, raw)
+    enforced = enforce_unruled_check_spoken_behavior(
+        SLAAD_NPC,
+        {"rulings": []},
+        tagged,
+        player_text="Hello, can you help us?",
+        ask_llm_fn=_ask,
+    )
+    assert len(calls) == 1
+    assert "Slaadi" in calls[0][-1]["content"]
+    assert "Hello, can you help us?" in calls[0][-1]["content"]
+    assert "Krah-thok" in enforced
+    assert "understand you" not in enforced.lower()
+
+
+def test_generate_rewrites_english_for_unruled_language_barrier():
+    calls = {"n": 0}
+
+    def _ask(messages):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return "Hello, I can help you with that."
+        return "*Snarls.* Krah-thok vek?"
+
+    text = generate_npc_reply_text(
+        SLAAD_NPC,
+        {"rulings": []},
+        [],
+        _ask,
+        player_text="Hello, can you help us?",
+    )
+    assert calls["n"] == 2
+    assert "help you" not in text.lower()
+    assert "Krah-thok" in text
+    assert "[DM CHECK:" in text
+
+
+def test_generate_allows_english_after_language_success_ruling():
+    dm_context = {
+        "rulings": [
+            {
+                "verdict": "confirmed",
+                "claim_summary": "Does the speaker know the necessary language to talk to the NPC",
+                "ruling_text": "Yes, they speak the language.",
+            }
+        ]
+    }
+    text = generate_npc_reply_text(
+        SLAAD_NPC,
+        dm_context,
+        [],
+        lambda _m: "Welcome, traveler. What do you need?",
+    )
+    assert "Welcome, traveler" in text
+    assert "[DM CHECK:" not in text
+
+
+def test_language_comprehension_claim_rejects_generic_understand():
+    from required_dm_checks import _is_language_comprehension_claim
+
+    assert not _is_language_comprehension_claim("does the player understand the secret")
+    assert not _is_language_comprehension_claim("party understands the mayor's plan")
+    assert _is_language_comprehension_claim(
+        "Does the speaker know the necessary language to talk to the NPC"
+    )
+    assert _is_language_comprehension_claim(
+        "does this speaker know Language Slaadi"
+    )
+
+
+def test_generic_understand_npc_is_not_rewritten_to_fantasy_language():
+    """Failure + understand in rules must not trigger barrier rewrite without barrier setup."""
+    from required_dm_checks import enforce_unruled_check_spoken_behavior
+
+    npc = {
+        "llm_rules": [
+            "End unsettled replies with [DM CHECK: does the player understand the secret]",
+            "[DM Ruling: Success] Reveal the secret.",
+            "[DM Ruling: Failure] You do not understand what they mean.",
+        ],
+    }
+    raw = "Yes, I understand completely. Here is the answer."
+    tagged = ensure_required_dm_check_tags(npc, {"rulings": []}, raw)
+    enforced = enforce_unruled_check_spoken_behavior(npc, {"rulings": []}, tagged)
+    assert "Skraa-vek" not in enforced
+    assert "understand completely" in enforced.lower()
