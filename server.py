@@ -777,28 +777,58 @@ def load_memories(npc_id: str, player_id: str, limit: int = 20, campaign_id: str
     return [row["memory"] for row in reversed(rows)]
 
 
-def clear_memories(npc_id: str, player_id: str, campaign_id: str = "") -> int:
+def clear_memories(
+    npc_id: str,
+    player_id: str = "",
+    campaign_id: str = "",
+    *,
+    all_players: bool = False,
+) -> int:
     campaign_id = normalize_campaign_id(campaign_id)
+    npc_id = (npc_id or "").strip()
+    player_id = (player_id or "").strip()
     with get_db() as conn:
-        cur = conn.execute("""
-            DELETE FROM npc_memories
-            WHERE campaign_id = ?
-              AND npc_id = ?
-              AND player_id = ?
-        """, (campaign_id, npc_id, player_id))
+        if all_players or not player_id:
+            cur = conn.execute("""
+                DELETE FROM npc_memories
+                WHERE campaign_id = ?
+                  AND npc_id = ?
+            """, (campaign_id, npc_id))
+        else:
+            cur = conn.execute("""
+                DELETE FROM npc_memories
+                WHERE campaign_id = ?
+                  AND npc_id = ?
+                  AND player_id = ?
+            """, (campaign_id, npc_id, player_id))
         conn.commit()
         return cur.rowcount
 
 
-def clear_recent_turns(npc_id: str, player_id: str, campaign_id: str = "") -> int:
+def clear_recent_turns(
+    npc_id: str,
+    player_id: str = "",
+    campaign_id: str = "",
+    *,
+    all_players: bool = False,
+) -> int:
     campaign_id = normalize_campaign_id(campaign_id)
+    npc_id = (npc_id or "").strip()
+    player_id = (player_id or "").strip()
     with get_db() as conn:
-        cur = conn.execute("""
-            DELETE FROM conversation_turns
-            WHERE campaign_id = ?
-              AND npc_id = ?
-              AND player_id = ?
-        """, (campaign_id, npc_id, player_id))
+        if all_players or not player_id:
+            cur = conn.execute("""
+                DELETE FROM conversation_turns
+                WHERE campaign_id = ?
+                  AND npc_id = ?
+            """, (campaign_id, npc_id))
+        else:
+            cur = conn.execute("""
+                DELETE FROM conversation_turns
+                WHERE campaign_id = ?
+                  AND npc_id = ?
+                  AND player_id = ?
+            """, (campaign_id, npc_id, player_id))
         conn.commit()
         return cur.rowcount
 
@@ -4805,6 +4835,13 @@ def clear_npc_memory():
     player_id = session["player_id"]
     campaign_id = session["campaign_id"]
     clear_type = body.get("clear_type", "memories").strip().lower()
+    # DM console clear buttons omit player_id and mean "this NPC in this campaign"
+    # for every speaker. Opt out with all_players=false + an explicit player_id.
+    raw_all_players = body.get("all_players", True)
+    if isinstance(raw_all_players, str):
+        all_players = raw_all_players.strip().lower() in ("1", "true", "yes", "on")
+    else:
+        all_players = bool(raw_all_players)
 
     valid_clear_types = ("memories", "turns", "history", "conversation", "dm", "all")
     if clear_type not in valid_clear_types:
@@ -4818,13 +4855,28 @@ def clear_npc_memory():
     deleted_dm = {}
 
     if clear_type in ("memories", "all"):
-        deleted_memories = clear_memories(npc_id, player_id, campaign_id=campaign_id)
+        deleted_memories = clear_memories(
+            npc_id,
+            player_id,
+            campaign_id=campaign_id,
+            all_players=all_players,
+        )
 
     if clear_type in ("turns", "history", "conversation", "all"):
-        deleted_turns = clear_recent_turns(npc_id, player_id, campaign_id=campaign_id)
+        deleted_turns = clear_recent_turns(
+            npc_id,
+            player_id,
+            campaign_id=campaign_id,
+            all_players=all_players,
+        )
 
     if clear_type in ("dm", "all"):
-        deleted_dm = clear_dm_data(npc_id, player_id, campaign_id=campaign_id)
+        deleted_dm = clear_dm_data(
+            npc_id,
+            player_id,
+            campaign_id=campaign_id,
+            all_players=all_players,
+        )
 
     return jsonify({
         "status": "cleared",
@@ -4833,6 +4885,7 @@ def clear_npc_memory():
         "party_id": session["party_id"],
         "campaign_id": session["campaign_id"],
         "clear_type": clear_type,
+        "all_players": all_players,
         "deleted_memories": deleted_memories,
         "deleted_turns": deleted_turns,
         "deleted_dm": deleted_dm,

@@ -439,3 +439,59 @@ def test_dismiss_pending_check_rejects_already_ruled(tmp_path, monkeypatch):
     still = dm_channel.load_pending_check_by_id(pending_id)
     assert still is not None
     assert still["status"] == "confirmed"
+
+
+def test_clear_dm_data_all_players_removes_other_speakers_rulings(tmp_path, monkeypatch):
+    """DM clear must wipe language Denies stored under the speaking player_id."""
+    import dm_channel
+
+    mem_db = tmp_path / "dm_clear_all_players.db"
+    monkeypatch.setattr(dm_channel, "MEMORY_DB", mem_db)
+    dm_channel.init_dm_tables()
+
+    campaign = "greyhaven_intro"
+    npc = "slaad_guard"
+    pending = dm_channel.save_pending_check(
+        npc_id=npc,
+        player_id="player_alden",
+        claim_summary="Does the speaker know the necessary language to talk to the NPC",
+        player_text="Hello",
+        npc_text="Waiting.",
+        source="npc",
+        campaign_id=campaign,
+    )
+    ruling_id = dm_channel.save_ruling(
+        npc_id=npc,
+        player_id="player_alden",
+        claim_summary="Does the speaker know the necessary language to talk to the NPC",
+        verdict="denied",
+        ruling_text="Failure",
+        source="dm",
+        pending_check_id=pending,
+        campaign_id=campaign,
+    )
+    assert ruling_id
+    assert dm_channel.load_rulings(npc, "player_alden", campaign_id=campaign)
+
+    # Wrong speaker id (what the old DM clear used) must not leave the ruling.
+    noop = dm_channel.clear_dm_data(
+        npc,
+        "dm_console",
+        campaign_id=campaign,
+        all_players=False,
+    )
+    assert noop["deleted_rulings"] == 0
+    assert dm_channel.load_rulings(npc, "player_alden", campaign_id=campaign)
+
+    cleared = dm_channel.clear_dm_data(
+        npc,
+        "dm_console",
+        campaign_id=campaign,
+        all_players=True,
+    )
+    assert cleared["deleted_rulings"] >= 1
+    assert cleared["all_players"] is True
+    assert dm_channel.load_rulings(npc, "player_alden", campaign_id=campaign) == []
+    assert dm_channel.load_pending_checks(
+        npc, "player_alden", status=None, campaign_id=campaign
+    ) == []
