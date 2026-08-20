@@ -39,6 +39,8 @@ from content_import import (
 from required_dm_checks import (
     format_required_dm_checks_prompt_block,
     generate_npc_reply_text,
+    is_language_comprehension_claim,
+    resolve_npc_native_language,
 )
 from dm_channel import (
     build_dm_injection_messages,
@@ -1376,6 +1378,18 @@ def build_dm_followup_messages(
             "access or benefit. Put spoken refusal/dialogue in plain text (NPC voice), "
             "not inside *asterisks* — asterisks are only for one short nonverbal beat."
         )
+        if is_language_comprehension_claim(claim_summary):
+            native = resolve_npc_native_language(npc, language_claim=claim_summary)
+            if native:
+                action_hint += (
+                    f" Language barrier Failure is in force: do NOT speak English or Common. "
+                    f"Reply ONLY in {native} (short confusion / refusal), never translate."
+                )
+            else:
+                action_hint += (
+                    " Language barrier Failure is in force: do NOT speak English or Common. "
+                    "Reply only in this NPC's native/fantasy language from its rules."
+                )
     else:
         action_hint = "Apply the DM's guidance in character."
 
