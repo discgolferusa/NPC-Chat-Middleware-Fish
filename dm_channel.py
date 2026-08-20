@@ -1436,23 +1436,55 @@ def log_dm_turn(
     print(" ".join(str(part) for part in parts), flush=True)
 
 
-def clear_dm_data(npc_id: str, player_id: str, campaign_id: str = "") -> dict[str, int]:
+def clear_dm_data(
+    npc_id: str,
+    player_id: str = "",
+    campaign_id: str = "",
+    *,
+    all_players: bool = False,
+) -> dict[str, int]:
+    """
+    Delete DM channel rows for an NPC.
+
+    When ``all_players`` is true (DM console clear), wipe every player's pending
+    checks and rulings for this NPC in the campaign. Language Deny rulings are
+    stored under the speaking player_id; clearing only the DM session speaker
+    left those rulings in place and blocked language re-checks.
+    """
     campaign_id = normalize_campaign_id(campaign_id)
+    npc_id = (npc_id or "").strip()
+    player_id = (player_id or "").strip()
     with get_db() as conn:
-        deleted_messages = conn.execute("""
-            DELETE FROM dm_messages
-            WHERE campaign_id = ? AND npc_id = ? AND player_id = ?
-        """, (campaign_id, npc_id, player_id)).rowcount
+        if all_players or not player_id:
+            deleted_messages = conn.execute("""
+                DELETE FROM dm_messages
+                WHERE campaign_id = ? AND npc_id = ?
+            """, (campaign_id, npc_id)).rowcount
 
-        deleted_pending = conn.execute("""
-            DELETE FROM dm_pending_checks
-            WHERE campaign_id = ? AND npc_id = ? AND player_id = ?
-        """, (campaign_id, npc_id, player_id)).rowcount
+            deleted_pending = conn.execute("""
+                DELETE FROM dm_pending_checks
+                WHERE campaign_id = ? AND npc_id = ?
+            """, (campaign_id, npc_id)).rowcount
 
-        deleted_rulings = conn.execute("""
-            DELETE FROM dm_rulings
-            WHERE campaign_id = ? AND npc_id = ? AND player_id = ?
-        """, (campaign_id, npc_id, player_id)).rowcount
+            deleted_rulings = conn.execute("""
+                DELETE FROM dm_rulings
+                WHERE campaign_id = ? AND npc_id = ?
+            """, (campaign_id, npc_id)).rowcount
+        else:
+            deleted_messages = conn.execute("""
+                DELETE FROM dm_messages
+                WHERE campaign_id = ? AND npc_id = ? AND player_id = ?
+            """, (campaign_id, npc_id, player_id)).rowcount
+
+            deleted_pending = conn.execute("""
+                DELETE FROM dm_pending_checks
+                WHERE campaign_id = ? AND npc_id = ? AND player_id = ?
+            """, (campaign_id, npc_id, player_id)).rowcount
+
+            deleted_rulings = conn.execute("""
+                DELETE FROM dm_rulings
+                WHERE campaign_id = ? AND npc_id = ? AND player_id = ?
+            """, (campaign_id, npc_id, player_id)).rowcount
 
         conn.commit()
 
@@ -1460,4 +1492,5 @@ def clear_dm_data(npc_id: str, player_id: str, campaign_id: str = "") -> dict[st
         "deleted_messages": deleted_messages,
         "deleted_pending_checks": deleted_pending,
         "deleted_rulings": deleted_rulings,
+        "all_players": bool(all_players or not player_id),
     }

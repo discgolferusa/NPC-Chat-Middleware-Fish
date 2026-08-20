@@ -782,6 +782,54 @@ def test_dm_pending_and_ruling_are_campaign_wide_without_player_id(api, monkeypa
     assert all(item.get("id") != pending_id for item in still_open)
 
 
+def test_npc_memory_clear_dm_wipes_other_players_language_rulings(api):
+    """DM Knowledge clear must remove Deny rulings under the speaking player_id."""
+    client, server, headers = api
+    import dm_channel
+
+    campaign = "greyhaven_intro"
+    npc = "captain_varra"
+    pending_id = dm_channel.save_pending_check(
+        npc_id=npc,
+        player_id="player_alden",
+        claim_summary="Does the speaker know the necessary language to talk to the NPC",
+        player_text="Hello",
+        npc_text="Waiting.",
+        source="npc",
+        campaign_id=campaign,
+    )
+    ruling_id = dm_channel.save_ruling(
+        npc_id=npc,
+        player_id="player_alden",
+        claim_summary="Does the speaker know the necessary language to talk to the NPC",
+        verdict="denied",
+        ruling_text="Failure",
+        source="dm",
+        pending_check_id=pending_id,
+        campaign_id=campaign,
+    )
+    assert ruling_id
+    assert dm_channel.load_rulings(npc, "player_alden", campaign_id=campaign)
+
+    # Session speaker is not player_alden — old clear would no-op on these rows.
+    cleared = client.post(
+        "/npc-memory/clear",
+        headers=headers,
+        json={
+            "npc_id": npc,
+            "campaign_id": campaign,
+            "clear_type": "dm",
+            "player_id": "dm_console",
+            "all_players": True,
+        },
+    )
+    assert cleared.status_code == 200, cleared.get_json()
+    body = cleared.get_json()
+    assert body.get("all_players") is True
+    assert (body.get("deleted_dm") or {}).get("deleted_rulings", 0) >= 1
+    assert dm_channel.load_rulings(npc, "player_alden", campaign_id=campaign) == []
+
+
 def test_dm_ruling_auto_respond_uses_pending_player_party_context(api, monkeypatch):
     """After check_id override, auto_respond must use the pending claim's player speaker."""
     client, server, headers = api
