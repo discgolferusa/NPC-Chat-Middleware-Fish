@@ -296,7 +296,7 @@ def test_generate_still_enforces_authored_template():
     )
     assert calls["n"] == 0
     assert "Confused stare." not in text
-    assert "Waiting on a DM decision" in text
+    assert "Waiting on a decision from game master" in text
     assert "[DM CHECK:" in text
     assert "necessary language" in text.lower()
 
@@ -396,7 +396,7 @@ def test_generate_rewrites_english_for_unruled_language_barrier():
     )
     assert calls["n"] == 0
     assert "help you" not in text.lower()
-    assert "Waiting on a DM decision" in text
+    assert "Waiting on a decision from game master" in text
     assert "[DM CHECK:" in text
 
 
@@ -416,7 +416,7 @@ def test_generate_still_calls_llm_when_pending_is_situational():
     )
     assert calls["n"] == 1
     assert "come on through" in text.lower()
-    assert "Waiting on a DM decision" not in text
+    assert "Waiting on a decision from game master" not in text
 
 
 def test_situational_template_does_not_skip_llm_on_greeting():
@@ -441,7 +441,7 @@ def test_situational_template_does_not_skip_llm_on_greeting():
     )
     assert calls["n"] == 1
     assert "Hello there, traveler." in text
-    assert "Waiting on a DM decision" not in text
+    assert "Waiting on a decision from game master" not in text
     assert "[DM CHECK:" not in text
 
 

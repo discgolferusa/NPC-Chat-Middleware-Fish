@@ -32,6 +32,7 @@ def test_clean_for_tts_expands_and_pronounces():
 def test_asterisk_body_tts_type_keeps_stage_beats_on_narrator():
     assert is_nonverbal_stage_direction("Varra narrows her eyes.")
     assert is_nonverbal_stage_direction("Snarls.")
+    assert is_nonverbal_stage_direction("Waiting on a decision from game master.")
     assert is_nonverbal_stage_direction("Waiting on a DM decision.")
     assert asterisk_body_tts_type("Xill cocks its head.") == "narrator"
 

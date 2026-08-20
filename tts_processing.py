@@ -415,7 +415,7 @@ def is_nonverbal_stage_direction(text: str) -> bool:
     if not inner:
         return False
     lowered = inner.lower()
-    if "waiting on a dm decision" in lowered:
+    if "waiting on a decision from game master" in lowered or "waiting on a dm decision" in lowered:
         return True
     # Spoken lines often ask/exclaim; stage beats usually do not.
     if "?" in inner:

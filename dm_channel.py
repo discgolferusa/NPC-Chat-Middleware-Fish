@@ -19,14 +19,17 @@ MEMORY_DB = db_paths.MEMORY_DB
 LEGACY_CAMPAIGN_BACKFILL_ID = "greyhaven_intro"
 
 # Spoken while a DM CHECK is still unruled — narrator TTS, not NPC dialogue.
-DM_PENDING_WAIT_NARRATION = "*Waiting on a DM decision.*"
+DM_PENDING_WAIT_NARRATION = "*Waiting on a decision from game master.*"
 
 
 def is_dm_wait_narration(text: str) -> bool:
     stripped = (text or "").strip().strip("*").strip().lower()
     if not stripped:
         return False
-    return "waiting on a dm decision" in stripped
+    return (
+        "waiting on a decision from game master" in stripped
+        or "waiting on a dm decision" in stripped
+    )
 
 
 def assistant_history_text(npc_response: dict[str, Any] | None) -> str:

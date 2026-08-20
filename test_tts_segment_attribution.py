@@ -42,6 +42,8 @@ def test_split_puts_italicized_denied_claim_dialogue_on_npc():
 def test_split_keeps_wait_narration_on_narrator():
     import server
 
-    segments = server.split_into_ordered_tts_segments("*Waiting on a DM decision.*")
+    segments = server.split_into_ordered_tts_segments(
+        "*Waiting on a decision from game master.*"
+    )
     assert len(segments) == 1
     assert segments[0]["type"] == "narrator"
