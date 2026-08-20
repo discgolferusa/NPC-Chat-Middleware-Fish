@@ -498,3 +498,45 @@ def test_failure_language_barrier_prompt_block_without_pending_checks():
     assert "LANGUAGE BARRIER" in block
     assert "DM ruled Failure" in block
     assert "Slaadi" in block
+
+
+def test_language_barrier_uses_latest_ruling_when_claim_ruled_multiple_times():
+    """load_rulings is oldest-first; enforcement must honor the newest verdict."""
+    claim = "does this speaker know Language Slaadi"
+    raw = "Yes, I understand you perfectly."
+
+    failure_then_success = {
+        "rulings": [
+            {"verdict": "denied", "claim_summary": claim},
+            {"verdict": "confirmed", "claim_summary": claim},
+        ]
+    }
+    enforced = enforce_unruled_check_spoken_behavior(
+        USER_PROSE_SLAAD_NPC,
+        failure_then_success,
+        raw,
+    )
+    assert "understand you" in enforced.lower()
+
+    success_then_failure = {
+        "rulings": [
+            {"verdict": "confirmed", "claim_summary": claim},
+            {"verdict": "denied", "claim_summary": claim},
+        ]
+    }
+    enforced = enforce_unruled_check_spoken_behavior(
+        USER_PROSE_SLAAD_NPC,
+        success_then_failure,
+        raw,
+    )
+    assert "understand you" not in enforced.lower()
+    assert "Skraa-vek" in enforced
+
+    assert "DM ruled Failure" not in format_required_dm_checks_prompt_block(
+        USER_PROSE_SLAAD_NPC,
+        failure_then_success,
+    )
+    assert "DM ruled Failure" in format_required_dm_checks_prompt_block(
+        USER_PROSE_SLAAD_NPC,
+        success_then_failure,
+    )

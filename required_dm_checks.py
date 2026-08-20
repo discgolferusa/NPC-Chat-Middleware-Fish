@@ -351,8 +351,9 @@ def _language_barrier_ruling_for_template(
     template: str,
     dm_context: dict[str, Any] | None,
 ) -> str | None:
-    """Return ``confirmed``, ``denied``, or None for a language template."""
-    for ruling in (dm_context or {}).get("rulings") or []:
+    """Return the latest ``confirmed`` / ``denied`` verdict for a language template."""
+    rulings = (dm_context or {}).get("rulings") or []
+    for ruling in reversed(rulings):
         verdict = str(ruling.get("verdict") or "").strip().lower()
         if verdict not in ("confirmed", "denied"):
             continue
