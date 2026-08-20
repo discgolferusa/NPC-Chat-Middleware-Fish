@@ -664,9 +664,16 @@ def save_player_npc_conversation_turns(
     npc_response: dict,
     *,
     campaign_id: str = "",
+    save_user: bool = True,
 ) -> str:
-    """Persist the player line and in-character NPC draft, never wait-narration."""
-    save_turn(npc_id, player_id, "user", player_text, campaign_id=campaign_id)
+    """Persist the player line and in-character NPC draft, never wait-narration.
+
+    Callers that already saved the user utterance before a long LLM wait should pass
+    ``save_user=False`` so a force-displaced turn still leaves the player line in
+    history for DM auto-response follow-ups.
+    """
+    if save_user:
+        save_turn(npc_id, player_id, "user", player_text, campaign_id=campaign_id)
     history_text = assistant_history_text(npc_response)
     if history_text:
         save_turn(npc_id, player_id, "assistant", history_text, campaign_id=campaign_id)
@@ -2698,6 +2705,10 @@ def npc_turn():
         player_claim = process_player_message(npc_id, player_id, player_text, campaign_id=campaign_id)
         dm_context = get_dm_context(npc_id, player_id, campaign_id=campaign_id)
 
+        # Persist the player line before the LLM wait so a DM Confirm/Deny that
+        # force-supersedes this turn still leaves the utterance in history.
+        save_turn(npc_id, player_id, "user", player_text, campaign_id=campaign_id)
+
         set_turn_progress(request_id, "preparing_prompt")
         messages = build_npc_llm_messages(
             npc,
@@ -2744,6 +2755,7 @@ def npc_turn():
             player_text,
             npc_response,
             campaign_id=campaign_id,
+            save_user=False,
         )
         history_npc_text = assistant_history_text(npc_response)
         step_start = log_timing(request_id, "save text conversation turns", step_start)
@@ -2963,6 +2975,10 @@ def npc_voice_turn():
         player_claim = process_player_message(npc_id, player_id, player_text, campaign_id=campaign_id)
         dm_context = get_dm_context(npc_id, player_id, campaign_id=campaign_id)
 
+        # Persist the player line before the LLM wait so a DM Confirm/Deny that
+        # force-supersedes this turn still leaves the utterance in history.
+        save_turn(npc_id, player_id, "user", player_text, campaign_id=campaign_id)
+
         set_turn_progress(request_id, "preparing_prompt")
         messages = build_npc_llm_messages(
             npc,
@@ -3039,6 +3055,7 @@ def npc_voice_turn():
             player_text,
             npc_response,
             campaign_id=campaign_id,
+            save_user=False,
         )
         step_start = log_timing(request_id, "save conversation turns", step_start)
         history_npc_text = assistant_history_text(npc_response)
