@@ -462,7 +462,7 @@ def test_npc_turn_slaad_strips_english_when_language_check_unruled(api, monkeypa
         "location_id": "demo",
         "personality": ["aggressive"],
         "public_facts": ["dislikes humans"],
-        "known_facts": [],
+        "known_facts": ["Native language: Slaadi"],
         "secrets": [],
         "voice": [],
         "llm_rules": [
@@ -473,14 +473,16 @@ def test_npc_turn_slaad_strips_english_when_language_check_unruled(api, monkeypa
         ],
     }
 
+    llm_calls = {"n": 0}
+
+    def _ask(_messages):
+        llm_calls["n"] += 1
+        if llm_calls["n"] == 1:
+            return "*Snarls.* Yes, I understand you. What do you want?"
+        return "*Snarls.* Krah-thok slaad-vek?"
+
     monkeypatch.setattr(server, "load_npc", lambda _id: dict(rule_npc))
-    monkeypatch.setattr(
-        server,
-        "ask_llm",
-        lambda _messages: (
-            "*Snarls.* Yes, I understand you. What do you want?"
-        ),
-    )
+    monkeypatch.setattr(server, "ask_llm", _ask)
 
     turn = client.post(
         "/npc-turn",
@@ -497,8 +499,9 @@ def test_npc_turn_slaad_strips_english_when_language_check_unruled(api, monkeypa
     assert turn.status_code == 200
     body = turn.get_json()
     reply = body.get("npc_text") or body.get("text") or ""
+    assert llm_calls["n"] == 2
     assert "understand you" not in reply.lower()
-    assert "Skraa-vek" in reply
+    assert "Krah-thok" in reply
     assert body.get("dm_check_claim")
     assert "necessary language" in str(body.get("dm_check_claim")).lower()
 

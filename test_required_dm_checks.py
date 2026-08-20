@@ -10,6 +10,7 @@ from required_dm_checks import (
     generate_npc_reply_text,
     log_llm_prompt_to_console,
     required_dm_checks,
+    resolve_npc_native_language,
 )
 
 
@@ -28,6 +29,13 @@ SLAAD_RULES = [
     "'[DM Ruling: Success] Respond to the speaker in English.'",
     "'[DM Ruling: Failure] You do not understand them; reply only to show that, in a short fantasy-language line.'",
 ]
+
+SLAAD_NPC = {
+    "id": "slaad",
+    "name": "Slaad",
+    "llm_rules": SLAAD_RULES,
+    "known_facts": ["Native language: Slaadi"],
+}
 
 
 def test_extract_dm_check_from_rules():
@@ -291,38 +299,82 @@ def test_slaad_quoted_yaml_rules_extract_language_template():
 
 
 def test_format_includes_language_barrier_block_for_slaad():
-    npc = {"llm_rules": SLAAD_RULES}
-    block = format_required_dm_checks_prompt_block(npc, {"rulings": []})
+    block = format_required_dm_checks_prompt_block(SLAAD_NPC, {"rulings": []})
     assert "LANGUAGE BARRIER" in block
-    assert "Do NOT respond in English" in block
+    assert "native language is Slaadi" in block
+
+
+def test_resolve_native_language_from_known_facts_or_claim():
+    assert resolve_npc_native_language(SLAAD_NPC) == "Slaadi"
+    assert resolve_npc_native_language(
+        {"known_facts": ["Speaks only Infernal"]}
+    ) == "Infernal"
+    assert resolve_npc_native_language(
+        {},
+        language_claim="Does the speaker know Language Slaadi",
+    ) == "Slaadi"
+    assert resolve_npc_native_language(
+        {},
+        language_claim="Does the speaker know the necessary language to talk to the NPC",
+    ) == ""
 
 
 def test_enforce_strips_english_comprehension_when_language_check_unruled():
-    npc = {"llm_rules": SLAAD_RULES}
     raw = "*Snarls.* Yes, I understand you perfectly. How may I help?"
-    tagged = ensure_required_dm_check_tags(npc, {"rulings": []}, raw)
-    enforced = enforce_unruled_check_spoken_behavior(npc, {"rulings": []}, tagged)
+    tagged = ensure_required_dm_check_tags(SLAAD_NPC, {"rulings": []}, raw)
+    enforced = enforce_unruled_check_spoken_behavior(SLAAD_NPC, {"rulings": []}, tagged)
     assert "understand you" not in enforced.lower()
     assert "Skraa-vek" in enforced
     assert "[DM CHECK:" in enforced
     assert "necessary language" in enforced.lower()
 
 
+def test_enforce_uses_native_language_llm_rewrite():
+    calls: list[list[dict[str, str]]] = []
+
+    def _ask(messages):
+        calls.append(messages)
+        return "*Snarls.* Krah-thok slaad-vek?"
+
+    raw = "*Snarls.* Yes, I understand you perfectly."
+    tagged = ensure_required_dm_check_tags(SLAAD_NPC, {"rulings": []}, raw)
+    enforced = enforce_unruled_check_spoken_behavior(
+        SLAAD_NPC,
+        {"rulings": []},
+        tagged,
+        player_text="Hello, can you help us?",
+        ask_llm_fn=_ask,
+    )
+    assert len(calls) == 1
+    assert "Slaadi" in calls[0][-1]["content"]
+    assert "Hello, can you help us?" in calls[0][-1]["content"]
+    assert "Krah-thok" in enforced
+    assert "understand you" not in enforced.lower()
+
+
 def test_generate_rewrites_english_for_unruled_language_barrier():
-    npc = {"llm_rules": SLAAD_RULES}
+    calls = {"n": 0}
+
+    def _ask(messages):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return "Hello, I can help you with that."
+        return "*Snarls.* Krah-thok vek?"
+
     text = generate_npc_reply_text(
-        npc,
+        SLAAD_NPC,
         {"rulings": []},
         [],
-        lambda _m: "Hello, I can help you with that.",
+        _ask,
+        player_text="Hello, can you help us?",
     )
+    assert calls["n"] == 2
     assert "help you" not in text.lower()
-    assert "Skraa-vek" in text
+    assert "Krah-thok" in text
     assert "[DM CHECK:" in text
 
 
 def test_generate_allows_english_after_language_success_ruling():
-    npc = {"llm_rules": SLAAD_RULES}
     dm_context = {
         "rulings": [
             {
@@ -333,7 +385,7 @@ def test_generate_allows_english_after_language_success_ruling():
         ]
     }
     text = generate_npc_reply_text(
-        npc,
+        SLAAD_NPC,
         dm_context,
         [],
         lambda _m: "Welcome, traveler. What do you need?",
