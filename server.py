@@ -2358,7 +2358,10 @@ def synthesize_segmented_speech_clips(
 
     # Always synthesize the first clip on the request thread.
     if _synthesize_one(0, segments[0]) is None:
-        return _result(pending=False)
+        # Empty clips without raising used to make /npc-voice-turn send_file a
+        # missing {request_id}_response.wav (500). Surface supersede instead.
+        progress = get_turn_progress(request_id)
+        raise TurnSupersededError(progress)
 
     if return_after_first_clip and len(segments) > 1:
         remaining = list(enumerate(segments[1:], start=1))
@@ -3162,6 +3165,10 @@ def npc_voice_turn():
         streaming = bool(clip_result.get("pending"))
         # Prefer last segment as HTTP body; clients play via SignalR clip list.
         response_path = turn_audio_path(request_id, len(clips) - 1) if clips else (speech_path or narration_path or output_path)
+        if not clips or not Path(response_path).is_file():
+            # Race: superseded after synthesize returned, or missing WAV body.
+            ensure_turn_in_progress(request_id)
+            raise RuntimeError("TTS produced no playable audio for this turn")
 
         set_turn_progress(
             request_id,

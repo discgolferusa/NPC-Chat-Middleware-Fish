@@ -228,6 +228,57 @@ def test_npc_voice_turn(api):
     assert "watch" in npc_text.lower() or "firm" in npc_text.lower()
 
 
+def test_npc_voice_turn_returns_409_when_tts_superseded_before_first_clip(api, monkeypatch):
+    """Confirm/Deny during narrator setup must not send_file a missing response WAV."""
+    client, server, headers = api
+    import turn_progress as tp
+
+    request_id = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    npc_id = "captain_varra"
+    player_id = "player_alden"
+    campaign_id = "greyhaven_intro"
+
+    def _supersede_on_tts(**_kwargs):
+        tp.register_turn_progress(
+            "ffffffffffffffffffffffffffffffff",
+            route="/dm-ruling-auto-response",
+            npc_id=npc_id,
+            player_id=player_id,
+            mode="text",
+            campaign_id=campaign_id,
+            force=True,
+        )
+        return {
+            "clips": [],
+            "narration_text": "",
+            "dialogue_text": "",
+            "speech_path": None,
+            "narration_path": None,
+            "pending": False,
+        }
+
+    monkeypatch.setattr(server, "synthesize_segmented_speech_clips", _supersede_on_tts)
+
+    audio = (io.BytesIO(b"RIFF" + (b"\x00" * 2048)), "clip.wav")
+    response = client.post(
+        "/npc-voice-turn",
+        headers=headers,
+        data={
+            "npc_id": npc_id,
+            "scene": "Barracks",
+            "player_id": player_id,
+            "campaign_id": campaign_id,
+            "request_id": request_id,
+            "audio": audio,
+        },
+        content_type="multipart/form-data",
+    )
+    assert response.status_code == 409
+    body = response.get_json()
+    assert body.get("error") == "superseded"
+    assert response.mimetype != "audio/wav"
+
+
 def test_npc_voice_turn_upload_failure_releases_lock(api, monkeypatch):
     client, server, headers = api
 
