@@ -51,8 +51,26 @@ _LANGUAGE_BARRIER_CLAIM_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# "Slaadi language", "Common language" (name before the word language).
+_NAMED_LANGUAGE_BEFORE_PATTERN = re.compile(
+    r"\b([a-z][a-z-]{2,})\s+language\b",
+    re.IGNORECASE,
+)
+
+# "know the Slaadi language", "speak the Common language"
+_KNOW_SPEAK_NAMED_LANGUAGE_PATTERN = re.compile(
+    r"\b(?:know|knows|speak|speaks)\s+the\s+[a-z][a-z-]+\s+language\b",
+    re.IGNORECASE,
+)
+
+# Leading words to strip from a captured language name (not the language itself).
+_LANGUAGE_NAME_LEADING_FILLER = frozenset(
+    {"is", "are", "was", "were", "the", "a", "an"},
+)
+
 _NATIVE_LANGUAGE_PATTERNS = (
-    re.compile(r"native language[:\s]+([a-z][a-z\s-]{2,})", re.IGNORECASE),
+    re.compile(r"native language\s*:\s*([a-z][a-z\s-]{2,})", re.IGNORECASE),
+    re.compile(r"native language\s+is\s+([a-z][a-z\s-]{2,})", re.IGNORECASE),
     re.compile(r"speaks only ([a-z][a-z\s-]{2,})", re.IGNORECASE),
     re.compile(r"speak only ([a-z][a-z\s-]{2,})", re.IGNORECASE),
     re.compile(r"only speaks ([a-z][a-z\s-]{2,})", re.IGNORECASE),
@@ -62,7 +80,7 @@ _NATIVE_LANGUAGE_PATTERNS = (
 # Words that are not a creature language name when parsed from a claim.
 _LANGUAGE_NAME_STOPWORDS = frozenset(
     {
-        "the", "to", "talk", "speak", "npc", "necessary", "required", "common",
+        "the", "to", "talk", "speak", "npc", "necessary", "required",
         "understood", "unknown", "player", "speaker", "party",
     }
 )
@@ -231,20 +249,27 @@ def required_dm_checks(
 def _clean_language_name(raw: str) -> str:
     name = re.sub(r"\s+", " ", (raw or "").strip()).strip(" .'\"")
     words = name.split()
+    while words and words[0].lower() in _LANGUAGE_NAME_LEADING_FILLER:
+        words.pop(0)
     if not words:
         return ""
     if words[0].lower() in _LANGUAGE_NAME_STOPWORDS:
         return ""
     if len(words) > 4:
         return ""
-    return name
+    return " ".join(words)
 
 
 def _language_from_claim(claim: str) -> str:
     match = _LANGUAGE_BARRIER_CLAIM_PATTERN.search(claim or "")
-    if not match:
-        return ""
-    return _clean_language_name(match.group(1))
+    if match:
+        cleaned = _clean_language_name(match.group(1))
+        if cleaned:
+            return cleaned
+    before = _NAMED_LANGUAGE_BEFORE_PATTERN.search(claim or "")
+    if before:
+        return _clean_language_name(before.group(1))
+    return ""
 
 
 def _language_from_text_blob(text: str) -> str:
@@ -300,6 +325,12 @@ def _is_language_comprehension_claim(claim: str) -> bool:
         return True
     if "language" not in normalized:
         return False
+    if _KNOW_SPEAK_NAMED_LANGUAGE_PATTERN.search(claim or ""):
+        return True
+    if _NAMED_LANGUAGE_BEFORE_PATTERN.search(claim or "") and any(
+        word in normalized for word in ("know", "speak", "speaker", "necessary")
+    ):
+        return True
     if any(phrase in normalized for phrase in _LANGUAGE_BARRIER_CLAIM_PHRASES):
         return True
     # Authored template: "Does the speaker know the necessary language to talk to the NPC"
@@ -308,11 +339,96 @@ def _is_language_comprehension_claim(claim: str) -> bool:
     return False
 
 
+def _language_barrier_templates(npc: dict[str, Any] | None) -> list[str]:
+    return [
+        claim
+        for claim in extract_dm_check_templates_from_rules(npc)
+        if _is_language_comprehension_claim(claim)
+    ]
+
+
+def _language_barrier_ruling_for_template(
+    template: str,
+    dm_context: dict[str, Any] | None,
+) -> str | None:
+    """Return the latest ``confirmed`` / ``denied`` verdict for a language template."""
+    rulings = (dm_context or {}).get("rulings") or []
+    for ruling in reversed(rulings):
+        verdict = str(ruling.get("verdict") or "").strip().lower()
+        if verdict not in ("confirmed", "denied"):
+            continue
+        summary = str(ruling.get("claim_summary") or "")
+        if _claim_matches(template, summary):
+            return verdict
+    return None
+
+
+def _language_barrier_enforcement_context(
+    npc: dict[str, Any] | None,
+    dm_context: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """
+    Decide whether to rewrite English barrier replies.
+
+    Returns None when Success is ruled (English allowed). Otherwise returns metadata
+    for unruled (append DM CHECK tags) or denied Failure (rewrite only).
+    """
+    if not _npc_has_language_barrier_rules(npc):
+        return None
+
+    templates = _language_barrier_templates(npc)
+    if not templates:
+        return None
+
+    for template in templates:
+        verdict = _language_barrier_ruling_for_template(template, dm_context)
+        if verdict == "confirmed":
+            return None
+
+    pending = [
+        claim
+        for claim in required_dm_checks(npc, dm_context)
+        if _is_language_comprehension_claim(claim)
+    ]
+    if pending:
+        return {
+            "mode": "unruled",
+            "language_claim": pending[0],
+            "append_checks": True,
+            "pending": pending,
+        }
+
+    for template in templates:
+        if _language_barrier_ruling_for_template(template, dm_context) == "denied":
+            return {
+                "mode": "failure",
+                "language_claim": template,
+                "append_checks": False,
+                "pending": [],
+            }
+
+    return None
+
+
 def _npc_has_language_barrier_rules(npc: dict[str, Any] | None) -> bool:
+    if _language_barrier_templates(npc):
+        return True
     blob = _npc_rules_blob(npc).lower()
     if "do not treat the speaker as understood" in blob:
         return True
     if "fantasy-language" in blob:
+        return True
+    prose_markers = (
+        "does not understand common",
+        "do not understand common",
+        "never switch to common",
+        "only understands language",
+        "do not answer the meaning",
+        "not answer the meaning of their words",
+        "keep failing to understand",
+        "confirms a speaker knows",
+    )
+    if any(marker in blob for marker in prose_markers):
         return True
     failure_hint = _extract_failure_ruling_hint(npc).lower()
     return bool(
@@ -444,12 +560,11 @@ def enforce_unruled_check_spoken_behavior(
     ask_llm_fn: Callable[[list[dict[str, str]]], str] | None = None,
 ) -> str:
     """
-    When a language-barrier DM CHECK is still unruled, strip English comprehension
-    dialogue the model may have added before/after the tag.
+    When a language-barrier DM CHECK is still unruled (or Failure was ruled),
+    strip English comprehension dialogue the model may have added before/after tags.
     """
-    pending = required_dm_checks(npc, dm_context)
-    language_pending = [claim for claim in pending if _is_language_comprehension_claim(claim)]
-    if not language_pending or not _npc_has_language_barrier_rules(npc):
+    barrier = _language_barrier_enforcement_context(npc, dm_context)
+    if not barrier:
         return raw_text
 
     from dm_channel import extract_dm_check_tags
@@ -460,7 +575,7 @@ def enforce_unruled_check_spoken_behavior(
 
     native_language = resolve_npc_native_language(
         npc,
-        language_claim=language_pending[0],
+        language_claim=barrier["language_claim"],
     )
     rewritten = _rewrite_language_barrier_spoken(
         spoken,
@@ -470,7 +585,11 @@ def enforce_unruled_check_spoken_behavior(
         ask_llm_fn=ask_llm_fn,
     )
     result = rewritten.rstrip()
+    if not barrier.get("append_checks"):
+        return result
+
     tag_claims = list(claims)
+    pending = barrier.get("pending") or []
     for claim in pending:
         if not any(_claim_matches(claim, existing) for existing in tag_claims):
             tag_claims.append(claim)
@@ -485,10 +604,12 @@ def format_required_dm_checks_prompt_block(
 ) -> str:
     """Remind the model of NPC-authored tags that are still waiting on a ruling."""
     pending = required_dm_checks(npc, dm_context)
-    if not pending:
-        return ""
-
-    lines = "\n".join(f"- [DM CHECK: {claim}]" for claim in pending)
+    barrier_templates = _language_barrier_templates(npc)
+    failure_templates = [
+        template
+        for template in barrier_templates
+        if _language_barrier_ruling_for_template(template, dm_context) == "denied"
+    ]
     language_waiting = any(_is_language_comprehension_claim(claim) for claim in pending)
     language_block = ""
     if language_waiting and _npc_has_language_barrier_rules(npc):
@@ -511,7 +632,31 @@ def format_required_dm_checks_prompt_block(
 LANGUAGE BARRIER (still waiting on DM ruling):
 Until a matching confirmed Success ruling exists, do NOT treat the speaker as understood.
 {native_line} {failure_line}"""
-    return f"""
+    elif failure_templates and _npc_has_language_barrier_rules(npc):
+        failure_hint = _extract_failure_ruling_hint(npc)
+        failure_line = failure_hint or "Use a short fantasy-language line only; do not reply in English."
+        native_language = resolve_npc_native_language(
+            npc,
+            language_claim=failure_templates[0],
+        )
+        native_line = (
+            f"This NPC's native language is {native_language}. Reply ONLY in {native_language}, never English."
+            if native_language
+            else "Reply only in this NPC's native language (see NPC facts/rules), never English."
+        )
+        language_block = f"""
+
+LANGUAGE BARRIER (DM ruled Failure — do not use English):
+The DM already ruled the speaker does NOT know this NPC's language.
+{native_line} {failure_line}"""
+
+    if not pending and not language_block:
+        return ""
+
+    lines = "\n".join(f"- [DM CHECK: {claim}]" for claim in pending)
+    tags_intro = ""
+    if pending:
+        tags_intro = f"""
 
 NPC-AUTHORED DM CHECK TAGS (still required until the DM rules):
 This NPC's llm_rules declare the exact checks below. Prefer these tag wordings over a
@@ -519,8 +664,8 @@ global paraphrase for the same situation. Until DM channel context shows a match
 confirmed (Success) or denied (Failure) ruling for each claim, end your reply with
 those exact tags (one per line, after spoken dialogue / stage directions). Follow any
 NPC [DM Ruling: Success] / [DM Ruling: Failure] instructions after a matching ruling.
-Do not invent DM rulings yourself.{language_block}
-{lines}"""
+Do not invent DM rulings yourself."""
+    return f"{tags_intro}{language_block}\n{lines}".rstrip()
 
 
 def ensure_required_dm_check_tags(
