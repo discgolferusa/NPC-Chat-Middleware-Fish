@@ -1432,6 +1432,8 @@ def build_dm_followup_messages(
             "Put spoken dialogue in plain text (NPC voice), never inside *asterisks*. "
             "Use *asterisks* only for a short third-person action beat "
             "(*The guard steps aside.*), which the narrator reads aloud. "
+            "Include at most one such beat and put it at the very beginning of the "
+            "reply — never in the middle or at the end. "
             "Do not mention the DM, pending checks, or game mechanics. "
             "Do not emit [DM CHECK] tags — this claim was already ruled."
         ),
