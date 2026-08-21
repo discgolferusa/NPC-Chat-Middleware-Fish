@@ -96,6 +96,37 @@ def test_seam_debris_is_still_cleaned_when_the_reply_opens_with_a_beat():
     ) == "*Torin looks up. He turns away.* and then he left."
 
 
+def test_seam_debris_is_cleaned_across_a_newline_the_beat_opened():
+    """Keeping the newline must not put the debris beside it out of the strip's reach."""
+    assert normalize_stage_directions(
+        "*Torin looks up.*\n, and then he left. *He turns away.*"
+    ) == "*Torin looks up. He turns away.*\nand then he left."
+    assert normalize_stage_directions(
+        "*Torin looks up.*\n- and then he left. *He turns away.*"
+    ) == "*Torin looks up. He turns away.*\nand then he left."
+
+
+def test_dialogue_never_opens_with_seam_debris():
+    """Debris can straddle the newline; none of it may start the spoken line."""
+    normalized = normalize_stage_directions(
+        "*Torin looks up.* ,\n; and then he left. *He turns away.*"
+    )
+    spoken = normalized.split("*", 2)[2].strip()
+    assert spoken.startswith("and then he left")
+
+
+def test_debris_is_stripped_without_costing_the_dm_check_tag_its_line():
+    """Both behaviors at once: the comma goes, the newline stays."""
+    normalized = normalize_stage_directions(
+        "*Torin looks up.* *He sets down the hammer.*,\n"
+        "[DM CHECK: whether the party carries a writ]"
+    )
+    assert normalized == (
+        "*Torin looks up. He sets down the hammer.*\n"
+        "[DM CHECK: whether the party carries a writ]"
+    )
+
+
 def test_dm_wait_narration_is_preserved_exactly():
     """Wait copy is a whole-turn narrator line; reflowing it would break matching."""
     from dm_channel import DM_PENDING_WAIT_NARRATION

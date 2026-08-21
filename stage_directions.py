@@ -44,7 +44,10 @@ def _tidy_seam(text: str, *, opens_at_seam: bool) -> str:
     text = re.sub(r"([,;:])(\s*[,;:])+", r"\1", text)
     text = re.sub(r"[ \t]+\n", "\n", text)
     if opens_at_seam:
-        text = re.sub(r"^[ \t,;:.\-–—]+", "", text)
+        # A beat can leave debris on either side of the newline it opened, so strip
+        # across that newline while keeping it: it is what holds a trailing
+        # [DM CHECK: ...] tag on its own line.
+        text = re.sub(r"^[ \t,;:.\-–—]*(\n?)[ \t,;:.\-–—]*", r"\1", text, count=1)
     leading_newline = "\n" if text[:1] == "\n" else ""
     return leading_newline + text.strip()
 
