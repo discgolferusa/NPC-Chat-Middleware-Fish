@@ -1,4 +1,4 @@
-"""TTS attribution: spoken dialogue must not ride the narrator voice."""
+"""TTS attribution: asterisks are narrator, plain text is the NPC voice."""
 
 from __future__ import annotations
 
@@ -18,35 +18,24 @@ def test_split_keeps_stage_direction_on_narrator_and_speech_on_npc():
     assert "krah" in segments[1]["text"].lower()
 
 
-def test_split_puts_italicized_language_line_on_npc_not_narrator():
+def test_split_keeps_unitalicized_language_line_on_npc():
+    """Language-barrier speech is emitted as plain text, so it stays NPC voice."""
     import server
 
-    segments = server.split_into_ordered_tts_segments("*Krah-vesh?*")
-    assert len(segments) == 1
-    assert segments[0]["type"] == "npc"
-    assert "krah" in segments[0]["text"].lower()
+    segments = server.split_into_ordered_tts_segments("*Xill cocks its head.* Skraa-vek?")
+    assert [s["type"] for s in segments] == ["narrator", "npc"]
+    assert "skraa" in segments[1]["text"].lower()
 
 
-def test_split_puts_italicized_denied_claim_dialogue_on_npc():
-    """Not language-only — any check where the model wraps speech in asterisks."""
+def test_split_keeps_plain_dialogue_on_npc():
     import server
 
     segments = server.split_into_ordered_tts_segments(
-        "*I will not open the gate without proof.*"
+        "I will not open the gate without proof."
     )
     assert len(segments) == 1
     assert segments[0]["type"] == "npc"
     assert "gate" in segments[0]["text"].lower()
-
-
-def test_split_puts_mixed_action_and_dialogue_italics_on_npc():
-    import server
-
-    segments = server.split_into_ordered_tts_segments(
-        "*Snarls. I will not open the gate.*"
-    )
-    assert len(segments) == 1
-    assert segments[0]["type"] == "npc"
 
 
 def test_split_keeps_post_ruling_outcome_narration_on_narrator():
@@ -59,6 +48,18 @@ def test_split_keeps_post_ruling_outcome_narration_on_narrator():
     assert [s["type"] for s in segments] == ["narrator", "npc"]
     assert "gate" in segments[0]["text"].lower()
     assert "through" in segments[1]["text"].lower()
+
+
+def test_split_narrates_long_italics_regardless_of_length():
+    """Length is governed by the prompt rules, never by TTS attribution."""
+    import server
+
+    segments = server.split_into_ordered_tts_segments(
+        "*The guard studies the seal for a long moment, then steps aside and "
+        "hauls the gate open, waving the whole party through without a word.*"
+    )
+    assert len(segments) == 1
+    assert segments[0]["type"] == "narrator"
 
 
 def test_split_keeps_trailing_outcome_narration_on_narrator():

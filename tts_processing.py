@@ -395,126 +395,17 @@ def ensure_sentence_ending(text: str) -> str:
     return text
 
 
-# Stage verbs that can open a subjectless beat (*Snarls.* / *Nods slowly.*).
-# Sentences that name a subject are matched structurally instead, so outcome
-# narration after a DM ruling ("The guard unlatches the gate.") is not limited
-# to this list.
-_NONVERBAL_STAGE_VERB_RE = re.compile(
-    r"(?i)\b("
-    r"narrows|cocks|snarls|glares|nods|shrugs|points|smiles|grins|frowns|sighs|"
-    r"growls|hisses|barks|tilts|raises|lowers|crosses|folds|leans|steps|turns|"
-    r"shakes|waves|gestures|pauses|stares|looks|watches|listens|snorts|bows|"
-    r"chuckles|laughs|whispers|mutters|spits|draws|sheathes|clenches|tenses|"
-    r"freezes|blinks|winces|grimaces|sneers|scowls|beams|grunts"
-    r")\b"
-)
-_SPEECH_FRAME_RE = re.compile(
-    r"(?i)\b("
-    r"says|said|asks|asked|tells|told|replies|replied|shouts|shouted|"
-    r"yells|yelled|answers|answered|speaks|spoke|speaking"
-    r")\b"
-)
-# First person anywhere in the span means the NPC is talking, not being described.
-# Second person only counts as address when it opens the span, so descriptive
-# beats aimed at the party ("Varra narrows her eyes at you.") stay narration.
-_FIRST_PERSON_RE = re.compile(
-    r"(?i)\b(I|I'm|I'll|I'd|I've|me|my|mine|myself|"
-    r"we|we're|we'll|we'd|we've|us|our|ours)\b"
-)
-_SECOND_PERSON_START_RE = re.compile(
-    r"(?i)^(you|you're|you'll|you'd|you've|your|yours)\b"
-)
-# A third-person subject: pronoun, determiner phrase, or a proper name.
-_THIRD_PERSON_SUBJECT_RE = re.compile(
-    r"(?i)^(?:the|a|an|his|her|its|their|he|she|it|they|[A-Za-z][\w'’-]*)\b"
-)
-# Words after a determiner/possessive are nouns ("the gates"), not verbs.
-_DETERMINER_RE = re.compile(
-    r"(?i)^(the|a|an|his|her|its|their|our|my|your|some|any|no|many|several|"
-    r"few|these|those|both|two|three|four|five)$"
-)
-_INFLECTED_VERB_RE = re.compile(r"^[a-z]{3,}(?:s|ed)$")
-_SENTENCE_SPLIT_RE = re.compile(r"[.!]+\s+")
-_MAX_STAGE_WORDS = 30
-
-
-def _is_dm_wait_copy(inner: str) -> bool:
-    """OOC hold copy is narrator even when wording drifts or asterisks are lost."""
-    try:
-        from dm_channel import is_dm_wait_narration
-    except ImportError:
-        lowered = inner.lower()
-        return "waiting on a decision" in lowered and (
-            "game master" in lowered or "dm decision" in lowered or " dm " in f" {lowered} "
-        )
-    return bool(is_dm_wait_narration(inner))
-
-
-def _has_inflected_verb(words: list[str]) -> bool:
-    for index, word in enumerate(words):
-        if index == 0:
-            continue
-        if not word.islower() or not _INFLECTED_VERB_RE.match(word):
-            continue
-        if _DETERMINER_RE.match(words[index - 1]):
-            continue
-        return True
-    return False
-
-
-def _is_narration_sentence(sentence: str) -> bool:
-    """True when one sentence reads as third-person description, not speech."""
-    inner = sentence.strip().strip(".!,;:").strip()
-    if not inner:
-        return False
-    if "?" in sentence:
-        return False
-    if _SPEECH_FRAME_RE.search(inner):
-        return False
-    if _FIRST_PERSON_RE.search(inner):
-        return False
-    if _SECOND_PERSON_START_RE.match(inner):
-        return False
-
-    words = re.findall(r"[A-Za-z0-9']+(?:-[A-Za-z0-9']+)?", inner)
-    if not words or len(words) > _MAX_STAGE_WORDS:
-        return False
-    # Verb-first beat with no subject: "Snarls." / "Nods slowly."
-    if _NONVERBAL_STAGE_VERB_RE.match(words[0]):
-        return True
-    if not _THIRD_PERSON_SUBJECT_RE.match(inner):
-        return False
-    return _has_inflected_verb(words)
-
-
-def is_nonverbal_stage_direction(text: str) -> bool:
-    """
-    True when asterisk-wrapped text is third-person description rather than
-    spoken dialogue the model wrongly italicized.
-
-    Every sentence must read as narration, so a stage beat glued to a spoken
-    command ("Snarls. Leave now.") still goes to the NPC voice.
-    """
-    inner = (text or "").strip().strip("*").strip()
-    if not inner:
-        return False
-    if _is_dm_wait_copy(inner):
-        return True
-    sentences = [s for s in _SENTENCE_SPLIT_RE.split(inner) if s.strip()]
-    if not sentences:
-        return False
-    return all(_is_narration_sentence(sentence) for sentence in sentences)
-
-
-def asterisk_body_tts_type(inner: str) -> str:
+def asterisk_body_tts_type(_inner: str) -> str:
     """
     Map asterisk-wrapped markup to a TTS speaker.
 
-    Global rules: only nonverbal stage directions use *asterisks*. Spoken NPC
-    dialogue (including post-ruling / language-barrier lines) must use the NPC
-    voice even when the model wraps them in italics.
+    Asterisks mean narration, unconditionally — length and wording are not
+    inspected. The prompt contract (``llm_rules.yaml``, the language-barrier
+    prompt, and the post-ruling prompt) already reserves asterisks for stage
+    directions and requires spoken dialogue to be plain text, so guessing here
+    only mislabels the long outcome narration that follows a DM ruling.
     """
-    return "narrator" if is_nonverbal_stage_direction(inner) else "npc"
+    return "narrator"
 
 
 def clean_for_tts(text: str, pronunciation: dict[str, str] | None = None) -> str:

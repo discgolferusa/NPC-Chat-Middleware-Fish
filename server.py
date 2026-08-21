@@ -1981,9 +1981,8 @@ def split_into_ordered_tts_segments(
     """
     Split raw model output into ordered TTS segments, preserving document order.
 
-    Asterisk-wrapped nonverbal stage directions become narrator clips. Spoken
-    dialogue wrongly wrapped in asterisks (common after DM rulings / language
-    barriers) stays on the NPC voice. Bare DM-wait copy (no asterisks) is still
+    Asterisk-wrapped text is narration and becomes a narrator clip whatever its
+    length; plain text is NPC dialogue. Bare DM-wait copy (no asterisks) is also
     narrator so Piper never voices the hold line as the NPC.
     """
     raw_text, _ = strip_dm_check_tag(text or "")
