@@ -49,6 +49,28 @@ def test_split_puts_mixed_action_and_dialogue_italics_on_npc():
     assert segments[0]["type"] == "npc"
 
 
+def test_split_keeps_post_ruling_outcome_narration_on_narrator():
+    """After a confirmed DM check the NPC narrates the outcome, then speaks."""
+    import server
+
+    segments = server.split_into_ordered_tts_segments(
+        "*The guard steps aside and unlatches the gate.* Go on through, then."
+    )
+    assert [s["type"] for s in segments] == ["narrator", "npc"]
+    assert "gate" in segments[0]["text"].lower()
+    assert "through" in segments[1]["text"].lower()
+
+
+def test_split_keeps_trailing_outcome_narration_on_narrator():
+    import server
+
+    segments = server.split_into_ordered_tts_segments(
+        "Very well, the seal is genuine. *She slides the brass key across the counter.*"
+    )
+    assert [s["type"] for s in segments] == ["npc", "narrator"]
+    assert "key" in segments[1]["text"].lower()
+
+
 def test_split_keeps_wait_narration_on_narrator():
     import server
 

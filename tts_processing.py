@@ -395,10 +395,10 @@ def ensure_sentence_ending(text: str) -> str:
     return text
 
 
-# Nonverbal stage-direction cues (*Varra narrows her eyes.* / *Snarls.*).
-# Asterisk bodies default to NPC speech; only a short, pure stage beat stays
-# on the narrator. A verb anywhere in mixed action+dialogue must not flip the
-# whole span to narrator.
+# Stage verbs that can open a subjectless beat (*Snarls.* / *Nods slowly.*).
+# Sentences that name a subject are matched structurally instead, so outcome
+# narration after a DM ruling ("The guard unlatches the gate.") is not limited
+# to this list.
 _NONVERBAL_STAGE_VERB_RE = re.compile(
     r"(?i)\b("
     r"narrows|cocks|snarls|glares|nods|shrugs|points|smiles|grins|frowns|sighs|"
@@ -414,49 +414,96 @@ _SPEECH_FRAME_RE = re.compile(
     r"yells|yelled|answers|answered|speaks|spoke|speaking"
     r")\b"
 )
-_FIRST_PERSON_OR_ADDRESS_RE = re.compile(
-    r"(?i)^(I|I'm|I'll|I'd|I've|We|We're|We'll|You|You're|You'll)\b"
+# First person anywhere in the span means the NPC is talking, not being described.
+# Second person only counts as address when it opens the span, so descriptive
+# beats aimed at the party ("Varra narrows her eyes at you.") stay narration.
+_FIRST_PERSON_RE = re.compile(
+    r"(?i)\b(I|I'm|I'll|I'd|I've|me|my|mine|myself|"
+    r"we|we're|we'll|we'd|we've|us|our|ours)\b"
 )
-_MAX_STAGE_WORDS = 8
+_SECOND_PERSON_START_RE = re.compile(
+    r"(?i)^(you|you're|you'll|you'd|you've|your|yours)\b"
+)
+# A third-person subject: pronoun, determiner phrase, or a proper name.
+_THIRD_PERSON_SUBJECT_RE = re.compile(
+    r"(?i)^(?:the|a|an|his|her|its|their|he|she|it|they|[A-Za-z][\w'’-]*)\b"
+)
+# Words after a determiner/possessive are nouns ("the gates"), not verbs.
+_DETERMINER_RE = re.compile(
+    r"(?i)^(the|a|an|his|her|its|their|our|my|your|some|any|no|many|several|"
+    r"few|these|those|both|two|three|four|five)$"
+)
+_INFLECTED_VERB_RE = re.compile(r"^[a-z]{3,}(?:s|ed)$")
+_SENTENCE_SPLIT_RE = re.compile(r"[.!]+\s+")
+_MAX_STAGE_WORDS = 30
 
 
-def is_nonverbal_stage_direction(text: str) -> bool:
-    """True only for a short pure nonverbal beat, not mixed/spoken asterisk text."""
-    inner = (text or "").strip().strip("*").strip()
-    if not inner:
-        return False
-    # OOC DM-wait copy is always narrator — even when wording drifts or asterisks
-    # were stripped before the segment splitter runs.
+def _is_dm_wait_copy(inner: str) -> bool:
+    """OOC hold copy is narrator even when wording drifts or asterisks are lost."""
     try:
         from dm_channel import is_dm_wait_narration
     except ImportError:
-        is_dm_wait_narration = None  # type: ignore[assignment]
-    if is_dm_wait_narration is not None:
-        if is_dm_wait_narration(inner):
-            return True
-    else:
         lowered = inner.lower()
-        if "waiting on a decision" in lowered and (
+        return "waiting on a decision" in lowered and (
             "game master" in lowered or "dm decision" in lowered or " dm " in f" {lowered} "
-        ):
-            return True
-    # Spoken lines — questions, direct speech framing, first-person/address.
-    if "?" in inner:
+        )
+    return bool(is_dm_wait_narration(inner))
+
+
+def _has_inflected_verb(words: list[str]) -> bool:
+    for index, word in enumerate(words):
+        if index == 0:
+            continue
+        if not word.islower() or not _INFLECTED_VERB_RE.match(word):
+            continue
+        if _DETERMINER_RE.match(words[index - 1]):
+            continue
+        return True
+    return False
+
+
+def _is_narration_sentence(sentence: str) -> bool:
+    """True when one sentence reads as third-person description, not speech."""
+    inner = sentence.strip().strip(".!,;:").strip()
+    if not inner:
+        return False
+    if "?" in sentence:
         return False
     if _SPEECH_FRAME_RE.search(inner):
         return False
-    if _FIRST_PERSON_OR_ADDRESS_RE.match(inner):
+    if _FIRST_PERSON_RE.search(inner):
         return False
-    # Action + dialogue in one italics span ("Snarls. Leave now.") → NPC.
-    if re.search(r"[.!]+\s+\S", inner):
+    if _SECOND_PERSON_START_RE.match(inner):
         return False
+
     words = re.findall(r"[A-Za-z0-9']+(?:-[A-Za-z0-9']+)?", inner)
-    if len(words) > _MAX_STAGE_WORDS:
+    if not words or len(words) > _MAX_STAGE_WORDS:
         return False
-    # Fantasy / dialogue-only lines with no stage verb stay on NPC.
-    if not _NONVERBAL_STAGE_VERB_RE.search(inner):
+    # Verb-first beat with no subject: "Snarls." / "Nods slowly."
+    if _NONVERBAL_STAGE_VERB_RE.match(words[0]):
+        return True
+    if not _THIRD_PERSON_SUBJECT_RE.match(inner):
         return False
-    return True
+    return _has_inflected_verb(words)
+
+
+def is_nonverbal_stage_direction(text: str) -> bool:
+    """
+    True when asterisk-wrapped text is third-person description rather than
+    spoken dialogue the model wrongly italicized.
+
+    Every sentence must read as narration, so a stage beat glued to a spoken
+    command ("Snarls. Leave now.") still goes to the NPC voice.
+    """
+    inner = (text or "").strip().strip("*").strip()
+    if not inner:
+        return False
+    if _is_dm_wait_copy(inner):
+        return True
+    sentences = [s for s in _SENTENCE_SPLIT_RE.split(inner) if s.strip()]
+    if not sentences:
+        return False
+    return all(_is_narration_sentence(sentence) for sentence in sentences)
 
 
 def asterisk_body_tts_type(inner: str) -> str:

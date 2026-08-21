@@ -37,6 +37,25 @@ def test_asterisk_body_tts_type_keeps_stage_beats_on_narrator():
     assert asterisk_body_tts_type("Xill cocks its head.") == "narrator"
 
 
+def test_asterisk_body_tts_type_keeps_ruling_outcome_narration_on_narrator():
+    # A confirmed DM check makes the NPC narrate the outcome, so stage directions
+    # run longer than a stock emotional beat and use verbs outside the stage list.
+    assert asterisk_body_tts_type(
+        "The guard steps aside and lets the party through the gate."
+    ) == "narrator"
+    assert asterisk_body_tts_type("Varra examines the seal, then hands it back.") == "narrator"
+    assert asterisk_body_tts_type("The innkeeper slides a brass key across the counter.") == "narrator"
+    assert asterisk_body_tts_type(
+        "He looks toward the door and refuses without another word."
+    ) == "narrator"
+
+
+def test_asterisk_body_tts_type_keeps_multi_sentence_narration_on_narrator():
+    assert asterisk_body_tts_type(
+        "The guard steps aside. The gate swings open."
+    ) == "narrator"
+
+
 def test_asterisk_body_tts_type_puts_spoken_lines_on_npc():
     # Language-barrier / denied-claim dialogue often arrives fully italicized.
     assert asterisk_body_tts_type("Krah-vesh?") == "npc"
@@ -52,9 +71,7 @@ def test_asterisk_body_tts_type_rejects_mixed_action_and_dialogue():
     assert asterisk_body_tts_type("I raise my voice and refuse.") == "npc"
     assert asterisk_body_tts_type("She turns away and says the vault stays sealed.") == "npc"
     assert asterisk_body_tts_type("You shake the latch, but it holds.") == "npc"
-    assert asterisk_body_tts_type(
-        "He looks toward the door and refuses without another word."
-    ) == "npc"
+    assert asterisk_body_tts_type("Steps back. You are not welcome here.") == "npc"
 
 
 def test_curated_low_quality_is_less_noisy():

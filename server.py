@@ -1405,8 +1405,7 @@ def build_dm_followup_messages(
     elif verdict == "DENIED":
         action_hint = (
             "The DM denied the claim. Refuse the request in character without granting "
-            "access or benefit. Put spoken refusal/dialogue in plain text (NPC voice), "
-            "not inside *asterisks* — asterisks are only for one short nonverbal beat."
+            "access or benefit."
         )
         if is_language_comprehension_claim(claim_summary):
             native = resolve_npc_native_language(npc, language_claim=claim_summary)
@@ -1430,6 +1429,9 @@ def build_dm_followup_messages(
             f"DM said: {ruling_text}\n\n"
             f"{action_hint} Respond now as the NPC to continue the scene from your last exchange. "
             "Keep the reply concise and suitable for spoken dialogue. "
+            "Put spoken dialogue in plain text (NPC voice), never inside *asterisks*. "
+            "Use *asterisks* only for a short third-person action beat "
+            "(*The guard steps aside.*), which the narrator reads aloud. "
             "Do not mention the DM, pending checks, or game mechanics. "
             "Do not emit [DM CHECK] tags — this claim was already ruled."
         ),
