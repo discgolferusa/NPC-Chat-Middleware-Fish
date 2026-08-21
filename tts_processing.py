@@ -395,79 +395,17 @@ def ensure_sentence_ending(text: str) -> str:
     return text
 
 
-# Nonverbal stage-direction cues (*Varra narrows her eyes.* / *Snarls.*).
-# Asterisk bodies default to NPC speech; only a short, pure stage beat stays
-# on the narrator. A verb anywhere in mixed action+dialogue must not flip the
-# whole span to narrator.
-_NONVERBAL_STAGE_VERB_RE = re.compile(
-    r"(?i)\b("
-    r"narrows|cocks|snarls|glares|nods|shrugs|points|smiles|grins|frowns|sighs|"
-    r"growls|hisses|barks|tilts|raises|lowers|crosses|folds|leans|steps|turns|"
-    r"shakes|waves|gestures|pauses|stares|looks|watches|listens|snorts|bows|"
-    r"chuckles|laughs|whispers|mutters|spits|draws|sheathes|clenches|tenses|"
-    r"freezes|blinks|winces|grimaces|sneers|scowls|beams|grunts"
-    r")\b"
-)
-_SPEECH_FRAME_RE = re.compile(
-    r"(?i)\b("
-    r"says|said|asks|asked|tells|told|replies|replied|shouts|shouted|"
-    r"yells|yelled|answers|answered|speaks|spoke|speaking"
-    r")\b"
-)
-_FIRST_PERSON_OR_ADDRESS_RE = re.compile(
-    r"(?i)^(I|I'm|I'll|I'd|I've|We|We're|We'll|You|You're|You'll)\b"
-)
-_MAX_STAGE_WORDS = 8
-
-
-def is_nonverbal_stage_direction(text: str) -> bool:
-    """True only for a short pure nonverbal beat, not mixed/spoken asterisk text."""
-    inner = (text or "").strip().strip("*").strip()
-    if not inner:
-        return False
-    # OOC DM-wait copy is always narrator — even when wording drifts or asterisks
-    # were stripped before the segment splitter runs.
-    try:
-        from dm_channel import is_dm_wait_narration
-    except ImportError:
-        is_dm_wait_narration = None  # type: ignore[assignment]
-    if is_dm_wait_narration is not None:
-        if is_dm_wait_narration(inner):
-            return True
-    else:
-        lowered = inner.lower()
-        if "waiting on a decision" in lowered and (
-            "game master" in lowered or "dm decision" in lowered or " dm " in f" {lowered} "
-        ):
-            return True
-    # Spoken lines — questions, direct speech framing, first-person/address.
-    if "?" in inner:
-        return False
-    if _SPEECH_FRAME_RE.search(inner):
-        return False
-    if _FIRST_PERSON_OR_ADDRESS_RE.match(inner):
-        return False
-    # Action + dialogue in one italics span ("Snarls. Leave now.") → NPC.
-    if re.search(r"[.!]+\s+\S", inner):
-        return False
-    words = re.findall(r"[A-Za-z0-9']+(?:-[A-Za-z0-9']+)?", inner)
-    if len(words) > _MAX_STAGE_WORDS:
-        return False
-    # Fantasy / dialogue-only lines with no stage verb stay on NPC.
-    if not _NONVERBAL_STAGE_VERB_RE.search(inner):
-        return False
-    return True
-
-
-def asterisk_body_tts_type(inner: str) -> str:
+def asterisk_body_tts_type(_inner: str) -> str:
     """
     Map asterisk-wrapped markup to a TTS speaker.
 
-    Global rules: only nonverbal stage directions use *asterisks*. Spoken NPC
-    dialogue (including post-ruling / language-barrier lines) must use the NPC
-    voice even when the model wraps them in italics.
+    Asterisks mean narration, unconditionally — length and wording are not
+    inspected. The prompt contract (``llm_rules.yaml``, the language-barrier
+    prompt, and the post-ruling prompt) already reserves asterisks for stage
+    directions and requires spoken dialogue to be plain text, so guessing here
+    only mislabels the long outcome narration that follows a DM ruling.
     """
-    return "narrator" if is_nonverbal_stage_direction(inner) else "npc"
+    return "narrator"
 
 
 def clean_for_tts(text: str, pronunciation: dict[str, str] | None = None) -> str:
