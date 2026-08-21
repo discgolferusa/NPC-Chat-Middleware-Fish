@@ -15,6 +15,8 @@ import re
 import threading
 from typing import Any, Callable
 
+from stage_directions import normalize_stage_directions
+
 DM_CHECK_IN_RULES_PATTERN = re.compile(
     r"\[DM CHECK:\s*([^\]]+?)\]",
     re.IGNORECASE,
@@ -779,7 +781,32 @@ def generate_npc_reply_text(
     Set ``enforce_required_dm_checks=False`` for post-ruling auto-replies so a just-
     resolved claim is not force-appended again. Language-barrier **Failure** rewrites
     still run so a Deny cannot leave the NPC speaking English.
+
+    Stage-direction placement is normalized on the way out: every reply path here
+    ends up as ``npc_text``, so this is the one place that can hold the llm_rules
+    contract for all of text, voice, and post-ruling turns.
     """
+    return normalize_stage_directions(
+        _generate_npc_reply_text(
+            npc,
+            dm_context,
+            messages,
+            ask_llm_fn,
+            player_text=player_text,
+            enforce_required_dm_checks=enforce_required_dm_checks,
+        )
+    )
+
+
+def _generate_npc_reply_text(
+    npc: dict[str, Any] | None,
+    dm_context: dict[str, Any] | None,
+    messages: list[dict[str, str]],
+    ask_llm_fn: Callable[[list[dict[str, str]]], str],
+    *,
+    player_text: str | None = None,
+    enforce_required_dm_checks: bool = True,
+) -> str:
     if enforce_required_dm_checks and _should_skip_llm_for_pending_dm(npc, dm_context):
         from dm_channel import DM_PENDING_WAIT_NARRATION
 

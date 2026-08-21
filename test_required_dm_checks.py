@@ -314,6 +314,63 @@ def test_generate_can_skip_required_dm_check_enforcement():
     assert "[DM CHECK:" not in text
 
 
+def test_generate_moves_a_misplaced_stage_direction_to_the_front():
+    """llm_rules ban mid-reply beats; the model ignores that often enough to enforce here."""
+    text = generate_npc_reply_text(
+        {"llm_rules": ["Be stern."]},
+        {"rulings": []},
+        [],
+        lambda _m: "Aye, come in. *He turns back to the forge.*",
+        player_text="Can we come in?",
+    )
+    assert text == "*He turns back to the forge.* Aye, come in."
+
+
+def test_generate_normalizes_post_ruling_replies_too():
+    """The post-ruling path skips tag enforcement but still owes the same format."""
+    text = generate_npc_reply_text(
+        {"llm_rules": ["Be stern."]},
+        {"rulings": []},
+        [],
+        lambda _m: "The gate is open. *The guard steps aside.*",
+        enforce_required_dm_checks=False,
+    )
+    assert text == "*The guard steps aside.* The gate is open."
+
+
+def test_generate_keeps_an_authored_dm_check_tag_last_after_normalizing():
+    npc = {
+        "llm_rules": [
+            "If asked about secrets, end with "
+            "[DM CHECK: the player is probing one of this NPC's secrets]"
+        ]
+    }
+    text = generate_npc_reply_text(
+        npc,
+        {"rulings": []},
+        [],
+        lambda _m: (
+            "That is not mine to tell. *She looks away.*\n"
+            "[DM CHECK: the player is probing one of this NPC's secrets]"
+        ),
+        player_text="What are you hiding?",
+    )
+    assert text.startswith("*She looks away.*")
+    assert text.splitlines()[-1].strip().startswith("[DM CHECK:")
+
+
+def test_generate_leaves_a_well_formed_reply_byte_for_byte():
+    reply = "*Varra narrows her eyes.* State your business."
+    text = generate_npc_reply_text(
+        {"llm_rules": ["Be stern."]},
+        {"rulings": []},
+        [],
+        lambda _m: reply,
+        player_text="Hello",
+    )
+    assert text == reply
+
+
 def test_generate_rewrites_english_on_denied_language_even_when_checks_not_enforced():
     """Post-ruling auto-reply skips re-tagging but must not speak English after Failure."""
     claim = "Does the speaker know the necessary language to talk to the NPC"
