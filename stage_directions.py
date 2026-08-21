@@ -28,14 +28,25 @@ def _end_sentence(body: str) -> str:
     return body + "."
 
 
-def _tidy_seam(text: str) -> str:
-    """Clean up the punctuation left behind where a stage direction was lifted out."""
+def _tidy_seam(text: str, *, opens_at_seam: bool) -> str:
+    """
+    Clean up the punctuation left behind where a stage direction was lifted out.
+
+    ``opens_at_seam`` says the remainder starts where a direction used to be, so its
+    leading punctuation is seam debris. Without that guard the model's own opening
+    ellipsis or dash reads as debris too, and the hesitation it marks is dropped.
+
+    A leading newline always survives: it is what keeps a trailing ``[DM CHECK: ...]``
+    tag on its own line when the rest of the reply was beats.
+    """
     text = re.sub(r"[ \t]{2,}", " ", text)
     text = re.sub(r"[ \t]+([,.;:!?])", r"\1", text)
     text = re.sub(r"([,;:])(\s*[,;:])+", r"\1", text)
-    text = re.sub(r"^[\s,;:.\-–—]+", "", text)
     text = re.sub(r"[ \t]+\n", "\n", text)
-    return text.strip()
+    if opens_at_seam:
+        text = re.sub(r"^[ \t,;:.\-–—]+", "", text)
+    leading_newline = "\n" if text[:1] == "\n" else ""
+    return leading_newline + text.strip()
 
 
 def normalize_stage_directions(text: str) -> str:
@@ -59,8 +70,13 @@ def normalize_stage_directions(text: str) -> str:
         return source
 
     direction = " ".join(_end_sentence(m.group(1)) for m in matches).strip()
-    remainder = _tidy_seam(STAGE_DIRECTION_PATTERN.sub(" ", source))
+    remainder = _tidy_seam(
+        STAGE_DIRECTION_PATTERN.sub(" ", source),
+        opens_at_seam=not source[: matches[0].start()].strip(),
+    )
 
     if not remainder:
         return f"*{direction}*"
+    if remainder.startswith("\n"):
+        return f"*{direction}*{remainder}"
     return f"*{direction}* {remainder}"

@@ -63,6 +63,39 @@ def test_dm_check_tag_stays_on_its_own_final_line():
     assert normalized.splitlines()[-1].startswith("[DM CHECK:")
 
 
+def test_dm_check_tag_keeps_its_line_when_the_reply_is_only_beats():
+    """The tag's newline is the whole remainder's first character, not seam debris."""
+    normalized = normalize_stage_directions(
+        "*Torin looks up.* *He sets down the hammer.*\n"
+        "[DM CHECK: whether the party carries a writ]"
+    )
+    assert normalized == (
+        "*Torin looks up. He sets down the hammer.*\n"
+        "[DM CHECK: whether the party carries a writ]"
+    )
+    assert normalized.splitlines()[-1].startswith("[DM CHECK:")
+
+
+def test_leading_hesitation_survives_a_misplaced_beat():
+    """An opening ellipsis is the model's pacing, not leftovers from the lifted beat."""
+    assert normalize_stage_directions(
+        "... *he hesitates* I cannot say."
+    ) == "*he hesitates.* ... I cannot say."
+
+
+def test_leading_dash_survives_a_misplaced_beat():
+    assert normalize_stage_directions(
+        "— *she pauses* Aye."
+    ) == "*she pauses.* — Aye."
+
+
+def test_seam_debris_is_still_cleaned_when_the_reply_opens_with_a_beat():
+    """The leading strip still has to run where the remainder really starts at a seam."""
+    assert normalize_stage_directions(
+        "*Torin looks up.*, and then he left. *He turns away.*"
+    ) == "*Torin looks up. He turns away.* and then he left."
+
+
 def test_dm_wait_narration_is_preserved_exactly():
     """Wait copy is a whole-turn narrator line; reflowing it would break matching."""
     from dm_channel import DM_PENDING_WAIT_NARRATION
