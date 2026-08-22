@@ -10,8 +10,8 @@ Manual test (PowerShell):
   curl http://127.0.0.1:5000/llm/models
   curl http://127.0.0.1:5000/llm/status
   curl -X POST http://127.0.0.1:5000/llm/select -H "Content-Type: application/json" -d "{\"model_id\":\"local\",\"provider_mode\":\"local\"}"
-  curl -X POST http://127.0.0.1:5000/llm/select -H "Content-Type: application/json" -d "{\"model_id\":\"groq-llama-3.3-70b\",\"provider_mode\":\"groq_with_local_fallback\"}"
-  curl -X POST http://127.0.0.1:5000/llm/select -H "Content-Type: application/json" -d "{\"model_id\":\"groq-llama-3.3-70b\",\"provider_mode\":\"groq_with_local_fallback\",\"purpose\":\"content_creation\"}"
+  curl -X POST http://127.0.0.1:5000/llm/select -H "Content-Type: application/json" -d "{\"model_id\":\"groq-gpt-oss-120b\",\"provider_mode\":\"groq_with_local_fallback\"}"
+  curl -X POST http://127.0.0.1:5000/llm/select -H "Content-Type: application/json" -d "{\"model_id\":\"groq-compound\",\"provider_mode\":\"groq_with_local_fallback\",\"purpose\":\"content_creation\"}"
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ CONTENT_CREATION_LOCAL_TIMEOUT_SECONDS = int(
 )
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1/chat/completions")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 GROQ_TIMEOUT_SECONDS = int(os.getenv("GROQ_TIMEOUT_SECONDS", "10"))
 # content_creation sends large prompts and asks for long JSON completions;
 # the chat default (10s) is far too short and causes cascading timeouts.
@@ -69,6 +69,10 @@ PURPOSE_CONTENT_CREATION = "content_creation"
 VALID_PURPOSES = frozenset({PURPOSE_CHAT, PURPOSE_CONTENT_CREATION})
 DEFAULT_PURPOSE = PURPOSE_CHAT
 
+# Groq free-plan catalog, checked against console.groq.com/docs/models and
+# /docs/rate-limits on 2026-08-21. `limits` are the Free plan caps (Developer plan
+# is roughly 10x) so preflight refuses a request before Groq answers 429.
+# `purposes` gates which Admin -> LLM dropdown offers the model.
 LLM_MODELS: dict[str, dict[str, Any]] = {
     "local": {
         "id": "local",
@@ -78,31 +82,7 @@ LLM_MODELS: dict[str, dict[str, Any]] = {
         "url": LOCAL_LLM_URL,
         "online": False,
         "limits": None,
-    },
-    "groq-llama-3.1-8b-instant": {
-        "id": "groq-llama-3.1-8b-instant",
-        "label": "Groq Llama 3.1 8B Instant",
-        "provider": "groq",
-        "model": "llama-3.1-8b-instant",
-        "online": True,
-        # Free-tier-ish defaults; paid plans are higher — these stay conservative for preflight.
-        "limits": {"rpm": 30, "rpd": 14400, "tpm": 6000, "tpd": 500000},
-    },
-    "groq-llama-3.3-70b": {
-        "id": "groq-llama-3.3-70b",
-        "label": "Groq Llama 3.3 70B Versatile",
-        "provider": "groq",
-        "model": "llama-3.3-70b-versatile",
-        "online": True,
-        "limits": {"rpm": 30, "rpd": 1000, "tpm": 12000, "tpd": 100000},
-    },
-    "groq-qwen3.6-27b": {
-        "id": "groq-qwen3.6-27b",
-        "label": "Groq Qwen3.6 27B",
-        "provider": "groq",
-        "model": "qwen/qwen3.6-27b",
-        "online": True,
-        "limits": {"rpm": 30, "rpd": 1000, "tpm": 6000, "tpd": 500000},
+        "purposes": [PURPOSE_CHAT, PURPOSE_CONTENT_CREATION],
     },
     "groq-gpt-oss-120b": {
         "id": "groq-gpt-oss-120b",
@@ -111,6 +91,7 @@ LLM_MODELS: dict[str, dict[str, Any]] = {
         "model": "openai/gpt-oss-120b",
         "online": True,
         "limits": {"rpm": 30, "rpd": 1000, "tpm": 8000, "tpd": 200000},
+        "purposes": [PURPOSE_CHAT, PURPOSE_CONTENT_CREATION],
     },
     "groq-gpt-oss-20b": {
         "id": "groq-gpt-oss-20b",
@@ -119,13 +100,50 @@ LLM_MODELS: dict[str, dict[str, Any]] = {
         "model": "openai/gpt-oss-20b",
         "online": True,
         "limits": {"rpm": 30, "rpd": 1000, "tpm": 8000, "tpd": 200000},
+        "purposes": [PURPOSE_CHAT, PURPOSE_CONTENT_CREATION],
+    },
+    "groq-qwen3.6-27b": {
+        "id": "groq-qwen3.6-27b",
+        "label": "Groq Qwen3.6 27B",
+        "provider": "groq",
+        "model": "qwen/qwen3.6-27b",
+        "online": True,
+        "limits": {"rpm": 30, "rpd": 1000, "tpm": 8000, "tpd": 200000},
+        "purposes": [PURPOSE_CHAT, PURPOSE_CONTENT_CREATION],
+    },
+    # Compound is an agentic system with built-in web search and code execution.
+    # Its 70K TPM is the only free-plan budget large enough for document import,
+    # but the live tools would leak real-world facts into spoken NPC turns, so it
+    # is deliberately withheld from the chat purpose.
+    "groq-compound": {
+        "id": "groq-compound",
+        "label": "Groq Compound (agentic, import only)",
+        "provider": "groq",
+        "model": "groq/compound",
+        "online": True,
+        "limits": {"rpm": 30, "rpd": 250, "tpm": 70000, "tpd": None},
+        "purposes": [PURPOSE_CONTENT_CREATION],
+    },
+    "groq-compound-mini": {
+        "id": "groq-compound-mini",
+        "label": "Groq Compound Mini (agentic, import only)",
+        "provider": "groq",
+        "model": "groq/compound-mini",
+        "online": True,
+        "limits": {"rpm": 30, "rpd": 250, "tpm": 70000, "tpd": None},
+        "purposes": [PURPOSE_CONTENT_CREATION],
     },
 }
 
 # Retired Groq model ids still present in older llm_runtime_config.json files.
+# Targets follow Groq's own recommended replacements from its deprecation notices;
+# aliases may chain (scout -> llama-3.3-70b -> gpt-oss-120b).
 DEPRECATED_MODEL_ALIASES: dict[str, str] = {
     "groq-llama-4-scout": "groq-llama-3.3-70b",
     "groq-qwen3-32b": "groq-qwen3.6-27b",
+    # Shut down by Groq on 2026-08-16.
+    "groq-llama-3.1-8b-instant": "groq-gpt-oss-20b",
+    "groq-llama-3.3-70b": "groq-gpt-oss-120b",
 }
 
 # --- chat purpose (default / backward-compatible globals) ---
@@ -152,11 +170,13 @@ USAGE_RETENTION_HOURS = int(os.getenv("LLM_USAGE_RETENTION_HOURS", str(24 * 30))
 # Source: https://groq.com/pricing (update when Groq changes rates).
 GROQ_ON_DEMAND_PRICES_USD: dict[str, dict[str, float]] = {
     "local": {"input": 0.0, "output": 0.0},
-    "groq-llama-3.1-8b-instant": {"input": 0.05, "output": 0.08},
-    "groq-llama-3.3-70b": {"input": 0.59, "output": 0.79},
-    "groq-qwen3.6-27b": {"input": 0.60, "output": 3.00},
     "groq-gpt-oss-120b": {"input": 0.15, "output": 0.60},
     "groq-gpt-oss-20b": {"input": 0.075, "output": 0.30},
+    "groq-qwen3.6-27b": {"input": 0.60, "output": 3.00},
+    # Groq publishes no per-token list price for the Compound systems (they bill as
+    # the models they orchestrate), so charts show tokens without inventing a rate.
+    "groq-compound": {"input": 0.0, "output": 0.0},
+    "groq-compound-mini": {"input": 0.0, "output": 0.0},
 }
 
 _STATE_LOCK = threading.Lock()
@@ -228,6 +248,26 @@ def _load_secrets_file() -> None:
         print(f"[LLM] failed to read secrets file: {ex}", flush=True)
 
 
+def model_supports_purpose(model_id: str, purpose: str) -> bool:
+    """Whether the catalog offers ``model_id`` for ``purpose``.
+
+    Entries with no explicit ``purposes`` list count as universal, so a trimmed
+    catalog can never leave a dropdown with nothing to choose.
+    """
+    entry = LLM_MODELS.get(model_id)
+    if not entry:
+        return False
+    allowed = entry.get("purposes")
+    if not allowed:
+        return True
+    return _normalize_purpose(purpose) in allowed
+
+
+def models_for_purpose(purpose: str) -> list[str]:
+    normalized = _normalize_purpose(purpose)
+    return [mid for mid in LLM_MODELS if model_supports_purpose(mid, normalized)]
+
+
 def _alias_model_id(model_id: str | None) -> str:
     """Follow retired-model aliases only. Does not invent a fallback catalog id."""
     candidate = str(model_id or "").strip()
@@ -240,14 +280,29 @@ def _alias_model_id(model_id: str | None) -> str:
     return candidate
 
 
-def _resolve_model_id(model_id: str | None, *, default: str = "local") -> str:
-    """Map retired catalog ids onto current models, else fall back to default."""
+def _resolve_model_id(
+    model_id: str | None,
+    *,
+    default: str = "local",
+    purpose: str | None = None,
+) -> str:
+    """Map retired catalog ids onto current models, else fall back to default.
+
+    When ``purpose`` is given, a model the catalog no longer offers for that
+    purpose is treated the same as a retired id.
+    """
     candidate = _alias_model_id(model_id)
     if not candidate:
         candidate = default
-    if candidate in LLM_MODELS:
+
+    def _usable(mid: str) -> bool:
+        if mid not in LLM_MODELS:
+            return False
+        return purpose is None or model_supports_purpose(mid, purpose)
+
+    if _usable(candidate):
         return candidate
-    if default in LLM_MODELS:
+    if _usable(default):
         return default
     return "local"
 
@@ -264,9 +319,11 @@ def _load_runtime_config() -> None:
         else:
             LLM_PROVIDER_MODE = "local"
 
-        CONTENT_CREATION_MODEL_ID = os.getenv("CONTENT_CREATION_LLM_MODEL_ID", CURRENT_LLM_MODEL_ID)
-        if CONTENT_CREATION_MODEL_ID not in LLM_MODELS:
-            CONTENT_CREATION_MODEL_ID = "local"
+        CONTENT_CREATION_MODEL_ID = _resolve_model_id(
+            os.getenv("CONTENT_CREATION_LLM_MODEL_ID", CURRENT_LLM_MODEL_ID),
+            default="local",
+            purpose=PURPOSE_CONTENT_CREATION,
+        )
         CONTENT_CREATION_PROVIDER_MODE = os.getenv("CONTENT_CREATION_LLM_PROVIDER_MODE", LLM_PROVIDER_MODE)
         if CONTENT_CREATION_PROVIDER_MODE not in VALID_PROVIDER_MODES:
             CONTENT_CREATION_PROVIDER_MODE = "local"
@@ -289,7 +346,7 @@ def _load_runtime_config() -> None:
     # model_id/provider_mode. Treat those as the "chat" purpose.
     chat_cfg = purposes.get(PURPOSE_CHAT) if isinstance(purposes.get(PURPOSE_CHAT), dict) else {}
     raw_chat_model_id = str(chat_cfg.get("model_id", data.get("model_id", CURRENT_LLM_MODEL_ID)) or "")
-    chat_model_id = _resolve_model_id(raw_chat_model_id, default="local")
+    chat_model_id = _resolve_model_id(raw_chat_model_id, default="local", purpose=PURPOSE_CHAT)
     chat_provider_mode = chat_cfg.get("provider_mode", data.get("provider_mode", LLM_PROVIDER_MODE))
 
     CURRENT_LLM_MODEL_ID = chat_model_id
@@ -305,7 +362,11 @@ def _load_runtime_config() -> None:
         else {}
     )
     raw_creation_model_id = str(creation_cfg.get("model_id", CONTENT_CREATION_MODEL_ID) or "")
-    creation_model_id = _resolve_model_id(raw_creation_model_id, default=CURRENT_LLM_MODEL_ID)
+    creation_model_id = _resolve_model_id(
+        raw_creation_model_id,
+        default=CURRENT_LLM_MODEL_ID,
+        purpose=PURPOSE_CONTENT_CREATION,
+    )
     creation_provider_mode = creation_cfg.get("provider_mode", CONTENT_CREATION_PROVIDER_MODE)
 
     CONTENT_CREATION_MODEL_ID = creation_model_id
@@ -358,8 +419,9 @@ def _public_model_entry(model_id: str) -> dict[str, Any]:
     return entry
 
 
-def _public_model_list() -> list[dict[str, Any]]:
-    return [_public_model_entry(model_id) for model_id in LLM_MODELS]
+def _public_model_list(purpose: str | None = None) -> list[dict[str, Any]]:
+    model_ids = LLM_MODELS if purpose is None else models_for_purpose(purpose)
+    return [_public_model_entry(model_id) for model_id in model_ids]
 
 
 def groq_is_configured() -> bool:
@@ -683,7 +745,7 @@ def _would_exceed_groq_limits(
             if purpose == PURPOSE_CONTENT_CREATION:
                 action = (
                     "Wait about a minute, shorten the document, or switch content creation "
-                    "to a higher-TPM model such as groq-llama-3.3-70b (Admin → LLM)."
+                    "to a higher-TPM model such as groq-compound (Admin → LLM)."
                 )
             else:
                 action = (
@@ -803,7 +865,7 @@ def content_creation_zero_budget_error_message() -> str:
     return (
         "The content creation model's Groq tokens-per-minute budget is too small "
         "for document import (completion reserve fills the limit). Switch content "
-        "creation to a higher-TPM Groq model such as groq-llama-3.3-70b in Admin → LLM, "
+        "creation to a higher-TPM Groq model such as groq-compound in Admin → LLM, "
         "or wait a minute if recent usage exhausted the budget."
     )
 
@@ -1304,7 +1366,7 @@ def generate_llm_response(
         friendly = (
             f"Groq model '{model_name}' is unavailable on this API key/plan "
             f"(retired or not entitled). Pick another model in Admin → LLM "
-            f"(e.g. groq-llama-3.3-70b)."
+            f"(e.g. groq-gpt-oss-120b)."
             if model_missing
             else f"HTTP {response.status_code}: {error_text}"
         )
@@ -1371,6 +1433,9 @@ def select_llm_model(
             model_id = remapped
         else:
             raise ValueError(f"Unknown model_id: {model_id}")
+
+    if not model_supports_purpose(model_id, purpose):
+        raise ValueError(f"Model {model_id} is not available for purpose {purpose}")
 
     if provider_mode is not None and provider_mode not in VALID_PROVIDER_MODES:
         raise ValueError(f"Invalid provider_mode: {provider_mode}")
@@ -1729,15 +1794,19 @@ def get_llm_models_payload() -> dict[str, Any]:
                 "label": "groq_with_local_fallback — try Groq, fall back to local",
             },
         ],
+        # Full catalog for back-compat; each entry carries `purposes`, and every
+        # purpose also gets its own pre-filtered list so clients need not re-derive it.
         "models": _public_model_list(),
         "purposes": {
             PURPOSE_CHAT: {
                 "current_model_id": CURRENT_LLM_MODEL_ID,
                 "provider_mode": LLM_PROVIDER_MODE,
+                "models": _public_model_list(PURPOSE_CHAT),
             },
             PURPOSE_CONTENT_CREATION: {
                 "current_model_id": CONTENT_CREATION_MODEL_ID,
                 "provider_mode": CONTENT_CREATION_PROVIDER_MODE,
+                "models": _public_model_list(PURPOSE_CONTENT_CREATION),
             },
         },
     }

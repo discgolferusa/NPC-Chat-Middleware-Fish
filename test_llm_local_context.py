@@ -24,7 +24,7 @@ def test_zero_budget_error_message_is_local_specific(monkeypatch):
 
 
 def test_zero_budget_error_message_is_groq_specific(monkeypatch):
-    monkeypatch.setattr(llm_router, "CONTENT_CREATION_MODEL_ID", "groq-llama-3.3-70b")
+    monkeypatch.setattr(llm_router, "CONTENT_CREATION_MODEL_ID", "groq-gpt-oss-120b")
     monkeypatch.setattr(llm_router, "CONTENT_CREATION_PROVIDER_MODE", "groq")
     message = llm_router.content_creation_zero_budget_error_message()
     assert "Groq tokens-per-minute" in message

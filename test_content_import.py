@@ -9,6 +9,18 @@ import pytest
 import content_import
 
 
+@pytest.fixture(autouse=True)
+def generous_import_budget(monkeypatch):
+    """Pin the import character budget so these tests exercise import logic only.
+
+    Otherwise every outline test inherits whatever content_creation model the
+    operator last picked in Admin -> LLM, and a model whose Groq TPM cannot host an
+    import request fails the whole file for reasons unrelated to parsing. Tests that
+    assert budget-specific behavior override this with their own monkeypatch.
+    """
+    monkeypatch.setattr(content_import, "content_creation_max_input_chars", lambda: 200_000)
+
+
 FIXTURE_PATH = (
     Path(__file__).resolve().parent / "tests" / "fixtures" / "chariot_of_the_gods_npc_section.txt"
 )
