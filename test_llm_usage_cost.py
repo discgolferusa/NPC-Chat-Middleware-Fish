@@ -66,15 +66,15 @@ def test_failed_rows_excluded_from_cost_report(tmp_path, monkeypatch):
 
     llm_router.record_llm_usage(
         provider="groq",
-        model_id="groq-llama-3.3-70b",
-        model="llama-3.3-70b-versatile",
+        model_id="groq-gpt-oss-120b",
+        model="openai/gpt-oss-120b",
         prompt_tokens=5000,
         completion_tokens=0,
         total_tokens=5000,
         success=False,
         fallback=True,
         purpose="chat",
-        selected_model_id="groq-llama-3.3-70b",
+        selected_model_id="groq-gpt-oss-120b",
     )
 
     report = llm_router.get_llm_usage_cost_report(hours=24)
