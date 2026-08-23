@@ -9,8 +9,20 @@ from pathlib import Path
 from typing import Any
 
 _POOL_LOCK = threading.Lock()
-_VOICES: dict[str, Any] = {}
-_VOICE_LOCKS: dict[str, threading.Lock] = {}
+
+
+class _VoiceSlot:
+    __slots__ = ("voice", "lock", "ready", "loading", "error")
+
+    def __init__(self) -> None:
+        self.voice: Any | None = None
+        self.lock = threading.Lock()
+        self.ready = threading.Event()
+        self.loading = False
+        self.error: BaseException | None = None
+
+
+_SLOTS: dict[str, _VoiceSlot] = {}
 _WARM_THREADS: dict[str, threading.Thread] = {}
 
 
@@ -28,18 +40,55 @@ def _create_piper_voice(model_path: Path) -> Any:
     return PiperVoice.load(model_path, use_cuda=use_cuda)
 
 
+def _store_loaded_voice(key: str, voice: Any) -> None:
+    with _POOL_LOCK:
+        slot = _SLOTS[key]
+        if slot.voice is None:
+            slot.voice = voice
+        slot.loading = False
+        slot.error = None
+        slot.ready.set()
+
+
+def _store_load_error(key: str, error: BaseException) -> None:
+    with _POOL_LOCK:
+        slot = _SLOTS.get(key)
+        if slot is None:
+            return
+        slot.loading = False
+        slot.error = error
+        slot.ready.set()
+
+
+def _claim_loader(key: str) -> tuple[_VoiceSlot, bool]:
+    """Return (slot, should_load). Caller loads only when should_load is True."""
+    with _POOL_LOCK:
+        slot = _SLOTS.get(key)
+        if slot is not None and slot.voice is not None:
+            return slot, False
+        if slot is not None and slot.loading:
+            return slot, False
+        if slot is None:
+            slot = _VoiceSlot()
+            _SLOTS[key] = slot
+        elif slot.error is not None:
+            slot.error = None
+            slot.ready.clear()
+        slot.loading = True
+        return slot, True
+
+
 def _load_voice(model_path: Path, request_id: str | None) -> None:
     key = _voice_key(model_path)
     try:
         voice = _create_piper_voice(model_path)
-        with _POOL_LOCK:
-            _VOICES[key] = voice
-            _VOICE_LOCKS.setdefault(key, threading.Lock())
+        _store_loaded_voice(key, voice)
         print(
             f"[PIPER-POOL] warmed model={model_path.name} request_id={request_id or '-'}",
             flush=True,
         )
     except Exception as ex:
+        _store_load_error(key, ex)
         print(
             f"[PIPER-POOL] warm_failed model={model_path.name} "
             f"request_id={request_id or '-'} error={ex!r}",
@@ -63,44 +112,50 @@ def warm_voice_models(model_paths: list[Path], *, request_id: str | None = None)
 
     for model_path in unique:
         key = _voice_key(model_path)
+        _slot, should_start = _claim_loader(key)
+        if not should_start:
+            continue
+        thread = threading.Thread(
+            target=_load_voice,
+            args=(model_path, request_id),
+            name=f"piper-warm-{model_path.name}",
+            daemon=True,
+        )
         with _POOL_LOCK:
-            if key in _VOICES:
-                continue
-            warm_thread = _WARM_THREADS.get(key)
-            if warm_thread is not None and warm_thread.is_alive():
-                continue
-            thread = threading.Thread(
-                target=_load_voice,
-                args=(model_path, request_id),
-                name=f"piper-warm-{model_path.name}",
-                daemon=True,
-            )
             _WARM_THREADS[key] = thread
-            thread.start()
+        thread.start()
 
 
 def _get_voice_and_lock(model_path: Path) -> tuple[Any, threading.Lock]:
     key = _voice_key(model_path)
 
     with _POOL_LOCK:
-        voice = _VOICES.get(key)
-        if voice is not None:
-            return voice, _VOICE_LOCKS.setdefault(key, threading.Lock())
+        slot = _SLOTS.get(key)
+        if slot is not None and slot.voice is not None:
+            return slot.voice, slot.lock
 
-    warm_thread = _WARM_THREADS.get(key)
-    if warm_thread is not None and warm_thread.is_alive():
-        warm_thread.join(timeout=120.0)
+    slot, should_load = _claim_loader(key)
+    if should_load:
+        try:
+            voice = _create_piper_voice(model_path)
+            _store_loaded_voice(key, voice)
+        except Exception as ex:
+            _store_load_error(key, ex)
+            raise
+        with _POOL_LOCK:
+            slot = _SLOTS[key]
+            return slot.voice, slot.lock
+
+    if not slot.ready.wait(timeout=120.0):
+        raise TimeoutError(f"Timed out waiting for Piper voice load: {model_path}")
 
     with _POOL_LOCK:
-        voice = _VOICES.get(key)
-        if voice is not None:
-            return voice, _VOICE_LOCKS.setdefault(key, threading.Lock())
-
-        voice = _create_piper_voice(model_path)
-        _VOICES[key] = voice
-        lock = threading.Lock()
-        _VOICE_LOCKS[key] = lock
-        return voice, lock
+        slot = _SLOTS[key]
+        if slot.error is not None:
+            raise slot.error
+        if slot.voice is None:
+            raise RuntimeError(f"Piper voice failed to load: {model_path}")
+        return slot.voice, slot.lock
 
 
 def synthesize_wav_file(
@@ -146,6 +201,5 @@ def synthesize_wav_file(
 def clear_pool_for_tests() -> None:
     """Reset module state (tests only)."""
     with _POOL_LOCK:
-        _VOICES.clear()
-        _VOICE_LOCKS.clear()
+        _SLOTS.clear()
         _WARM_THREADS.clear()

@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 import time
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock
 
 import piper_pool
@@ -47,7 +48,8 @@ def test_warm_voice_models_loads_in_background(monkeypatch, tmp_path):
     assert load_done.wait(timeout=1.0)
 
     with piper_pool._POOL_LOCK:
-        assert str(model_path) in piper_pool._VOICES
+        assert str(model_path) in piper_pool._SLOTS
+        assert piper_pool._SLOTS[str(model_path)].voice is not None
 
 
 def test_warm_voice_models_is_idempotent(monkeypatch, tmp_path):
@@ -116,3 +118,55 @@ def test_get_voice_waits_for_warm_thread(monkeypatch, tmp_path):
 
     voice, _lock = piper_pool._get_voice_and_lock(model_path)
     assert voice.model_path == model_path
+
+
+def test_cold_path_load_does_not_block_other_models(monkeypatch, tmp_path):
+    piper_pool.clear_pool_for_tests()
+    slow_path = tmp_path / "slow.onnx"
+    fast_path = tmp_path / "fast.onnx"
+    slow_path.write_bytes(b"onnx")
+    fast_path.write_bytes(b"onnx")
+
+    load_started = threading.Event()
+    release_slow = threading.Event()
+
+    def fake_create(path: Path):
+        if path == slow_path:
+            load_started.set()
+            assert release_slow.wait(timeout=1.0)
+            return _FakeVoice(path)
+        return _FakeVoice(path)
+
+    monkeypatch.setattr(piper_pool, "_create_piper_voice", fake_create)
+
+    slow_result: dict[str, Any] = {}
+    fast_result: dict[str, Any] = {}
+
+    def load_slow():
+        voice, lock = piper_pool._get_voice_and_lock(slow_path)
+        slow_result["voice"] = voice
+        slow_result["lock"] = lock
+
+    def load_fast():
+        load_started.wait(timeout=1.0)
+        voice, lock = piper_pool._get_voice_and_lock(fast_path)
+        fast_result["voice"] = voice
+        fast_result["lock"] = lock
+
+    slow_thread = threading.Thread(target=load_slow)
+    slow_thread.start()
+    assert load_started.wait(timeout=1.0)
+
+    fast_thread = threading.Thread(target=load_fast)
+    fast_start = time.perf_counter()
+    fast_thread.start()
+    fast_thread.join(timeout=1.0)
+    fast_elapsed = time.perf_counter() - fast_start
+
+    assert fast_thread.is_alive() is False
+    assert "voice" in fast_result
+    assert fast_elapsed < 0.25
+
+    release_slow.set()
+    slow_thread.join(timeout=1.0)
+    assert "voice" in slow_result
