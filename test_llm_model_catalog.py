@@ -119,6 +119,60 @@ def test_fetch_credit_snapshot_negative_cache(monkeypatch):
     assert calls["n"] == 1
 
 
+def test_fetch_credit_snapshot_failed_refresh_preserves_good_cache(monkeypatch):
+    good = {
+        "source": "key+budget",
+        "total_credits": 10.0,
+        "total_usage": 9.0,
+        "usage_ratio": 0.9,
+    }
+    monkeypatch.setattr(llm_router, "OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setattr(llm_router, "_CREDITS_SNAPSHOT", dict(good))
+    monkeypatch.setattr(llm_router, "_CREDITS_LOOKUP_UNTIL", None)
+    monkeypatch.setattr(llm_router, "_fetch_openrouter_credit_snapshot_live", lambda: None)
+
+    result = llm_router.fetch_openrouter_credit_snapshot(force=True)
+    assert result == good
+    assert llm_router._CREDITS_SNAPSHOT == good
+
+
+def test_fetch_credit_snapshot_returns_local_copy_under_lock(monkeypatch):
+    """Return value must not re-read globals outside the lock."""
+    good = {
+        "source": "key",
+        "total_credits": 10.0,
+        "total_usage": 5.0,
+        "usage_ratio": 0.5,
+    }
+    monkeypatch.setattr(llm_router, "OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setattr(llm_router, "_CREDITS_SNAPSHOT", None)
+    monkeypatch.setattr(llm_router, "_CREDITS_LOOKUP_UNTIL", None)
+
+    original_lock = llm_router._CREDITS_LOCK
+
+    class RaceLock:
+        def __enter__(self):
+            original_lock.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return original_lock.__exit__(*args)
+
+    lock = RaceLock()
+    monkeypatch.setattr(llm_router, "_CREDITS_LOCK", lock)
+
+    def fake_live():
+        return dict(good)
+
+    monkeypatch.setattr(llm_router, "_fetch_openrouter_credit_snapshot_live", fake_live)
+
+    result = llm_router.fetch_openrouter_credit_snapshot(force=True)
+    assert result == good
+    # Mutating globals after fetch must not change the returned dict.
+    llm_router._CREDITS_SNAPSHOT = None
+    assert result == good
+
+
 def test_fetch_credit_snapshot_skips_credits_without_management_key(monkeypatch):
     calls = {"key": 0, "credits": 0}
 

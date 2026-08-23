@@ -593,6 +593,10 @@ def _fetch_openrouter_credit_snapshot_live() -> dict[str, Any] | None:
     return snapshot
 
 
+def _copy_credit_snapshot(snapshot: dict[str, Any] | None) -> dict[str, Any] | None:
+    return dict(snapshot) if snapshot is not None else None
+
+
 def fetch_openrouter_credit_snapshot(*, force: bool = False) -> dict[str, Any] | None:
     """Return cached OpenRouter credit usage, or refresh from /key (then /credits)."""
     global _CREDITS_SNAPSHOT, _CREDITS_LOOKUP_UNTIL
@@ -607,15 +611,34 @@ def fetch_openrouter_credit_snapshot(*, force: bool = False) -> dict[str, Any] |
             and _CREDITS_LOOKUP_UNTIL is not None
             and now < _CREDITS_LOOKUP_UNTIL
         ):
-            return dict(_CREDITS_SNAPSHOT) if _CREDITS_SNAPSHOT else None
+            return _copy_credit_snapshot(_CREDITS_SNAPSHOT)
 
     snapshot = _fetch_openrouter_credit_snapshot_live()
 
     with _CREDITS_LOCK:
-        _CREDITS_SNAPSHOT = dict(snapshot) if snapshot else None
-        _CREDITS_LOOKUP_UNTIL = now + timedelta(seconds=max(5, OPENROUTER_CREDITS_CACHE_SECONDS))
+        # Another thread may have refreshed while this one was in flight.
+        refreshed_now = _utc_now()
+        if (
+            not force
+            and _CREDITS_LOOKUP_UNTIL is not None
+            and refreshed_now < _CREDITS_LOOKUP_UNTIL
+        ):
+            return _copy_credit_snapshot(_CREDITS_SNAPSHOT)
 
-    return dict(_CREDITS_SNAPSHOT) if _CREDITS_SNAPSHOT else None
+        ttl = timedelta(seconds=max(5, OPENROUTER_CREDITS_CACHE_SECONDS))
+        if snapshot is not None:
+            cached = dict(snapshot)
+            _CREDITS_SNAPSHOT = cached
+            _CREDITS_LOOKUP_UNTIL = refreshed_now + ttl
+            return dict(cached)
+
+        if _CREDITS_SNAPSHOT is not None:
+            # Failed refresh — keep the last good snapshot; do not negative-cache over it.
+            return dict(_CREDITS_SNAPSHOT)
+
+        _CREDITS_SNAPSHOT = None
+        _CREDITS_LOOKUP_UNTIL = refreshed_now + ttl
+        return None
 
 
 def openrouter_credit_threshold_reason() -> str | None:
