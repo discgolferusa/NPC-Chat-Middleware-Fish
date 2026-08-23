@@ -62,11 +62,23 @@ OPENROUTER_CREDITS_CACHE_SECONDS = int(os.getenv("OPENROUTER_CREDITS_CACHE_SECON
 # (USD credits purchased) to compute the 80% fallback ratio.
 OPENROUTER_CREDIT_BUDGET_USD = float(os.getenv("OPENROUTER_CREDIT_BUDGET_USD", "0") or "0")
 OPENROUTER_MANAGEMENT_API_KEY = os.getenv("OPENROUTER_MANAGEMENT_API_KEY", "")
-# Comma-separated OpenRouter provider slugs, e.g. amazon-bedrock,novita
-OPENROUTER_PROVIDER_ORDER_RAW = os.getenv("OPENROUTER_PROVIDER_ORDER", "")
-OPENROUTER_PROVIDER_ALLOW_FALLBACKS = os.getenv(
-    "OPENROUTER_PROVIDER_ALLOW_FALLBACKS", "true"
-).strip().lower() not in {"0", "false", "no", "off"}
+# Comma-separated OpenRouter provider slugs. Default prefers Bedrock with Novita backup.
+# Empty OPENROUTER_PROVIDER_ORDER disables preference routing (OpenRouter price load-balance).
+_DEFAULT_OPENROUTER_PROVIDER_ORDER = "amazon-bedrock,novita"
+_OPENROUTER_PROVIDER_ORDER_ENV_SET = "OPENROUTER_PROVIDER_ORDER" in os.environ
+OPENROUTER_PROVIDER_ORDER_RAW = os.getenv(
+    "OPENROUTER_PROVIDER_ORDER", _DEFAULT_OPENROUTER_PROVIDER_ORDER
+)
+# False = only try providers in order (no Parasail/DeepInfra/etc.). True = fall through.
+_OPENROUTER_PROVIDER_ALLOW_FALLBACKS_ENV = os.getenv(
+    "OPENROUTER_PROVIDER_ALLOW_FALLBACKS", "false"
+)
+OPENROUTER_PROVIDER_ALLOW_FALLBACKS = _OPENROUTER_PROVIDER_ALLOW_FALLBACKS_ENV.strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
 
 # Spoken NPC replies are short, but reasoning models spend completion tokens on
 # chain-of-thought first. max_tokens=180 with gpt-oss often yields empty
@@ -228,11 +240,18 @@ def _get_purpose_provider_mode(purpose: str) -> str:
     return _normalize_provider_mode(raw, default="local")
 
 
-def _load_secrets_file() -> None:
-    global OPENROUTER_API_KEY
+def _parse_allow_fallbacks(raw: str | None, *, default: bool = False) -> bool:
+    if raw is None or str(raw).strip() == "":
+        return default
+    return str(raw).strip().lower() not in {"0", "false", "no", "off"}
 
-    if OPENROUTER_API_KEY:
-        return
+
+def _load_secrets_file() -> None:
+    """Load OpenRouter settings from llm_secrets.env when process env did not set them."""
+    global OPENROUTER_API_KEY
+    global OPENROUTER_PROVIDER_ORDER_RAW
+    global OPENROUTER_PROVIDER_ALLOW_FALLBACKS
+    global _OPENROUTER_PROVIDER_ORDER_ENV_SET
 
     if not LLM_SECRETS_FILE.exists():
         return
@@ -245,9 +264,18 @@ def _load_secrets_file() -> None:
             key, value = line.split("=", 1)
             key = key.strip()
             value = value.strip().strip('"').strip("'")
-            if key == "OPENROUTER_API_KEY" and value:
+            if not value:
+                continue
+            if key == "OPENROUTER_API_KEY" and not OPENROUTER_API_KEY:
                 OPENROUTER_API_KEY = value
-                break
+            elif key == "OPENROUTER_PROVIDER_ORDER" and not _OPENROUTER_PROVIDER_ORDER_ENV_SET:
+                OPENROUTER_PROVIDER_ORDER_RAW = value
+                _OPENROUTER_PROVIDER_ORDER_ENV_SET = True
+            elif (
+                key == "OPENROUTER_PROVIDER_ALLOW_FALLBACKS"
+                and "OPENROUTER_PROVIDER_ALLOW_FALLBACKS" not in os.environ
+            ):
+                OPENROUTER_PROVIDER_ALLOW_FALLBACKS = _parse_allow_fallbacks(value, default=False)
     except OSError as ex:
         print(f"[LLM] failed to read secrets file: {ex}", flush=True)
 
@@ -1207,21 +1235,46 @@ def call_local_chat_completions(
 
 
 def _openrouter_provider_order() -> list[str]:
-    raw = (OPENROUTER_PROVIDER_ORDER_RAW or "").strip()
+    # Prefer live process env so operators can set the key without restarting Python import order.
+    raw = os.getenv("OPENROUTER_PROVIDER_ORDER")
+    if raw is None:
+        raw = OPENROUTER_PROVIDER_ORDER_RAW or ""
+    raw = raw.strip()
     if not raw:
         return []
     parts = raw.replace(";", ",").split(",")
     return [part.strip() for part in parts if part.strip()]
 
 
+def _openrouter_allow_fallbacks() -> bool:
+    if "OPENROUTER_PROVIDER_ALLOW_FALLBACKS" in os.environ:
+        return _parse_allow_fallbacks(os.getenv("OPENROUTER_PROVIDER_ALLOW_FALLBACKS"), default=False)
+    return OPENROUTER_PROVIDER_ALLOW_FALLBACKS
+
+
 def _apply_openrouter_provider_preferences(payload: dict[str, Any]) -> None:
     order = _openrouter_provider_order()
     if not order:
+        print(
+            "[LLM] openrouter provider order empty — OpenRouter will price load-balance "
+            "(set OPENROUTER_PROVIDER_ORDER=amazon-bedrock,novita)",
+            flush=True,
+        )
         return
-    payload["provider"] = {
+    allow_fallbacks = _openrouter_allow_fallbacks()
+    provider: dict[str, Any] = {
         "order": order,
-        "allow_fallbacks": OPENROUTER_PROVIDER_ALLOW_FALLBACKS,
+        "allow_fallbacks": allow_fallbacks,
     }
+    # When fallbacks are disabled, also pin `only` so other endpoints cannot be selected.
+    if not allow_fallbacks:
+        provider["only"] = list(order)
+    payload["provider"] = provider
+    print(
+        f"[LLM] openrouter provider preferences order={order} "
+        f"allow_fallbacks={allow_fallbacks} only={provider.get('only')}",
+        flush=True,
+    )
 
 
 def _openrouter_timeout_seconds(
@@ -2077,7 +2130,7 @@ def get_llm_status() -> dict[str, Any]:
         "select_endpoint": "/llm/select",
         "openrouter": {
             "provider_order": _openrouter_provider_order(),
-            "provider_allow_fallbacks": OPENROUTER_PROVIDER_ALLOW_FALLBACKS,
+            "provider_allow_fallbacks": _openrouter_allow_fallbacks(),
         },
         # --- purpose-scoped detail ---
         "purposes": {
@@ -2138,10 +2191,13 @@ def init_llm_router() -> None:
     LLM_MODELS["local"]["model"] = LOCAL_LLM_MODEL
     LLM_MODELS["local"]["url"] = LOCAL_LLM_URL
 
+    provider_order = _openrouter_provider_order()
     print(
         f"[LLM] router ready chat_model={CURRENT_LLM_MODEL_ID} chat_mode={LLM_PROVIDER_MODE} "
         f"content_creation_model={CONTENT_CREATION_MODEL_ID} content_creation_mode={CONTENT_CREATION_PROVIDER_MODE} "
-        f"openrouter_configured={openrouter_is_configured()}",
+        f"openrouter_configured={openrouter_is_configured()} "
+        f"provider_order={provider_order or '(none)'} "
+        f"provider_allow_fallbacks={_openrouter_allow_fallbacks()}",
         flush=True,
     )
 
