@@ -147,6 +147,7 @@ from tts_processing import (
     resolve_tts_options,
 )
 from piper_paths import LEGACY_WINDOWS_PIPER_EXE, resolve_piper_exe
+import piper_pool
 from db_paths import MEMORY_DB as _SHARED_MEMORY_DB
 from db_paths import refresh_memory_db, resolve_memory_db
 
@@ -2521,6 +2522,68 @@ def pick_npc_voice_model(npc: dict, override: str | None = None) -> str | None:
     return text or None
 
 
+def resolve_voice_model_paths_for_turn(
+    npc_id: str,
+    voice_override: str | None = None,
+) -> list[Path]:
+    """Resolved ONNX paths for NPC + narrator voices on a voice turn."""
+    paths: list[Path] = []
+    seen: set[str] = set()
+
+    def _add(voice_model: str | None) -> None:
+        if not voice_model or not str(voice_model).strip():
+            return
+        resolved = resolve_voice_model_path(voice_model)
+        key = str(resolved)
+        if key in seen:
+            return
+        seen.add(key)
+        paths.append(resolved)
+
+    try:
+        npc = load_npc(npc_id)
+        _add(pick_npc_voice_model(npc, voice_override))
+    except Exception as ex:
+        print(
+            f"[PIPER-POOL] npc_voice_unresolved npc_id={npc_id} error={ex!r}",
+            flush=True,
+        )
+
+    try:
+        narrator = get_narrator_tts_settings()
+        _add(narrator.get("resolved_voice_model") or narrator.get("voice_model"))
+    except Exception as ex:
+        print(f"[PIPER-POOL] narrator_voice_unresolved error={ex!r}", flush=True)
+
+    return paths
+
+
+def schedule_piper_warm_for_voice_turn(
+    npc_id: str,
+    voice_override: str | None,
+    *,
+    request_id: str,
+) -> None:
+    """Load Piper ONNX models in the background while STT/LLM run."""
+    if str(os.environ.get("PIPER_USE_SUBPROCESS", "")).strip().lower() in ("1", "true", "yes"):
+        return
+    try:
+        model_paths = resolve_voice_model_paths_for_turn(npc_id, voice_override)
+        if not model_paths:
+            return
+        piper_pool.warm_voice_models(model_paths, request_id=request_id)
+        names = ", ".join(p.name for p in model_paths)
+        print(
+            f"[PIPER-POOL] scheduled warm request_id={request_id} models={names}",
+            flush=True,
+        )
+    except Exception as ex:
+        print(
+            f"[PIPER-POOL] schedule_skipped request_id={request_id} error={ex!r}",
+            flush=True,
+        )
+
+
 def pick_npc_length_scale(npc: dict, override: Any = None) -> float:
     opts = pick_npc_tts_options(npc, {"tts_length_scale": override} if override is not None else None)
     return float(opts["length_scale"])
@@ -2575,11 +2638,28 @@ def synthesize_speech(
     # Same resolution as /voices/preview so UNC/partial/editor paths work at runtime.
     model_path = resolve_voice_model_path(voice_model)
 
-    piper_exe = resolve_piper_exe()
-
     if not model_path.exists():
         raise FileNotFoundError(f"Piper voice model not found: {model_path}")
 
+    use_subprocess = str(os.environ.get("PIPER_USE_SUBPROCESS", "")).strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    if not use_subprocess:
+        piper_pool.synthesize_wav_file(
+            model_path,
+            output_path,
+            text,
+            length_scale=length_scale,
+            noise_scale=noise_scale,
+            noise_w=noise_w,
+            sentence_silence=sentence_silence,
+            speaker_id=speaker_id,
+        )
+        return
+
+    piper_exe = resolve_piper_exe()
     cmd = [
         str(piper_exe),
         "--model", str(model_path),
@@ -3006,6 +3086,14 @@ def npc_voice_turn():
         input_path = save_uploaded_audio(request.files["audio"], request_id)
         step_start = log_timing(request_id, "save uploaded audio", step_start)
 
+        voice_override = (request.form.get("voice_model") or "").strip() or None
+        schedule_piper_warm_for_voice_turn(
+            npc_id,
+            voice_override,
+            request_id=request_id,
+        )
+        step_start = log_timing(request_id, "schedule piper warm-up", step_start)
+
         set_turn_progress(request_id, "transcribing")
         player_text = transcribe_audio(input_path)
         step_start = log_timing(request_id, "speech-to-text", step_start)
@@ -3363,6 +3451,14 @@ def npc_voice_turn_debug():
 
     input_path = save_uploaded_audio(request.files["audio"], request_id)
     step_start = log_timing(request_id, "debug save uploaded audio", step_start)
+
+    voice_override = (request.form.get("voice_model") or "").strip() or None
+    schedule_piper_warm_for_voice_turn(
+        npc_id,
+        voice_override,
+        request_id=request_id,
+    )
+    step_start = log_timing(request_id, "debug schedule piper warm-up", step_start)
 
     try:
         player_text = transcribe_audio(input_path)
