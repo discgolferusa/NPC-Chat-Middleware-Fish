@@ -20,7 +20,7 @@ def test_fallback_usage_attributed_to_selected_online_model(tmp_path, monkeypatc
         success=True,
         fallback=True,
         purpose="content_creation",
-        selected_model_id="groq-gpt-oss-20b",
+        selected_model_id="openrouter-gpt-oss-20b",
         attribute_cost_to_selected=True,
     )
 
@@ -28,12 +28,12 @@ def test_fallback_usage_attributed_to_selected_online_model(tmp_path, monkeypatc
     assert report["totals"]["requests"] == 1
     assert report["totals"]["prompt_tokens"] == 8000
     assert report["totals"]["completion_tokens"] == 400
-    assert report["by_model"][0]["model_id"] == "groq-gpt-oss-20b"
+    assert report["by_model"][0]["model_id"] == "openrouter-gpt-oss-20b"
     assert report["by_model"][0]["fallback_attributed_requests"] == 1
-    # 8000/1e6 * 0.075 + 400/1e6 * 0.30
-    assert report["by_model"][0]["estimated_total_cost_usd"] == 0.00072
+    # 8000/1e6 * 0.03 + 400/1e6 * 0.13 = 0.00024 + 0.000052 = 0.000292
+    assert report["by_model"][0]["estimated_total_cost_usd"] == 0.000292
     assert report["by_user"][0]["owner_user_id"] == "user-alpha"
-    assert report["by_user"][0]["estimated_total_cost_usd"] == 0.00072
+    assert report["by_user"][0]["estimated_total_cost_usd"] == 0.000292
 
 
 def test_local_only_usage_has_zero_cost(tmp_path, monkeypatch):
@@ -65,16 +65,16 @@ def test_failed_rows_excluded_from_cost_report(tmp_path, monkeypatch):
     monkeypatch.setattr(llm_router, "_request_owner_user_id", lambda: "user-x")
 
     llm_router.record_llm_usage(
-        provider="groq",
-        model_id="groq-gpt-oss-120b",
-        model="openai/gpt-oss-120b",
+        provider="openrouter",
+        model_id="openrouter-gpt-oss-20b",
+        model="openai/gpt-oss-20b",
         prompt_tokens=5000,
         completion_tokens=0,
         total_tokens=5000,
         success=False,
         fallback=True,
         purpose="chat",
-        selected_model_id="groq-gpt-oss-120b",
+        selected_model_id="openrouter-gpt-oss-20b",
     )
 
     report = llm_router.get_llm_usage_cost_report(hours=24)
