@@ -170,3 +170,68 @@ def test_cold_path_load_does_not_block_other_models(monkeypatch, tmp_path):
     release_slow.set()
     slow_thread.join(timeout=1.0)
     assert "voice" in slow_result
+
+
+def test_get_voice_retries_after_warm_failure(monkeypatch, tmp_path):
+    piper_pool.clear_pool_for_tests()
+    model_path = tmp_path / "flaky.onnx"
+    model_path.write_bytes(b"onnx")
+    calls = {"n": 0}
+
+    def fake_create(path: Path):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("transient warm failure")
+        return _FakeVoice(path)
+
+    monkeypatch.setattr(piper_pool, "_create_piper_voice", fake_create)
+
+    piper_pool.warm_voice_models([model_path], request_id="warm-fail")
+    time.sleep(0.08)
+
+    voice, _lock = piper_pool._get_voice_and_lock(model_path)
+    assert voice.model_path == model_path
+    assert calls["n"] == 2
+
+
+def test_waiter_waits_for_inflight_retry_instead_of_stale_error(monkeypatch, tmp_path):
+    piper_pool.clear_pool_for_tests()
+    model_path = tmp_path / "race.onnx"
+    model_path.write_bytes(b"onnx")
+    key = str(model_path)
+
+    slot = piper_pool._VoiceSlot()
+    slot.error = OSError("first failure")
+    slot.ready.set()
+    piper_pool._SLOTS[key] = slot
+
+    retry_started = threading.Event()
+    allow_retry_done = threading.Event()
+
+    def fake_create(path: Path):
+        retry_started.set()
+        assert allow_retry_done.wait(timeout=1.0)
+        return _FakeVoice(path)
+
+    monkeypatch.setattr(piper_pool, "_create_piper_voice", fake_create)
+
+    waiter_result: dict[str, Any] = {}
+
+    def waiter():
+        voice, _lock = piper_pool._get_voice_and_lock(model_path)
+        waiter_result["voice"] = voice
+
+    waiter_thread = threading.Thread(target=waiter)
+    waiter_thread.start()
+
+    assert retry_started.wait(timeout=1.0)
+
+    with piper_pool._POOL_LOCK:
+        active = piper_pool._SLOTS[key]
+        assert active.loading is True
+        assert active.error is None
+
+    allow_retry_done.set()
+    waiter_thread.join(timeout=1.0)
+
+    assert waiter_result["voice"].model_path == model_path

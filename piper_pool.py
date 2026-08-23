@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 import wave
 from pathlib import Path
 from typing import Any
@@ -128,34 +129,44 @@ def warm_voice_models(model_paths: list[Path], *, request_id: str | None = None)
 
 def _get_voice_and_lock(model_path: Path) -> tuple[Any, threading.Lock]:
     key = _voice_key(model_path)
+    deadline = time.perf_counter() + 120.0
 
-    with _POOL_LOCK:
-        slot = _SLOTS.get(key)
-        if slot is not None and slot.voice is not None:
-            return slot.voice, slot.lock
+    while True:
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0:
+            raise TimeoutError(f"Timed out waiting for Piper voice load: {model_path}")
 
-    slot, should_load = _claim_loader(key)
-    if should_load:
-        try:
-            voice = _create_piper_voice(model_path)
-            _store_loaded_voice(key, voice)
-        except Exception as ex:
-            _store_load_error(key, ex)
-            raise
+        with _POOL_LOCK:
+            slot = _SLOTS.get(key)
+            if slot is not None and slot.voice is not None:
+                return slot.voice, slot.lock
+
+        slot, should_load = _claim_loader(key)
+        if should_load:
+            try:
+                voice = _create_piper_voice(model_path)
+                _store_loaded_voice(key, voice)
+            except Exception as ex:
+                _store_load_error(key, ex)
+                raise
+            with _POOL_LOCK:
+                loaded = _SLOTS[key]
+                return loaded.voice, loaded.lock
+
+        if not slot.ready.wait(timeout=remaining):
+            raise TimeoutError(f"Timed out waiting for Piper voice load: {model_path}")
+
         with _POOL_LOCK:
             slot = _SLOTS[key]
-            return slot.voice, slot.lock
-
-    if not slot.ready.wait(timeout=120.0):
-        raise TimeoutError(f"Timed out waiting for Piper voice load: {model_path}")
-
-    with _POOL_LOCK:
-        slot = _SLOTS[key]
-        if slot.error is not None:
-            raise slot.error
-        if slot.voice is None:
-            raise RuntimeError(f"Piper voice failed to load: {model_path}")
-        return slot.voice, slot.lock
+            if slot.voice is not None:
+                return slot.voice, slot.lock
+            if slot.loading:
+                # Another thread claimed a retry after our wait returned.
+                continue
+            if slot.error is not None:
+                raise slot.error
+            # Stale ready or retry claimed between wait return and lock: loop again.
+            continue
 
 
 def synthesize_wav_file(
