@@ -444,14 +444,20 @@ def test_llm_status_includes_credits_block(api, monkeypatch):
 
 
 def test_openrouter_provider_order_parsed_from_env(monkeypatch):
-    monkeypatch.setattr(llm_router, "OPENROUTER_PROVIDER_ORDER_RAW", "amazon-bedrock, novita")
+    monkeypatch.setenv("OPENROUTER_PROVIDER_ORDER", "amazon-bedrock, novita")
+    assert llm_router._openrouter_provider_order() == ["amazon-bedrock", "novita"]
+
+
+def test_openrouter_provider_order_defaults_to_bedrock_then_novita(monkeypatch):
+    monkeypatch.delenv("OPENROUTER_PROVIDER_ORDER", raising=False)
+    monkeypatch.setattr(llm_router, "OPENROUTER_PROVIDER_ORDER_RAW", "amazon-bedrock,novita")
     assert llm_router._openrouter_provider_order() == ["amazon-bedrock", "novita"]
 
 
 def test_call_openrouter_includes_provider_preferences(monkeypatch):
     monkeypatch.setattr(llm_router, "OPENROUTER_API_KEY", "test-key")
-    monkeypatch.setattr(llm_router, "OPENROUTER_PROVIDER_ORDER_RAW", "amazon-bedrock,novita")
-    monkeypatch.setattr(llm_router, "OPENROUTER_PROVIDER_ALLOW_FALLBACKS", True)
+    monkeypatch.setenv("OPENROUTER_PROVIDER_ORDER", "amazon-bedrock,novita")
+    monkeypatch.setenv("OPENROUTER_PROVIDER_ALLOW_FALLBACKS", "false")
 
     captured: dict = {}
 
@@ -480,16 +486,64 @@ def test_call_openrouter_includes_provider_preferences(monkeypatch):
     assert content == "Hello"
     assert captured["json"]["provider"] == {
         "order": ["amazon-bedrock", "novita"],
-        "allow_fallbacks": True,
+        "allow_fallbacks": False,
+        "only": ["amazon-bedrock", "novita"],
     }
+
+
+def test_call_openrouter_allow_fallbacks_omits_only(monkeypatch):
+    monkeypatch.setattr(llm_router, "OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setenv("OPENROUTER_PROVIDER_ORDER", "amazon-bedrock,novita")
+    monkeypatch.setenv("OPENROUTER_PROVIDER_ALLOW_FALLBACKS", "true")
+
+    captured: dict = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {
+                "choices": [{"message": {"content": "Hello"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            }
+
+    def fake_post(url, headers, json, timeout):
+        captured["json"] = json
+        return FakeResponse()
+
+    monkeypatch.setattr(llm_router.requests, "post", fake_post)
+    llm_router.call_openrouter_chat_completions([{"role": "user", "content": "hi"}], "openai/gpt-oss-20b")
+    assert captured["json"]["provider"]["allow_fallbacks"] is True
+    assert "only" not in captured["json"]["provider"]
 
 
 def test_llm_status_exposes_openrouter_provider_order(api, monkeypatch):
     client, _server, headers = api
-    monkeypatch.setattr(llm_router, "OPENROUTER_PROVIDER_ORDER_RAW", "amazon-bedrock,novita")
+    monkeypatch.setenv("OPENROUTER_PROVIDER_ORDER", "amazon-bedrock,novita")
+    monkeypatch.setenv("OPENROUTER_PROVIDER_ALLOW_FALLBACKS", "false")
 
     response = client.get("/llm/status", headers=headers)
     assert response.status_code == 200
     payload = response.get_json()
     assert payload["openrouter"]["provider_order"] == ["amazon-bedrock", "novita"]
-    assert payload["openrouter"]["provider_allow_fallbacks"] is True
+    assert payload["openrouter"]["provider_allow_fallbacks"] is False
+
+
+def test_secrets_file_loads_provider_order(monkeypatch, tmp_path):
+    secrets = tmp_path / "llm_secrets.env"
+    secrets.write_text(
+        "OPENROUTER_API_KEY=from-file\nOPENROUTER_PROVIDER_ORDER=amazon-bedrock,novita\n"
+        "OPENROUTER_PROVIDER_ALLOW_FALLBACKS=false\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(llm_router, "LLM_SECRETS_FILE", secrets)
+    monkeypatch.setattr(llm_router, "OPENROUTER_API_KEY", "")
+    monkeypatch.setattr(llm_router, "_OPENROUTER_PROVIDER_ORDER_ENV_SET", False)
+    monkeypatch.setattr(llm_router, "OPENROUTER_PROVIDER_ORDER_RAW", "")
+    monkeypatch.delenv("OPENROUTER_PROVIDER_ORDER", raising=False)
+    monkeypatch.delenv("OPENROUTER_PROVIDER_ALLOW_FALLBACKS", raising=False)
+
+    llm_router._load_secrets_file()
+    assert llm_router.OPENROUTER_API_KEY == "from-file"
+    assert llm_router.OPENROUTER_PROVIDER_ORDER_RAW == "amazon-bedrock,novita"
+    assert llm_router.OPENROUTER_PROVIDER_ALLOW_FALLBACKS is False
