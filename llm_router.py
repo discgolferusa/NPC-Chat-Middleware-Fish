@@ -62,6 +62,11 @@ OPENROUTER_CREDITS_CACHE_SECONDS = int(os.getenv("OPENROUTER_CREDITS_CACHE_SECON
 # (USD credits purchased) to compute the 80% fallback ratio.
 OPENROUTER_CREDIT_BUDGET_USD = float(os.getenv("OPENROUTER_CREDIT_BUDGET_USD", "0") or "0")
 OPENROUTER_MANAGEMENT_API_KEY = os.getenv("OPENROUTER_MANAGEMENT_API_KEY", "")
+# Comma-separated OpenRouter provider slugs, e.g. amazon-bedrock,novita
+OPENROUTER_PROVIDER_ORDER_RAW = os.getenv("OPENROUTER_PROVIDER_ORDER", "")
+OPENROUTER_PROVIDER_ALLOW_FALLBACKS = os.getenv(
+    "OPENROUTER_PROVIDER_ALLOW_FALLBACKS", "true"
+).strip().lower() not in {"0", "false", "no", "off"}
 
 # Spoken NPC replies are short, but reasoning models spend completion tokens on
 # chain-of-thought first. max_tokens=180 with gpt-oss often yields empty
@@ -1201,6 +1206,24 @@ def call_local_chat_completions(
 
 
 
+def _openrouter_provider_order() -> list[str]:
+    raw = (OPENROUTER_PROVIDER_ORDER_RAW or "").strip()
+    if not raw:
+        return []
+    parts = raw.replace(";", ",").split(",")
+    return [part.strip() for part in parts if part.strip()]
+
+
+def _apply_openrouter_provider_preferences(payload: dict[str, Any]) -> None:
+    order = _openrouter_provider_order()
+    if not order:
+        return
+    payload["provider"] = {
+        "order": order,
+        "allow_fallbacks": OPENROUTER_PROVIDER_ALLOW_FALLBACKS,
+    }
+
+
 def _openrouter_timeout_seconds(
     *,
     purpose: str = DEFAULT_PURPOSE,
@@ -1239,6 +1262,7 @@ def call_openrouter_chat_completions(
         "max_tokens": effective_max,
     }
     _apply_reasoning_options(payload, model_id=model_id or "", model_name=model_name)
+    _apply_openrouter_provider_preferences(payload)
 
     response = requests.post(
         OPENROUTER_BASE_URL,
@@ -1259,6 +1283,12 @@ def call_openrouter_chat_completions(
     choice = (data.get("choices") or [{}])[0]
     message = choice.get("message") or {}
     content = _extract_chat_content(message)
+    routed_provider = data.get("provider") or choice.get("provider")
+    if routed_provider:
+        print(
+            f"[LLM] openrouter routed provider={routed_provider!r} model={model_name}",
+            flush=True,
+        )
     usage = data.get("usage") or {}
 
     prompt_tokens = int(usage.get("prompt_tokens") or _estimate_prompt_tokens(messages))
@@ -2045,6 +2075,10 @@ def get_llm_status() -> dict[str, Any]:
         "remaining_estimate": chat_status["remaining_estimate"],
         "models_endpoint": "/llm/models",
         "select_endpoint": "/llm/select",
+        "openrouter": {
+            "provider_order": _openrouter_provider_order(),
+            "provider_allow_fallbacks": OPENROUTER_PROVIDER_ALLOW_FALLBACKS,
+        },
         # --- purpose-scoped detail ---
         "purposes": {
             PURPOSE_CHAT: chat_status,
