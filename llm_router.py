@@ -1,17 +1,19 @@
 """
-Multi-provider LLM routing: local llama.cpp (default/fallback) and Groq.
+Multi-provider LLM routing: local llama.cpp (default/fallback) and OpenRouter.
 
 Requests are scoped by "purpose":
   - chat: spoken NPC dialogue turns (default, short completions).
   - content_creation: campaign document import / generation tooling
     (longer completions, its own selected model + provider mode).
 
+When OpenRouter credit usage reaches OPENROUTER_CREDIT_FALLBACK_RATIO (default 80%)
+of available credits, online modes automatically fall back to local llama.cpp.
+
 Manual test (PowerShell):
   curl http://127.0.0.1:5000/llm/models
   curl http://127.0.0.1:5000/llm/status
   curl -X POST http://127.0.0.1:5000/llm/select -H "Content-Type: application/json" -d "{\"model_id\":\"local\",\"provider_mode\":\"local\"}"
-  curl -X POST http://127.0.0.1:5000/llm/select -H "Content-Type: application/json" -d "{\"model_id\":\"groq-gpt-oss-120b\",\"provider_mode\":\"groq_with_local_fallback\"}"
-  curl -X POST http://127.0.0.1:5000/llm/select -H "Content-Type: application/json" -d "{\"model_id\":\"groq-compound\",\"provider_mode\":\"groq_with_local_fallback\",\"purpose\":\"content_creation\"}"
+  curl -X POST http://127.0.0.1:5000/llm/select -H "Content-Type: application/json" -d "{\"model_id\":\"openrouter-gpt-oss-20b\",\"provider_mode\":\"openrouter_with_local_fallback\"}"
 """
 
 from __future__ import annotations
@@ -37,18 +39,26 @@ LOCAL_LLM_TIMEOUT_SECONDS = int(os.getenv("LOCAL_LLM_TIMEOUT_SECONDS", "180"))
 CONTENT_CREATION_LOCAL_TIMEOUT_SECONDS = int(
     os.getenv("CONTENT_CREATION_LOCAL_TIMEOUT_SECONDS", "600")
 )
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1/chat/completions")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
-GROQ_TIMEOUT_SECONDS = int(os.getenv("GROQ_TIMEOUT_SECONDS", "10"))
-# content_creation sends large prompts and asks for long JSON completions;
-# the chat default (10s) is far too short and causes cascading timeouts.
-CONTENT_CREATION_GROQ_TIMEOUT_SECONDS = int(
-    os.getenv("CONTENT_CREATION_GROQ_TIMEOUT_SECONDS", "120")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_BASE_URL = os.getenv(
+    "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1/chat/completions"
 )
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-oss-20b")
+OPENROUTER_TIMEOUT_SECONDS = int(os.getenv("OPENROUTER_TIMEOUT_SECONDS", "30"))
+# content_creation sends large prompts and asks for long JSON completions;
+# the chat default is too short and causes cascading timeouts.
+CONTENT_CREATION_OPENROUTER_TIMEOUT_SECONDS = int(
+    os.getenv("CONTENT_CREATION_OPENROUTER_TIMEOUT_SECONDS", "120")
+)
+OPENROUTER_HTTP_REFERER = os.getenv("OPENROUTER_HTTP_REFERER", "https://npcnarrator.com")
+OPENROUTER_APP_TITLE = os.getenv("OPENROUTER_APP_TITLE", "NPC Narrator")
+# Auto-fall back to local llama when lifetime credit usage reaches this fraction
+# of total available credits (OpenRouter /key or /credits).
+OPENROUTER_CREDIT_FALLBACK_RATIO = float(os.getenv("OPENROUTER_CREDIT_FALLBACK_RATIO", "0.8"))
+OPENROUTER_CREDITS_CACHE_SECONDS = int(os.getenv("OPENROUTER_CREDITS_CACHE_SECONDS", "60"))
 
 # Spoken NPC replies are short, but reasoning models spend completion tokens on
-# chain-of-thought first. max_tokens=180 with gpt-oss/qwen3 often yields empty
+# chain-of-thought first. max_tokens=180 with gpt-oss often yields empty
 # message.content (finish_reason=length) -> "I have nothing more to say."
 DEFAULT_MAX_TOKENS = 180
 REASONING_MAX_TOKENS = int(os.getenv("LLM_REASONING_MAX_TOKENS", "768"))
@@ -61,7 +71,15 @@ LLM_USAGE_FILE = BASE_DIR / "llm_usage.json"
 LLM_RUNTIME_CONFIG_FILE = BASE_DIR / "llm_runtime_config.json"
 LLM_SECRETS_FILE = BASE_DIR / "llm_secrets.env"
 
-VALID_PROVIDER_MODES = frozenset({"local", "groq", "groq_with_local_fallback"})
+VALID_PROVIDER_MODES = frozenset({"local", "openrouter", "openrouter_with_local_fallback"})
+# Older llm_runtime_config.json / Admin UI selections used Groq mode names.
+PROVIDER_MODE_ALIASES: dict[str, str] = {
+    "groq": "openrouter",
+    "groq_with_local_fallback": "openrouter_with_local_fallback",
+}
+ONLINE_PROVIDER_MODES = frozenset({"openrouter", "openrouter_with_local_fallback"})
+ONLINE_WITH_FALLBACK_MODE = "openrouter_with_local_fallback"
+ONLINE_STRICT_MODE = "openrouter"
 REASONING_MODEL_MARKERS = ("gpt-oss", "qwen3")
 
 PURPOSE_CHAT = "chat"
@@ -69,9 +87,7 @@ PURPOSE_CONTENT_CREATION = "content_creation"
 VALID_PURPOSES = frozenset({PURPOSE_CHAT, PURPOSE_CONTENT_CREATION})
 DEFAULT_PURPOSE = PURPOSE_CHAT
 
-# Groq free-plan catalog, checked against console.groq.com/docs/models and
-# /docs/rate-limits on 2026-08-21. `limits` are the Free plan caps (Developer plan
-# is roughly 10x) so preflight refuses a request before Groq answers 429.
+# OpenRouter catalog. Credit budget (not RPM/TPM) gates online vs local fallback.
 # `purposes` gates which Admin -> LLM dropdown offers the model.
 LLM_MODELS: dict[str, dict[str, Any]] = {
     "local": {
@@ -84,71 +100,33 @@ LLM_MODELS: dict[str, dict[str, Any]] = {
         "limits": None,
         "purposes": [PURPOSE_CHAT, PURPOSE_CONTENT_CREATION],
     },
-    "groq-gpt-oss-120b": {
-        "id": "groq-gpt-oss-120b",
-        "label": "Groq GPT-OSS 120B",
-        "provider": "groq",
-        "model": "openai/gpt-oss-120b",
-        "online": True,
-        "limits": {"rpm": 30, "rpd": 1000, "tpm": 8000, "tpd": 200000},
-        "purposes": [PURPOSE_CHAT, PURPOSE_CONTENT_CREATION],
-    },
-    "groq-gpt-oss-20b": {
-        "id": "groq-gpt-oss-20b",
-        "label": "Groq GPT-OSS 20B",
-        "provider": "groq",
+    "openrouter-gpt-oss-20b": {
+        "id": "openrouter-gpt-oss-20b",
+        "label": "OpenRouter GPT-OSS 20B",
+        "provider": "openrouter",
         "model": "openai/gpt-oss-20b",
         "online": True,
-        "limits": {"rpm": 30, "rpd": 1000, "tpm": 8000, "tpd": 200000},
+        "limits": None,
         "purposes": [PURPOSE_CHAT, PURPOSE_CONTENT_CREATION],
-    },
-    "groq-qwen3.6-27b": {
-        "id": "groq-qwen3.6-27b",
-        "label": "Groq Qwen3.6 27B",
-        "provider": "groq",
-        "model": "qwen/qwen3.6-27b",
-        "online": True,
-        "limits": {"rpm": 30, "rpd": 1000, "tpm": 8000, "tpd": 200000},
-        "purposes": [PURPOSE_CHAT, PURPOSE_CONTENT_CREATION],
-    },
-    # Compound is an agentic system with built-in web search and code execution.
-    # Its 70K TPM is the only free-plan budget large enough for document import,
-    # but the live tools would leak real-world facts into spoken NPC turns, so it
-    # is deliberately withheld from the chat purpose.
-    "groq-compound": {
-        "id": "groq-compound",
-        "label": "Groq Compound (agentic, import only)",
-        "provider": "groq",
-        "model": "groq/compound",
-        "online": True,
-        "limits": {"rpm": 30, "rpd": 250, "tpm": 70000, "tpd": None},
-        "purposes": [PURPOSE_CONTENT_CREATION],
-    },
-    "groq-compound-mini": {
-        "id": "groq-compound-mini",
-        "label": "Groq Compound Mini (agentic, import only)",
-        "provider": "groq",
-        "model": "groq/compound-mini",
-        "online": True,
-        "limits": {"rpm": 30, "rpd": 250, "tpm": 70000, "tpd": None},
-        "purposes": [PURPOSE_CONTENT_CREATION],
     },
 }
 
-# Retired Groq model ids still present in older llm_runtime_config.json files.
-# Targets follow Groq's own recommended replacements from its deprecation notices;
-# aliases may chain (scout -> llama-3.3-70b -> gpt-oss-120b).
+# Retired Groq catalog ids (and chained aliases) remap onto OpenRouter gpt-oss-20b.
 DEPRECATED_MODEL_ALIASES: dict[str, str] = {
     "groq-llama-4-scout": "groq-llama-3.3-70b",
-    "groq-qwen3-32b": "groq-qwen3.6-27b",
-    # Shut down by Groq on 2026-08-16.
-    "groq-llama-3.1-8b-instant": "groq-gpt-oss-20b",
-    "groq-llama-3.3-70b": "groq-gpt-oss-120b",
+    "groq-qwen3-32b": "openrouter-gpt-oss-20b",
+    "groq-llama-3.1-8b-instant": "openrouter-gpt-oss-20b",
+    "groq-llama-3.3-70b": "openrouter-gpt-oss-20b",
+    "groq-gpt-oss-20b": "openrouter-gpt-oss-20b",
+    "groq-gpt-oss-120b": "openrouter-gpt-oss-20b",
+    "groq-qwen3.6-27b": "openrouter-gpt-oss-20b",
+    "groq-compound": "openrouter-gpt-oss-20b",
+    "groq-compound-mini": "openrouter-gpt-oss-20b",
 }
 
 # --- chat purpose (default / backward-compatible globals) ---
 CURRENT_LLM_MODEL_ID = os.getenv("CURRENT_LLM_MODEL_ID", "local")
-LLM_PROVIDER_MODE = os.getenv("LLM_PROVIDER_MODE", "groq_with_local_fallback")
+LLM_PROVIDER_MODE = os.getenv("LLM_PROVIDER_MODE", "openrouter_with_local_fallback")
 
 # --- content_creation purpose (campaign/document generation tooling) ---
 CONTENT_CREATION_MODEL_ID = os.getenv("CONTENT_CREATION_LLM_MODEL_ID", CURRENT_LLM_MODEL_ID)
@@ -166,21 +144,20 @@ ONLINE_DISABLED_UNTIL: datetime | None = None
 # Keep ledger longer than the 24h rate-limit window so Admin cost charts have history.
 USAGE_RETENTION_HOURS = int(os.getenv("LLM_USAGE_RETENTION_HOURS", str(24 * 30)))
 
-# Alpha on-demand Groq list prices (USD per 1M tokens). Not billed by us — estimation only.
-# Source: https://groq.com/pricing (update when Groq changes rates).
-GROQ_ON_DEMAND_PRICES_USD: dict[str, dict[str, float]] = {
+# Alpha OpenRouter list prices (USD per 1M tokens). Not billed by us — estimation only.
+# Source: https://openrouter.ai/openai/gpt-oss-20b/pricing (weighted floor ~$0.03/$0.13).
+ONLINE_ON_DEMAND_PRICES_USD: dict[str, dict[str, float]] = {
     "local": {"input": 0.0, "output": 0.0},
-    "groq-gpt-oss-120b": {"input": 0.15, "output": 0.60},
-    "groq-gpt-oss-20b": {"input": 0.075, "output": 0.30},
-    "groq-qwen3.6-27b": {"input": 0.60, "output": 3.00},
-    # Groq publishes no per-token list price for the Compound systems (they bill as
-    # the models they orchestrate), so charts show tokens without inventing a rate.
-    "groq-compound": {"input": 0.0, "output": 0.0},
-    "groq-compound-mini": {"input": 0.0, "output": 0.0},
+    "openrouter-gpt-oss-20b": {"input": 0.03, "output": 0.13},
 }
+# Backward-compatible alias for older imports/tests.
+GROQ_ON_DEMAND_PRICES_USD = ONLINE_ON_DEMAND_PRICES_USD
 
 _STATE_LOCK = threading.Lock()
 _USAGE_LOCK = threading.Lock()
+_CREDITS_LOCK = threading.Lock()
+_CREDITS_CACHE: dict[str, Any] | None = None
+_CREDITS_CACHE_UNTIL: datetime | None = None
 
 
 class LLMProviderError(Exception):
@@ -189,6 +166,21 @@ class LLMProviderError(Exception):
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _normalize_provider_mode(mode: str | None, *, default: str = "local") -> str:
+    candidate = PROVIDER_MODE_ALIASES.get(str(mode or "").strip(), str(mode or "").strip())
+    if candidate in VALID_PROVIDER_MODES:
+        return candidate
+    return default
+
+
+def _allows_local_fallback(provider_mode: str) -> bool:
+    return provider_mode != ONLINE_STRICT_MODE
+
+
+def _is_online_provider_mode(provider_mode: str) -> bool:
+    return provider_mode in ONLINE_PROVIDER_MODES
 
 
 def _utc_iso(dt: datetime | None) -> str | None:
@@ -221,13 +213,14 @@ def _get_purpose_model_id(purpose: str) -> str:
 
 
 def _get_purpose_provider_mode(purpose: str) -> str:
-    return CONTENT_CREATION_PROVIDER_MODE if purpose == PURPOSE_CONTENT_CREATION else LLM_PROVIDER_MODE
+    raw = CONTENT_CREATION_PROVIDER_MODE if purpose == PURPOSE_CONTENT_CREATION else LLM_PROVIDER_MODE
+    return _normalize_provider_mode(raw, default="local")
 
 
 def _load_secrets_file() -> None:
-    global GROQ_API_KEY
+    global OPENROUTER_API_KEY
 
-    if GROQ_API_KEY:
+    if OPENROUTER_API_KEY:
         return
 
     if not LLM_SECRETS_FILE.exists():
@@ -241,8 +234,8 @@ def _load_secrets_file() -> None:
             key, value = line.split("=", 1)
             key = key.strip()
             value = value.strip().strip('"').strip("'")
-            if key == "GROQ_API_KEY" and value:
-                GROQ_API_KEY = value
+            if key == "OPENROUTER_API_KEY" and value:
+                OPENROUTER_API_KEY = value
                 break
     except OSError as ex:
         print(f"[LLM] failed to read secrets file: {ex}", flush=True)
@@ -314,8 +307,7 @@ def _load_runtime_config() -> None:
     if not LLM_RUNTIME_CONFIG_FILE.exists():
         CURRENT_LLM_MODEL_ID = "local"
         if os.getenv("LLM_PROVIDER_MODE"):
-            if LLM_PROVIDER_MODE not in VALID_PROVIDER_MODES:
-                LLM_PROVIDER_MODE = "local"
+            LLM_PROVIDER_MODE = _normalize_provider_mode(LLM_PROVIDER_MODE, default="local")
         else:
             LLM_PROVIDER_MODE = "local"
 
@@ -324,9 +316,10 @@ def _load_runtime_config() -> None:
             default="local",
             purpose=PURPOSE_CONTENT_CREATION,
         )
-        CONTENT_CREATION_PROVIDER_MODE = os.getenv("CONTENT_CREATION_LLM_PROVIDER_MODE", LLM_PROVIDER_MODE)
-        if CONTENT_CREATION_PROVIDER_MODE not in VALID_PROVIDER_MODES:
-            CONTENT_CREATION_PROVIDER_MODE = "local"
+        CONTENT_CREATION_PROVIDER_MODE = _normalize_provider_mode(
+            os.getenv("CONTENT_CREATION_LLM_PROVIDER_MODE", LLM_PROVIDER_MODE),
+            default="local",
+        )
         return
 
     try:
@@ -347,14 +340,10 @@ def _load_runtime_config() -> None:
     chat_cfg = purposes.get(PURPOSE_CHAT) if isinstance(purposes.get(PURPOSE_CHAT), dict) else {}
     raw_chat_model_id = str(chat_cfg.get("model_id", data.get("model_id", CURRENT_LLM_MODEL_ID)) or "")
     chat_model_id = _resolve_model_id(raw_chat_model_id, default="local", purpose=PURPOSE_CHAT)
-    chat_provider_mode = chat_cfg.get("provider_mode", data.get("provider_mode", LLM_PROVIDER_MODE))
+    raw_chat_provider_mode = chat_cfg.get("provider_mode", data.get("provider_mode", LLM_PROVIDER_MODE))
 
     CURRENT_LLM_MODEL_ID = chat_model_id
-
-    if chat_provider_mode in VALID_PROVIDER_MODES:
-        LLM_PROVIDER_MODE = chat_provider_mode
-    elif LLM_PROVIDER_MODE not in VALID_PROVIDER_MODES:
-        LLM_PROVIDER_MODE = "local"
+    LLM_PROVIDER_MODE = _normalize_provider_mode(raw_chat_provider_mode, default="local")
 
     creation_cfg = (
         purposes.get(PURPOSE_CONTENT_CREATION)
@@ -367,19 +356,27 @@ def _load_runtime_config() -> None:
         default=CURRENT_LLM_MODEL_ID,
         purpose=PURPOSE_CONTENT_CREATION,
     )
-    creation_provider_mode = creation_cfg.get("provider_mode", CONTENT_CREATION_PROVIDER_MODE)
+    raw_creation_provider_mode = creation_cfg.get("provider_mode", CONTENT_CREATION_PROVIDER_MODE)
 
     CONTENT_CREATION_MODEL_ID = creation_model_id
+    CONTENT_CREATION_PROVIDER_MODE = _normalize_provider_mode(
+        raw_creation_provider_mode, default="local"
+    )
 
-    if creation_provider_mode in VALID_PROVIDER_MODES:
-        CONTENT_CREATION_PROVIDER_MODE = creation_provider_mode
-    elif CONTENT_CREATION_PROVIDER_MODE not in VALID_PROVIDER_MODES:
-        CONTENT_CREATION_PROVIDER_MODE = "local"
-
-    if raw_chat_model_id != CURRENT_LLM_MODEL_ID or raw_creation_model_id != CONTENT_CREATION_MODEL_ID:
+    remapped_modes = (
+        raw_chat_provider_mode != LLM_PROVIDER_MODE
+        or raw_creation_provider_mode != CONTENT_CREATION_PROVIDER_MODE
+    )
+    if (
+        raw_chat_model_id != CURRENT_LLM_MODEL_ID
+        or raw_creation_model_id != CONTENT_CREATION_MODEL_ID
+        or remapped_modes
+    ):
         print(
-            f"[LLM] remapped retired model ids: chat {raw_chat_model_id!r}->{CURRENT_LLM_MODEL_ID!r}, "
-            f"content_creation {raw_creation_model_id!r}->{CONTENT_CREATION_MODEL_ID!r}",
+            f"[LLM] remapped retired model/mode ids: chat {raw_chat_model_id!r}->{CURRENT_LLM_MODEL_ID!r} "
+            f"mode {raw_chat_provider_mode!r}->{LLM_PROVIDER_MODE!r}, "
+            f"content_creation {raw_creation_model_id!r}->{CONTENT_CREATION_MODEL_ID!r} "
+            f"mode {raw_creation_provider_mode!r}->{CONTENT_CREATION_PROVIDER_MODE!r}",
             flush=True,
         )
         _save_runtime_config()
@@ -424,16 +421,23 @@ def _public_model_list(purpose: str | None = None) -> list[dict[str, Any]]:
     return [_public_model_entry(model_id) for model_id in model_ids]
 
 
-def groq_is_configured() -> bool:
-    return bool(GROQ_API_KEY)
+def openrouter_is_configured() -> bool:
+    return bool(OPENROUTER_API_KEY)
 
 
-def groq_is_available() -> bool:
-    if not groq_is_configured():
+# Backward-compatible aliases for older callers/tests.
+groq_is_configured = openrouter_is_configured
+
+
+def openrouter_is_available() -> bool:
+    if not openrouter_is_configured():
         return False
     if ONLINE_DISABLED_UNTIL is not None and _utc_now() < ONLINE_DISABLED_UNTIL:
         return False
     return True
+
+
+groq_is_available = openrouter_is_available
 
 
 def _set_online_disabled(seconds: int, reason: str) -> None:
@@ -441,8 +445,176 @@ def _set_online_disabled(seconds: int, reason: str) -> None:
 
     ONLINE_DISABLED_UNTIL = _utc_now() + timedelta(seconds=max(1, seconds))
     print(
-        f"[LLM] Groq disabled until {_utc_iso(ONLINE_DISABLED_UNTIL)} ({reason})",
+        f"[LLM] OpenRouter disabled until {_utc_iso(ONLINE_DISABLED_UNTIL)} ({reason})",
         flush=True,
+    )
+
+
+def _openrouter_api_root() -> str:
+    base = (OPENROUTER_BASE_URL or "").rstrip("/")
+    if base.endswith("/chat/completions"):
+        return base[: -len("/chat/completions")]
+    if base.endswith("/v1"):
+        return base
+    return "https://openrouter.ai/api/v1"
+
+
+def _openrouter_auth_headers() -> dict[str, str]:
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    if OPENROUTER_HTTP_REFERER:
+        headers["HTTP-Referer"] = OPENROUTER_HTTP_REFERER
+    if OPENROUTER_APP_TITLE:
+        headers["X-Title"] = OPENROUTER_APP_TITLE
+    return headers
+
+
+def _credit_snapshot_from_key_payload(data: dict[str, Any]) -> dict[str, Any] | None:
+    """Build a credit snapshot from GET /api/v1/key ``data`` object."""
+    limit = data.get("limit")
+    limit_remaining = data.get("limit_remaining")
+    usage = data.get("usage")
+    try:
+        usage_f = float(usage) if usage is not None else None
+    except (TypeError, ValueError):
+        usage_f = None
+
+    total_credits: float | None = None
+    total_usage: float | None = usage_f
+    usage_ratio: float | None = None
+
+    try:
+        limit_f = float(limit) if limit is not None else None
+    except (TypeError, ValueError):
+        limit_f = None
+    try:
+        remaining_f = float(limit_remaining) if limit_remaining is not None else None
+    except (TypeError, ValueError):
+        remaining_f = None
+
+    if limit_f is not None and limit_f > 0:
+        total_credits = limit_f
+        if remaining_f is not None:
+            total_usage = max(0.0, limit_f - remaining_f)
+        elif usage_f is not None:
+            total_usage = usage_f
+        if total_usage is not None:
+            usage_ratio = max(0.0, min(1.0, total_usage / limit_f))
+    elif usage_f is not None and remaining_f is not None and remaining_f >= 0:
+        # Unlimited key but remaining is reported — treat usage+remaining as total.
+        total_usage = usage_f
+        total_credits = usage_f + remaining_f
+        if total_credits > 0:
+            usage_ratio = max(0.0, min(1.0, total_usage / total_credits))
+
+    if usage_ratio is None:
+        return None
+
+    return {
+        "source": "key",
+        "total_credits": total_credits,
+        "total_usage": total_usage,
+        "usage_ratio": usage_ratio,
+        "limit": limit_f,
+        "limit_remaining": remaining_f,
+        "is_free_tier": bool(data.get("is_free_tier")),
+        "fetched_at": _utc_iso(_utc_now()),
+    }
+
+
+def _credit_snapshot_from_credits_payload(data: dict[str, Any]) -> dict[str, Any] | None:
+    try:
+        total_credits = float(data.get("total_credits"))
+        total_usage = float(data.get("total_usage"))
+    except (TypeError, ValueError):
+        return None
+    if total_credits <= 0:
+        return None
+    usage_ratio = max(0.0, min(1.0, total_usage / total_credits))
+    return {
+        "source": "credits",
+        "total_credits": total_credits,
+        "total_usage": total_usage,
+        "usage_ratio": usage_ratio,
+        "limit": total_credits,
+        "limit_remaining": max(0.0, total_credits - total_usage),
+        "is_free_tier": None,
+        "fetched_at": _utc_iso(_utc_now()),
+    }
+
+
+def fetch_openrouter_credit_snapshot(*, force: bool = False) -> dict[str, Any] | None:
+    """Return cached OpenRouter credit usage, or refresh from /key (then /credits)."""
+    global _CREDITS_CACHE, _CREDITS_CACHE_UNTIL
+
+    if not openrouter_is_configured():
+        return None
+
+    now = _utc_now()
+    with _CREDITS_LOCK:
+        if (
+            not force
+            and _CREDITS_CACHE is not None
+            and _CREDITS_CACHE_UNTIL is not None
+            and now < _CREDITS_CACHE_UNTIL
+        ):
+            return dict(_CREDITS_CACHE)
+
+    root = _openrouter_api_root()
+    headers = _openrouter_auth_headers()
+    snapshot: dict[str, Any] | None = None
+
+    try:
+        key_resp = requests.get(f"{root}/key", headers=headers, timeout=10)
+        if key_resp.status_code < 400:
+            payload = key_resp.json() if key_resp.content else {}
+            data = payload.get("data") if isinstance(payload, dict) else None
+            if isinstance(data, dict):
+                snapshot = _credit_snapshot_from_key_payload(data)
+    except (requests.RequestException, ValueError, TypeError) as ex:
+        print(f"[LLM] OpenRouter /key credit check failed: {ex}", flush=True)
+
+    if snapshot is None:
+        try:
+            credits_resp = requests.get(f"{root}/credits", headers=headers, timeout=10)
+            if credits_resp.status_code < 400:
+                payload = credits_resp.json() if credits_resp.content else {}
+                data = payload.get("data") if isinstance(payload, dict) else None
+                if isinstance(data, dict):
+                    snapshot = _credit_snapshot_from_credits_payload(data)
+        except (requests.RequestException, ValueError, TypeError) as ex:
+            print(f"[LLM] OpenRouter /credits check failed: {ex}", flush=True)
+
+    with _CREDITS_LOCK:
+        _CREDITS_CACHE = dict(snapshot) if snapshot else None
+        _CREDITS_CACHE_UNTIL = now + timedelta(seconds=max(5, OPENROUTER_CREDITS_CACHE_SECONDS))
+        return dict(_CREDITS_CACHE) if _CREDITS_CACHE else None
+
+
+def openrouter_credit_threshold_reason() -> str | None:
+    """If credit usage >= fallback ratio, return a human-readable fallback reason."""
+    threshold = max(0.0, min(1.0, OPENROUTER_CREDIT_FALLBACK_RATIO))
+    snapshot = fetch_openrouter_credit_snapshot()
+    if not snapshot:
+        return None
+    ratio = snapshot.get("usage_ratio")
+    if ratio is None:
+        return None
+    try:
+        ratio_f = float(ratio)
+    except (TypeError, ValueError):
+        return None
+    if ratio_f < threshold:
+        return None
+    total_credits = snapshot.get("total_credits")
+    total_usage = snapshot.get("total_usage")
+    pct = int(round(threshold * 100))
+    return (
+        f"OpenRouter credit usage is at {ratio_f:.0%} of available credits "
+        f"(threshold {pct}%; used {total_usage} of {total_credits}). "
+        "Falling back to local llama.cpp until credits are topped up."
     )
 
 
@@ -505,18 +677,19 @@ def _extract_chat_content(message: dict[str, Any] | None) -> str:
     return str(content).strip()
 
 
-def _apply_groq_reasoning_options(payload: dict[str, Any], *, model_id: str, model_name: str) -> None:
+def _apply_reasoning_options(payload: dict[str, Any], *, model_id: str, model_name: str) -> None:
     """Keep reasoning cheap so spoken dialogue still fits in max_tokens."""
     if not _is_reasoning_model(model_id, model_name):
         return
     name = (model_name or "").casefold()
     mid = (model_id or "").casefold()
     if "gpt-oss" in name or "gpt-oss" in mid:
-        # Groq gpt-oss supports low|medium|high (default medium).
         payload.setdefault("reasoning_effort", "low")
     elif "qwen3" in name or "qwen3" in mid:
-        # Groq qwen3 supports none|default|... — disable thinking for NPC turns.
         payload.setdefault("reasoning_effort", "none")
+
+
+_apply_groq_reasoning_options = _apply_reasoning_options
 
 
 def _load_usage_records() -> list[dict[str, Any]]:
@@ -648,7 +821,7 @@ def _filter_usage_records(
             continue
         if provider is not None and record.get("provider") != provider:
             continue
-        if online_only and record.get("provider") != "groq":
+        if online_only and record.get("provider") not in {"openrouter", "groq"}:
             continue
         if purpose is not None and record.get("purpose", DEFAULT_PURPOSE) != purpose:
             continue
@@ -702,20 +875,29 @@ def get_usage_summary(model_id: str, purpose: str | None = None) -> dict[str, in
     }
 
 
-def _would_exceed_groq_limits(
+def _would_exceed_online_limits(
     model_id: str,
     estimated_total_tokens: int,
     *,
     purpose: str = DEFAULT_PURPOSE,
 ) -> str | None:
-    # Rate limits are enforced per model_id on the Groq account, shared across
-    # purposes — do not filter by purpose here. Messages are purpose-aware so
-    # chat failures do not tell operators to shorten an import document.
+    """Preflight before an OpenRouter call.
+
+    Primary gate is account credit usage (>= OPENROUTER_CREDIT_FALLBACK_RATIO).
+    Optional catalog ``limits`` (rpm/rpd/tpm/tpd) remain supported if present.
+    """
+    credit_reason = openrouter_credit_threshold_reason()
+    if credit_reason:
+        return credit_reason
+
     model_entry = LLM_MODELS.get(model_id)
-    if not model_entry or model_entry.get("provider") != "groq":
+    if not model_entry or model_entry.get("provider") != "openrouter":
         return None
 
     limits = model_entry.get("limits") or {}
+    if not limits:
+        return None
+
     label = model_entry.get("label") or model_id
     purpose = _normalize_purpose(purpose)
     model_slot = (
@@ -727,14 +909,14 @@ def _would_exceed_groq_limits(
     rpm = limits.get("rpm")
     if rpm is not None and usage_requests_last_60s(model_id=model_id) + 1 > rpm:
         return (
-            f"Groq requests-per-minute limit reached for {label} "
+            f"OpenRouter requests-per-minute limit reached for {label} "
             f"({rpm}/min). Wait about a minute, then retry."
         )
 
     rpd = limits.get("rpd")
     if rpd is not None and usage_requests_last_24h(model_id=model_id) + 1 > rpd:
         return (
-            f"Groq requests-per-day limit reached for {label} "
+            f"OpenRouter requests-per-day limit reached for {label} "
             f"({rpd}/day). Try again tomorrow or switch the {model_slot} in Admin → LLM."
         )
 
@@ -742,30 +924,24 @@ def _would_exceed_groq_limits(
     if tpm is not None:
         used = usage_tokens_last_60s(model_id=model_id)
         if used + estimated_total_tokens > tpm:
-            if purpose == PURPOSE_CONTENT_CREATION:
-                action = (
-                    "Wait about a minute, shorten the document, or switch content creation "
-                    "to a higher-TPM model such as groq-compound (Admin → LLM)."
-                )
-            else:
-                action = (
-                    "Wait about a minute, or switch the chat model in Admin → LLM "
-                    "(this is not a document-import size issue)."
-                )
             return (
-                f"Groq tokens-per-minute budget too small for this request on {label} "
+                f"OpenRouter tokens-per-minute budget too small for this request on {label} "
                 f"(need ~{estimated_total_tokens} tokens, limit {tpm}/min, "
-                f"~{used} used in the last minute). {action}"
+                f"~{used} used in the last minute)."
             )
 
     tpd = limits.get("tpd")
     if tpd is not None and usage_tokens_last_24h(model_id=model_id) + estimated_total_tokens > tpd:
         return (
-            f"Groq tokens-per-day limit reached for {label} "
+            f"OpenRouter tokens-per-day limit reached for {label} "
             f"({tpd}/day). Try again tomorrow or switch the {model_slot} in Admin → LLM."
         )
 
     return None
+
+
+_would_exceed_groq_limits = _would_exceed_online_limits
+
 
 
 # Rough tokens reserved for system prompt + outline instructions outside the document body.
@@ -860,31 +1036,30 @@ def content_creation_zero_budget_error_message() -> str:
             f"Local llama.cpp context is too small for document import "
             f"(LOCAL_LLM_CONTEXT_TOKENS={LOCAL_LLM_CONTEXT_TOKENS}). "
             "Raise llama-server -c / --ctx-size and set LOCAL_LLM_CONTEXT_TOKENS to match, "
-            "or switch content_creation to Groq in Admin → LLM."
+            "or switch content_creation to OpenRouter in Admin → LLM."
         )
     return (
-        "The content creation model's Groq tokens-per-minute budget is too small "
-        "for document import (completion reserve fills the limit). Switch content "
-        "creation to a higher-TPM Groq model such as groq-compound in Admin → LLM, "
-        "or wait a minute if recent usage exhausted the budget."
+        "The content creation model cannot fit document import in the current budget. "
+        "Switch content_creation to OpenRouter GPT-OSS 20B or local llama.cpp in Admin → LLM, "
+        "or wait if recent usage exhausted a rate limit."
     )
 
 
 def content_creation_max_input_chars() -> int:
     """Chars of document body that fit the content_creation model's current budget.
 
-    Returns 0 when a strict-Groq setup cannot fit a minimal import request, or when
+    Returns 0 when a strict-online setup cannot fit a minimal import request, or when
     local n_ctx / LOCAL_LLM_CONTEXT_TOKENS is too tight for import.
-    For groq_with_local_fallback, do NOT pre-truncate using Groq TPM —
-    otherwise Groq limit failures fall back to local with a head-chopped document
+    For openrouter_with_local_fallback, do NOT pre-truncate using online TPM —
+    otherwise online failures fall back to local with a head-chopped document
     and NPC/location sections later in the file are invisible to the local model.
     """
     model_id = CONTENT_CREATION_MODEL_ID
     provider_mode = CONTENT_CREATION_PROVIDER_MODE
     if provider_mode == "local" or model_id == "local":
         return _local_content_creation_max_input_chars()
-    if provider_mode == "groq_with_local_fallback":
-        # Groq may take the full doc; local fallback truncates in call_local_chat_completions.
+    if provider_mode == ONLINE_WITH_FALLBACK_MODE:
+        # OpenRouter may take the full doc; local fallback truncates in call_local_chat_completions.
         return 120_000
 
     model_entry = LLM_MODELS.get(model_id) or {}
@@ -930,8 +1105,8 @@ def call_local_chat_completions(
     except requests.ConnectionError as ex:
         raise LLMProviderError(
             f"Local LLM is not reachable at {LOCAL_LLM_URL}. "
-            "Start llama.cpp on that port, or set the content_creation / chat model to Groq "
-            "in Admin → LLM (provider mode 'groq' or 'groq_with_local_fallback')."
+            "Start llama.cpp on that port, or set the content_creation / chat model to OpenRouter "
+            "in Admin → LLM (provider mode 'openrouter' or 'openrouter_with_local_fallback')."
         ) from ex
     except requests.Timeout as ex:
         raise LLMProviderError(
@@ -947,7 +1122,7 @@ def call_local_chat_completions(
             f"Estimated prompt ~{prompt_tokens} tokens + max_tokens={effective_max} "
             f"exceeds LOCAL_LLM_CONTEXT_TOKENS={LOCAL_LLM_CONTEXT_TOKENS}. "
             "Raise n_ctx when starting llama.cpp, set LOCAL_LLM_CONTEXT_TOKENS to match, "
-            "or use Groq for content_creation in Admin → LLM."
+            "or use OpenRouter for content_creation in Admin → LLM."
         )
         if detail:
             hint = f"{hint} Server said: {detail}"
@@ -977,7 +1152,8 @@ def call_local_chat_completions(
     }
 
 
-def _groq_timeout_seconds(
+
+def _openrouter_timeout_seconds(
     *,
     purpose: str = DEFAULT_PURPOSE,
     model_id: str | None = None,
@@ -987,13 +1163,16 @@ def _groq_timeout_seconds(
     if timeout is not None:
         return max(1, int(timeout))
     if purpose == PURPOSE_CONTENT_CREATION:
-        return max(CONTENT_CREATION_GROQ_TIMEOUT_SECONDS, GROQ_TIMEOUT_SECONDS)
+        return max(CONTENT_CREATION_OPENROUTER_TIMEOUT_SECONDS, OPENROUTER_TIMEOUT_SECONDS)
     if _is_reasoning_model(model_id, model_name):
-        return max(GROQ_TIMEOUT_SECONDS, 30)
-    return GROQ_TIMEOUT_SECONDS
+        return max(OPENROUTER_TIMEOUT_SECONDS, 30)
+    return OPENROUTER_TIMEOUT_SECONDS
 
 
-def call_groq_chat_completions(
+_groq_timeout_seconds = _openrouter_timeout_seconds
+
+
+def call_openrouter_chat_completions(
     messages: list[dict[str, Any]],
     model_name: str,
     *,
@@ -1003,10 +1182,7 @@ def call_groq_chat_completions(
     timeout: int | None = None,
     purpose: str = DEFAULT_PURPOSE,
 ) -> tuple[str, dict[str, int], requests.Response]:
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json",
-    }
+    headers = _openrouter_auth_headers()
     effective_max = _effective_max_tokens(model_id, max_tokens, model_name=model_name, purpose=purpose)
     payload: dict[str, Any] = {
         "model": model_name,
@@ -1014,13 +1190,13 @@ def call_groq_chat_completions(
         "temperature": 0.80 if temperature is None else temperature,
         "max_tokens": effective_max,
     }
-    _apply_groq_reasoning_options(payload, model_id=model_id or "", model_name=model_name)
+    _apply_reasoning_options(payload, model_id=model_id or "", model_name=model_name)
 
     response = requests.post(
-        GROQ_BASE_URL,
+        OPENROUTER_BASE_URL,
         headers=headers,
         json=payload,
-        timeout=_groq_timeout_seconds(
+        timeout=_openrouter_timeout_seconds(
             purpose=purpose,
             model_id=model_id,
             model_name=model_name,
@@ -1043,7 +1219,7 @@ def call_groq_chat_completions(
 
     if not content:
         print(
-            f"[LLM] groq empty content model={model_name} finish={choice.get('finish_reason')!r} "
+            f"[LLM] openrouter empty content model={model_name} finish={choice.get('finish_reason')!r} "
             f"completion_tokens={completion_tokens} max_tokens={effective_max} "
             f"reasoning_effort={payload.get('reasoning_effort')!r}",
             flush=True,
@@ -1054,6 +1230,10 @@ def call_groq_chat_completions(
         "completion_tokens": completion_tokens,
         "total_tokens": total_tokens,
     }, response
+
+
+call_groq_chat_completions = call_openrouter_chat_completions
+
 
 
 def _effective_provider_mode(model_id: str, provider_mode: str) -> str:
@@ -1167,29 +1347,29 @@ def generate_llm_response(
         )
         return content
 
-    if not groq_is_configured():
-        if provider_mode == "groq":
-            LAST_LLM_ERROR[purpose] = "Groq API key is not configured"
+    if not openrouter_is_configured():
+        if not _allows_local_fallback(provider_mode):
+            LAST_LLM_ERROR[purpose] = "OpenRouter API key is not configured"
             raise LLMProviderError(LAST_LLM_ERROR[purpose])
         return _fallback_to_local(
             messages,
-            reason="groq_missing_api_key",
+            reason="openrouter_missing_api_key",
             selected_model_id=selected_model_id,
             temperature=temperature,
             max_tokens=effective_max_tokens,
-            error="Groq API key is not configured",
+            error="OpenRouter API key is not configured",
             purpose=purpose,
             **kwargs,
         )
 
     if ONLINE_DISABLED_UNTIL is not None and _utc_now() < ONLINE_DISABLED_UNTIL:
-        disabled_msg = f"Groq temporarily disabled until {_utc_iso(ONLINE_DISABLED_UNTIL)}"
-        if provider_mode == "groq":
+        disabled_msg = f"OpenRouter temporarily disabled until {_utc_iso(ONLINE_DISABLED_UNTIL)}"
+        if not _allows_local_fallback(provider_mode):
             LAST_LLM_ERROR[purpose] = disabled_msg
             raise LLMProviderError(LAST_LLM_ERROR[purpose])
         return _fallback_to_local(
             messages,
-            reason="groq_disabled_until",
+            reason="openrouter_disabled_until",
             selected_model_id=selected_model_id,
             temperature=temperature,
             max_tokens=effective_max_tokens,
@@ -1198,18 +1378,24 @@ def generate_llm_response(
             **kwargs,
         )
 
-    limit_reason = _would_exceed_groq_limits(
+    limit_reason = _would_exceed_online_limits(
         selected_model_id,
         estimated_total_tokens,
         purpose=purpose,
     )
     if limit_reason:
-        if provider_mode == "groq":
+        # Credit threshold and rate preflight always prefer local when fallback is allowed.
+        fallback_reason = (
+            "openrouter_credit_threshold"
+            if "credit usage" in limit_reason.casefold()
+            else limit_reason
+        )
+        if not _allows_local_fallback(provider_mode):
             LAST_LLM_ERROR[purpose] = limit_reason
             raise LLMProviderError(limit_reason)
         return _fallback_to_local(
             messages,
-            reason=limit_reason,
+            reason=fallback_reason,
             selected_model_id=selected_model_id,
             temperature=temperature,
             max_tokens=effective_max_tokens,
@@ -1219,30 +1405,30 @@ def generate_llm_response(
         )
 
     model_name = selected_model["model"]
-    groq_timeout = _groq_timeout_seconds(
+    online_timeout = _openrouter_timeout_seconds(
         purpose=purpose,
         model_id=selected_model_id,
         model_name=model_name,
     )
 
     try:
-        content, usage, response = call_groq_chat_completions(
+        content, usage, response = call_openrouter_chat_completions(
             messages,
             model_name,
             model_id=selected_model_id,
             temperature=temperature,
             max_tokens=effective_max_tokens,
-            timeout=groq_timeout,
+            timeout=online_timeout,
             purpose=purpose,
         )
     except requests.Timeout as ex:
-        # Creation timeouts are expected for large docs; do not disable Groq for chat.
+        # Creation timeouts are expected for large docs; do not disable OpenRouter for chat.
         if purpose == PURPOSE_CHAT:
-            _set_online_disabled(300, "groq_timeout")
-        if provider_mode == "groq":
+            _set_online_disabled(300, "openrouter_timeout")
+        if not _allows_local_fallback(provider_mode):
             LAST_LLM_ERROR[purpose] = str(ex)
             record_llm_usage(
-                provider="groq",
+                provider="openrouter",
                 model_id=selected_model_id,
                 model=model_name,
                 prompt_tokens=estimated_prompt_tokens,
@@ -1253,10 +1439,10 @@ def generate_llm_response(
                 error=str(ex),
                 purpose=purpose,
             )
-            raise LLMProviderError(f"Groq request timed out: {ex}") from ex
+            raise LLMProviderError(f"OpenRouter request timed out: {ex}") from ex
         return _fallback_to_local(
             messages,
-            reason="groq_timeout",
+            reason="openrouter_timeout",
             selected_model_id=selected_model_id,
             temperature=temperature,
             max_tokens=effective_max_tokens,
@@ -1266,11 +1452,11 @@ def generate_llm_response(
         )
     except requests.RequestException as ex:
         if purpose == PURPOSE_CHAT:
-            _set_online_disabled(300, "groq_exception")
-        if provider_mode == "groq":
+            _set_online_disabled(300, "openrouter_exception")
+        if not _allows_local_fallback(provider_mode):
             LAST_LLM_ERROR[purpose] = str(ex)
             record_llm_usage(
-                provider="groq",
+                provider="openrouter",
                 model_id=selected_model_id,
                 model=model_name,
                 prompt_tokens=estimated_prompt_tokens,
@@ -1281,10 +1467,10 @@ def generate_llm_response(
                 error=str(ex),
                 purpose=purpose,
             )
-            raise LLMProviderError(f"Groq request failed: {ex}") from ex
+            raise LLMProviderError(f"OpenRouter request failed: {ex}") from ex
         return _fallback_to_local(
             messages,
-            reason="groq_exception",
+            reason="openrouter_exception",
             selected_model_id=selected_model_id,
             temperature=temperature,
             max_tokens=effective_max_tokens,
@@ -1293,28 +1479,31 @@ def generate_llm_response(
             **kwargs,
         )
 
-    if response.status_code == 429:
+    # 402 = payment / credits exhausted on OpenRouter.
+    if response.status_code in (402, 429):
         retry_seconds = _parse_retry_after_seconds(response) or 300
-        _set_online_disabled(retry_seconds, "groq_rate_limited")
+        reason = "openrouter_credits_exhausted" if response.status_code == 402 else "openrouter_rate_limited"
+        _set_online_disabled(retry_seconds, reason)
         error_text = response.text[:500]
         record_llm_usage(
-            provider="groq",
+            provider="openrouter",
             model_id=selected_model_id,
             model=model_name,
             prompt_tokens=estimated_prompt_tokens,
             completion_tokens=0,
             total_tokens=estimated_prompt_tokens,
             success=False,
-            fallback=provider_mode != "groq",
+            fallback=_allows_local_fallback(provider_mode),
             error=error_text,
             purpose=purpose,
         )
-        if provider_mode == "groq":
-            LAST_LLM_ERROR[purpose] = "Groq rate limited"
-            raise LLMProviderError("Groq rate limited")
+        if not _allows_local_fallback(provider_mode):
+            msg = "OpenRouter credits exhausted" if response.status_code == 402 else "OpenRouter rate limited"
+            LAST_LLM_ERROR[purpose] = msg
+            raise LLMProviderError(msg)
         return _fallback_to_local(
             messages,
-            reason="groq_rate_limited",
+            reason=reason,
             selected_model_id=selected_model_id,
             temperature=temperature,
             max_tokens=effective_max_tokens,
@@ -1327,26 +1516,26 @@ def generate_llm_response(
         # Transient server errors: disable globally for chat only. Creation
         # retries should not take chat offline for five minutes.
         if purpose == PURPOSE_CHAT:
-            _set_online_disabled(300, "groq_http_error")
+            _set_online_disabled(300, "openrouter_http_error")
         error_text = response.text[:500]
         record_llm_usage(
-            provider="groq",
+            provider="openrouter",
             model_id=selected_model_id,
             model=model_name,
             prompt_tokens=estimated_prompt_tokens,
             completion_tokens=0,
             total_tokens=estimated_prompt_tokens,
             success=False,
-            fallback=provider_mode != "groq",
+            fallback=_allows_local_fallback(provider_mode),
             error=f"HTTP {response.status_code}: {error_text}",
             purpose=purpose,
         )
-        if provider_mode == "groq":
-            LAST_LLM_ERROR[purpose] = f"Groq HTTP {response.status_code}"
+        if not _allows_local_fallback(provider_mode):
+            LAST_LLM_ERROR[purpose] = f"OpenRouter HTTP {response.status_code}"
             raise LLMProviderError(LAST_LLM_ERROR[purpose])
         return _fallback_to_local(
             messages,
-            reason="groq_http_error",
+            reason="openrouter_http_error",
             selected_model_id=selected_model_id,
             temperature=temperature,
             max_tokens=effective_max_tokens,
@@ -1361,28 +1550,28 @@ def generate_llm_response(
             "model_not_found" in error_text
             or "does not exist" in error_text
             or "do not have access" in error_text
+            or "No endpoints found" in error_text
         )
-        reason = "groq_model_not_found" if model_missing else "groq_http_error"
+        reason = "openrouter_model_not_found" if model_missing else "openrouter_http_error"
         friendly = (
-            f"Groq model '{model_name}' is unavailable on this API key/plan "
-            f"(retired or not entitled). Pick another model in Admin → LLM "
-            f"(e.g. groq-gpt-oss-120b)."
+            f"OpenRouter model '{model_name}' is unavailable on this API key/plan. "
+            f"Pick openrouter-gpt-oss-20b (or local) in Admin → LLM."
             if model_missing
             else f"HTTP {response.status_code}: {error_text}"
         )
         record_llm_usage(
-            provider="groq",
+            provider="openrouter",
             model_id=selected_model_id,
             model=model_name,
             prompt_tokens=estimated_prompt_tokens,
             completion_tokens=0,
             total_tokens=estimated_prompt_tokens,
             success=False,
-            fallback=provider_mode != "groq",
+            fallback=_allows_local_fallback(provider_mode),
             error=friendly,
             purpose=purpose,
         )
-        if provider_mode == "groq":
+        if not _allows_local_fallback(provider_mode):
             LAST_LLM_ERROR[purpose] = friendly
             raise LLMProviderError(friendly)
         return _fallback_to_local(
@@ -1396,12 +1585,12 @@ def generate_llm_response(
             **kwargs,
         )
 
-    _set_active("groq", selected_model_id, purpose)
+    _set_active("openrouter", selected_model_id, purpose)
     LAST_FALLBACK_REASON[purpose] = None
     LAST_LLM_ERROR[purpose] = None
 
     record_llm_usage(
-        provider="groq",
+        provider="openrouter",
         model_id=selected_model_id,
         model=model_name,
         prompt_tokens=usage["prompt_tokens"],
@@ -1437,8 +1626,11 @@ def select_llm_model(
     if not model_supports_purpose(model_id, purpose):
         raise ValueError(f"Model {model_id} is not available for purpose {purpose}")
 
-    if provider_mode is not None and provider_mode not in VALID_PROVIDER_MODES:
-        raise ValueError(f"Invalid provider_mode: {provider_mode}")
+    if provider_mode is not None:
+        normalized_mode = _normalize_provider_mode(provider_mode, default="")
+        if normalized_mode not in VALID_PROVIDER_MODES:
+            raise ValueError(f"Invalid provider_mode: {provider_mode}")
+        provider_mode = normalized_mode
 
     with _STATE_LOCK:
         if purpose == PURPOSE_CONTENT_CREATION:
@@ -1614,13 +1806,13 @@ def get_llm_usage_cost_report(*, hours: int = 24) -> dict[str, Any]:
         "window_hours": hours,
         "retention_hours": USAGE_RETENTION_HOURS,
         "pricing_note": (
-            "Alpha estimates using Groq on-demand list prices. "
-            "When provider mode is groq_with_local_fallback, successful local fallbacks "
+            "Alpha estimates using OpenRouter list prices for openai/gpt-oss-20b. "
+            "When provider mode is openrouter_with_local_fallback, successful local fallbacks "
             "are attributed to the selected online model for cost estimation."
         ),
         "pricing": {
             model_id: {"input_per_mtok": prices["input"], "output_per_mtok": prices["output"]}
-            for model_id, prices in GROQ_ON_DEMAND_PRICES_USD.items()
+            for model_id, prices in ONLINE_ON_DEMAND_PRICES_USD.items()
         },
         "by_model": sorted(
             by_model.values(),
@@ -1657,7 +1849,7 @@ def _remaining_estimate(model_id: str) -> dict[str, int | None]:
     tpd = limits.get("tpd")
 
     # Remaining quota reflects actual account usage across all purposes,
-    # since Groq enforces limits per model regardless of caller purpose.
+    # since online providers enforce limits per model regardless of caller purpose.
     usage = get_usage_summary(model_id)
 
     return {
@@ -1668,6 +1860,33 @@ def _remaining_estimate(model_id: str) -> dict[str, int | None]:
     }
 
 
+
+def _credits_status_payload() -> dict[str, Any]:
+    snapshot = fetch_openrouter_credit_snapshot()
+    threshold = max(0.0, min(1.0, OPENROUTER_CREDIT_FALLBACK_RATIO))
+    if not snapshot:
+        return {
+            "source": None,
+            "total_credits": None,
+            "total_usage": None,
+            "usage_ratio": None,
+            "limit": None,
+            "limit_remaining": None,
+            "fallback_threshold": threshold,
+            "above_threshold": None,
+        }
+    ratio = snapshot.get("usage_ratio")
+    try:
+        ratio_f = float(ratio) if ratio is not None else None
+    except (TypeError, ValueError):
+        ratio_f = None
+    return {
+        **snapshot,
+        "fallback_threshold": threshold,
+        "above_threshold": (ratio_f is not None and ratio_f >= threshold),
+    }
+
+
 def _purpose_status(purpose: str) -> dict[str, Any]:
     selected_model_id = _get_purpose_model_id(purpose)
     if selected_model_id not in LLM_MODELS:
@@ -1675,19 +1894,19 @@ def _purpose_status(purpose: str) -> dict[str, Any]:
 
     provider_mode = _get_purpose_provider_mode(purpose)
     selected_model = _public_model_entry(selected_model_id)
-    usage_model_id = selected_model_id if selected_model.get("provider") == "groq" else None
+    usage_model_id = selected_model_id if selected_model.get("provider") == "openrouter" else None
 
     if usage_model_id:
         # "usage" is purpose-specific (how much this purpose consumed);
-        # "remaining_estimate" is the real shared-quota remaining for the model.
+        # "remaining_estimate" is optional catalog-limit remaining for the model.
         usage = get_usage_summary(usage_model_id, purpose=purpose)
         remaining = _remaining_estimate(usage_model_id)
     else:
         usage = {
-            "requests_last_minute": usage_requests_last_60s(provider="groq", purpose=purpose),
-            "tokens_last_minute": usage_tokens_last_60s(provider="groq", purpose=purpose),
-            "requests_last_24h": usage_requests_last_24h(provider="groq", purpose=purpose),
-            "tokens_last_24h": usage_tokens_last_24h(provider="groq", purpose=purpose),
+            "requests_last_minute": usage_requests_last_60s(provider="openrouter", purpose=purpose),
+            "tokens_last_minute": usage_tokens_last_60s(provider="openrouter", purpose=purpose),
+            "requests_last_24h": usage_requests_last_24h(provider="openrouter", purpose=purpose),
+            "tokens_last_24h": usage_tokens_last_24h(provider="openrouter", purpose=purpose),
         }
         remaining = {
             "requests_this_minute": None,
@@ -1719,20 +1938,21 @@ def _purpose_status(purpose: str) -> dict[str, Any]:
         "selected_model": selected_model,
         "active_provider": LAST_ACTIVE_PROVIDER.get(purpose, "local"),
         "active_model_id": LAST_ACTIVE_MODEL_ID.get(purpose, "local"),
-        "online_available": groq_is_available(),
-        "online_configured": groq_is_configured(),
+        "online_available": openrouter_is_available(),
+        "online_configured": openrouter_is_configured(),
         "online_disabled_until": _utc_iso(ONLINE_DISABLED_UNTIL),
         "last_fallback_reason": LAST_FALLBACK_REASON.get(purpose),
         "last_error": LAST_LLM_ERROR.get(purpose),
         "usage": usage,
         "local_usage": local_usage,
         "remaining_estimate": remaining,
+        "credits": _credits_status_payload(),
     }
 
 
 def _usage_by_purpose_summary(purpose: str) -> dict[str, Any]:
-    # Unlike usage_requests_last_60s/etc (which are online/Groq-only for rate
-    # limiting), this reports ALL provider usage (local + groq) for a purpose.
+    # Unlike usage_requests_last_60s/etc (which are online-only for rate
+    # limiting), this reports ALL provider usage (local + openrouter) for a purpose.
     last_minute = _filter_usage_records(since=timedelta(seconds=60), purpose=purpose)
     last_24h = _filter_usage_records(since=timedelta(hours=24), purpose=purpose)
     return {
@@ -1786,12 +2006,15 @@ def get_llm_models_payload() -> dict[str, Any]:
                 "label": "local — llama.cpp only (must be running on LOCAL_LLM_URL)",
             },
             {
-                "id": "groq",
-                "label": "groq — Groq only (fails if Groq is unavailable)",
+                "id": "openrouter",
+                "label": "openrouter — OpenRouter only (fails if OpenRouter is unavailable)",
             },
             {
-                "id": "groq_with_local_fallback",
-                "label": "groq_with_local_fallback — try Groq, fall back to local",
+                "id": "openrouter_with_local_fallback",
+                "label": (
+                    "openrouter_with_local_fallback — try OpenRouter, fall back to local "
+                    "(also auto-falls back at 80% credit usage)"
+                ),
             },
         ],
         # Full catalog for back-compat; each entry carries `purposes`, and every
@@ -1823,7 +2046,7 @@ def init_llm_router() -> None:
     print(
         f"[LLM] router ready chat_model={CURRENT_LLM_MODEL_ID} chat_mode={LLM_PROVIDER_MODE} "
         f"content_creation_model={CONTENT_CREATION_MODEL_ID} content_creation_mode={CONTENT_CREATION_PROVIDER_MODE} "
-        f"groq_configured={groq_is_configured()}",
+        f"openrouter_configured={openrouter_is_configured()}",
         flush=True,
     )
 

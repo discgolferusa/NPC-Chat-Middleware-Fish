@@ -1,7 +1,6 @@
-"""Groq catalog freshness, purpose gating, and retired-id remapping.
+"""OpenRouter catalog, credit-threshold fallback, and retired-id remapping.
 
-The catalog in llm_router is the only source for the Admin -> LLM dropdowns, so a
-stale entry here silently sends every NPC turn at a model Groq has shut down.
+The catalog in llm_router is the only source for the Admin -> LLM dropdowns.
 """
 
 from __future__ import annotations
@@ -10,147 +9,133 @@ import pytest
 
 import llm_router
 
-# Groq model ids reachable on the Free plan as of 2026-08-21
-# (console.groq.com/docs/models + /docs/rate-limits). Speech-to-text, text-to-speech,
-# prompt-guard classifiers and enterprise-only models are intentionally absent.
-CURRENT_GROQ_FREE_PLAN_MODELS = frozenset(
-    {
-        "openai/gpt-oss-120b",
-        "openai/gpt-oss-20b",
-        "openai/gpt-oss-safeguard-20b",
-        "qwen/qwen3.6-27b",
-        "groq/compound",
-        "groq/compound-mini",
-    }
-)
 
-# Groq shutdown dates: llama3 2025-08-30, kimi-k2 2026-04-15, qwen3-32b and
-# llama-4-scout 2026-07-17, llama-3.1-8b / llama-3.3-70b 2026-08-16.
-SHUT_DOWN_GROQ_MODELS = (
-    "llama-3.1-8b-instant",
-    "llama-3.3-70b-versatile",
-    "qwen/qwen3-32b",
-    "meta-llama/llama-4-scout-17b-16e-instruct",
-    "moonshotai/kimi-k2-instruct-0905",
-    "mixtral-8x7b-32768",
-    "gemma2-9b-it",
-)
+def _online_entries() -> list[dict]:
+    return [e for e in llm_router.LLM_MODELS.values() if e.get("provider") == "openrouter"]
 
 
-def _groq_entries() -> list[dict]:
-    return [e for e in llm_router.LLM_MODELS.values() if e.get("provider") == "groq"]
+def test_catalog_offers_openrouter_gpt_oss_20b():
+    entry = llm_router.LLM_MODELS["openrouter-gpt-oss-20b"]
+    assert entry["model"] == "openai/gpt-oss-20b"
+    assert entry["online"] is True
+    assert "chat" in entry["purposes"]
+    assert "content_creation" in entry["purposes"]
 
 
-def test_every_groq_entry_is_on_the_current_free_plan():
-    for entry in _groq_entries():
-        assert entry["model"] in CURRENT_GROQ_FREE_PLAN_MODELS, (
-            f"{entry['id']} points at {entry['model']!r}, which Groq no longer serves"
-        )
-
-
-def test_catalog_has_no_shut_down_groq_models():
-    served = {entry["model"] for entry in _groq_entries()}
-    for retired in SHUT_DOWN_GROQ_MODELS:
-        assert retired not in served
-
-
-def test_groq_default_model_env_is_current():
-    assert llm_router.GROQ_MODEL in CURRENT_GROQ_FREE_PLAN_MODELS
-
-
-def test_every_groq_entry_declares_free_plan_limits():
-    for entry in _groq_entries():
-        limits = entry.get("limits")
-        assert limits, f"{entry['id']} has no limits for preflight"
-        for key in ("rpm", "rpd", "tpm"):
-            assert isinstance(limits.get(key), int), f"{entry['id']} missing {key}"
+def test_default_openrouter_model_env_matches_catalog():
+    assert llm_router.OPENROUTER_MODEL == "openai/gpt-oss-20b"
 
 
 def test_every_catalog_id_has_a_pricing_row():
     for model_id in llm_router.LLM_MODELS:
-        assert model_id in llm_router.GROQ_ON_DEMAND_PRICES_USD
+        assert model_id in llm_router.ONLINE_ON_DEMAND_PRICES_USD
 
 
 def test_pricing_table_has_no_orphan_rows():
-    for model_id in llm_router.GROQ_ON_DEMAND_PRICES_USD:
+    for model_id in llm_router.ONLINE_ON_DEMAND_PRICES_USD:
         assert model_id in llm_router.LLM_MODELS
 
 
 @pytest.mark.parametrize(
     ("retired_id", "replacement_id"),
     [
-        ("groq-llama-3.1-8b-instant", "groq-gpt-oss-20b"),
-        ("groq-llama-3.3-70b", "groq-gpt-oss-120b"),
-        ("groq-qwen3-32b", "groq-qwen3.6-27b"),
-        # Chains through the now-retired llama-3.3-70b alias.
-        ("groq-llama-4-scout", "groq-gpt-oss-120b"),
+        ("groq-llama-3.1-8b-instant", "openrouter-gpt-oss-20b"),
+        ("groq-llama-3.3-70b", "openrouter-gpt-oss-20b"),
+        ("groq-gpt-oss-120b", "openrouter-gpt-oss-20b"),
+        ("groq-gpt-oss-20b", "openrouter-gpt-oss-20b"),
+        ("groq-compound", "openrouter-gpt-oss-20b"),
+        ("groq-qwen3-32b", "openrouter-gpt-oss-20b"),
+        ("groq-llama-4-scout", "openrouter-gpt-oss-20b"),
     ],
 )
-def test_retired_ids_alias_onto_live_models(retired_id, replacement_id):
+def test_retired_ids_alias_onto_openrouter(retired_id, replacement_id):
     assert llm_router._alias_model_id(retired_id) == replacement_id
     assert llm_router._resolve_model_id(retired_id) == replacement_id
 
 
 def test_unknown_model_id_falls_back_to_local():
-    assert llm_router._resolve_model_id("groq-does-not-exist") == "local"
+    assert llm_router._resolve_model_id("openrouter-does-not-exist") == "local"
 
 
-def test_compound_is_offered_for_content_creation_only():
+def test_groq_provider_modes_alias_to_openrouter():
+    assert llm_router._normalize_provider_mode("groq") == "openrouter"
+    assert (
+        llm_router._normalize_provider_mode("groq_with_local_fallback")
+        == "openrouter_with_local_fallback"
+    )
+
+
+def test_models_for_purpose_include_openrouter_and_local():
     chat_models = llm_router.models_for_purpose("chat")
     creation_models = llm_router.models_for_purpose("content_creation")
-
-    assert "groq-compound" not in chat_models
-    assert "groq-compound-mini" not in chat_models
-    assert "groq-compound" in creation_models
-    assert "groq-compound-mini" in creation_models
-    # Plain chat models stay available to both dropdowns.
-    for shared in ("local", "groq-gpt-oss-120b", "groq-gpt-oss-20b", "groq-qwen3.6-27b"):
+    for shared in ("local", "openrouter-gpt-oss-20b"):
         assert shared in chat_models
         assert shared in creation_models
 
 
-def test_compound_has_the_largest_free_tpm_budget():
-    """Import guidance points at groq-compound, so it must really be the roomiest."""
-    tpm = {e["id"]: (e["limits"] or {}).get("tpm") or 0 for e in _groq_entries()}
-    assert tpm["groq-compound"] == max(tpm.values())
-
-
-def test_resolve_model_id_coerces_a_chat_selection_compound_cannot_serve():
-    resolved = llm_router._resolve_model_id("groq-compound", default="local", purpose="chat")
-    assert resolved == "local"
-    assert (
-        llm_router._resolve_model_id("groq-compound", default="local", purpose="content_creation")
-        == "groq-compound"
+def test_credit_snapshot_from_key_limit():
+    snapshot = llm_router._credit_snapshot_from_key_payload(
+        {"limit": 10.0, "limit_remaining": 1.5, "usage": 8.5, "is_free_tier": True}
     )
+    assert snapshot is not None
+    assert snapshot["usage_ratio"] == pytest.approx(0.85)
+    assert snapshot["total_credits"] == 10.0
+    assert snapshot["total_usage"] == 8.5
 
 
-def test_zero_budget_advice_recommends_a_model_still_in_the_catalog(monkeypatch):
-    monkeypatch.setattr(llm_router, "CONTENT_CREATION_MODEL_ID", "groq-gpt-oss-20b")
-    monkeypatch.setattr(llm_router, "CONTENT_CREATION_PROVIDER_MODE", "groq")
-
-    message = llm_router.content_creation_zero_budget_error_message()
-    assert "groq-compound" in message
-    assert "groq-llama" not in message
-
-
-def test_tpm_breach_advice_recommends_a_model_still_in_the_catalog(monkeypatch):
-    monkeypatch.setattr(llm_router, "usage_requests_last_60s", lambda **kwargs: 0)
-    monkeypatch.setattr(llm_router, "usage_requests_last_24h", lambda **kwargs: 0)
-    monkeypatch.setattr(llm_router, "usage_tokens_last_60s", lambda **kwargs: 0)
-
-    reason = llm_router._would_exceed_groq_limits(
-        "groq-gpt-oss-20b",
-        999_999,
-        purpose="content_creation",
+def test_credit_snapshot_from_credits_endpoint():
+    snapshot = llm_router._credit_snapshot_from_credits_payload(
+        {"total_credits": 100.0, "total_usage": 81.0}
     )
+    assert snapshot is not None
+    assert snapshot["usage_ratio"] == pytest.approx(0.81)
+
+
+def test_credit_threshold_triggers_fallback_reason(monkeypatch):
+    monkeypatch.setattr(llm_router, "OPENROUTER_CREDIT_FALLBACK_RATIO", 0.8)
+    monkeypatch.setattr(
+        llm_router,
+        "fetch_openrouter_credit_snapshot",
+        lambda force=False: {
+            "source": "key",
+            "total_credits": 10.0,
+            "total_usage": 8.1,
+            "usage_ratio": 0.81,
+        },
+    )
+    reason = llm_router.openrouter_credit_threshold_reason()
     assert reason is not None
-    assert "groq-compound" in reason
-    assert "groq-llama" not in reason
+    assert "80%" in reason or "credit usage" in reason.casefold()
+
+
+def test_credit_threshold_below_ratio_is_none(monkeypatch):
+    monkeypatch.setattr(llm_router, "OPENROUTER_CREDIT_FALLBACK_RATIO", 0.8)
+    monkeypatch.setattr(
+        llm_router,
+        "fetch_openrouter_credit_snapshot",
+        lambda force=False: {
+            "source": "key",
+            "total_credits": 10.0,
+            "total_usage": 5.0,
+            "usage_ratio": 0.5,
+        },
+    )
+    assert llm_router.openrouter_credit_threshold_reason() is None
+
+
+def test_would_exceed_online_limits_uses_credit_threshold(monkeypatch):
+    monkeypatch.setattr(
+        llm_router,
+        "openrouter_credit_threshold_reason",
+        lambda: "OpenRouter credit usage is at 85% of available credits (threshold 80%).",
+    )
+    reason = llm_router._would_exceed_online_limits("openrouter-gpt-oss-20b", 100)
+    assert reason is not None
+    assert "85%" in reason
 
 
 @pytest.fixture()
 def isolated_selection(monkeypatch, tmp_path):
-    """Keep select_llm_model off the developer's llm_runtime_config.json."""
     monkeypatch.setattr(
         llm_router, "LLM_RUNTIME_CONFIG_FILE", tmp_path / "llm_runtime_config.json"
     )
@@ -161,84 +146,116 @@ def isolated_selection(monkeypatch, tmp_path):
     return tmp_path
 
 
-def test_select_rejects_compound_for_chat(isolated_selection):
-    with pytest.raises(ValueError, match="not available for purpose chat"):
-        llm_router.select_llm_model("groq-compound", provider_mode="groq", purpose="chat")
-    assert llm_router.CURRENT_LLM_MODEL_ID == "local"
-
-
-def test_select_accepts_compound_for_content_creation(isolated_selection):
+def test_select_accepts_openrouter_model(isolated_selection):
     result = llm_router.select_llm_model(
-        "groq-compound", provider_mode="groq", purpose="content_creation"
+        "openrouter-gpt-oss-20b",
+        provider_mode="openrouter_with_local_fallback",
+        purpose="chat",
     )
-    assert result["model_id"] == "groq-compound"
-    assert result["selected_model"]["model"] == "groq/compound"
+    assert result["model_id"] == "openrouter-gpt-oss-20b"
+    assert result["provider_mode"] == "openrouter_with_local_fallback"
+
+
+def test_select_accepts_legacy_groq_mode_alias(isolated_selection):
+    result = llm_router.select_llm_model(
+        "openrouter-gpt-oss-20b",
+        provider_mode="groq_with_local_fallback",
+        purpose="chat",
+    )
+    assert result["provider_mode"] == "openrouter_with_local_fallback"
 
 
 def test_select_remaps_a_retired_id(isolated_selection):
-    result = llm_router.select_llm_model("groq-llama-3.3-70b", provider_mode="groq", purpose="chat")
-    assert result["model_id"] == "groq-gpt-oss-120b"
+    result = llm_router.select_llm_model(
+        "groq-llama-3.3-70b", provider_mode="openrouter", purpose="chat"
+    )
+    assert result["model_id"] == "openrouter-gpt-oss-20b"
 
 
-def test_models_payload_exposes_purpose_filtered_lists(isolated_selection):
+def test_models_payload_exposes_openrouter_modes(isolated_selection):
     payload = llm_router.get_llm_models_payload()
-
+    mode_ids = {m["id"] for m in payload["provider_modes"]}
+    assert mode_ids == {"local", "openrouter", "openrouter_with_local_fallback"}
     chat_ids = [m["id"] for m in payload["purposes"]["chat"]["models"]]
-    creation_ids = [m["id"] for m in payload["purposes"]["content_creation"]["models"]]
-
+    assert "openrouter-gpt-oss-20b" in chat_ids
     assert "groq-compound" not in chat_ids
-    assert "groq-compound" in creation_ids
-    # Every entry advertises its purposes so older clients can filter the flat list.
-    for model in payload["models"]:
-        assert model["purposes"]
+
+
+def test_generate_falls_back_to_local_when_credits_exceed_threshold(monkeypatch):
+    calls = {"local": 0}
+
+    monkeypatch.setattr(llm_router, "CURRENT_LLM_MODEL_ID", "openrouter-gpt-oss-20b")
+    monkeypatch.setattr(llm_router, "LLM_PROVIDER_MODE", "openrouter_with_local_fallback")
+    monkeypatch.setattr(llm_router, "OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setattr(llm_router, "ONLINE_DISABLED_UNTIL", None)
+    monkeypatch.setattr(
+        llm_router,
+        "openrouter_credit_threshold_reason",
+        lambda: "OpenRouter credit usage is at 90% of available credits (threshold 80%).",
+    )
+
+    def fake_local(messages, **kwargs):
+        calls["local"] += 1
+        return "local-ok", {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}
+
+    monkeypatch.setattr(llm_router, "call_local_chat_completions", fake_local)
+    monkeypatch.setattr(llm_router, "record_llm_usage", lambda **kwargs: None)
+
+    result = llm_router.generate_llm_response([{"role": "user", "content": "hi"}])
+    assert result == "local-ok"
+    assert calls["local"] == 1
+    assert llm_router.LAST_FALLBACK_REASON["chat"] == "openrouter_credit_threshold"
+
+
+def test_generate_strict_openrouter_raises_on_credit_threshold(monkeypatch):
+    monkeypatch.setattr(llm_router, "CURRENT_LLM_MODEL_ID", "openrouter-gpt-oss-20b")
+    monkeypatch.setattr(llm_router, "LLM_PROVIDER_MODE", "openrouter")
+    monkeypatch.setattr(llm_router, "OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setattr(llm_router, "ONLINE_DISABLED_UNTIL", None)
+    monkeypatch.setattr(
+        llm_router,
+        "openrouter_credit_threshold_reason",
+        lambda: "OpenRouter credit usage is at 90% of available credits (threshold 80%).",
+    )
+
+    with pytest.raises(llm_router.LLMProviderError, match="credit usage"):
+        llm_router.generate_llm_response([{"role": "user", "content": "hi"}])
 
 
 # --- functional: the HTTP surface Admin -> LLM actually calls ---
 
 
-def test_llm_models_endpoint_returns_purpose_filtered_catalog(api):
+def test_llm_models_endpoint_returns_openrouter_catalog(api):
     client, _server, headers = api
 
     response = client.get("/llm/models", headers=headers)
     assert response.status_code == 200
     payload = response.get_json()
 
-    served = {m["model"] for m in payload["models"]}
-    for retired in SHUT_DOWN_GROQ_MODELS:
-        assert retired not in served
+    served = {m["id"] for m in payload["models"]}
+    assert "openrouter-gpt-oss-20b" in served
+    assert "local" in served
+    assert "groq-compound" not in served
 
-    chat_ids = [m["id"] for m in payload["purposes"]["chat"]["models"]]
-    creation_ids = [m["id"] for m in payload["purposes"]["content_creation"]["models"]]
-    assert "groq-compound" not in chat_ids
-    assert "groq-compound" in creation_ids
-    assert "groq-gpt-oss-120b" in chat_ids
-
-
-def test_llm_select_endpoint_rejects_compound_for_chat(api, isolated_selection):
-    client, _server, headers = api
-
-    response = client.post(
-        "/llm/select",
-        headers=headers,
-        json={"model_id": "groq-compound", "provider_mode": "groq", "purpose": "chat"},
-    )
-    assert response.status_code == 400
+    mode_ids = {m["id"] for m in payload["provider_modes"]}
+    assert "openrouter_with_local_fallback" in mode_ids
+    assert "groq" not in mode_ids
 
 
-def test_llm_select_endpoint_accepts_compound_for_content_creation(api, isolated_selection):
+def test_llm_select_endpoint_accepts_openrouter(api, isolated_selection):
     client, _server, headers = api
 
     response = client.post(
         "/llm/select",
         headers=headers,
         json={
-            "model_id": "groq-compound",
-            "provider_mode": "groq",
-            "purpose": "content_creation",
+            "model_id": "openrouter-gpt-oss-20b",
+            "provider_mode": "openrouter_with_local_fallback",
+            "purpose": "chat",
         },
     )
     assert response.status_code == 200
-    assert response.get_json()["model_id"] == "groq-compound"
+    assert response.get_json()["model_id"] == "openrouter-gpt-oss-20b"
 
 
 def test_llm_select_endpoint_remaps_retired_id(api, isolated_selection):
@@ -247,7 +264,35 @@ def test_llm_select_endpoint_remaps_retired_id(api, isolated_selection):
     response = client.post(
         "/llm/select",
         headers=headers,
-        json={"model_id": "groq-llama-3.1-8b-instant", "provider_mode": "groq", "purpose": "chat"},
+        json={
+            "model_id": "groq-llama-3.1-8b-instant",
+            "provider_mode": "openrouter",
+            "purpose": "chat",
+        },
     )
     assert response.status_code == 200
-    assert response.get_json()["model_id"] == "groq-gpt-oss-20b"
+    assert response.get_json()["model_id"] == "openrouter-gpt-oss-20b"
+
+
+def test_llm_status_includes_credits_block(api, monkeypatch):
+    client, _server, headers = api
+    monkeypatch.setattr(
+        llm_router,
+        "fetch_openrouter_credit_snapshot",
+        lambda force=False: {
+            "source": "key",
+            "total_credits": 10.0,
+            "total_usage": 2.0,
+            "usage_ratio": 0.2,
+            "limit": 10.0,
+            "limit_remaining": 8.0,
+        },
+    )
+
+    response = client.get("/llm/status", headers=headers)
+    assert response.status_code == 200
+    payload = response.get_json()
+    credits = payload["purposes"]["chat"]["credits"]
+    assert credits["fallback_threshold"] == pytest.approx(llm_router.OPENROUTER_CREDIT_FALLBACK_RATIO)
+    assert credits["above_threshold"] is False
+    assert credits["usage_ratio"] == pytest.approx(0.2)

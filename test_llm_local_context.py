@@ -20,14 +20,14 @@ def test_zero_budget_error_message_is_local_specific(monkeypatch):
     assert llm_router.content_creation_max_input_chars() == 0
     message = llm_router.content_creation_zero_budget_error_message()
     assert "LOCAL_LLM_CONTEXT_TOKENS" in message
-    assert "Groq tokens-per-minute" not in message
+    assert "OpenRouter GPT-OSS 20B" not in message
 
 
-def test_zero_budget_error_message_is_groq_specific(monkeypatch):
-    monkeypatch.setattr(llm_router, "CONTENT_CREATION_MODEL_ID", "groq-gpt-oss-120b")
-    monkeypatch.setattr(llm_router, "CONTENT_CREATION_PROVIDER_MODE", "groq")
+def test_zero_budget_error_message_is_openrouter_specific(monkeypatch):
+    monkeypatch.setattr(llm_router, "CONTENT_CREATION_MODEL_ID", "openrouter-gpt-oss-20b")
+    monkeypatch.setattr(llm_router, "CONTENT_CREATION_PROVIDER_MODE", "openrouter")
     message = llm_router.content_creation_zero_budget_error_message()
-    assert "Groq tokens-per-minute" in message
+    assert "OpenRouter GPT-OSS 20B" in message
     assert "LOCAL_LLM_CONTEXT_TOKENS" not in message
 
 
