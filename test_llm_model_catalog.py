@@ -83,6 +83,95 @@ def test_credit_snapshot_from_key_limit():
     assert snapshot["total_usage"] == 8.5
 
 
+def test_credit_snapshot_from_key_usage_and_budget(monkeypatch):
+    monkeypatch.setattr(llm_router, "OPENROUTER_CREDIT_BUDGET_USD", 25.0)
+    snapshot = llm_router._credit_snapshot_from_key_payload(
+        {"limit": None, "limit_remaining": None, "usage": 20.5, "is_free_tier": False}
+    )
+    assert snapshot is not None
+    assert snapshot["source"] == "key+budget"
+    assert snapshot["usage_ratio"] == pytest.approx(0.82)
+    assert snapshot["total_credits"] == 25.0
+    assert snapshot["total_usage"] == 20.5
+
+
+def test_credit_snapshot_null_limit_without_budget_returns_none(monkeypatch):
+    monkeypatch.setattr(llm_router, "OPENROUTER_CREDIT_BUDGET_USD", 0.0)
+    assert llm_router._credit_snapshot_from_key_payload(
+        {"limit": None, "limit_remaining": None, "usage": 12.0}
+    ) is None
+
+
+def test_fetch_credit_snapshot_negative_cache(monkeypatch):
+    calls = {"n": 0}
+
+    def fake_live():
+        calls["n"] += 1
+        return None
+
+    monkeypatch.setattr(llm_router, "OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setattr(llm_router, "_fetch_openrouter_credit_snapshot_live", fake_live)
+    monkeypatch.setattr(llm_router, "_CREDITS_SNAPSHOT", None)
+    monkeypatch.setattr(llm_router, "_CREDITS_LOOKUP_UNTIL", None)
+
+    assert llm_router.fetch_openrouter_credit_snapshot() is None
+    assert llm_router.fetch_openrouter_credit_snapshot() is None
+    assert calls["n"] == 1
+
+
+def test_fetch_credit_snapshot_skips_credits_without_management_key(monkeypatch):
+    calls = {"key": 0, "credits": 0}
+
+    class FakeResp:
+        status_code = 200
+        content = b'{"data":{"limit":null,"usage":1.0}}'
+
+        def json(self):
+            return {"data": {"limit": None, "usage": 1.0}}
+
+    def fake_get(url, **kwargs):
+        if url.endswith("/key"):
+            calls["key"] += 1
+            return FakeResp()
+        if url.endswith("/credits"):
+            calls["credits"] += 1
+            raise AssertionError("/credits must not be called without management key")
+        raise AssertionError(url)
+
+    monkeypatch.setattr(llm_router, "OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setattr(llm_router, "OPENROUTER_MANAGEMENT_API_KEY", "")
+    monkeypatch.setattr(llm_router, "OPENROUTER_CREDIT_BUDGET_USD", 0.0)
+    monkeypatch.setattr(llm_router, "_CREDITS_SNAPSHOT", None)
+    monkeypatch.setattr(llm_router, "_CREDITS_LOOKUP_UNTIL", None)
+    monkeypatch.setattr(llm_router.requests, "get", fake_get)
+
+    assert llm_router.fetch_openrouter_credit_snapshot(force=True) is None
+    assert calls["key"] == 1
+    assert calls["credits"] == 0
+
+
+def test_credits_status_payload_marks_fallback_only_in_fallback_mode(monkeypatch):
+    monkeypatch.setattr(
+        llm_router,
+        "fetch_openrouter_credit_snapshot",
+        lambda force=False: {
+            "source": "key+budget",
+            "total_credits": 10.0,
+            "total_usage": 9.0,
+            "usage_ratio": 0.9,
+        },
+    )
+    strict = llm_router._credits_status_payload(provider_mode="openrouter")
+    assert strict["above_threshold"] is True
+    assert strict["fallback_applies"] is False
+    assert strict["credit_fallback_active"] is False
+
+    fallback = llm_router._credits_status_payload(provider_mode="openrouter_with_local_fallback")
+    assert fallback["above_threshold"] is True
+    assert fallback["fallback_applies"] is True
+    assert fallback["credit_fallback_active"] is True
+
+
 def test_credit_snapshot_from_credits_endpoint():
     snapshot = llm_router._credit_snapshot_from_credits_payload(
         {"total_credits": 100.0, "total_usage": 81.0}
@@ -295,4 +384,6 @@ def test_llm_status_includes_credits_block(api, monkeypatch):
     credits = payload["purposes"]["chat"]["credits"]
     assert credits["fallback_threshold"] == pytest.approx(llm_router.OPENROUTER_CREDIT_FALLBACK_RATIO)
     assert credits["above_threshold"] is False
+    assert credits["credit_fallback_active"] is False
+    assert credits["fallback_applies"] is True
     assert credits["usage_ratio"] == pytest.approx(0.2)

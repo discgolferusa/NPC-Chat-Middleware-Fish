@@ -53,9 +53,15 @@ CONTENT_CREATION_OPENROUTER_TIMEOUT_SECONDS = int(
 OPENROUTER_HTTP_REFERER = os.getenv("OPENROUTER_HTTP_REFERER", "https://npcnarrator.com")
 OPENROUTER_APP_TITLE = os.getenv("OPENROUTER_APP_TITLE", "NPC Narrator")
 # Auto-fall back to local llama when lifetime credit usage reaches this fraction
-# of total available credits (OpenRouter /key or /credits).
+# of total available credits. Ratio comes from GET /key (per-key limit or
+# OPENROUTER_CREDIT_BUDGET_USD + key usage). /credits is only used with
+# OPENROUTER_MANAGEMENT_API_KEY.
 OPENROUTER_CREDIT_FALLBACK_RATIO = float(os.getenv("OPENROUTER_CREDIT_FALLBACK_RATIO", "0.8"))
 OPENROUTER_CREDITS_CACHE_SECONDS = int(os.getenv("OPENROUTER_CREDITS_CACHE_SECONDS", "60"))
+# When /key reports limit: null (typical), divide key lifetime usage by this budget
+# (USD credits purchased) to compute the 80% fallback ratio.
+OPENROUTER_CREDIT_BUDGET_USD = float(os.getenv("OPENROUTER_CREDIT_BUDGET_USD", "0") or "0")
+OPENROUTER_MANAGEMENT_API_KEY = os.getenv("OPENROUTER_MANAGEMENT_API_KEY", "")
 
 # Spoken NPC replies are short, but reasoning models spend completion tokens on
 # chain-of-thought first. max_tokens=180 with gpt-oss often yields empty
@@ -156,8 +162,8 @@ GROQ_ON_DEMAND_PRICES_USD = ONLINE_ON_DEMAND_PRICES_USD
 _STATE_LOCK = threading.Lock()
 _USAGE_LOCK = threading.Lock()
 _CREDITS_LOCK = threading.Lock()
-_CREDITS_CACHE: dict[str, Any] | None = None
-_CREDITS_CACHE_UNTIL: datetime | None = None
+_CREDITS_SNAPSHOT: dict[str, Any] | None = None
+_CREDITS_LOOKUP_UNTIL: datetime | None = None
 
 
 class LLMProviderError(Exception):
@@ -484,6 +490,7 @@ def _credit_snapshot_from_key_payload(data: dict[str, Any]) -> dict[str, Any] | 
     total_credits: float | None = None
     total_usage: float | None = usage_f
     usage_ratio: float | None = None
+    source = "key"
 
     try:
         limit_f = float(limit) if limit is not None else None
@@ -508,17 +515,24 @@ def _credit_snapshot_from_key_payload(data: dict[str, Any]) -> dict[str, Any] | 
         total_credits = usage_f + remaining_f
         if total_credits > 0:
             usage_ratio = max(0.0, min(1.0, total_usage / total_credits))
+    elif usage_f is not None and OPENROUTER_CREDIT_BUDGET_USD > 0:
+        # Typical setup: limit is null; compare key lifetime usage to configured budget.
+        total_credits = OPENROUTER_CREDIT_BUDGET_USD
+        total_usage = usage_f
+        usage_ratio = max(0.0, min(1.0, usage_f / OPENROUTER_CREDIT_BUDGET_USD))
+        source = "key+budget"
 
     if usage_ratio is None:
         return None
 
     return {
-        "source": "key",
+        "source": source,
         "total_credits": total_credits,
         "total_usage": total_usage,
         "usage_ratio": usage_ratio,
         "limit": limit_f,
         "limit_remaining": remaining_f,
+        "budget_usd": OPENROUTER_CREDIT_BUDGET_USD if source == "key+budget" else None,
         "is_free_tier": bool(data.get("is_free_tier")),
         "fetched_at": _utc_iso(_utc_now()),
     }
@@ -545,23 +559,8 @@ def _credit_snapshot_from_credits_payload(data: dict[str, Any]) -> dict[str, Any
     }
 
 
-def fetch_openrouter_credit_snapshot(*, force: bool = False) -> dict[str, Any] | None:
-    """Return cached OpenRouter credit usage, or refresh from /key (then /credits)."""
-    global _CREDITS_CACHE, _CREDITS_CACHE_UNTIL
-
-    if not openrouter_is_configured():
-        return None
-
-    now = _utc_now()
-    with _CREDITS_LOCK:
-        if (
-            not force
-            and _CREDITS_CACHE is not None
-            and _CREDITS_CACHE_UNTIL is not None
-            and now < _CREDITS_CACHE_UNTIL
-        ):
-            return dict(_CREDITS_CACHE)
-
+def _fetch_openrouter_credit_snapshot_live() -> dict[str, Any] | None:
+    """Call OpenRouter once (no cache). Prefer /key; /credits only with management key."""
     root = _openrouter_api_root()
     headers = _openrouter_auth_headers()
     snapshot: dict[str, Any] | None = None
@@ -576,9 +575,13 @@ def fetch_openrouter_credit_snapshot(*, force: bool = False) -> dict[str, Any] |
     except (requests.RequestException, ValueError, TypeError) as ex:
         print(f"[LLM] OpenRouter /key credit check failed: {ex}", flush=True)
 
-    if snapshot is None:
+    if snapshot is None and OPENROUTER_MANAGEMENT_API_KEY:
+        mgmt_headers = {
+            "Authorization": f"Bearer {OPENROUTER_MANAGEMENT_API_KEY}",
+            "Content-Type": "application/json",
+        }
         try:
-            credits_resp = requests.get(f"{root}/credits", headers=headers, timeout=10)
+            credits_resp = requests.get(f"{root}/credits", headers=mgmt_headers, timeout=10)
             if credits_resp.status_code < 400:
                 payload = credits_resp.json() if credits_resp.content else {}
                 data = payload.get("data") if isinstance(payload, dict) else None
@@ -587,10 +590,32 @@ def fetch_openrouter_credit_snapshot(*, force: bool = False) -> dict[str, Any] |
         except (requests.RequestException, ValueError, TypeError) as ex:
             print(f"[LLM] OpenRouter /credits check failed: {ex}", flush=True)
 
+    return snapshot
+
+
+def fetch_openrouter_credit_snapshot(*, force: bool = False) -> dict[str, Any] | None:
+    """Return cached OpenRouter credit usage, or refresh from /key (then /credits)."""
+    global _CREDITS_SNAPSHOT, _CREDITS_LOOKUP_UNTIL
+
+    if not openrouter_is_configured():
+        return None
+
+    now = _utc_now()
     with _CREDITS_LOCK:
-        _CREDITS_CACHE = dict(snapshot) if snapshot else None
-        _CREDITS_CACHE_UNTIL = now + timedelta(seconds=max(5, OPENROUTER_CREDITS_CACHE_SECONDS))
-        return dict(_CREDITS_CACHE) if _CREDITS_CACHE else None
+        if (
+            not force
+            and _CREDITS_LOOKUP_UNTIL is not None
+            and now < _CREDITS_LOOKUP_UNTIL
+        ):
+            return dict(_CREDITS_SNAPSHOT) if _CREDITS_SNAPSHOT else None
+
+    snapshot = _fetch_openrouter_credit_snapshot_live()
+
+    with _CREDITS_LOCK:
+        _CREDITS_SNAPSHOT = dict(snapshot) if snapshot else None
+        _CREDITS_LOOKUP_UNTIL = now + timedelta(seconds=max(5, OPENROUTER_CREDITS_CACHE_SECONDS))
+
+    return dict(_CREDITS_SNAPSHOT) if _CREDITS_SNAPSHOT else None
 
 
 def openrouter_credit_threshold_reason() -> str | None:
@@ -1861,9 +1886,12 @@ def _remaining_estimate(model_id: str) -> dict[str, int | None]:
 
 
 
-def _credits_status_payload() -> dict[str, Any]:
+def _credits_status_payload(*, provider_mode: str) -> dict[str, Any]:
     snapshot = fetch_openrouter_credit_snapshot()
     threshold = max(0.0, min(1.0, OPENROUTER_CREDIT_FALLBACK_RATIO))
+    fallback_applies = _allows_local_fallback(provider_mode)
+    budget_configured = OPENROUTER_CREDIT_BUDGET_USD > 0
+
     if not snapshot:
         return {
             "source": None,
@@ -1872,18 +1900,28 @@ def _credits_status_payload() -> dict[str, Any]:
             "usage_ratio": None,
             "limit": None,
             "limit_remaining": None,
+            "budget_usd": OPENROUTER_CREDIT_BUDGET_USD if budget_configured else None,
+            "budget_configured": budget_configured,
+            "monitoring_available": False,
             "fallback_threshold": threshold,
+            "fallback_applies": fallback_applies,
             "above_threshold": None,
+            "credit_fallback_active": False,
         }
     ratio = snapshot.get("usage_ratio")
     try:
         ratio_f = float(ratio) if ratio is not None else None
     except (TypeError, ValueError):
         ratio_f = None
+    above = ratio_f is not None and ratio_f >= threshold
     return {
         **snapshot,
+        "budget_configured": budget_configured,
+        "monitoring_available": True,
         "fallback_threshold": threshold,
-        "above_threshold": (ratio_f is not None and ratio_f >= threshold),
+        "fallback_applies": fallback_applies,
+        "above_threshold": above,
+        "credit_fallback_active": above and fallback_applies,
     }
 
 
@@ -1946,7 +1984,7 @@ def _purpose_status(purpose: str) -> dict[str, Any]:
         "usage": usage,
         "local_usage": local_usage,
         "remaining_estimate": remaining,
-        "credits": _credits_status_payload(),
+        "credits": _credits_status_payload(provider_mode=provider_mode),
     }
 
 
