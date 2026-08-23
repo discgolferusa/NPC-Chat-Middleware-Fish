@@ -3021,7 +3021,7 @@ def npc_voice_turn():
                 "error": "Couldn't catch that. Speak a bit clearer or hold a moment longer, then try again.",
                 "request_id": request_id,
             })
-            return attach_timing_headers(err, request_id), 400
+            return attach_timing_headers(err, request_id, include_voice_phases=True), 400
 
         log_dm_turn(
             request_id=request_id,
@@ -3305,7 +3305,7 @@ def npc_voice_turn():
             response.headers["X-Narration-Audio-Url"] = turn_audio_url(request_id, "narration")
         if speech_path:
             response.headers["X-Speech-Audio-Url"] = turn_audio_url(request_id, "speech")
-        return attach_timing_headers(response, request_id)
+        return attach_timing_headers(response, request_id, include_voice_phases=True)
 
     except TurnSupersededError as ex:
         print(
@@ -3313,7 +3313,7 @@ def npc_voice_turn():
             flush=True,
         )
         body, status = _turn_superseded_response(request_id, ex.progress)
-        return attach_timing_headers(body, request_id), status
+        return attach_timing_headers(body, request_id, include_voice_phases=True), status
 
     except Exception as ex:
         total_elapsed = time.perf_counter() - total_start
@@ -3332,7 +3332,7 @@ def npc_voice_turn():
             "request_id": request_id,
             "npc_id": npc_id
         })
-        return attach_timing_headers(err, request_id), 500
+        return attach_timing_headers(err, request_id, include_voice_phases=True), 500
 
 
 @app.post("/npc-voice-turn-debug")

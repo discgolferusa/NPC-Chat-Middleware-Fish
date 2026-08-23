@@ -441,3 +441,55 @@ def test_llm_status_includes_credits_block(api, monkeypatch):
     assert credits["credit_fallback_active"] is False
     assert credits["fallback_applies"] is True
     assert credits["usage_ratio"] == pytest.approx(0.2)
+
+
+def test_openrouter_provider_order_parsed_from_env(monkeypatch):
+    monkeypatch.setattr(llm_router, "OPENROUTER_PROVIDER_ORDER_RAW", "amazon-bedrock, novita")
+    assert llm_router._openrouter_provider_order() == ["amazon-bedrock", "novita"]
+
+
+def test_call_openrouter_includes_provider_preferences(monkeypatch):
+    monkeypatch.setattr(llm_router, "OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setattr(llm_router, "OPENROUTER_PROVIDER_ORDER_RAW", "amazon-bedrock,novita")
+    monkeypatch.setattr(llm_router, "OPENROUTER_PROVIDER_ALLOW_FALLBACKS", True)
+
+    captured: dict = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {
+                "choices": [{"message": {"content": "Hello"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                "provider": "Amazon Bedrock",
+            }
+
+    def fake_post(url, headers, json, timeout):
+        captured["url"] = url
+        captured["json"] = json
+        captured["timeout"] = timeout
+        return FakeResponse()
+
+    monkeypatch.setattr(llm_router.requests, "post", fake_post)
+
+    content, usage, response = llm_router.call_openrouter_chat_completions(
+        [{"role": "user", "content": "hi"}],
+        "openai/gpt-oss-20b",
+    )
+    assert content == "Hello"
+    assert captured["json"]["provider"] == {
+        "order": ["amazon-bedrock", "novita"],
+        "allow_fallbacks": True,
+    }
+
+
+def test_llm_status_exposes_openrouter_provider_order(api, monkeypatch):
+    client, _server, headers = api
+    monkeypatch.setattr(llm_router, "OPENROUTER_PROVIDER_ORDER_RAW", "amazon-bedrock,novita")
+
+    response = client.get("/llm/status", headers=headers)
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["openrouter"]["provider_order"] == ["amazon-bedrock", "novita"]
+    assert payload["openrouter"]["provider_allow_fallbacks"] is True
