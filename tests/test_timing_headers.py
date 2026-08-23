@@ -30,6 +30,7 @@ def test_attach_timing_headers_includes_total_and_steps():
         assert "load npc context=" in steps
         assert "llm text npc response=" in steps
         assert resp.headers.get("X-Turn-Request-Id") == "rid"
+        assert "X-Timing-Phases" not in resp.headers
 
 
 def test_build_voice_timing_phases_groups_steps_and_cumulative():
@@ -52,7 +53,7 @@ def test_build_voice_timing_phases_groups_steps_and_cumulative():
     assert phases["cumulative_ms"]["tts"] == 3360
 
 
-def test_attach_timing_headers_includes_voice_phases_json():
+def test_attach_timing_headers_voice_phases_only_when_requested():
     app = Flask(__name__)
     with app.test_request_context("/npc-voice-turn", method="POST"):
         request_timing.begin_request_timing()
@@ -61,7 +62,7 @@ def test_attach_timing_headers_includes_voice_phases_json():
         step = request_timing.log_timing("rid", "llm npc response", step)
         step = request_timing.log_timing("rid", "piper segmented tts", step)
         resp = Response(response=b"RIFF", status=200, mimetype="audio/wav")
-        request_timing.attach_timing_headers(resp, "rid")
+        request_timing.attach_timing_headers(resp, "rid", include_voice_phases=True)
         raw = resp.headers.get("X-Timing-Phases")
         assert raw
         phases = json.loads(raw)

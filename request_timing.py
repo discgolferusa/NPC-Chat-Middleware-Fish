@@ -110,7 +110,12 @@ def log_timing(request_id: str, label: str, start_time: float) -> float:
     return time.perf_counter()
 
 
-def attach_timing_headers(response: Any, request_id: str | None = None) -> Any:
+def attach_timing_headers(
+    response: Any,
+    request_id: str | None = None,
+    *,
+    include_voice_phases: bool = False,
+) -> Any:
     """Attach X-Timing-* headers for editor latency analytics."""
     start = getattr(g, "_timing_start", None)
     middleware_total_ms: int | None = None
@@ -125,15 +130,16 @@ def attach_timing_headers(response: Any, request_id: str | None = None) -> Any:
             compact = compact[:1800]
         response.headers[HeaderSteps] = compact
 
-        phases = build_voice_timing_phases(steps)
-        if middleware_total_ms is not None:
-            phases["middleware_total_ms"] = middleware_total_ms
-            phases["cumulative_ms"]["middleware"] = middleware_total_ms
-        phases_json = json.dumps(phases, separators=(",", ":"))
-        if len(phases_json) <= 1800:
-            response.headers[HeaderPhases] = phases_json
-        if request_id:
-            print(f"[TIMING] {request_id} phases: {phases_json}", flush=True)
+        if include_voice_phases:
+            phases = build_voice_timing_phases(steps)
+            if middleware_total_ms is not None:
+                phases["middleware_total_ms"] = middleware_total_ms
+                phases["cumulative_ms"]["middleware"] = middleware_total_ms
+            phases_json = json.dumps(phases, separators=(",", ":"))
+            if len(phases_json) <= 1800:
+                response.headers[HeaderPhases] = phases_json
+            if request_id:
+                print(f"[TIMING] {request_id} phases: {phases_json}", flush=True)
 
     if request_id:
         response.headers.setdefault("X-Turn-Request-Id", str(request_id))
