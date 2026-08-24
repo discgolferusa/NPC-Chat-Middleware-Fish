@@ -279,6 +279,20 @@ def _kick_loaders(model_path: Path, *, clear_error: bool = False) -> _ModelEntry
     return entry
 
 
+def _snapshot_acquire_state(key: str) -> tuple[bool, BaseException | None, int, threading.Event] | None:
+    """Read acquire-relevant fields under the pool lock; never block/wait here."""
+    with _POOL_LOCK:
+        current = _MODELS.get(key)
+        if current is None:
+            return None
+        return (
+            bool(current.instances),
+            current.error,
+            current.inflight,
+            current.ready,
+        )
+
+
 def _acquire_instance(model_path: Path) -> _VoiceInstance:
     key = _voice_key(model_path)
     deadline = time.perf_counter() + 120.0
@@ -291,39 +305,33 @@ def _acquire_instance(model_path: Path) -> _VoiceInstance:
 
         entry = _kick_loaders(model_path)
 
-        with _POOL_LOCK:
-            current = _MODELS.get(key)
-            if current is None:
-                continue
-            if (
-                not current.instances
-                and current.error is not None
-                and current.inflight == 0
-            ):
-                if retried_error:
-                    raise current.error
-                retried_error = True
-                entry = _kick_loaders(model_path, clear_error=True)
+        snap = _snapshot_acquire_state(key)
+        if snap is None:
+            continue
+        has_instances, err, inflight, ready_event = snap
+        if not has_instances and err is not None and inflight == 0:
+            if retried_error:
+                raise err
+            retried_error = True
+            # Must not hold _POOL_LOCK here — _kick_loaders takes it (non-reentrant).
+            entry = _kick_loaders(model_path, clear_error=True)
 
         try:
             return entry.free.get(timeout=min(0.5, remaining))
         except queue.Empty:
-            with _POOL_LOCK:
-                current = _MODELS.get(key)
-                if current is None:
-                    continue
-                if (
-                    not current.instances
-                    and current.error is not None
-                    and current.inflight == 0
-                ):
-                    if retried_error:
-                        raise current.error
-                    retried_error = True
-                    _kick_loaders(model_path, clear_error=True)
-                    continue
-                if not current.instances:
-                    current.ready.wait(timeout=min(0.5, remaining))
+            snap = _snapshot_acquire_state(key)
+            if snap is None:
+                continue
+            has_instances, err, inflight, ready_event = snap
+            if not has_instances and err is not None and inflight == 0:
+                if retried_error:
+                    raise err
+                retried_error = True
+                _kick_loaders(model_path, clear_error=True)
+                continue
+            if not has_instances:
+                # Wait outside _POOL_LOCK so loaders can store replicas / set ready.
+                ready_event.wait(timeout=min(0.5, remaining))
             continue
 
 

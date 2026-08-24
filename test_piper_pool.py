@@ -358,3 +358,97 @@ def test_waiter_waits_for_inflight_retry_instead_of_stale_error(monkeypatch, tmp
     waiter_thread.join(timeout=1.0)
 
     assert waiter_result["voice"].model_path == model_path
+
+
+class _ReentrancyDetectLock:
+    """threading.Lock stand-in that fails fast on same-thread re-acquire."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._owner: int | None = None
+        self._count = 0
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        me = threading.get_ident()
+        if self._owner == me:
+            raise RuntimeError("reentrant _POOL_LOCK acquire")
+        ok = self._lock.acquire(blocking, timeout) if timeout >= 0 else self._lock.acquire(blocking)
+        if ok:
+            self._owner = me
+            self._count += 1
+        return ok
+
+    def release(self) -> None:
+        self._owner = None
+        self._count -= 1
+        self._lock.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.release()
+
+
+def test_acquire_error_retry_does_not_reenter_pool_lock(monkeypatch, tmp_path):
+    """Regression: error retry must not call _kick_loaders while holding _POOL_LOCK."""
+    piper_pool.clear_pool_for_tests()
+    model_path = _write_onnx_with_speakers(tmp_path / "retry.onnx", 1)
+    key = str(model_path)
+
+    entry = piper_pool._ModelEntry(model_path, 1)
+    entry.target_count = 1
+    entry.error = OSError("stale")
+    entry.ready.set()
+    piper_pool._MODELS[key] = entry
+
+    detect = _ReentrancyDetectLock()
+    monkeypatch.setattr(piper_pool, "_POOL_LOCK", detect)
+    monkeypatch.setenv("PIPER_POOL_SLOTS", "1")
+
+    def fake_create(path: Path):
+        return _FakeVoice(path)
+
+    monkeypatch.setattr(piper_pool, "_create_piper_voice", fake_create)
+
+    instance = piper_pool._acquire_instance(model_path)
+    assert instance.voice.model_path == model_path
+    piper_pool._release_instance(instance)
+
+
+def test_slow_warm_completes_while_acquire_waits(monkeypatch, tmp_path):
+    """Regression: acquire must not hold _POOL_LOCK while waiting on ready."""
+    piper_pool.clear_pool_for_tests()
+    model_path = _write_onnx_with_speakers(tmp_path / "slow-warm.onnx", 1)
+
+    load_started = threading.Event()
+    release_load = threading.Event()
+
+    def slow_create(path: Path):
+        load_started.set()
+        assert release_load.wait(timeout=2.0)
+        return _FakeVoice(path)
+
+    monkeypatch.setattr(piper_pool, "_create_piper_voice", slow_create)
+    monkeypatch.setenv("PIPER_POOL_SLOTS", "1")
+
+    result: dict[str, Any] = {}
+
+    def waiter():
+        instance = piper_pool._acquire_instance(model_path)
+        result["voice"] = instance.voice
+        piper_pool._release_instance(instance)
+
+    thread = threading.Thread(target=waiter)
+    thread.start()
+    assert load_started.wait(timeout=1.0)
+
+    # While loader is blocked, pool lock must still be acquirable (acquire is waiting unlocked).
+    assert piper_pool._POOL_LOCK.acquire(timeout=0.5)
+    piper_pool._POOL_LOCK.release()
+
+    release_load.set()
+    thread.join(timeout=2.0)
+    assert thread.is_alive() is False
+    assert result["voice"].model_path == model_path
