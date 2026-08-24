@@ -1,8 +1,9 @@
-"""In-process Piper voice pool with background model warm-up."""
+"""In-process Piper voice pool with background warm-up and multi-replica slots."""
 
 from __future__ import annotations
 
 import os
+import queue
 import threading
 import time
 import wave
@@ -10,25 +11,119 @@ from pathlib import Path
 from typing import Any
 
 _POOL_LOCK = threading.Lock()
+_DEFAULT_SLOT_BUDGET = 10
 
 
-class _VoiceSlot:
-    __slots__ = ("voice", "lock", "ready", "loading", "error")
+class _VoiceInstance:
+    __slots__ = ("voice", "model_key")
 
-    def __init__(self) -> None:
-        self.voice: Any | None = None
-        self.lock = threading.Lock()
+    def __init__(self, voice: Any, model_key: str) -> None:
+        self.voice = voice
+        self.model_key = model_key
+
+
+class _ModelEntry:
+    __slots__ = (
+        "model_path",
+        "weight",
+        "target_count",
+        "instances",
+        "free",
+        "inflight",
+        "ready",
+        "error",
+    )
+
+    def __init__(self, model_path: Path, weight: int) -> None:
+        self.model_path = model_path
+        self.weight = max(1, int(weight))
+        self.target_count = 1
+        self.instances: list[_VoiceInstance] = []
+        self.free: queue.Queue[_VoiceInstance] = queue.Queue()
+        self.inflight = 0
         self.ready = threading.Event()
-        self.loading = False
         self.error: BaseException | None = None
 
 
-_SLOTS: dict[str, _VoiceSlot] = {}
-_WARM_THREADS: dict[str, threading.Thread] = {}
+_MODELS: dict[str, _ModelEntry] = {}
 
 
 def _voice_key(model_path: Path) -> str:
     return str(model_path)
+
+
+def pool_slot_budget() -> int:
+    raw = str(os.environ.get("PIPER_POOL_SLOTS", "")).strip()
+    if not raw:
+        return _DEFAULT_SLOT_BUDGET
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return _DEFAULT_SLOT_BUDGET
+
+
+def allocate_replicas(weights: dict[str, int], total_slots: int) -> dict[str, int]:
+    """
+    Largest-remainder share of ``total_slots`` by speaker weight.
+
+    Each registered model gets at least 1 when ``len(weights) <= total_slots``.
+    If more models than slots, each still gets 1 (soft over-budget) so none starve.
+    """
+    if not weights:
+        return {}
+    keys = list(weights.keys())
+    n = len(keys)
+    cleaned = {k: max(1, int(weights[k] or 1)) for k in keys}
+    budget = max(1, int(total_slots))
+
+    if n >= budget:
+        return {k: 1 for k in keys}
+
+    total_w = sum(cleaned.values())
+    exact = {k: budget * cleaned[k] / total_w for k in keys}
+    result = {k: int(exact[k]) for k in keys}
+
+    for k in keys:
+        if result[k] > 0:
+            continue
+        donor = max(keys, key=lambda x: result[x])
+        if result[donor] > 1:
+            result[donor] -= 1
+            result[k] = 1
+        else:
+            result[k] = 1
+
+    used = sum(result.values())
+    rem = budget - used
+    if rem > 0:
+        order = sorted(
+            keys,
+            key=lambda k: (exact[k] - int(exact[k]), cleaned[k]),
+            reverse=True,
+        )
+        for k in order:
+            if rem <= 0:
+                break
+            result[k] += 1
+            rem -= 1
+    elif rem < 0:
+        order = sorted(keys, key=lambda k: result[k], reverse=True)
+        guard = 0
+        while rem < 0 and guard < n * budget:
+            k = order[guard % n]
+            if result[k] > 1:
+                result[k] -= 1
+                rem += 1
+            guard += 1
+
+    return result
+
+
+def _speaker_weight(model_path: Path) -> int:
+    from tts_processing import load_piper_model_meta
+
+    meta = load_piper_model_meta(model_path)
+    return max(1, int(meta.get("num_speakers") or 1))
 
 
 def _create_piper_voice(model_path: Path) -> Any:
@@ -41,51 +136,99 @@ def _create_piper_voice(model_path: Path) -> Any:
     return PiperVoice.load(model_path, use_cuda=use_cuda)
 
 
-def _store_loaded_voice(key: str, voice: Any) -> None:
+def _trim_idle_surplus_locked(entry: _ModelEntry) -> None:
+    """Drop idle free replicas when target shrank after rebalance."""
+    while len(entry.instances) > entry.target_count:
+        try:
+            instance = entry.free.get_nowait()
+        except queue.Empty:
+            break
+        if instance in entry.instances:
+            entry.instances.remove(instance)
+
+
+def _recompute_targets_locked() -> None:
+    weights = {key: entry.weight for key, entry in _MODELS.items()}
+    targets = allocate_replicas(weights, pool_slot_budget())
+    for key, entry in _MODELS.items():
+        entry.target_count = targets.get(key, 1)
+        _trim_idle_surplus_locked(entry)
+
+
+def _capacity_count(entry: _ModelEntry) -> int:
+    return len(entry.instances) + entry.inflight
+
+
+def _register_model_locked(model_path: Path) -> _ModelEntry:
+    key = _voice_key(model_path)
+    entry = _MODELS.get(key)
+    if entry is not None:
+        return entry
+    entry = _ModelEntry(model_path, _speaker_weight(model_path))
+    _MODELS[key] = entry
+    _recompute_targets_locked()
+    return entry
+
+
+def _start_loaders_locked(entry: _ModelEntry, request_id: str | None) -> list[threading.Thread]:
+    threads: list[threading.Thread] = []
+    while _capacity_count(entry) < entry.target_count:
+        entry.inflight += 1
+        entry.error = None
+        if not entry.instances:
+            entry.ready.clear()
+        thread = threading.Thread(
+            target=_load_voice_replica,
+            args=(entry.model_path, request_id),
+            name=f"piper-warm-{entry.model_path.name}",
+            daemon=True,
+        )
+        threads.append(thread)
+    return threads
+
+
+def _store_loaded_replica(key: str, voice: Any) -> None:
     with _POOL_LOCK:
-        slot = _SLOTS[key]
-        if slot.voice is None:
-            slot.voice = voice
-        slot.loading = False
-        slot.error = None
-        slot.ready.set()
+        entry = _MODELS.get(key)
+        if entry is None:
+            return
+        entry.inflight = max(0, entry.inflight - 1)
+        if len(entry.instances) >= entry.target_count:
+            # Target shrank while this replica was loading; discard it.
+            entry.error = None
+            if entry.instances:
+                entry.ready.set()
+            return
+        instance = _VoiceInstance(voice, key)
+        entry.instances.append(instance)
+        entry.error = None
+        entry.ready.set()
+        entry.free.put(instance)
 
 
 def _store_load_error(key: str, error: BaseException) -> None:
     with _POOL_LOCK:
-        slot = _SLOTS.get(key)
-        if slot is None:
+        entry = _MODELS.get(key)
+        if entry is None:
             return
-        slot.loading = False
-        slot.error = error
-        slot.ready.set()
+        entry.inflight = max(0, entry.inflight - 1)
+        if not entry.instances and entry.inflight == 0:
+            entry.error = error
+            entry.ready.set()
 
 
-def _claim_loader(key: str) -> tuple[_VoiceSlot, bool]:
-    """Return (slot, should_load). Caller loads only when should_load is True."""
-    with _POOL_LOCK:
-        slot = _SLOTS.get(key)
-        if slot is not None and slot.voice is not None:
-            return slot, False
-        if slot is not None and slot.loading:
-            return slot, False
-        if slot is None:
-            slot = _VoiceSlot()
-            _SLOTS[key] = slot
-        elif slot.error is not None:
-            slot.error = None
-            slot.ready.clear()
-        slot.loading = True
-        return slot, True
-
-
-def _load_voice(model_path: Path, request_id: str | None) -> None:
+def _load_voice_replica(model_path: Path, request_id: str | None) -> None:
     key = _voice_key(model_path)
     try:
         voice = _create_piper_voice(model_path)
-        _store_loaded_voice(key, voice)
+        _store_loaded_replica(key, voice)
+        with _POOL_LOCK:
+            entry = _MODELS.get(key)
+            live = len(entry.instances) if entry is not None else 0
+            target = entry.target_count if entry is not None else 0
         print(
-            f"[PIPER-POOL] warmed model={model_path.name} request_id={request_id or '-'}",
+            f"[PIPER-POOL] warmed model={model_path.name} "
+            f"replicas={live}/{target} request_id={request_id or '-'}",
             flush=True,
         )
     except Exception as ex:
@@ -98,7 +241,7 @@ def _load_voice(model_path: Path, request_id: str | None) -> None:
 
 
 def warm_voice_models(model_paths: list[Path], *, request_id: str | None = None) -> None:
-    """Start background ONNX load for each unique model path (idempotent)."""
+    """Register models, rebalance slot targets, and warm replicas in the background."""
     unique: list[Path] = []
     seen: set[str] = set()
     for raw in model_paths:
@@ -111,62 +254,88 @@ def warm_voice_models(model_paths: list[Path], *, request_id: str | None = None)
         seen.add(key)
         unique.append(path)
 
-    for model_path in unique:
-        key = _voice_key(model_path)
-        _slot, should_start = _claim_loader(key)
-        if not should_start:
-            continue
-        thread = threading.Thread(
-            target=_load_voice,
-            args=(model_path, request_id),
-            name=f"piper-warm-{model_path.name}",
-            daemon=True,
-        )
-        with _POOL_LOCK:
-            _WARM_THREADS[key] = thread
+    threads: list[threading.Thread] = []
+    with _POOL_LOCK:
+        for model_path in unique:
+            _register_model_locked(model_path)
+        _recompute_targets_locked()
+        for entry in _MODELS.values():
+            threads.extend(_start_loaders_locked(entry, request_id))
+
+    for thread in threads:
         thread.start()
 
 
-def _get_voice_and_lock(model_path: Path) -> tuple[Any, threading.Lock]:
+def _kick_loaders(model_path: Path, *, clear_error: bool = False) -> _ModelEntry:
+    with _POOL_LOCK:
+        entry = _register_model_locked(model_path)
+        _recompute_targets_locked()
+        if clear_error and entry.error is not None and not entry.instances:
+            entry.error = None
+            entry.ready.clear()
+        threads = _start_loaders_locked(entry, None)
+    for thread in threads:
+        thread.start()
+    return entry
+
+
+def _acquire_instance(model_path: Path) -> _VoiceInstance:
     key = _voice_key(model_path)
     deadline = time.perf_counter() + 120.0
+    retried_error = False
 
     while True:
         remaining = deadline - time.perf_counter()
         if remaining <= 0:
             raise TimeoutError(f"Timed out waiting for Piper voice load: {model_path}")
 
-        with _POOL_LOCK:
-            slot = _SLOTS.get(key)
-            if slot is not None and slot.voice is not None:
-                return slot.voice, slot.lock
-
-        slot, should_load = _claim_loader(key)
-        if should_load:
-            try:
-                voice = _create_piper_voice(model_path)
-                _store_loaded_voice(key, voice)
-            except Exception as ex:
-                _store_load_error(key, ex)
-                raise
-            with _POOL_LOCK:
-                loaded = _SLOTS[key]
-                return loaded.voice, loaded.lock
-
-        if not slot.ready.wait(timeout=remaining):
-            raise TimeoutError(f"Timed out waiting for Piper voice load: {model_path}")
+        entry = _kick_loaders(model_path)
 
         with _POOL_LOCK:
-            slot = _SLOTS[key]
-            if slot.voice is not None:
-                return slot.voice, slot.lock
-            if slot.loading:
-                # Another thread claimed a retry after our wait returned.
+            current = _MODELS.get(key)
+            if current is None:
                 continue
-            if slot.error is not None:
-                raise slot.error
-            # Stale ready or retry claimed between wait return and lock: loop again.
+            if (
+                not current.instances
+                and current.error is not None
+                and current.inflight == 0
+            ):
+                if retried_error:
+                    raise current.error
+                retried_error = True
+                entry = _kick_loaders(model_path, clear_error=True)
+
+        try:
+            return entry.free.get(timeout=min(0.5, remaining))
+        except queue.Empty:
+            with _POOL_LOCK:
+                current = _MODELS.get(key)
+                if current is None:
+                    continue
+                if (
+                    not current.instances
+                    and current.error is not None
+                    and current.inflight == 0
+                ):
+                    if retried_error:
+                        raise current.error
+                    retried_error = True
+                    _kick_loaders(model_path, clear_error=True)
+                    continue
+                if not current.instances:
+                    current.ready.wait(timeout=min(0.5, remaining))
             continue
+
+
+def _release_instance(instance: _VoiceInstance) -> None:
+    with _POOL_LOCK:
+        entry = _MODELS.get(instance.model_key)
+        if entry is None:
+            return
+        if len(entry.instances) > entry.target_count and instance in entry.instances:
+            entry.instances.remove(instance)
+            return
+    entry.free.put(instance)
 
 
 def synthesize_wav_file(
@@ -180,20 +349,21 @@ def synthesize_wav_file(
     sentence_silence: float,
     speaker_id: int | None = None,
 ) -> None:
-    """Synthesize text to a WAV file using a pooled in-process Piper voice."""
+    """Synthesize text to a WAV file using a pooled in-process Piper voice replica."""
     from piper import SynthesisConfig
 
-    voice, voice_lock = _get_voice_and_lock(model_path)
-    syn_config = SynthesisConfig(
-        speaker_id=speaker_id,
-        length_scale=length_scale,
-        noise_scale=noise_scale,
-        noise_w_scale=noise_w,
-        normalize_audio=True,
-    )
-    silence_bytes = bytes(int(voice.config.sample_rate * sentence_silence * 2))
+    instance = _acquire_instance(model_path)
+    voice = instance.voice
+    try:
+        syn_config = SynthesisConfig(
+            speaker_id=speaker_id,
+            length_scale=length_scale,
+            noise_scale=noise_scale,
+            noise_w_scale=noise_w,
+            normalize_audio=True,
+        )
+        silence_bytes = bytes(int(voice.config.sample_rate * sentence_silence * 2))
 
-    with voice_lock:
         with wave.open(str(output_path), "wb") as wav_file:
             wav_params_set = False
             for chunk_index, audio_chunk in enumerate(voice.synthesize(text, syn_config)):
@@ -207,10 +377,23 @@ def synthesize_wav_file(
                     wav_file.writeframes(silence_bytes)
 
                 wav_file.writeframes(audio_chunk.audio_int16_bytes)
+    finally:
+        _release_instance(instance)
 
 
 def clear_pool_for_tests() -> None:
     """Reset module state (tests only)."""
     with _POOL_LOCK:
-        _SLOTS.clear()
-        _WARM_THREADS.clear()
+        _MODELS.clear()
+
+
+def model_replica_counts_for_tests() -> dict[str, int]:
+    """Return live replica counts keyed by model path (tests only)."""
+    with _POOL_LOCK:
+        return {key: len(entry.instances) for key, entry in _MODELS.items()}
+
+
+def model_targets_for_tests() -> dict[str, int]:
+    """Return target replica counts keyed by model path (tests only)."""
+    with _POOL_LOCK:
+        return {key: entry.target_count for key, entry in _MODELS.items()}
