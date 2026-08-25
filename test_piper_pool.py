@@ -138,6 +138,47 @@ def test_warm_splits_slots_by_speaker_count(monkeypatch, tmp_path):
     assert piper_pool.model_replica_counts_for_tests()[str(small)] == 1
 
 
+def test_cold_warm_loads_one_replica_before_topup(monkeypatch, tmp_path):
+    """Cold start must not run N parallel ONNX loads before the first replica is ready."""
+    piper_pool.clear_pool_for_tests()
+    model_path = _write_onnx_with_speakers(tmp_path / "solo.onnx", 50)
+
+    active = {"n": 0}
+    max_active = {"n": 0}
+    first_done = threading.Event()
+    lock = threading.Lock()
+
+    def fake_create(path: Path):
+        with lock:
+            active["n"] += 1
+            max_active["n"] = max(max_active["n"], active["n"])
+            in_bootstrap = not first_done.is_set()
+        if in_bootstrap:
+            time.sleep(0.05)
+        with lock:
+            active["n"] -= 1
+            first_done.set()
+        return _FakeVoice(path)
+
+    monkeypatch.setattr(piper_pool, "_create_piper_voice", fake_create)
+    monkeypatch.setenv("PIPER_POOL_SLOTS", "10")
+
+    piper_pool.warm_voice_models([model_path], request_id="bootstrap")
+    assert first_done.wait(timeout=1.0)
+
+    # During the first load, at most one create should have been in flight.
+    assert max_active["n"] == 1
+
+    deadline = time.perf_counter() + 2.0
+    while time.perf_counter() < deadline:
+        if piper_pool.model_replica_counts_for_tests().get(str(model_path), 0) == 10:
+            break
+        time.sleep(0.02)
+
+    assert piper_pool.model_targets_for_tests()[str(model_path)] == 10
+    assert piper_pool.model_replica_counts_for_tests()[str(model_path)] == 10
+
+
 def test_synthesize_wav_file_uses_pooled_voice(monkeypatch, tmp_path):
     piper_pool.clear_pool_for_tests()
     model_path = _write_onnx_with_speakers(tmp_path / "npc.onnx", 1)
