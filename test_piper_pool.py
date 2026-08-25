@@ -1,7 +1,8 @@
-"""Unit tests for in-process Piper voice pool warm-up."""
+"""Unit tests for in-process Piper voice pool warm-up and replica slots."""
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 from pathlib import Path
@@ -26,10 +27,40 @@ class _FakeVoice:
         yield chunk
 
 
+def _write_onnx_with_speakers(path: Path, num_speakers: int) -> Path:
+    path.write_bytes(b"onnx")
+    speaker_map = {f"spk_{i}": i for i in range(num_speakers)}
+    path.with_suffix(path.suffix + ".json").write_text(
+        json.dumps({"num_speakers": num_speakers, "speaker_id_map": speaker_map}),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_allocate_replicas_equal_speakers():
+    got = piper_pool.allocate_replicas({"a": 100, "b": 100}, 10)
+    assert got == {"a": 5, "b": 5}
+
+
+def test_allocate_replicas_proportional():
+    got = piper_pool.allocate_replicas({"big": 90, "small": 10}, 10)
+    assert got == {"big": 9, "small": 1}
+
+
+def test_allocate_replicas_single_model_gets_budget():
+    got = piper_pool.allocate_replicas({"only": 40}, 10)
+    assert got == {"only": 10}
+
+
+def test_allocate_replicas_more_models_than_slots():
+    got = piper_pool.allocate_replicas({f"m{i}": 10 for i in range(12)}, 10)
+    assert all(v == 1 for v in got.values())
+    assert len(got) == 12
+
+
 def test_warm_voice_models_loads_in_background(monkeypatch, tmp_path):
     piper_pool.clear_pool_for_tests()
-    model_path = tmp_path / "npc.onnx"
-    model_path.write_bytes(b"onnx")
+    model_path = _write_onnx_with_speakers(tmp_path / "npc.onnx", 1)
 
     load_started = threading.Event()
     load_done = threading.Event()
@@ -41,21 +72,24 @@ def test_warm_voice_models_loads_in_background(monkeypatch, tmp_path):
         return _FakeVoice(path)
 
     monkeypatch.setattr(piper_pool, "_create_piper_voice", fake_create)
+    monkeypatch.setenv("PIPER_POOL_SLOTS", "2")
 
     piper_pool.warm_voice_models([model_path], request_id="req-warm")
 
     assert load_started.wait(timeout=1.0)
     assert load_done.wait(timeout=1.0)
-
-    with piper_pool._POOL_LOCK:
-        assert str(model_path) in piper_pool._SLOTS
-        assert piper_pool._SLOTS[str(model_path)].voice is not None
+    deadline = time.perf_counter() + 1.0
+    while time.perf_counter() < deadline:
+        counts = piper_pool.model_replica_counts_for_tests()
+        if counts.get(str(model_path), 0) >= 1:
+            break
+        time.sleep(0.01)
+    assert piper_pool.model_replica_counts_for_tests()[str(model_path)] >= 1
 
 
 def test_warm_voice_models_is_idempotent(monkeypatch, tmp_path):
     piper_pool.clear_pool_for_tests()
-    model_path = tmp_path / "npc.onnx"
-    model_path.write_bytes(b"onnx")
+    model_path = _write_onnx_with_speakers(tmp_path / "npc.onnx", 1)
     calls = {"count": 0}
 
     def fake_create(path: Path):
@@ -63,6 +97,7 @@ def test_warm_voice_models_is_idempotent(monkeypatch, tmp_path):
         return _FakeVoice(path)
 
     monkeypatch.setattr(piper_pool, "_create_piper_voice", fake_create)
+    monkeypatch.setenv("PIPER_POOL_SLOTS", "1")
 
     piper_pool.warm_voice_models([model_path, model_path], request_id="req1")
     time.sleep(0.05)
@@ -72,18 +107,46 @@ def test_warm_voice_models_is_idempotent(monkeypatch, tmp_path):
     assert calls["count"] == 1
 
 
+def test_warm_splits_slots_by_speaker_count(monkeypatch, tmp_path):
+    piper_pool.clear_pool_for_tests()
+    big = _write_onnx_with_speakers(tmp_path / "big.onnx", 90)
+    small = _write_onnx_with_speakers(tmp_path / "small.onnx", 10)
+
+    def fake_create(path: Path):
+        return _FakeVoice(path)
+
+    monkeypatch.setattr(piper_pool, "_create_piper_voice", fake_create)
+    monkeypatch.setenv("PIPER_POOL_SLOTS", "10")
+
+    piper_pool.warm_voice_models([big, small], request_id="split")
+    deadline = time.perf_counter() + 2.0
+    while time.perf_counter() < deadline:
+        targets = piper_pool.model_targets_for_tests()
+        counts = piper_pool.model_replica_counts_for_tests()
+        if (
+            targets.get(str(big)) == 9
+            and targets.get(str(small)) == 1
+            and counts.get(str(big)) == 9
+            and counts.get(str(small)) == 1
+        ):
+            break
+        time.sleep(0.02)
+
+    assert piper_pool.model_targets_for_tests()[str(big)] == 9
+    assert piper_pool.model_targets_for_tests()[str(small)] == 1
+    assert piper_pool.model_replica_counts_for_tests()[str(big)] == 9
+    assert piper_pool.model_replica_counts_for_tests()[str(small)] == 1
+
+
 def test_synthesize_wav_file_uses_pooled_voice(monkeypatch, tmp_path):
     piper_pool.clear_pool_for_tests()
-    model_path = tmp_path / "npc.onnx"
-    model_path.write_bytes(b"onnx")
+    model_path = _write_onnx_with_speakers(tmp_path / "npc.onnx", 1)
     output_path = tmp_path / "out.wav"
 
     fake_voice = _FakeVoice(model_path)
-    monkeypatch.setattr(
-        piper_pool,
-        "_get_voice_and_lock",
-        lambda path: (fake_voice, threading.Lock()),
-    )
+    instance = piper_pool._VoiceInstance(fake_voice, str(model_path))
+    monkeypatch.setattr(piper_pool, "_acquire_instance", lambda path: instance)
+    monkeypatch.setattr(piper_pool, "_release_instance", lambda inst: None)
 
     piper_pool.synthesize_wav_file(
         model_path,
@@ -102,8 +165,7 @@ def test_synthesize_wav_file_uses_pooled_voice(monkeypatch, tmp_path):
 
 def test_get_voice_waits_for_warm_thread(monkeypatch, tmp_path):
     piper_pool.clear_pool_for_tests()
-    model_path = tmp_path / "wait.onnx"
-    model_path.write_bytes(b"onnx")
+    model_path = _write_onnx_with_speakers(tmp_path / "wait.onnx", 1)
 
     started = threading.Event()
 
@@ -113,19 +175,19 @@ def test_get_voice_waits_for_warm_thread(monkeypatch, tmp_path):
         return _FakeVoice(path)
 
     monkeypatch.setattr(piper_pool, "_create_piper_voice", slow_create)
+    monkeypatch.setenv("PIPER_POOL_SLOTS", "1")
     piper_pool.warm_voice_models([model_path], request_id="req-wait")
     assert started.wait(timeout=1.0)
 
-    voice, _lock = piper_pool._get_voice_and_lock(model_path)
-    assert voice.model_path == model_path
+    instance = piper_pool._acquire_instance(model_path)
+    assert instance.voice.model_path == model_path
+    piper_pool._release_instance(instance)
 
 
 def test_cold_path_load_does_not_block_other_models(monkeypatch, tmp_path):
     piper_pool.clear_pool_for_tests()
-    slow_path = tmp_path / "slow.onnx"
-    fast_path = tmp_path / "fast.onnx"
-    slow_path.write_bytes(b"onnx")
-    fast_path.write_bytes(b"onnx")
+    slow_path = _write_onnx_with_speakers(tmp_path / "slow.onnx", 1)
+    fast_path = _write_onnx_with_speakers(tmp_path / "fast.onnx", 1)
 
     load_started = threading.Event()
     release_slow = threading.Event()
@@ -138,20 +200,21 @@ def test_cold_path_load_does_not_block_other_models(monkeypatch, tmp_path):
         return _FakeVoice(path)
 
     monkeypatch.setattr(piper_pool, "_create_piper_voice", fake_create)
+    monkeypatch.setenv("PIPER_POOL_SLOTS", "2")
 
     slow_result: dict[str, Any] = {}
     fast_result: dict[str, Any] = {}
 
     def load_slow():
-        voice, lock = piper_pool._get_voice_and_lock(slow_path)
-        slow_result["voice"] = voice
-        slow_result["lock"] = lock
+        instance = piper_pool._acquire_instance(slow_path)
+        slow_result["voice"] = instance.voice
+        piper_pool._release_instance(instance)
 
     def load_fast():
         load_started.wait(timeout=1.0)
-        voice, lock = piper_pool._get_voice_and_lock(fast_path)
-        fast_result["voice"] = voice
-        fast_result["lock"] = lock
+        instance = piper_pool._acquire_instance(fast_path)
+        fast_result["voice"] = instance.voice
+        piper_pool._release_instance(instance)
 
     slow_thread = threading.Thread(target=load_slow)
     slow_thread.start()
@@ -172,10 +235,66 @@ def test_cold_path_load_does_not_block_other_models(monkeypatch, tmp_path):
     assert "voice" in slow_result
 
 
+def test_same_model_replicas_allow_parallel_synth(monkeypatch, tmp_path):
+    piper_pool.clear_pool_for_tests()
+    model_path = _write_onnx_with_speakers(tmp_path / "multi.onnx", 50)
+
+    hold = threading.Event()
+    started = {"n": 0}
+    started_lock = threading.Lock()
+    both_started = threading.Event()
+
+    class HoldingVoice(_FakeVoice):
+        def synthesize(self, text, syn_config=None):
+            with started_lock:
+                started["n"] += 1
+                if started["n"] >= 2:
+                    both_started.set()
+            assert hold.wait(timeout=1.0)
+            yield from super().synthesize(text, syn_config)
+
+    def fake_create(path: Path):
+        return HoldingVoice(path)
+
+    monkeypatch.setattr(piper_pool, "_create_piper_voice", fake_create)
+    monkeypatch.setenv("PIPER_POOL_SLOTS", "2")
+
+    piper_pool.warm_voice_models([model_path], request_id="parallel")
+    deadline = time.perf_counter() + 2.0
+    while time.perf_counter() < deadline:
+        if piper_pool.model_replica_counts_for_tests().get(str(model_path), 0) >= 2:
+            break
+        time.sleep(0.02)
+    assert piper_pool.model_replica_counts_for_tests()[str(model_path)] == 2
+
+    results: dict[str, bool] = {}
+
+    def run_synth(name: str, out: Path):
+        piper_pool.synthesize_wav_file(
+            model_path,
+            out,
+            "hello",
+            length_scale=1.0,
+            noise_scale=0.5,
+            noise_w=0.5,
+            sentence_silence=0.0,
+        )
+        results[name] = True
+
+    t1 = threading.Thread(target=run_synth, args=("a", tmp_path / "a.wav"))
+    t2 = threading.Thread(target=run_synth, args=("b", tmp_path / "b.wav"))
+    t1.start()
+    t2.start()
+    assert both_started.wait(timeout=1.0)
+    hold.set()
+    t1.join(timeout=1.0)
+    t2.join(timeout=1.0)
+    assert results == {"a": True, "b": True}
+
+
 def test_get_voice_retries_after_warm_failure(monkeypatch, tmp_path):
     piper_pool.clear_pool_for_tests()
-    model_path = tmp_path / "flaky.onnx"
-    model_path.write_bytes(b"onnx")
+    model_path = _write_onnx_with_speakers(tmp_path / "flaky.onnx", 1)
     calls = {"n": 0}
 
     def fake_create(path: Path):
@@ -185,25 +304,27 @@ def test_get_voice_retries_after_warm_failure(monkeypatch, tmp_path):
         return _FakeVoice(path)
 
     monkeypatch.setattr(piper_pool, "_create_piper_voice", fake_create)
+    monkeypatch.setenv("PIPER_POOL_SLOTS", "1")
 
     piper_pool.warm_voice_models([model_path], request_id="warm-fail")
     time.sleep(0.08)
 
-    voice, _lock = piper_pool._get_voice_and_lock(model_path)
-    assert voice.model_path == model_path
+    instance = piper_pool._acquire_instance(model_path)
+    assert instance.voice.model_path == model_path
     assert calls["n"] == 2
+    piper_pool._release_instance(instance)
 
 
 def test_waiter_waits_for_inflight_retry_instead_of_stale_error(monkeypatch, tmp_path):
     piper_pool.clear_pool_for_tests()
-    model_path = tmp_path / "race.onnx"
-    model_path.write_bytes(b"onnx")
+    model_path = _write_onnx_with_speakers(tmp_path / "race.onnx", 1)
     key = str(model_path)
 
-    slot = piper_pool._VoiceSlot()
-    slot.error = OSError("first failure")
-    slot.ready.set()
-    piper_pool._SLOTS[key] = slot
+    entry = piper_pool._ModelEntry(model_path, 1)
+    entry.target_count = 1
+    entry.error = OSError("first failure")
+    entry.ready.set()
+    piper_pool._MODELS[key] = entry
 
     retry_started = threading.Event()
     allow_retry_done = threading.Event()
@@ -214,12 +335,14 @@ def test_waiter_waits_for_inflight_retry_instead_of_stale_error(monkeypatch, tmp
         return _FakeVoice(path)
 
     monkeypatch.setattr(piper_pool, "_create_piper_voice", fake_create)
+    monkeypatch.setenv("PIPER_POOL_SLOTS", "1")
 
     waiter_result: dict[str, Any] = {}
 
     def waiter():
-        voice, _lock = piper_pool._get_voice_and_lock(model_path)
-        waiter_result["voice"] = voice
+        instance = piper_pool._acquire_instance(model_path)
+        waiter_result["voice"] = instance.voice
+        piper_pool._release_instance(instance)
 
     waiter_thread = threading.Thread(target=waiter)
     waiter_thread.start()
@@ -227,11 +350,105 @@ def test_waiter_waits_for_inflight_retry_instead_of_stale_error(monkeypatch, tmp
     assert retry_started.wait(timeout=1.0)
 
     with piper_pool._POOL_LOCK:
-        active = piper_pool._SLOTS[key]
-        assert active.loading is True
+        active = piper_pool._MODELS[key]
+        assert active.inflight >= 1
         assert active.error is None
 
     allow_retry_done.set()
     waiter_thread.join(timeout=1.0)
 
     assert waiter_result["voice"].model_path == model_path
+
+
+class _ReentrancyDetectLock:
+    """threading.Lock stand-in that fails fast on same-thread re-acquire."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._owner: int | None = None
+        self._count = 0
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        me = threading.get_ident()
+        if self._owner == me:
+            raise RuntimeError("reentrant _POOL_LOCK acquire")
+        ok = self._lock.acquire(blocking, timeout) if timeout >= 0 else self._lock.acquire(blocking)
+        if ok:
+            self._owner = me
+            self._count += 1
+        return ok
+
+    def release(self) -> None:
+        self._owner = None
+        self._count -= 1
+        self._lock.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.release()
+
+
+def test_acquire_error_retry_does_not_reenter_pool_lock(monkeypatch, tmp_path):
+    """Regression: error retry must not call _kick_loaders while holding _POOL_LOCK."""
+    piper_pool.clear_pool_for_tests()
+    model_path = _write_onnx_with_speakers(tmp_path / "retry.onnx", 1)
+    key = str(model_path)
+
+    entry = piper_pool._ModelEntry(model_path, 1)
+    entry.target_count = 1
+    entry.error = OSError("stale")
+    entry.ready.set()
+    piper_pool._MODELS[key] = entry
+
+    detect = _ReentrancyDetectLock()
+    monkeypatch.setattr(piper_pool, "_POOL_LOCK", detect)
+    monkeypatch.setenv("PIPER_POOL_SLOTS", "1")
+
+    def fake_create(path: Path):
+        return _FakeVoice(path)
+
+    monkeypatch.setattr(piper_pool, "_create_piper_voice", fake_create)
+
+    instance = piper_pool._acquire_instance(model_path)
+    assert instance.voice.model_path == model_path
+    piper_pool._release_instance(instance)
+
+
+def test_slow_warm_completes_while_acquire_waits(monkeypatch, tmp_path):
+    """Regression: acquire must not hold _POOL_LOCK while waiting on ready."""
+    piper_pool.clear_pool_for_tests()
+    model_path = _write_onnx_with_speakers(tmp_path / "slow-warm.onnx", 1)
+
+    load_started = threading.Event()
+    release_load = threading.Event()
+
+    def slow_create(path: Path):
+        load_started.set()
+        assert release_load.wait(timeout=2.0)
+        return _FakeVoice(path)
+
+    monkeypatch.setattr(piper_pool, "_create_piper_voice", slow_create)
+    monkeypatch.setenv("PIPER_POOL_SLOTS", "1")
+
+    result: dict[str, Any] = {}
+
+    def waiter():
+        instance = piper_pool._acquire_instance(model_path)
+        result["voice"] = instance.voice
+        piper_pool._release_instance(instance)
+
+    thread = threading.Thread(target=waiter)
+    thread.start()
+    assert load_started.wait(timeout=1.0)
+
+    # While loader is blocked, pool lock must still be acquirable (acquire is waiting unlocked).
+    assert piper_pool._POOL_LOCK.acquire(timeout=0.5)
+    piper_pool._POOL_LOCK.release()
+
+    release_load.set()
+    thread.join(timeout=2.0)
+    assert thread.is_alive() is False
+    assert result["voice"].model_path == model_path
