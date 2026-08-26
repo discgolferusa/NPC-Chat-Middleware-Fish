@@ -5,15 +5,14 @@ Dedicated DM channel: messages, pending verification checks, and automatic rulin
 from __future__ import annotations
 
 import re
-import sqlite3
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
-import db_paths
+import memory_db
 
-# Reassigned by server.py after game_api.env load; tests may monkeypatch this.
-MEMORY_DB = db_paths.MEMORY_DB
+# Reassigned by server.py after game_api.env load; tests may monkeypatch MEMORY_DB
+# (SQLite path) or memory_db.CONFIG.
+MEMORY_DB = memory_db.MEMORY_DB
 
 # Existing unscoped rows are attributed to this campaign on first migration.
 LEGACY_CAMPAIGN_BACKFILL_ID = "greyhaven_intro"
@@ -70,32 +69,19 @@ def _assert_safe_table(table: str) -> str:
     return table
 
 
-def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
-    _assert_safe_table(table)
-    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+def _table_columns(conn: memory_db.DbConnection, table: str) -> set[str]:
+    return memory_db.table_columns(conn, table, _ALLOWED_SQL_TABLES)
 
 
 def ensure_campaign_id_column(
-    conn: sqlite3.Connection,
+    conn: memory_db.DbConnection,
     table: str,
     *,
     backfill: str = LEGACY_CAMPAIGN_BACKFILL_ID,
 ) -> None:
     """Add campaign_id if missing and backfill legacy empty rows once."""
-    _assert_safe_table(table)
-    columns = _table_columns(conn, table)
-    if "campaign_id" not in columns:
-        conn.execute(
-            f"ALTER TABLE {table} ADD COLUMN campaign_id TEXT NOT NULL DEFAULT ''"
-        )
-        if backfill:
-            conn.execute(
-                f"UPDATE {table} SET campaign_id = ? WHERE campaign_id = '' OR campaign_id IS NULL",
-                (backfill,),
-            )
-    conn.execute(
-        f"CREATE INDEX IF NOT EXISTS idx_{table}_campaign_npc_player "
-        f"ON {table} (campaign_id, npc_id, player_id)"
+    memory_db.ensure_campaign_id_column(
+        conn, table, _ALLOWED_SQL_TABLES, backfill=backfill
     )
 
 # Prefer an end-anchored tag; fall back to the last tag anywhere in the reply so
@@ -189,62 +175,21 @@ def _utc_now_iso() -> str:
 
 
 def get_db():
-    conn = sqlite3.connect(MEMORY_DB)
-    conn.row_factory = sqlite3.Row
-    return conn
+    """Open memory/DM DB using current memory_db.CONFIG (MySQL or SQLite)."""
+    # Prefer module CONFIG so server.refresh after game_api.env applies here too.
+    # Tests that only patch MEMORY_DB (SQLite path) still work via CONFIG sync.
+    if memory_db.CONFIG.is_sqlite and MEMORY_DB != memory_db.CONFIG.sqlite_path:
+        return memory_db.connect(
+            memory_db.MemoryDbConfig(backend="sqlite", sqlite_path=MEMORY_DB)
+        )
+    return memory_db.get_db()
 
 
 def init_dm_tables() -> None:
     with get_db() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS dm_messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                campaign_id TEXT NOT NULL DEFAULT '',
-                npc_id TEXT NOT NULL,
-                player_id TEXT NOT NULL,
-                content TEXT NOT NULL,
-                detected_verdict TEXT,
-                detected_claim TEXT,
-                detection_confidence REAL,
-                created_at TEXT NOT NULL
-            )
-        """)
-
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS dm_pending_checks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                campaign_id TEXT NOT NULL DEFAULT '',
-                npc_id TEXT NOT NULL,
-                player_id TEXT NOT NULL,
-                claim_summary TEXT NOT NULL,
-                player_text TEXT,
-                npc_text TEXT,
-                source TEXT NOT NULL DEFAULT 'npc',
-                status TEXT NOT NULL DEFAULT 'pending',
-                ruling_id INTEGER,
-                created_at TEXT NOT NULL,
-                resolved_at TEXT
-            )
-        """)
-
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS dm_rulings (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                campaign_id TEXT NOT NULL DEFAULT '',
-                npc_id TEXT NOT NULL,
-                player_id TEXT NOT NULL,
-                claim_summary TEXT NOT NULL,
-                verdict TEXT NOT NULL,
-                ruling_text TEXT NOT NULL,
-                source TEXT NOT NULL,
-                pending_check_id INTEGER,
-                created_at TEXT NOT NULL
-            )
-        """)
-
+        memory_db.init_dm_schema_tables(conn)
         for table in ("dm_messages", "dm_pending_checks", "dm_rulings"):
             ensure_campaign_id_column(conn, table)
-
         conn.commit()
 
 

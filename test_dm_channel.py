@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from dm_channel import (
     build_dm_injection_messages,
     detect_npc_deferral,
@@ -12,6 +14,32 @@ from dm_channel import (
     infer_claim_summary,
     strip_dm_check_tag,
 )
+
+
+@pytest.fixture()
+def dm_sqlite(tmp_path, monkeypatch):
+    """Isolate DM channel tests on a temp SQLite file (ignore host MySQL env)."""
+    import dm_channel
+    import memory_db
+
+    for key in (
+        "MEMORY_MYSQL_HOST",
+        "MEMORY_MYSQL_PORT",
+        "MEMORY_MYSQL_DATABASE",
+        "MEMORY_MYSQL_USER",
+        "MEMORY_MYSQL_PASSWORD",
+        "MEMORY_MYSQL_CHARSET",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    mem_db = (tmp_path / "dm_test.db").resolve()
+    monkeypatch.setenv("MEMORY_DB", str(mem_db))
+    cfg = memory_db.MemoryDbConfig(backend="sqlite", sqlite_path=mem_db)
+    monkeypatch.setattr(memory_db, "CONFIG", cfg)
+    monkeypatch.setattr(memory_db, "MEMORY_DB", mem_db)
+    monkeypatch.setattr(dm_channel, "MEMORY_DB", mem_db)
+    dm_channel.init_dm_tables()
+    return dm_channel, mem_db
 
 
 def test_strip_dm_check_tag_extracts_claim():
@@ -115,13 +143,9 @@ def test_format_dm_context_and_injection():
     assert messages
 
 
-def test_process_npc_response_keeps_distinct_dm_checks(tmp_path, monkeypatch):
+def test_process_npc_response_keeps_distinct_dm_checks(dm_sqlite):
     """Same player_text must not collapse unrelated [DM CHECK] claims into one pending."""
-    import dm_channel
-
-    mem_db = tmp_path / "dm_multi_check.db"
-    monkeypatch.setattr(dm_channel, "MEMORY_DB", mem_db)
-    dm_channel.init_dm_tables()
+    dm_channel, _mem_db = dm_sqlite
 
     result = dm_channel.process_npc_response(
         "npc_x",
@@ -150,12 +174,8 @@ def test_process_npc_response_keeps_distinct_dm_checks(tmp_path, monkeypatch):
     assert len(pending) >= 2
 
 
-def test_save_pending_check_skips_when_claim_already_ruled(tmp_path, monkeypatch):
-    import dm_channel
-
-    mem_db = tmp_path / "dm_skip_ruled.db"
-    monkeypatch.setattr(dm_channel, "MEMORY_DB", mem_db)
-    dm_channel.init_dm_tables()
+def test_save_pending_check_skips_when_claim_already_ruled(dm_sqlite):
+    dm_channel, _mem_db = dm_sqlite
 
     dm_channel.create_manual_ruling(
         npc_id="captain_varra",
@@ -184,13 +204,9 @@ def test_save_pending_check_skips_when_claim_already_ruled(tmp_path, monkeypatch
     assert pending == []
 
 
-def test_save_pending_check_allows_distinct_claim_after_unrelated_ruling(tmp_path, monkeypatch):
+def test_save_pending_check_allows_distinct_claim_after_unrelated_ruling(dm_sqlite):
     """Shared generic tokens must not suppress a different claim under strict coverage."""
-    import dm_channel
-
-    mem_db = tmp_path / "dm_distinct_claim.db"
-    monkeypatch.setattr(dm_channel, "MEMORY_DB", mem_db)
-    dm_channel.init_dm_tables()
+    dm_channel, _mem_db = dm_sqlite
 
     dm_channel.create_manual_ruling(
         npc_id="captain_varra",
@@ -226,12 +242,8 @@ def test_save_pending_check_allows_distinct_claim_after_unrelated_ruling(tmp_pat
     assert any("slaadi" in row["claim_summary"].lower() for row in pending)
 
 
-def test_process_npc_response_can_strip_tags_without_creating_pending(tmp_path, monkeypatch):
-    import dm_channel
-
-    mem_db = tmp_path / "dm_no_create.db"
-    monkeypatch.setattr(dm_channel, "MEMORY_DB", mem_db)
-    dm_channel.init_dm_tables()
+def test_process_npc_response_can_strip_tags_without_creating_pending(dm_sqlite):
+    dm_channel, _mem_db = dm_sqlite
 
     result = dm_channel.process_npc_response(
         "captain_varra",
@@ -252,12 +264,8 @@ def test_process_npc_response_can_strip_tags_without_creating_pending(tmp_path, 
     ) == []
 
 
-def test_process_npc_response_holds_dialogue_while_existing_pending(tmp_path, monkeypatch):
-    import dm_channel
-
-    mem_db = tmp_path / "dm_hold_existing.db"
-    monkeypatch.setattr(dm_channel, "MEMORY_DB", mem_db)
-    dm_channel.init_dm_tables()
+def test_process_npc_response_holds_dialogue_while_existing_pending(dm_sqlite):
+    dm_channel, _mem_db = dm_sqlite
     dm_channel.save_pending_check(
         npc_id="captain_varra",
         player_id="player_alden",
@@ -299,13 +307,9 @@ def test_assistant_history_text_skips_wait_narration():
     }) == "Very well."
 
 
-def test_dm_console_loaders_are_campaign_wide_across_players(tmp_path, monkeypatch):
+def test_dm_console_loaders_are_campaign_wide_across_players(dm_sqlite):
     """DM console must see every player's pending checks / rulings in a campaign."""
-    import dm_channel
-
-    mem_db = tmp_path / "dm_console_scope.db"
-    monkeypatch.setattr(dm_channel, "MEMORY_DB", mem_db)
-    dm_channel.init_dm_tables()
+    dm_channel, _mem_db = dm_sqlite
 
     first = dm_channel.save_pending_check(
         npc_id="captain_varra",
@@ -361,12 +365,8 @@ def test_dm_console_loaders_are_campaign_wide_across_players(tmp_path, monkeypat
     assert any(row["player_id"] == "player_alden" for row in rulings)
 
 
-def test_dismiss_pending_check_marks_ignored_without_ruling(tmp_path, monkeypatch):
-    import dm_channel
-
-    mem_db = tmp_path / "dm_dismiss.db"
-    monkeypatch.setattr(dm_channel, "MEMORY_DB", mem_db)
-    dm_channel.init_dm_tables()
+def test_dismiss_pending_check_marks_ignored_without_ruling(dm_sqlite):
+    dm_channel, _mem_db = dm_sqlite
 
     pending_id = dm_channel.save_pending_check(
         npc_id="captain_varra",
@@ -401,13 +401,10 @@ def test_dismiss_pending_check_marks_ignored_without_ruling(tmp_path, monkeypatc
         dm_channel.dismiss_pending_check(pending_id)
 
 
-def test_dismiss_pending_check_rejects_already_ruled(tmp_path, monkeypatch):
+def test_dismiss_pending_check_rejects_already_ruled(dm_sqlite):
     import pytest
-    import dm_channel
 
-    mem_db = tmp_path / "dm_dismiss_ruled.db"
-    monkeypatch.setattr(dm_channel, "MEMORY_DB", mem_db)
-    dm_channel.init_dm_tables()
+    dm_channel, _mem_db = dm_sqlite
 
     pending_id = dm_channel.save_pending_check(
         npc_id="captain_varra",
@@ -441,13 +438,9 @@ def test_dismiss_pending_check_rejects_already_ruled(tmp_path, monkeypatch):
     assert still["status"] == "confirmed"
 
 
-def test_clear_dm_data_all_players_removes_other_speakers_rulings(tmp_path, monkeypatch):
+def test_clear_dm_data_all_players_removes_other_speakers_rulings(dm_sqlite):
     """DM clear must wipe language Denies stored under the speaking player_id."""
-    import dm_channel
-
-    mem_db = tmp_path / "dm_clear_all_players.db"
-    monkeypatch.setattr(dm_channel, "MEMORY_DB", mem_db)
-    dm_channel.init_dm_tables()
+    dm_channel, _mem_db = dm_sqlite
 
     campaign = "greyhaven_intro"
     npc = "slaad_guard"
