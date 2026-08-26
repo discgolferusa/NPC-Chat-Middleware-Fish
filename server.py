@@ -1526,6 +1526,7 @@ def run_dm_ruling_auto_response(
             npc_text_raw,
             campaign_id=campaign_id,
             create_pending_checks=False,
+            npc=npc,
         )
         npc_text = npc_response["spoken_text"]
 
@@ -2894,8 +2895,9 @@ def npc_turn():
             player_text,
             npc_text_raw,
             player_pending_id=player_claim.get("pending_check_id") if player_claim else None,
-                campaign_id=campaign_id,
-            )
+            campaign_id=campaign_id,
+            npc=npc,
+        )
         npc_text = npc_response["spoken_text"]
 
         ensure_turn_in_progress(request_id)
@@ -3172,8 +3174,9 @@ def npc_voice_turn():
             player_text,
             npc_text_raw,
             player_pending_id=player_claim.get("pending_check_id") if player_claim else None,
-                campaign_id=campaign_id,
-            )
+            campaign_id=campaign_id,
+            npc=npc,
+        )
         npc_text = npc_response["spoken_text"]
 
         tts_segments = split_into_ordered_tts_segments(npc_text)
@@ -3520,8 +3523,9 @@ def npc_voice_turn_debug():
             player_text,
             npc_text_raw,
             player_pending_id=player_claim.get("pending_check_id") if player_claim else None,
-                campaign_id=campaign_id,
-            )
+            campaign_id=campaign_id,
+            npc=npc,
+        )
         npc_text = npc_response["spoken_text"]
 
         tts_segments = split_narration_and_dialogue(npc_text)

@@ -4,6 +4,12 @@ llm_rules:
 - If NPC-specific rules require nonverbal-only replies, language incomprehension, or
   a mandatory [DM CHECK], follow those rules exactly and do not add spoken dialogue.
 - Speak only as this NPC.
+- >-
+  Do not prefix your reply with the NPC's name or a script label like "Name:".
+  The client already shows who is speaking.
+- >-
+  Never write checklist or meta lines about DM tags (for example "Check for DM tag none").
+  Either append a real machine-only [DM CHECK: …] tag, or omit it — never narrate that decision.
 - Always use the NPC's listed gender/identity and pronouns. Do not infer gender from
   the voice model, name, role, or scene.
 - When the prompt includes another NPC's gender/pronouns with their public facts, use

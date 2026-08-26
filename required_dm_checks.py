@@ -15,6 +15,7 @@ import re
 import threading
 from typing import Any, Callable
 
+from sanitize_npc_reply import sanitize_npc_reply_text
 from stage_directions import normalize_stage_directions
 
 DM_CHECK_IN_RULES_PATTERN = re.compile(
@@ -785,16 +786,23 @@ def generate_npc_reply_text(
     Stage-direction placement is normalized on the way out: every reply path here
     ends up as ``npc_text``, so this is the one place that can hold the llm_rules
     contract for all of text, voice, and post-ruling turns.
+
+    Speaker-name prefixes and DM-tag checklist leakage are stripped here so Piper
+    and shared transcripts never speak/show them. Discord captions still add
+    ``**Name:**`` from ``npc_name`` when a transcript channel is assigned.
     """
-    return normalize_stage_directions(
-        _generate_npc_reply_text(
-            npc,
-            dm_context,
-            messages,
-            ask_llm_fn,
-            player_text=player_text,
-            enforce_required_dm_checks=enforce_required_dm_checks,
-        )
+    return sanitize_npc_reply_text(
+        normalize_stage_directions(
+            _generate_npc_reply_text(
+                npc,
+                dm_context,
+                messages,
+                ask_llm_fn,
+                player_text=player_text,
+                enforce_required_dm_checks=enforce_required_dm_checks,
+            )
+        ),
+        npc,
     )
 
 
