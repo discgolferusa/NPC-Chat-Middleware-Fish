@@ -236,6 +236,43 @@ def table_columns(conn: DbConnection, table: str, allowed: frozenset[str]) -> se
     return {row[1] for row in rows}
 
 
+def index_exists(
+    conn: DbConnection,
+    table: str,
+    index_name: str,
+    allowed: frozenset[str],
+) -> bool:
+    """True if ``index_name`` already exists on ``table``."""
+    if table not in allowed:
+        raise ValueError(f"Refusing unsafe SQL table name: {table}")
+    if conn.config.is_mysql:
+        # Oracle MySQL has no CREATE INDEX IF NOT EXISTS (MariaDB does).
+        rows = conn.execute(
+            """
+            SELECT 1 AS present
+            FROM INFORMATION_SCHEMA.STATISTICS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = ?
+              AND INDEX_NAME = ?
+            LIMIT 1
+            """,
+            (table, index_name),
+        ).fetchall()
+        return bool(rows)
+    rows = conn.execute(
+        """
+        SELECT 1 AS present
+        FROM sqlite_master
+        WHERE type = 'index'
+          AND name = ?
+          AND tbl_name = ?
+        LIMIT 1
+        """,
+        (index_name, table),
+    ).fetchall()
+    return bool(rows)
+
+
 def ensure_campaign_id_column(
     conn: DbConnection,
     table: str,
@@ -264,16 +301,9 @@ def ensure_campaign_id_column(
                 (backfill,),
             )
     index_name = f"idx_{table}_campaign_npc_player"
-    if conn.config.is_mysql:
-        # MySQL 8.0+ supports IF NOT EXISTS on indexes.
+    if not index_exists(conn, table, index_name, allowed):
         conn.execute(
-            f"CREATE INDEX IF NOT EXISTS {index_name} "
-            f"ON {table} (campaign_id, npc_id, player_id)"
-        )
-    else:
-        conn.execute(
-            f"CREATE INDEX IF NOT EXISTS {index_name} "
-            f"ON {table} (campaign_id, npc_id, player_id)"
+            f"CREATE INDEX {index_name} ON {table} (campaign_id, npc_id, player_id)"
         )
 
 
