@@ -171,8 +171,22 @@ def _register_model_locked(model_path: Path) -> _ModelEntry:
 
 
 def _start_loaders_locked(entry: _ModelEntry, request_id: str | None) -> list[threading.Thread]:
+    """
+    Start replica load threads up to the model target.
+
+    Cold path: only one loader until the first instance exists, so first-request
+    TTS is not slowed by N parallel ONNX loads contending for disk/RAM/CPU.
+    After the first replica is ready, callers top up to ``target_count``.
+    """
     threads: list[threading.Thread] = []
-    while _capacity_count(entry) < entry.target_count:
+    if not entry.instances:
+        if entry.inflight > 0:
+            return threads
+        desired = 1
+    else:
+        desired = entry.target_count
+
+    while _capacity_count(entry) < desired:
         entry.inflight += 1
         entry.error = None
         if not entry.instances:
@@ -187,23 +201,26 @@ def _start_loaders_locked(entry: _ModelEntry, request_id: str | None) -> list[th
     return threads
 
 
-def _store_loaded_replica(key: str, voice: Any) -> None:
+def _store_loaded_replica(key: str, voice: Any) -> list[threading.Thread]:
+    """Store a loaded replica and return any top-up loader threads to start."""
     with _POOL_LOCK:
         entry = _MODELS.get(key)
         if entry is None:
-            return
+            return []
         entry.inflight = max(0, entry.inflight - 1)
         if len(entry.instances) >= entry.target_count:
             # Target shrank while this replica was loading; discard it.
             entry.error = None
             if entry.instances:
                 entry.ready.set()
-            return
+            return []
         instance = _VoiceInstance(voice, key)
         entry.instances.append(instance)
         entry.error = None
         entry.ready.set()
         entry.free.put(instance)
+        # First replica is ready — fill remaining slots in the background.
+        return _start_loaders_locked(entry, None)
 
 
 def _store_load_error(key: str, error: BaseException) -> None:
@@ -221,7 +238,9 @@ def _load_voice_replica(model_path: Path, request_id: str | None) -> None:
     key = _voice_key(model_path)
     try:
         voice = _create_piper_voice(model_path)
-        _store_loaded_replica(key, voice)
+        topup_threads = _store_loaded_replica(key, voice)
+        for thread in topup_threads:
+            thread.start()
         with _POOL_LOCK:
             entry = _MODELS.get(key)
             live = len(entry.instances) if entry is not None else 0

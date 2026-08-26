@@ -138,6 +138,53 @@ def test_warm_splits_slots_by_speaker_count(monkeypatch, tmp_path):
     assert piper_pool.model_replica_counts_for_tests()[str(small)] == 1
 
 
+def test_cold_warm_loads_one_replica_before_topup(monkeypatch, tmp_path):
+    """Cold start must not run N parallel ONNX loads before the first replica is ready."""
+    piper_pool.clear_pool_for_tests()
+    model_path = _write_onnx_with_speakers(tmp_path / "solo.onnx", 50)
+
+    active = {"n": 0}
+    # Peak concurrency only while the first (bootstrap) create is in flight.
+    # Top-up creates after first_done must not participate — otherwise this assert races.
+    bootstrap_peak = {"n": 0}
+    first_done = threading.Event()
+    lock = threading.Lock()
+
+    def fake_create(path: Path):
+        with lock:
+            # Capture before any later create can see first_done; top-ups start only
+            # after this function returns and _store_loaded_replica kicks loaders.
+            was_bootstrap = not first_done.is_set()
+            active["n"] += 1
+            if was_bootstrap:
+                bootstrap_peak["n"] = max(bootstrap_peak["n"], active["n"])
+        if was_bootstrap:
+            time.sleep(0.05)
+        with lock:
+            active["n"] -= 1
+            if was_bootstrap:
+                first_done.set()
+        return _FakeVoice(path)
+
+    monkeypatch.setattr(piper_pool, "_create_piper_voice", fake_create)
+    monkeypatch.setenv("PIPER_POOL_SLOTS", "10")
+
+    piper_pool.warm_voice_models([model_path], request_id="bootstrap")
+    assert first_done.wait(timeout=1.0)
+
+    # Bootstrap was single-flighted (top-up overlap is allowed and ignored here).
+    assert bootstrap_peak["n"] == 1
+
+    deadline = time.perf_counter() + 2.0
+    while time.perf_counter() < deadline:
+        if piper_pool.model_replica_counts_for_tests().get(str(model_path), 0) == 10:
+            break
+        time.sleep(0.02)
+
+    assert piper_pool.model_targets_for_tests()[str(model_path)] == 10
+    assert piper_pool.model_replica_counts_for_tests()[str(model_path)] == 10
+
+
 def test_synthesize_wav_file_uses_pooled_voice(monkeypatch, tmp_path):
     piper_pool.clear_pool_for_tests()
     model_path = _write_onnx_with_speakers(tmp_path / "npc.onnx", 1)
