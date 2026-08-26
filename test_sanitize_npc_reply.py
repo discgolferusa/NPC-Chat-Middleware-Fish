@@ -60,3 +60,35 @@ def test_full_name_and_first_token_aliases():
     npc = {"name": "Mateo Rios"}
     assert sanitize_npc_spoken_body("Mateo Rios: Go.", npc) == "Go."
     assert sanitize_npc_spoken_body("Mateo: Go.", npc) == "Go."
+
+
+def test_leading_stage_direction_does_not_block_name_strip_or_dedupe():
+    """Regression: *beat* is not a sentence boundary; peel it before cleanup."""
+    leaked = (
+        "*Mateo braces against the bulkhead.* "
+        "Mercy shut the launch hard-wired. The port's sealed. No way to fire the engines. "
+        "You can't get out that way. You either load the manual override or stay."
+        "Check for DM tag none."
+        "Mateo: Mercy shut the launch hard-wired. The port's sealed. No way to fire the engines. "
+        "You can't get out that way. You either load the manual override or stay."
+    )
+    expected = (
+        "*Mateo braces against the bulkhead.* "
+        "Mercy shut the launch hard-wired. The port's sealed. No way to fire the engines. "
+        "You can't get out that way. You either load the manual override or stay."
+    )
+    assert sanitize_npc_spoken_body(leaked, MATEO) == expected
+
+
+def test_name_prefix_right_after_stage_direction_is_stripped():
+    assert (
+        sanitize_npc_spoken_body(
+            "*Mateo braces against the bulkhead.* Mateo: Hold the line.",
+            MATEO,
+        )
+        == "*Mateo braces against the bulkhead.* Hold the line."
+    )
+
+
+def test_stage_only_reply_is_preserved():
+    assert sanitize_npc_spoken_body("*Mateo stares.*", MATEO) == "*Mateo stares.*"

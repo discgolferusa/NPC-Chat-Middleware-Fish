@@ -11,6 +11,9 @@ from __future__ import annotations
 import re
 from typing import Any
 
+# Same shape as stage_directions / TTS segmenter — leading beat only.
+_LEADING_STAGE_DIRECTION = re.compile(r"^(\*[^*]{1,800}\*)(\s*)(.*)$", re.DOTALL)
+
 # Model self-checks about whether a [DM CHECK] is needed (not a real machine tag).
 _DM_META_LEAK_PATTERN = re.compile(
     r"(?:"
@@ -22,8 +25,6 @@ _DM_META_LEAK_PATTERN = re.compile(
     r"\.?",
     re.IGNORECASE,
 )
-
-_SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?…])\s+|\n+")
 
 
 def _npc_name_aliases(npc: dict[str, Any] | None) -> list[str]:
@@ -39,6 +40,34 @@ def _npc_name_aliases(npc: dict[str, Any] | None) -> list[str]:
     return sorted(set(aliases), key=len, reverse=True)
 
 
+def _split_leading_stage_direction(text: str) -> tuple[str, str]:
+    """
+    Peel a leading ``*beat*`` so name-strip / dedupe see dialogue only.
+
+    ``normalize_stage_directions`` always places the beat first; leaving it attached
+    would block ``Name:`` removal (``*…*`` is not a sentence boundary) and make
+    duplicate halves unequal.
+    """
+    raw = text or ""
+    match = _LEADING_STAGE_DIRECTION.match(raw)
+    if not match or not match.group(1).strip("*").strip():
+        return "", raw
+    stage = match.group(1)
+    body = match.group(3)
+    return stage, body
+
+
+def _rejoin_stage_direction(stage: str, body: str) -> str:
+    body = (body or "").strip()
+    if not stage:
+        return body
+    if not body:
+        return stage
+    if body.startswith("\n"):
+        return f"{stage}{body}"
+    return f"{stage} {body}"
+
+
 def _strip_speaker_prefixes(text: str, aliases: list[str]) -> str:
     """Remove script-style ``Name:`` labels the model invents; UI/Discord re-add them."""
     if not text or not aliases:
@@ -46,9 +75,9 @@ def _strip_speaker_prefixes(text: str, aliases: list[str]) -> str:
     out = text
     for alias in aliases:
         escaped = re.escape(alias)
-        # Start of reply or after a newline / sentence end.
+        # Start of reply / after newline / sentence end / closed stage-direction *.
         pattern = re.compile(
-            rf"(^|(?<=\n)|(?<=[.!?…])\s*){escaped}\s*:\s*",
+            rf"(^|(?<=\n)|(?<=[.!?…])\s*|(?<=\*)\s*){escaped}\s*:\s*",
             re.IGNORECASE,
         )
         out = pattern.sub(r"\1", out)
@@ -105,10 +134,14 @@ def sanitize_npc_spoken_body(text: str, npc: dict[str, Any] | None = None) -> st
     Clean spoken dialogue only (no ``[DM CHECK:…]`` tags).
 
     Safe to run on ``spoken_text`` after tag extraction, or on TTS segment bodies.
+    Leading stage directions are preserved and reattached after dialogue cleanup.
     """
     body = (text or "").strip()
     if not body:
         return ""
+
+    stage, body = _split_leading_stage_direction(body)
+    body = body.strip() if stage else body
 
     aliases = _npc_name_aliases(npc)
     body = _strip_dm_meta_leaks(body)
@@ -118,7 +151,7 @@ def sanitize_npc_spoken_body(text: str, npc: dict[str, Any] | None = None) -> st
     body = _collapse_exact_duplicate_body(body)
     body = re.sub(r"[ \t]{2,}", " ", body)
     body = re.sub(r"\n{3,}", "\n\n", body)
-    return body.strip()
+    return _rejoin_stage_direction(stage, body.strip())
 
 
 def sanitize_npc_reply_text(text: str, npc: dict[str, Any] | None = None) -> str:
