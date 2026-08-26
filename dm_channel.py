@@ -1217,8 +1217,14 @@ def process_npc_response(
     player_pending_id: int | None = None,
     campaign_id: str = "",
     create_pending_checks: bool = True,
+    npc: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     spoken_text, dm_check_claims = extract_dm_check_tags(npc_text)
+    # Safety net for paths that skip generate_npc_reply_text (e.g. /dm/speak).
+    # Discord/browser still label speakers from npc_name; this only cleans the body.
+    from sanitize_npc_reply import sanitize_npc_spoken_body
+
+    spoken_text = sanitize_npc_spoken_body(spoken_text, npc)
     pending_id = None
     pending_ids: list[int] = []
     pending_source = None

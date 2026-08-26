@@ -1065,3 +1065,77 @@ def test_dm_pending_dismiss_rejects_already_confirmed(api):
     assert "already confirmed" in str(body.get("error") or "").lower()
     assert (body.get("check") or {}).get("status") == "confirmed"
 
+
+def test_npc_turn_strips_dm_meta_leak_and_script_name_for_tts(api, monkeypatch):
+    """Leaked DM-tag checklist / Name: prefixes must not reach npc_text or Piper."""
+    client, server, headers = api
+    npc_id = "mateo_leak_npc"
+    player_id = "player_alden"
+
+    mateo = {
+        "id": npc_id,
+        "name": "Mateo",
+        "role": "crew",
+        "location_id": "greyhaven",
+        "personality": ["tense"],
+        "public_facts": [],
+        "known_facts": [],
+        "secrets": [],
+        "voice": ["gruff"],
+        "llm_rules": [],
+    }
+
+    leaked = (
+        "Mercy shut the launch hard-wired. The port's sealed. No way to fire the engines. "
+        "You can't get out that way. You either load the manual override or stay."
+        "Check for DM tag none."
+        "Mateo: Mercy shut the launch hard-wired. The port's sealed. No way to fire the engines. "
+        "You can't get out that way. You either load the manual override or stay."
+    )
+    clean = (
+        "Mercy shut the launch hard-wired. The port's sealed. No way to fire the engines. "
+        "You can't get out that way. You either load the manual override or stay."
+    )
+
+    monkeypatch.setattr(server, "load_npc", lambda _id: dict(mateo))
+    monkeypatch.setattr(server, "ask_llm", lambda _messages: leaked)
+
+    tts_bodies: list[str] = []
+
+    def _fake_tts(*, npc_text, **_kwargs):
+        tts_bodies.append(npc_text)
+        return {
+            "clips": [],
+            "narration_text": "",
+            "dialogue_text": npc_text,
+            "speech_path": None,
+            "narration_path": None,
+            "pending": False,
+        }
+
+    monkeypatch.setattr(server, "synthesize_segmented_speech_clips", _fake_tts)
+
+    turn = client.post(
+        "/npc-turn",
+        headers=headers,
+        json={
+            "npc_id": npc_id,
+            "text": "What do you mean, Mercy stopped it?",
+            "scene": {"description": "Launch bay"},
+            "history": [],
+            "player_id": player_id,
+            "include_audio": True,
+        },
+    )
+    assert turn.status_code == 200
+    body = turn.get_json()
+    reply = (body.get("npc_text") or body.get("dialogue_text") or "").strip()
+    assert reply == clean
+    assert "Check for DM tag" not in reply
+    assert not reply.lower().startswith("mateo:")
+    assert "Mateo:" not in reply
+    assert tts_bodies
+    assert tts_bodies[0] == clean
+    # Clients (Discord captions / browser) still receive npc_name to label the speaker.
+    assert (body.get("npc_name") or "").strip() == "Mateo"
+
