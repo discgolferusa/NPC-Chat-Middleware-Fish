@@ -12,6 +12,7 @@ import scene_state
 def test_api_fixture_isolates_on_disk_paths(api):
     client, server, headers = api
 
+    assert server.MEMORY_DB_CONFIG.is_sqlite
     assert server.MEMORY_DB.resolve() != (server.BASE_DIR / "npc_memory.db").resolve()
     assert server.UPLOAD_DIR.resolve() != (server.BASE_DIR / "uploads").resolve()
     assert server.OUTPUT_DIR.resolve() != (server.BASE_DIR / "outputs").resolve()

@@ -5,7 +5,6 @@ import secrets
 import yaml
 import re
 import json
-import sqlite3
 import base64
 from datetime import datetime
 from pathlib import Path
@@ -148,8 +147,9 @@ from tts_processing import (
 )
 from piper_paths import LEGACY_WINDOWS_PIPER_EXE, resolve_piper_exe
 import piper_pool
-from db_paths import MEMORY_DB as _SHARED_MEMORY_DB
-from db_paths import refresh_memory_db, resolve_memory_db
+import memory_db
+from memory_db import MEMORY_DB as _SHARED_MEMORY_DB
+from memory_db import refresh_memory_db, refresh_memory_db_config
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -158,8 +158,9 @@ LOCATION_DIR = BASE_DIR / "locations"
 UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", str(BASE_DIR / "uploads")))
 OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", str(BASE_DIR / "outputs")))
 
-# Kept in sync with dm_channel.MEMORY_DB (see refresh after game_api.env load).
+# Kept in sync with dm_channel / memory_db after game_api.env load.
 MEMORY_DB = _SHARED_MEMORY_DB
+MEMORY_DB_CONFIG = memory_db.CONFIG
 
 PARTIES_DIR = BASE_DIR / "parties"
 CAMPAIGNS_DIR = BASE_DIR / "campaigns"
@@ -217,11 +218,11 @@ GAME_API_ENV_FILE = BASE_DIR / "game_api.env"
 
 
 def _load_game_api_env_file() -> None:
-    """Load GAME_API_* from game_api.env.
+    """Load GAME_API_* and MEMORY_* from game_api.env.
 
-    File values win for GAME_API_* keys so a stale shell export cannot silently
-    override the secrets file ops edited and verified.
-    Non-GAME_API_* keys still only fill gaps (shell wins).
+    File values win for GAME_API_* / MEMORY_MYSQL_* / MEMORY_DB so a stale shell
+    export cannot silently override the secrets file ops edited and verified.
+    Other keys still only fill gaps (shell wins).
     """
     if not GAME_API_ENV_FILE.exists():
         return
@@ -238,7 +239,7 @@ def _load_game_api_env_file() -> None:
             value = value.strip().strip('"').strip("'")
             if not key:
                 continue
-            if key.startswith("GAME_API_"):
+            if key.startswith("GAME_API_") or key.startswith("MEMORY_MYSQL_") or key == "MEMORY_DB":
                 os.environ[key] = value
                 applied.append(key)
                 continue
@@ -260,9 +261,19 @@ def _load_game_api_env_file() -> None:
 
 _load_game_api_env_file()
 
-# Re-bind after game_api.env so MEMORY_DB from the file applies to NPC + DM tables.
+# Re-bind after game_api.env so MEMORY_MYSQL_* / MEMORY_DB apply to NPC + DM tables.
+MEMORY_DB_CONFIG = refresh_memory_db_config()
 MEMORY_DB = refresh_memory_db()
 dm_channel.MEMORY_DB = MEMORY_DB
+if MEMORY_DB_CONFIG.is_mysql:
+    print(
+        f"[MEMORY_DB] MySQL {MEMORY_DB_CONFIG.mysql_user}@"
+        f"{MEMORY_DB_CONFIG.mysql_host}:{MEMORY_DB_CONFIG.mysql_port}/"
+        f"{MEMORY_DB_CONFIG.mysql_database}",
+        flush=True,
+    )
+else:
+    print(f"[MEMORY_DB] SQLite {MEMORY_DB}", flush=True)
 
 # Prefer PIPER_EXE / PATH; fall back to legacy Windows path for local Funnel/dev.
 try:
@@ -600,39 +611,19 @@ def _header_b64(value: str | None, *, max_chars: int = 6000) -> str:
 
 
 def get_db():
-    conn = sqlite3.connect(MEMORY_DB)
-    conn.row_factory = sqlite3.Row
-    return conn
+    """Open memory/DM DB (MySQL when MEMORY_MYSQL_HOST is set, else SQLite)."""
+    if memory_db.CONFIG.is_sqlite and MEMORY_DB != memory_db.CONFIG.sqlite_path:
+        return memory_db.connect(
+            memory_db.MemoryDbConfig(backend="sqlite", sqlite_path=MEMORY_DB)
+        )
+    return memory_db.get_db()
 
 
 def init_memory_db():
     with get_db() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS conversation_turns (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                campaign_id TEXT NOT NULL DEFAULT '',
-                npc_id TEXT NOT NULL,
-                player_id TEXT NOT NULL,
-                role TEXT NOT NULL,
-                content TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            )
-        """)
-
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS npc_memories (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                campaign_id TEXT NOT NULL DEFAULT '',
-                npc_id TEXT NOT NULL,
-                player_id TEXT NOT NULL,
-                memory TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            )
-        """)
-
+        memory_db.init_npc_memory_tables(conn)
         ensure_campaign_id_column(conn, "conversation_turns")
         ensure_campaign_id_column(conn, "npc_memories")
-
         conn.commit()
 
     init_dm_tables()

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import importlib
-import sqlite3
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -31,13 +30,22 @@ if "faster_whisper" not in sys.modules:
 def api(monkeypatch, tmp_path):
     """Authenticated Flask client with fully isolated on-disk side effects.
 
-    Redirects MEMORY_DB (including module-level init during reload), UPLOAD_DIR,
-    OUTPUT_DIR, and session/scene runtime config files into ``tmp_path`` so tests
-    cannot overwrite a developer's local defaults or leave upload artifacts.
+    Uses a temp SQLite MEMORY_DB (MySQL env cleared), plus isolated UPLOAD_DIR,
+    OUTPUT_DIR, and session/scene runtime config files under ``tmp_path``.
     """
     monkeypatch.setenv("GAME_API_KEY", "test-secret-key")
     monkeypatch.setenv("REQUIRE_GAME_API_KEY", "false")
     monkeypatch.delenv("VOICES_DIR", raising=False)
+    # Force SQLite for unit/functional tests (do not hit a developer MySQL).
+    for key in (
+        "MEMORY_MYSQL_HOST",
+        "MEMORY_MYSQL_PORT",
+        "MEMORY_MYSQL_DATABASE",
+        "MEMORY_MYSQL_USER",
+        "MEMORY_MYSQL_PASSWORD",
+        "MEMORY_MYSQL_CHARSET",
+    ):
+        monkeypatch.delenv(key, raising=False)
 
     mem_db = (tmp_path / "npc_memory.db").resolve()
     upload_dir = tmp_path / "uploads"
@@ -47,31 +55,24 @@ def api(monkeypatch, tmp_path):
     upload_dir.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    monkeypatch.setenv("MEMORY_DB", str(mem_db))
+
     import dm_channel
+    import memory_db
     import party_campaign
     import scene_state
     import server
     import turn_progress
 
-    repo_memory_db = (Path(server.__file__).resolve().parent / "npc_memory.db").resolve()
-    real_connect = sqlite3.connect
-
-    def _connect(database, *args, **kwargs):
-        """Keep reload-time init_memory_db() off the developer npc_memory.db."""
-        try:
-            db_path = Path(database).resolve()
-        except (TypeError, ValueError, OSError):
-            return real_connect(database, *args, **kwargs)
-        if db_path == repo_memory_db:
-            return real_connect(str(mem_db), *args, **kwargs)
-        return real_connect(database, *args, **kwargs)
-
-    monkeypatch.setattr(sqlite3, "connect", _connect)
-
+    importlib.reload(memory_db)
     importlib.reload(dm_channel)
     importlib.reload(server)
 
+    cfg = memory_db.refresh_memory_db_config()
+    monkeypatch.setattr(memory_db, "CONFIG", cfg)
+    monkeypatch.setattr(memory_db, "MEMORY_DB", mem_db)
     monkeypatch.setattr(server, "MEMORY_DB", mem_db)
+    monkeypatch.setattr(server, "MEMORY_DB_CONFIG", cfg)
     monkeypatch.setattr(dm_channel, "MEMORY_DB", mem_db)
     monkeypatch.setattr(server, "UPLOAD_DIR", upload_dir)
     monkeypatch.setattr(server, "OUTPUT_DIR", output_dir)
