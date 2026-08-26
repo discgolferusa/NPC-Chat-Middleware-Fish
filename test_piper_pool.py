@@ -144,20 +144,26 @@ def test_cold_warm_loads_one_replica_before_topup(monkeypatch, tmp_path):
     model_path = _write_onnx_with_speakers(tmp_path / "solo.onnx", 50)
 
     active = {"n": 0}
-    max_active = {"n": 0}
+    # Peak concurrency only while the first (bootstrap) create is in flight.
+    # Top-up creates after first_done must not participate — otherwise this assert races.
+    bootstrap_peak = {"n": 0}
     first_done = threading.Event()
     lock = threading.Lock()
 
     def fake_create(path: Path):
         with lock:
+            # Capture before any later create can see first_done; top-ups start only
+            # after this function returns and _store_loaded_replica kicks loaders.
+            was_bootstrap = not first_done.is_set()
             active["n"] += 1
-            max_active["n"] = max(max_active["n"], active["n"])
-            in_bootstrap = not first_done.is_set()
-        if in_bootstrap:
+            if was_bootstrap:
+                bootstrap_peak["n"] = max(bootstrap_peak["n"], active["n"])
+        if was_bootstrap:
             time.sleep(0.05)
         with lock:
             active["n"] -= 1
-            first_done.set()
+            if was_bootstrap:
+                first_done.set()
         return _FakeVoice(path)
 
     monkeypatch.setattr(piper_pool, "_create_piper_voice", fake_create)
@@ -166,8 +172,8 @@ def test_cold_warm_loads_one_replica_before_topup(monkeypatch, tmp_path):
     piper_pool.warm_voice_models([model_path], request_id="bootstrap")
     assert first_done.wait(timeout=1.0)
 
-    # During the first load, at most one create should have been in flight.
-    assert max_active["n"] == 1
+    # Bootstrap was single-flighted (top-up overlap is allowed and ignored here).
+    assert bootstrap_peak["n"] == 1
 
     deadline = time.perf_counter() + 2.0
     while time.perf_counter() < deadline:
