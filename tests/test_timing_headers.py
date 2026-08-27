@@ -121,6 +121,7 @@ def test_note_request_llm_model_first_chat_write_wins():
         )
         assert g._timing_llm_model_id == "npc-turn-model"
         assert g._timing_llm_selected_model_id == "npc-primary"
+        request_timing.log_timing("rid", "llm npc response", time.perf_counter() - 0.01)
         resp = Response(response=b"RIFF", status=200, mimetype="audio/wav")
         request_timing.attach_timing_headers(resp, "rid", include_voice_phases=True)
         assert resp.headers.get("X-Llm-Model-Id") == "npc-turn-model"
