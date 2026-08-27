@@ -1516,6 +1516,18 @@ def _effective_provider_mode(model_id: str, provider_mode: str) -> str:
 def _set_active(provider: str, model_id: str, purpose: str = DEFAULT_PURPOSE) -> None:
     LAST_ACTIVE_PROVIDER[purpose] = provider
     LAST_ACTIVE_MODEL_ID[purpose] = model_id
+    # Request-local timing attribution (ignore process-wide races / async memory).
+    try:
+        import request_timing
+
+        selected = _get_purpose_model_id(purpose)
+        request_timing.note_request_llm_model(
+            active_model_id=model_id,
+            selected_model_id=selected,
+            purpose=purpose,
+        )
+    except Exception:
+        pass
 
 
 def _local_timeout_for_purpose(purpose: str) -> int:

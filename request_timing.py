@@ -49,6 +49,44 @@ VOICE_TTS_LABELS = frozenset(
 def begin_request_timing() -> None:
     g._timing_steps = []
     g._timing_start = time.perf_counter()
+    g._timing_llm_model_id = None
+    g._timing_llm_selected_model_id = None
+
+
+def note_request_llm_model(
+    *,
+    active_model_id: str | None,
+    selected_model_id: str | None = None,
+    purpose: str | None = None,
+) -> None:
+    """Bind the model used for this HTTP request (first chat write wins).
+
+    Process-wide LAST_ACTIVE_* is unsafe under concurrency; timing headers must
+    read request-local state so another turn or async memory extract cannot
+    steal attribution.
+    """
+    try:
+        from flask import has_request_context
+
+        if not has_request_context():
+            return
+    except Exception:
+        return
+
+    purpose_norm = str(purpose or "").strip().lower() or None
+    if purpose_norm and purpose_norm not in ("chat", "default"):
+        return
+
+    active = str(active_model_id or "").strip() or None
+    selected = str(selected_model_id or "").strip() or None
+    if not active and not selected:
+        return
+
+    # First chat LLM in this request owns turn attribution (NPC reply, not memory).
+    if active and not getattr(g, "_timing_llm_model_id", None):
+        g._timing_llm_model_id = active
+    if selected and not getattr(g, "_timing_llm_selected_model_id", None):
+        g._timing_llm_selected_model_id = selected
 
 
 def _parse_step_entry(step: str) -> tuple[str, int]:
@@ -112,13 +150,11 @@ def log_timing(request_id: str, label: str, start_time: float) -> float:
     return time.perf_counter()
 
 
-def _active_llm_model_headers() -> tuple[str | None, str | None]:
-    """Return (active_model_id, selected_model_id) for chat purpose when available."""
+def _request_llm_model_headers() -> tuple[str | None, str | None]:
+    """Return (active_model_id, selected_model_id) from this request only."""
     try:
-        import llm_router
-
-        active = str(llm_router.LAST_ACTIVE_MODEL_ID.get(llm_router.PURPOSE_CHAT) or "").strip() or None
-        selected = str(getattr(llm_router, "CURRENT_LLM_MODEL_ID", "") or "").strip() or None
+        active = str(getattr(g, "_timing_llm_model_id", None) or "").strip() or None
+        selected = str(getattr(g, "_timing_llm_selected_model_id", None) or "").strip() or None
         return active, selected
     except Exception:
         return None, None
@@ -138,7 +174,7 @@ def attach_timing_headers(
         response.headers[HeaderTotalMs] = str(max(0, middleware_total_ms))
 
     steps = getattr(g, "_timing_steps", None)
-    active_model_id, selected_model_id = _active_llm_model_headers()
+    active_model_id, selected_model_id = _request_llm_model_headers()
     if active_model_id:
         response.headers[HeaderLlmModelId] = active_model_id
     if selected_model_id:

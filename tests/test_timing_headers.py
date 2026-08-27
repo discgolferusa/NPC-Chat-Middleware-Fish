@@ -9,7 +9,7 @@ import pytest
 
 pytest.importorskip("flask")
 
-from flask import Flask, Response
+from flask import Flask, Response, g
 
 import request_timing
 
@@ -53,16 +53,15 @@ def test_build_voice_timing_phases_groups_steps_and_cumulative():
     assert phases["cumulative_ms"]["tts"] == 3360
 
 
-def test_attach_timing_headers_voice_phases_only_when_requested(monkeypatch):
+def test_attach_timing_headers_voice_phases_only_when_requested():
     app = Flask(__name__)
-    monkeypatch.setattr(
-        request_timing,
-        "_active_llm_model_headers",
-        lambda: ("openrouter-gpt-oss-20b", "openrouter-gpt-oss-20b"),
-    )
-
     with app.test_request_context("/npc-voice-turn", method="POST"):
         request_timing.begin_request_timing()
+        request_timing.note_request_llm_model(
+            active_model_id="openrouter-gpt-oss-20b",
+            selected_model_id="openrouter-gpt-oss-20b",
+            purpose="chat",
+        )
         step = time.perf_counter()
         step = request_timing.log_timing("rid", "save uploaded audio", step)
         step = request_timing.log_timing("rid", "llm npc response", step)
@@ -80,16 +79,65 @@ def test_attach_timing_headers_voice_phases_only_when_requested(monkeypatch):
         assert phases["model_id"] == "openrouter-gpt-oss-20b"
 
 
-def test_attach_timing_headers_includes_llm_model_id(monkeypatch):
+def test_attach_timing_headers_uses_request_local_model_not_process_wide(monkeypatch):
     app = Flask(__name__)
-    monkeypatch.setattr(
-        request_timing,
-        "_active_llm_model_headers",
-        lambda: ("openrouter-deepseek-v4-flash", "openrouter-gpt-oss-20b"),
-    )
+
+    class FakeRouter:
+        PURPOSE_CHAT = "chat"
+        LAST_ACTIVE_MODEL_ID = {"chat": "wrong-stolen-model"}
+        CURRENT_LLM_MODEL_ID = "wrong-stolen-model"
+
+    monkeypatch.setitem(__import__("sys").modules, "llm_router", FakeRouter())
+
     with app.test_request_context("/npc-turn", method="POST"):
         request_timing.begin_request_timing()
+        request_timing.note_request_llm_model(
+            active_model_id="openrouter-deepseek-v4-flash",
+            selected_model_id="openrouter-gpt-oss-20b",
+            purpose="chat",
+        )
+        # Simulate another concurrent call overwriting process-wide state.
+        FakeRouter.LAST_ACTIVE_MODEL_ID["chat"] = "wrong-stolen-model"
         resp = Response(response=b'{"ok":true}', status=200, mimetype="application/json")
         request_timing.attach_timing_headers(resp, "rid")
         assert resp.headers.get("X-Llm-Model-Id") == "openrouter-deepseek-v4-flash"
         assert resp.headers.get("X-Llm-Selected-Model-Id") == "openrouter-gpt-oss-20b"
+
+
+def test_note_request_llm_model_first_chat_write_wins():
+    app = Flask(__name__)
+    with app.test_request_context("/npc-voice-turn", method="POST"):
+        request_timing.begin_request_timing()
+        request_timing.note_request_llm_model(
+            active_model_id="npc-turn-model",
+            selected_model_id="npc-primary",
+            purpose="chat",
+        )
+        # Sync/async memory extraction must not steal attribution.
+        request_timing.note_request_llm_model(
+            active_model_id="memory-model",
+            selected_model_id="memory-primary",
+            purpose="chat",
+        )
+        assert g._timing_llm_model_id == "npc-turn-model"
+        assert g._timing_llm_selected_model_id == "npc-primary"
+        resp = Response(response=b"RIFF", status=200, mimetype="audio/wav")
+        request_timing.attach_timing_headers(resp, "rid", include_voice_phases=True)
+        assert resp.headers.get("X-Llm-Model-Id") == "npc-turn-model"
+        phases = json.loads(resp.headers["X-Timing-Phases"])
+        assert phases["model_id"] == "npc-turn-model"
+
+
+def test_note_request_llm_model_ignores_content_creation_purpose():
+    app = Flask(__name__)
+    with app.test_request_context("/npc-turn", method="POST"):
+        request_timing.begin_request_timing()
+        request_timing.note_request_llm_model(
+            active_model_id="content-model",
+            selected_model_id="content-model",
+            purpose="content_creation",
+        )
+        assert getattr(g, "_timing_llm_model_id", None) is None
+        resp = Response(response=b'{"ok":true}', status=200, mimetype="application/json")
+        request_timing.attach_timing_headers(resp, "rid")
+        assert "X-Llm-Model-Id" not in resp.headers
