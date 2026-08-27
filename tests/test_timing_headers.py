@@ -129,6 +129,60 @@ def test_note_request_llm_model_first_chat_write_wins():
         assert phases["model_id"] == "npc-turn-model"
 
 
+def test_attach_timing_headers_includes_routed_provider():
+    app = Flask(__name__)
+    with app.test_request_context("/npc-voice-turn", method="POST"):
+        request_timing.begin_request_timing()
+        request_timing.note_request_llm_model(
+            active_model_id="openrouter-gpt-oss-20b",
+            selected_model_id="openrouter-gpt-oss-20b",
+            provider="Amazon Bedrock",
+            purpose="chat",
+        )
+        request_timing.log_timing("rid", "llm npc response", time.perf_counter() - 0.01)
+        resp = Response(response=b"RIFF", status=200, mimetype="audio/wav")
+        request_timing.attach_timing_headers(resp, "rid", include_voice_phases=True)
+        assert resp.headers.get("X-Llm-Provider") == "Amazon Bedrock"
+        assert json.loads(resp.headers["X-Timing-Phases"])["provider"] == "Amazon Bedrock"
+
+
+def test_note_request_llm_model_provider_follows_first_attributed_model():
+    app = Flask(__name__)
+    with app.test_request_context("/npc-turn", method="POST"):
+        request_timing.begin_request_timing()
+        request_timing.note_request_llm_model(
+            active_model_id="openrouter-nemotron-3.5-lightning-coreweave",
+            selected_model_id="openrouter-nemotron-3.5-lightning-coreweave",
+            provider="CoreWeave",
+            purpose="chat",
+        )
+        # A later memory-extraction hop on another host must not relabel the turn.
+        request_timing.note_request_llm_model(
+            active_model_id="local",
+            selected_model_id="local",
+            provider="local",
+            purpose="chat",
+        )
+        resp = Response(response=b'{"ok":true}', status=200, mimetype="application/json")
+        request_timing.attach_timing_headers(resp, "rid")
+        assert resp.headers.get("X-Llm-Model-Id") == "openrouter-nemotron-3.5-lightning-coreweave"
+        assert resp.headers.get("X-Llm-Provider") == "CoreWeave"
+
+
+def test_attach_timing_headers_omits_provider_when_unknown():
+    app = Flask(__name__)
+    with app.test_request_context("/npc-turn", method="POST"):
+        request_timing.begin_request_timing()
+        request_timing.note_request_llm_model(
+            active_model_id="openrouter-gpt-oss-20b",
+            selected_model_id="openrouter-gpt-oss-20b",
+            purpose="chat",
+        )
+        resp = Response(response=b'{"ok":true}', status=200, mimetype="application/json")
+        request_timing.attach_timing_headers(resp, "rid")
+        assert "X-Llm-Provider" not in resp.headers
+
+
 def test_note_request_llm_model_ignores_content_creation_purpose():
     app = Flask(__name__)
     with app.test_request_context("/npc-turn", method="POST"):

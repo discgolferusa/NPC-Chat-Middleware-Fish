@@ -226,8 +226,39 @@ _CREDITS_SNAPSHOT: dict[str, Any] | None = None
 _CREDITS_LOOKUP_UNTIL: datetime | None = None
 
 
+# OpenRouter picks the upstream host per call, so attribution must be per-thread
+# (one request = one thread) rather than process-wide.
+_ROUTED_PROVIDER = threading.local()
+
+
 class LLMProviderError(Exception):
     """Raised when strict online-only mode cannot complete a request."""
+
+
+def _clear_routed_provider() -> None:
+    _ROUTED_PROVIDER.value = None
+
+
+def _note_routed_provider(name: Any) -> None:
+    _ROUTED_PROVIDER.value = str(name or "").strip() or None
+
+
+def _routed_provider() -> str | None:
+    return getattr(_ROUTED_PROVIDER, "value", None)
+
+
+def _provider_label_for_model(model_id: str | None) -> str | None:
+    entry = LLM_MODELS.get(str(model_id or ""), {})
+    label = str(entry.get("provider_label") or "").strip()
+    return label or None
+
+
+def _attribution_provider(provider: str, model_id: str) -> str | None:
+    """Host that actually served this call, for latency/cost breakdowns."""
+    if provider == "local" or model_id == "local":
+        return "local"
+    # Catalog label is the fallback when OpenRouter omits `provider` in the body.
+    return _routed_provider() or _provider_label_for_model(model_id) or provider or None
 
 
 def _utc_now() -> datetime:
@@ -1456,6 +1487,7 @@ def call_openrouter_chat_completions(
     }
     _apply_reasoning_options(payload, model_id=model_id or "", model_name=model_name)
     _apply_openrouter_provider_preferences(payload, model_id=model_id)
+    _clear_routed_provider()
 
     response = requests.post(
         OPENROUTER_BASE_URL,
@@ -1477,6 +1509,7 @@ def call_openrouter_chat_completions(
     message = choice.get("message") or {}
     content = _extract_chat_content(message)
     routed_provider = data.get("provider") or choice.get("provider")
+    _note_routed_provider(routed_provider)
     if routed_provider:
         print(
             f"[LLM] openrouter routed provider={routed_provider!r} model={model_name}",
@@ -1524,6 +1557,7 @@ def _set_active(provider: str, model_id: str, purpose: str = DEFAULT_PURPOSE) ->
         request_timing.note_request_llm_model(
             active_model_id=model_id,
             selected_model_id=selected,
+            provider=_attribution_provider(provider, model_id),
             purpose=purpose,
         )
     except Exception:
