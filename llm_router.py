@@ -604,6 +604,16 @@ def _set_online_disabled(seconds: int, reason: str) -> None:
     )
 
 
+def _clear_online_disabled(*, reason: str | None = None) -> None:
+    global ONLINE_DISABLED_UNTIL
+
+    if ONLINE_DISABLED_UNTIL is None:
+        return
+    ONLINE_DISABLED_UNTIL = None
+    if reason:
+        print(f"[LLM] OpenRouter re-enabled ({reason})", flush=True)
+
+
 def _openrouter_api_root() -> str:
     base = (OPENROUTER_BASE_URL or "").rstrip("/")
     if base.endswith("/chat/completions"):
@@ -1674,6 +1684,7 @@ def _fallback_after_failure(
 
         LAST_FALLBACK_REASON[purpose] = reason
         LAST_LLM_ERROR[purpose] = last_error
+        _clear_online_disabled(reason=f"online_fallback_ok:{fallback_id}")
         _set_active("openrouter", fallback_id, purpose)
         record_llm_usage(
             provider="openrouter",
@@ -1687,7 +1698,8 @@ def _fallback_after_failure(
             error=last_error,
             purpose=purpose,
             selected_model_id=selected_model_id,
-            attribute_cost_to_selected=True,
+            # Bill the fallback catalog id that actually served tokens.
+            attribute_cost_to_selected=False,
         )
         return content
 
@@ -1824,9 +1836,8 @@ def generate_llm_response(
             purpose=purpose,
         )
     except requests.Timeout as ex:
-        # Creation timeouts are expected for large docs; do not disable OpenRouter for chat.
-        if purpose == PURPOSE_CHAT:
-            _set_online_disabled(300, "openrouter_timeout")
+        # Per-model timeout: try configured OpenRouter fallbacks. Do not circuit-break
+        # the whole account — that would skip DeepInfra/etc. on later turns.
         if not _allows_local_fallback(provider_mode):
             LAST_LLM_ERROR[purpose] = str(ex)
             record_llm_usage(
@@ -1854,8 +1865,6 @@ def generate_llm_response(
             **kwargs,
         )
     except requests.RequestException as ex:
-        if purpose == PURPOSE_CHAT:
-            _set_online_disabled(300, "openrouter_exception")
         if not _allows_local_fallback(provider_mode):
             LAST_LLM_ERROR[purpose] = str(ex)
             record_llm_usage(
@@ -1918,10 +1927,8 @@ def generate_llm_response(
         )
 
     if response.status_code in (500, 502, 503, 504):
-        # Transient server errors: disable globally for chat only. Creation
-        # retries should not take chat offline for five minutes.
-        if purpose == PURPOSE_CHAT:
-            _set_online_disabled(300, "openrouter_http_error")
+        # Transient per-endpoint errors: try other catalog fallbacks. Do not disable
+        # OpenRouter account-wide or later turns skip DeepInfra/etc.
         error_text = response.text[:500]
         record_llm_usage(
             provider="openrouter",
@@ -1992,6 +1999,7 @@ def generate_llm_response(
             **kwargs,
         )
 
+    _clear_online_disabled(reason=f"primary_ok:{selected_model_id}")
     _set_active("openrouter", selected_model_id, purpose)
     LAST_FALLBACK_REASON[purpose] = None
     LAST_LLM_ERROR[purpose] = None
