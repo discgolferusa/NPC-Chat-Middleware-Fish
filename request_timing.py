@@ -11,6 +11,8 @@ from flask import g
 HeaderTotalMs = "X-Timing-Total-Ms"
 HeaderSteps = "X-Timing-Steps"
 HeaderPhases = "X-Timing-Phases"
+HeaderLlmModelId = "X-Llm-Model-Id"
+HeaderLlmSelectedModelId = "X-Llm-Selected-Model-Id"
 
 VOICE_PRE_LLM_LABELS = frozenset(
     {
@@ -110,6 +112,18 @@ def log_timing(request_id: str, label: str, start_time: float) -> float:
     return time.perf_counter()
 
 
+def _active_llm_model_headers() -> tuple[str | None, str | None]:
+    """Return (active_model_id, selected_model_id) for chat purpose when available."""
+    try:
+        import llm_router
+
+        active = str(llm_router.LAST_ACTIVE_MODEL_ID.get(llm_router.PURPOSE_CHAT) or "").strip() or None
+        selected = str(getattr(llm_router, "CURRENT_LLM_MODEL_ID", "") or "").strip() or None
+        return active, selected
+    except Exception:
+        return None, None
+
+
 def attach_timing_headers(
     response: Any,
     request_id: str | None = None,
@@ -124,6 +138,12 @@ def attach_timing_headers(
         response.headers[HeaderTotalMs] = str(max(0, middleware_total_ms))
 
     steps = getattr(g, "_timing_steps", None)
+    active_model_id, selected_model_id = _active_llm_model_headers()
+    if active_model_id:
+        response.headers[HeaderLlmModelId] = active_model_id
+    if selected_model_id:
+        response.headers[HeaderLlmSelectedModelId] = selected_model_id
+
     if isinstance(steps, list) and steps:
         compact = "|".join(steps[:24])
         if len(compact) > 1800:
@@ -135,6 +155,10 @@ def attach_timing_headers(
             if middleware_total_ms is not None:
                 phases["middleware_total_ms"] = middleware_total_ms
                 phases["cumulative_ms"]["middleware"] = middleware_total_ms
+            if active_model_id:
+                phases["model_id"] = active_model_id
+            if selected_model_id:
+                phases["selected_model_id"] = selected_model_id
             phases_json = json.dumps(phases, separators=(",", ":"))
             if len(phases_json) <= 1800:
                 response.headers[HeaderPhases] = phases_json

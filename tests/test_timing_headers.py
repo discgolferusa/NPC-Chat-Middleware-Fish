@@ -53,8 +53,14 @@ def test_build_voice_timing_phases_groups_steps_and_cumulative():
     assert phases["cumulative_ms"]["tts"] == 3360
 
 
-def test_attach_timing_headers_voice_phases_only_when_requested():
+def test_attach_timing_headers_voice_phases_only_when_requested(monkeypatch):
     app = Flask(__name__)
+    monkeypatch.setattr(
+        request_timing,
+        "_active_llm_model_headers",
+        lambda: ("openrouter-gpt-oss-20b", "openrouter-gpt-oss-20b"),
+    )
+
     with app.test_request_context("/npc-voice-turn", method="POST"):
         request_timing.begin_request_timing()
         step = time.perf_counter()
@@ -69,3 +75,21 @@ def test_attach_timing_headers_voice_phases_only_when_requested():
         assert phases["llm_ms"] >= 0
         assert "cumulative_ms" in phases
         assert phases["cumulative_ms"]["middleware"] >= phases["cumulative_ms"]["tts"]
+        assert resp.headers.get("X-Llm-Model-Id") == "openrouter-gpt-oss-20b"
+        assert resp.headers.get("X-Llm-Selected-Model-Id") == "openrouter-gpt-oss-20b"
+        assert phases["model_id"] == "openrouter-gpt-oss-20b"
+
+
+def test_attach_timing_headers_includes_llm_model_id(monkeypatch):
+    app = Flask(__name__)
+    monkeypatch.setattr(
+        request_timing,
+        "_active_llm_model_headers",
+        lambda: ("openrouter-deepseek-v4-flash", "openrouter-gpt-oss-20b"),
+    )
+    with app.test_request_context("/npc-turn", method="POST"):
+        request_timing.begin_request_timing()
+        resp = Response(response=b'{"ok":true}', status=200, mimetype="application/json")
+        request_timing.attach_timing_headers(resp, "rid")
+        assert resp.headers.get("X-Llm-Model-Id") == "openrouter-deepseek-v4-flash"
+        assert resp.headers.get("X-Llm-Selected-Model-Id") == "openrouter-gpt-oss-20b"
