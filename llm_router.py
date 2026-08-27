@@ -604,16 +604,6 @@ def _set_online_disabled(seconds: int, reason: str) -> None:
     )
 
 
-def _clear_online_disabled(*, reason: str | None = None) -> None:
-    global ONLINE_DISABLED_UNTIL
-
-    if ONLINE_DISABLED_UNTIL is None:
-        return
-    ONLINE_DISABLED_UNTIL = None
-    if reason:
-        print(f"[LLM] OpenRouter re-enabled ({reason})", flush=True)
-
-
 def _openrouter_api_root() -> str:
     base = (OPENROUTER_BASE_URL or "").rstrip("/")
     if base.endswith("/chat/completions"):
@@ -1684,7 +1674,6 @@ def _fallback_after_failure(
 
         LAST_FALLBACK_REASON[purpose] = reason
         LAST_LLM_ERROR[purpose] = last_error
-        _clear_online_disabled(reason=f"online_fallback_ok:{fallback_id}")
         _set_active("openrouter", fallback_id, purpose)
         record_llm_usage(
             provider="openrouter",
@@ -1999,7 +1988,6 @@ def generate_llm_response(
             **kwargs,
         )
 
-    _clear_online_disabled(reason=f"primary_ok:{selected_model_id}")
     _set_active("openrouter", selected_model_id, purpose)
     LAST_FALLBACK_REASON[purpose] = None
     LAST_LLM_ERROR[purpose] = None

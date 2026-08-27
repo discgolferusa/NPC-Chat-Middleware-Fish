@@ -861,34 +861,21 @@ def test_generate_after_primary_5xx_still_tries_openrouter_next_turn(monkeypatch
     ]
 
 
-def test_online_fallback_success_clears_stale_online_disabled(monkeypatch):
+def test_openrouter_success_does_not_clear_402_cooldown(monkeypatch):
+    """In-flight work that already passed the disabled gate must not wipe Retry-After."""
     from datetime import timedelta
 
-    monkeypatch.setattr(llm_router, "CURRENT_LLM_MODEL_ID", "openrouter-nemotron-3.5-lightning-coreweave")
+    disabled_until = llm_router._utc_now() + timedelta(minutes=5)
+    monkeypatch.setattr(llm_router, "CURRENT_LLM_MODEL_ID", "openrouter-gpt-oss-20b")
     monkeypatch.setattr(llm_router, "LLM_PROVIDER_MODE", "openrouter_with_local_fallback")
-    monkeypatch.setattr(
-        llm_router,
-        "CHAT_FALLBACK_MODEL_IDS",
-        ["openrouter-nemotron-3.5-lightning-deepinfra", "local"],
-    )
+    monkeypatch.setattr(llm_router, "CHAT_FALLBACK_MODEL_IDS", ["local"])
     monkeypatch.setattr(llm_router, "OPENROUTER_API_KEY", "test-key")
-    monkeypatch.setattr(
-        llm_router,
-        "ONLINE_DISABLED_UNTIL",
-        llm_router._utc_now() + timedelta(minutes=5),
-    )
+    monkeypatch.setattr(llm_router, "ONLINE_DISABLED_UNTIL", None)
     monkeypatch.setattr(llm_router, "openrouter_credit_threshold_reason", lambda: None)
     monkeypatch.setattr(llm_router, "_would_exceed_online_limits", lambda *a, **k: None)
     monkeypatch.setattr(llm_router, "record_llm_usage", lambda **kwargs: None)
 
-    class FailPrimary:
-        status_code = 503
-        text = "down"
-
-        def json(self):
-            return {}
-
-    class OkFallback:
+    class OkResponse:
         status_code = 200
         text = ""
 
@@ -899,27 +886,37 @@ def test_online_fallback_success_clears_stale_online_disabled(monkeypatch):
             }
 
     def fake_openrouter(messages, model_name, **kwargs):
-        if kwargs.get("model_id") == "openrouter-nemotron-3.5-lightning-coreweave":
-            return "", {}, FailPrimary()
-        return "ok", {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}, OkFallback()
+        # Another request hit 402 while this in-flight call was already past the gate.
+        llm_router.ONLINE_DISABLED_UNTIL = disabled_until
+        return (
+            "ok",
+            {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            OkResponse(),
+        )
 
     monkeypatch.setattr(llm_router, "call_openrouter_chat_completions", fake_openrouter)
-    # Bypass the early disabled gate so we can exercise fallback clearing.
-    monkeypatch.setattr(llm_router, "ONLINE_DISABLED_UNTIL", llm_router._utc_now() + timedelta(minutes=5))
 
-    # Call fallback path directly (early generate gate would short-circuit when disabled).
+    assert llm_router.generate_llm_response([{"role": "user", "content": "hi"}]) == "ok"
+    assert llm_router.ONLINE_DISABLED_UNTIL == disabled_until
+
+    # Online fallback success must preserve the cooldown as well.
+    monkeypatch.setattr(llm_router, "ONLINE_DISABLED_UNTIL", disabled_until)
+    monkeypatch.setattr(
+        llm_router,
+        "CHAT_FALLBACK_MODEL_IDS",
+        ["openrouter-gpt-oss-20b", "local"],
+    )
     content = llm_router._fallback_after_failure(
         [{"role": "user", "content": "hi"}],
         reason="openrouter_http_error",
         selected_model_id="openrouter-nemotron-3.5-lightning-coreweave",
         temperature=None,
         max_tokens=180,
-        error="down",
         purpose="chat",
         respect_online_disabled=False,
     )
     assert content == "ok"
-    assert llm_router.ONLINE_DISABLED_UNTIL is None
+    assert llm_router.ONLINE_DISABLED_UNTIL == disabled_until
 
 def test_llm_status_exposes_openrouter_provider_order(api, monkeypatch):
     client, _server, headers = api
