@@ -11,6 +11,8 @@ from flask import g
 HeaderTotalMs = "X-Timing-Total-Ms"
 HeaderSteps = "X-Timing-Steps"
 HeaderPhases = "X-Timing-Phases"
+HeaderLlmModelId = "X-Llm-Model-Id"
+HeaderLlmSelectedModelId = "X-Llm-Selected-Model-Id"
 
 VOICE_PRE_LLM_LABELS = frozenset(
     {
@@ -47,6 +49,44 @@ VOICE_TTS_LABELS = frozenset(
 def begin_request_timing() -> None:
     g._timing_steps = []
     g._timing_start = time.perf_counter()
+    g._timing_llm_model_id = None
+    g._timing_llm_selected_model_id = None
+
+
+def note_request_llm_model(
+    *,
+    active_model_id: str | None,
+    selected_model_id: str | None = None,
+    purpose: str | None = None,
+) -> None:
+    """Bind the model used for this HTTP request (first chat write wins).
+
+    Process-wide LAST_ACTIVE_* is unsafe under concurrency; timing headers must
+    read request-local state so another turn or async memory extract cannot
+    steal attribution.
+    """
+    try:
+        from flask import has_request_context
+
+        if not has_request_context():
+            return
+    except Exception:
+        return
+
+    purpose_norm = str(purpose or "").strip().lower() or None
+    if purpose_norm and purpose_norm not in ("chat", "default"):
+        return
+
+    active = str(active_model_id or "").strip() or None
+    selected = str(selected_model_id or "").strip() or None
+    if not active and not selected:
+        return
+
+    # First chat LLM in this request owns turn attribution (NPC reply, not memory).
+    if active and not getattr(g, "_timing_llm_model_id", None):
+        g._timing_llm_model_id = active
+    if selected and not getattr(g, "_timing_llm_selected_model_id", None):
+        g._timing_llm_selected_model_id = selected
 
 
 def _parse_step_entry(step: str) -> tuple[str, int]:
@@ -110,6 +150,16 @@ def log_timing(request_id: str, label: str, start_time: float) -> float:
     return time.perf_counter()
 
 
+def _request_llm_model_headers() -> tuple[str | None, str | None]:
+    """Return (active_model_id, selected_model_id) from this request only."""
+    try:
+        active = str(getattr(g, "_timing_llm_model_id", None) or "").strip() or None
+        selected = str(getattr(g, "_timing_llm_selected_model_id", None) or "").strip() or None
+        return active, selected
+    except Exception:
+        return None, None
+
+
 def attach_timing_headers(
     response: Any,
     request_id: str | None = None,
@@ -124,6 +174,12 @@ def attach_timing_headers(
         response.headers[HeaderTotalMs] = str(max(0, middleware_total_ms))
 
     steps = getattr(g, "_timing_steps", None)
+    active_model_id, selected_model_id = _request_llm_model_headers()
+    if active_model_id:
+        response.headers[HeaderLlmModelId] = active_model_id
+    if selected_model_id:
+        response.headers[HeaderLlmSelectedModelId] = selected_model_id
+
     if isinstance(steps, list) and steps:
         compact = "|".join(steps[:24])
         if len(compact) > 1800:
@@ -135,6 +191,10 @@ def attach_timing_headers(
             if middleware_total_ms is not None:
                 phases["middleware_total_ms"] = middleware_total_ms
                 phases["cumulative_ms"]["middleware"] = middleware_total_ms
+            if active_model_id:
+                phases["model_id"] = active_model_id
+            if selected_model_id:
+                phases["selected_model_id"] = selected_model_id
             phases_json = json.dumps(phases, separators=(",", ":"))
             if len(phases_json) <= 1800:
                 response.headers[HeaderPhases] = phases_json
