@@ -114,11 +114,13 @@ DEFAULT_PURPOSE = PURPOSE_CHAT
 # `purposes` gates which Admin -> LLM dropdown offers the model.
 # Optional `provider_order` pins OpenRouter routing for that catalog entry
 # (overrides OPENROUTER_PROVIDER_ORDER for that model only).
+# `provider_label` is shown in Admin dropdowns so each option names its host.
 LLM_MODELS: dict[str, dict[str, Any]] = {
     "local": {
         "id": "local",
-        "label": "Local llama.cpp",
+        "label": "Local llama.cpp — local",
         "provider": "local",
+        "provider_label": "local",
         "model": LOCAL_LLM_MODEL,
         "url": LOCAL_LLM_URL,
         "online": False,
@@ -127,8 +129,9 @@ LLM_MODELS: dict[str, dict[str, Any]] = {
     },
     "openrouter-gpt-oss-20b": {
         "id": "openrouter-gpt-oss-20b",
-        "label": "OpenRouter GPT-OSS 20B",
+        "label": "GPT-OSS 20B — Amazon Bedrock / Novita",
         "provider": "openrouter",
+        "provider_label": "Amazon Bedrock / Novita",
         "model": "openai/gpt-oss-20b",
         "online": True,
         "limits": None,
@@ -138,8 +141,20 @@ LLM_MODELS: dict[str, dict[str, Any]] = {
         "id": "openrouter-nemotron-3.5-lightning-coreweave",
         "label": "Nemotron 3.5 Lightning — CoreWeave",
         "provider": "openrouter",
+        "provider_label": "CoreWeave",
         "model": "nvidia/nemotron-3.5-lightning",
         "provider_order": ["coreweave"],
+        "online": True,
+        "limits": None,
+        "purposes": [PURPOSE_CHAT, PURPOSE_CONTENT_CREATION],
+    },
+    "openrouter-nemotron-3.5-lightning-deepinfra": {
+        "id": "openrouter-nemotron-3.5-lightning-deepinfra",
+        "label": "Nemotron 3.5 Lightning — DeepInfra",
+        "provider": "openrouter",
+        "provider_label": "DeepInfra",
+        "model": "nvidia/nemotron-3.5-lightning",
+        "provider_order": ["deepinfra"],
         "online": True,
         "limits": None,
         "purposes": [PURPOSE_CHAT, PURPOSE_CONTENT_CREATION],
@@ -148,6 +163,7 @@ LLM_MODELS: dict[str, dict[str, Any]] = {
         "id": "openrouter-deepseek-v4-flash-0731-coreweave",
         "label": "DeepSeek V4 Flash 0731 — CoreWeave",
         "provider": "openrouter",
+        "provider_label": "CoreWeave",
         "model": "deepseek/deepseek-v4-flash-0731",
         "provider_order": ["coreweave"],
         "online": True,
@@ -172,10 +188,12 @@ DEPRECATED_MODEL_ALIASES: dict[str, str] = {
 # --- chat purpose (default / backward-compatible globals) ---
 CURRENT_LLM_MODEL_ID = os.getenv("CURRENT_LLM_MODEL_ID", "local")
 LLM_PROVIDER_MODE = os.getenv("LLM_PROVIDER_MODE", "openrouter_with_local_fallback")
+CHAT_FALLBACK_MODEL_IDS: list[str] = ["local"]
 
 # --- content_creation purpose (campaign/document generation tooling) ---
 CONTENT_CREATION_MODEL_ID = os.getenv("CONTENT_CREATION_LLM_MODEL_ID", CURRENT_LLM_MODEL_ID)
 CONTENT_CREATION_PROVIDER_MODE = os.getenv("CONTENT_CREATION_LLM_PROVIDER_MODE", LLM_PROVIDER_MODE)
+CONTENT_CREATION_FALLBACK_MODEL_IDS: list[str] = ["local"]
 
 # Per-purpose runtime status. Mutated in place (never rebound) so callers never
 # need `global` to update them.
@@ -195,6 +213,7 @@ ONLINE_ON_DEMAND_PRICES_USD: dict[str, dict[str, float]] = {
     "local": {"input": 0.0, "output": 0.0},
     "openrouter-gpt-oss-20b": {"input": 0.03, "output": 0.13},
     "openrouter-nemotron-3.5-lightning-coreweave": {"input": 0.10, "output": 0.25},
+    "openrouter-nemotron-3.5-lightning-deepinfra": {"input": 0.08, "output": 0.20},
     "openrouter-deepseek-v4-flash-0731-coreweave": {"input": 0.13, "output": 0.28},
 }
 # Backward-compatible alias for older imports/tests.
@@ -262,6 +281,50 @@ def _get_purpose_model_id(purpose: str) -> str:
 def _get_purpose_provider_mode(purpose: str) -> str:
     raw = CONTENT_CREATION_PROVIDER_MODE if purpose == PURPOSE_CONTENT_CREATION else LLM_PROVIDER_MODE
     return _normalize_provider_mode(raw, default="local")
+
+
+def _get_purpose_fallback_model_ids(purpose: str) -> list[str]:
+    if purpose == PURPOSE_CONTENT_CREATION:
+        return list(CONTENT_CREATION_FALLBACK_MODEL_IDS)
+    return list(CHAT_FALLBACK_MODEL_IDS)
+
+
+def _normalize_fallback_model_ids(
+    raw: Any,
+    *,
+    purpose: str,
+    primary_model_id: str | None = None,
+) -> list[str]:
+    """Dedupe and validate an ordered fallback chain for a purpose."""
+    if raw is None:
+        items: list[Any] = []
+    elif isinstance(raw, str):
+        items = [part.strip() for part in raw.replace(";", ",").split(",") if part.strip()]
+    elif isinstance(raw, (list, tuple)):
+        items = list(raw)
+    else:
+        items = []
+
+    primary = (primary_model_id or "").strip()
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items:
+        candidate = _alias_model_id(str(item or "").strip())
+        if not candidate or candidate == primary or candidate in seen:
+            continue
+        if candidate not in LLM_MODELS:
+            continue
+        if not model_supports_purpose(candidate, purpose):
+            continue
+        seen.add(candidate)
+        out.append(candidate)
+    return out
+
+
+def _default_fallback_model_ids(provider_mode: str) -> list[str]:
+    if provider_mode == ONLINE_WITH_FALLBACK_MODE:
+        return ["local"]
+    return []
 
 
 def _parse_allow_fallbacks(raw: str | None, *, default: bool = False) -> bool:
@@ -364,8 +427,9 @@ def _resolve_model_id(
 
 
 def _load_runtime_config() -> None:
-    global CURRENT_LLM_MODEL_ID, LLM_PROVIDER_MODE
+    global CURRENT_LLM_MODEL_ID, LLM_PROVIDER_MODE, CHAT_FALLBACK_MODEL_IDS
     global CONTENT_CREATION_MODEL_ID, CONTENT_CREATION_PROVIDER_MODE
+    global CONTENT_CREATION_FALLBACK_MODEL_IDS
 
     if not LLM_RUNTIME_CONFIG_FILE.exists():
         CURRENT_LLM_MODEL_ID = "local"
@@ -373,6 +437,7 @@ def _load_runtime_config() -> None:
             LLM_PROVIDER_MODE = _normalize_provider_mode(LLM_PROVIDER_MODE, default="local")
         else:
             LLM_PROVIDER_MODE = "local"
+        CHAT_FALLBACK_MODEL_IDS = _default_fallback_model_ids(LLM_PROVIDER_MODE)
 
         CONTENT_CREATION_MODEL_ID = _resolve_model_id(
             os.getenv("CONTENT_CREATION_LLM_MODEL_ID", CURRENT_LLM_MODEL_ID),
@@ -383,6 +448,9 @@ def _load_runtime_config() -> None:
             os.getenv("CONTENT_CREATION_LLM_PROVIDER_MODE", LLM_PROVIDER_MODE),
             default="local",
         )
+        CONTENT_CREATION_FALLBACK_MODEL_IDS = _default_fallback_model_ids(
+            CONTENT_CREATION_PROVIDER_MODE
+        )
         return
 
     try:
@@ -391,8 +459,10 @@ def _load_runtime_config() -> None:
         print(f"[LLM] invalid runtime config, using defaults: {ex}", flush=True)
         CURRENT_LLM_MODEL_ID = "local"
         LLM_PROVIDER_MODE = "local"
+        CHAT_FALLBACK_MODEL_IDS = []
         CONTENT_CREATION_MODEL_ID = "local"
         CONTENT_CREATION_PROVIDER_MODE = "local"
+        CONTENT_CREATION_FALLBACK_MODEL_IDS = []
         return
 
     data = raw if isinstance(raw, dict) else {}
@@ -407,6 +477,15 @@ def _load_runtime_config() -> None:
 
     CURRENT_LLM_MODEL_ID = chat_model_id
     LLM_PROVIDER_MODE = _normalize_provider_mode(raw_chat_provider_mode, default="local")
+    raw_chat_fallbacks = chat_cfg.get(
+        "fallback_model_ids",
+        data.get("fallback_model_ids", _default_fallback_model_ids(LLM_PROVIDER_MODE)),
+    )
+    CHAT_FALLBACK_MODEL_IDS = _normalize_fallback_model_ids(
+        raw_chat_fallbacks,
+        purpose=PURPOSE_CHAT,
+        primary_model_id=CURRENT_LLM_MODEL_ID,
+    )
 
     creation_cfg = (
         purposes.get(PURPOSE_CONTENT_CREATION)
@@ -424,6 +503,15 @@ def _load_runtime_config() -> None:
     CONTENT_CREATION_MODEL_ID = creation_model_id
     CONTENT_CREATION_PROVIDER_MODE = _normalize_provider_mode(
         raw_creation_provider_mode, default="local"
+    )
+    raw_creation_fallbacks = creation_cfg.get(
+        "fallback_model_ids",
+        _default_fallback_model_ids(CONTENT_CREATION_PROVIDER_MODE),
+    )
+    CONTENT_CREATION_FALLBACK_MODEL_IDS = _normalize_fallback_model_ids(
+        raw_creation_fallbacks,
+        purpose=PURPOSE_CONTENT_CREATION,
+        primary_model_id=CONTENT_CREATION_MODEL_ID,
     )
 
     remapped_modes = (
@@ -450,14 +538,17 @@ def _save_runtime_config() -> None:
         # Legacy top-level keys kept for backward compatibility; mirror "chat".
         "model_id": CURRENT_LLM_MODEL_ID,
         "provider_mode": LLM_PROVIDER_MODE,
+        "fallback_model_ids": list(CHAT_FALLBACK_MODEL_IDS),
         "purposes": {
             PURPOSE_CHAT: {
                 "model_id": CURRENT_LLM_MODEL_ID,
                 "provider_mode": LLM_PROVIDER_MODE,
+                "fallback_model_ids": list(CHAT_FALLBACK_MODEL_IDS),
             },
             PURPOSE_CONTENT_CREATION: {
                 "model_id": CONTENT_CREATION_MODEL_ID,
                 "provider_mode": CONTENT_CREATION_PROVIDER_MODE,
+                "fallback_model_ids": list(CONTENT_CREATION_FALLBACK_MODEL_IDS),
             },
         },
         "updated_at": _utc_iso(_utc_now()),
@@ -1476,6 +1567,136 @@ def _fallback_to_local(
     return content
 
 
+def _fallback_after_failure(
+    messages: list[dict[str, Any]],
+    *,
+    reason: str,
+    selected_model_id: str,
+    temperature: float | None,
+    max_tokens: int | None,
+    error: str | None = None,
+    purpose: str = DEFAULT_PURPOSE,
+    online_unavailable: bool = False,
+    respect_online_disabled: bool = True,
+    **kwargs: Any,
+) -> str:
+    """Walk Admin-configured fallback models, then local when allowed.
+
+    ``online_unavailable`` skips other OpenRouter catalog entries (credit threshold,
+    missing key, or OpenRouter globally disabled) and only tries local.
+    ``respect_online_disabled`` when false still tries other OpenRouter models after a
+    per-model outage (timeout/5xx), so CoreWeave → DeepInfra can recover.
+    """
+    purpose = _normalize_purpose(purpose)
+    chain = _normalize_fallback_model_ids(
+        _get_purpose_fallback_model_ids(purpose),
+        purpose=purpose,
+        primary_model_id=selected_model_id,
+    )
+    provider_mode = _get_purpose_provider_mode(purpose)
+    if provider_mode == ONLINE_WITH_FALLBACK_MODE and "local" not in chain:
+        chain = [*chain, "local"]
+
+    last_error = error
+    for fallback_id in chain:
+        entry = LLM_MODELS.get(fallback_id) or {}
+        if fallback_id == "local" or entry.get("provider") == "local":
+            return _fallback_to_local(
+                messages,
+                reason=reason,
+                selected_model_id=selected_model_id,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                error=last_error,
+                purpose=purpose,
+                **kwargs,
+            )
+
+        if online_unavailable or not openrouter_is_configured():
+            continue
+        if (
+            respect_online_disabled
+            and ONLINE_DISABLED_UNTIL is not None
+            and _utc_now() < ONLINE_DISABLED_UNTIL
+        ):
+            continue
+
+        model_name = str(entry.get("model") or "")
+        if not model_name:
+            continue
+
+        print(
+            f"[LLM] trying fallback model={fallback_id} ({reason}) purpose={purpose}",
+            flush=True,
+        )
+        try:
+            content, usage, response = call_openrouter_chat_completions(
+                messages,
+                model_name,
+                model_id=fallback_id,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                purpose=purpose,
+            )
+        except requests.RequestException as ex:
+            last_error = str(ex)
+            record_llm_usage(
+                provider="openrouter",
+                model_id=fallback_id,
+                model=model_name,
+                prompt_tokens=_estimate_prompt_tokens(messages),
+                completion_tokens=0,
+                total_tokens=_estimate_prompt_tokens(messages),
+                success=False,
+                fallback=True,
+                error=last_error,
+                purpose=purpose,
+                selected_model_id=selected_model_id,
+            )
+            continue
+
+        if response.status_code >= 400 or not content:
+            last_error = (response.text or f"HTTP {response.status_code}")[:500] or "empty content"
+            record_llm_usage(
+                provider="openrouter",
+                model_id=fallback_id,
+                model=model_name,
+                prompt_tokens=_estimate_prompt_tokens(messages),
+                completion_tokens=0,
+                total_tokens=_estimate_prompt_tokens(messages),
+                success=False,
+                fallback=True,
+                error=last_error,
+                purpose=purpose,
+                selected_model_id=selected_model_id,
+            )
+            continue
+
+        LAST_FALLBACK_REASON[purpose] = reason
+        LAST_LLM_ERROR[purpose] = last_error
+        _set_active("openrouter", fallback_id, purpose)
+        record_llm_usage(
+            provider="openrouter",
+            model_id=fallback_id,
+            model=model_name,
+            prompt_tokens=usage["prompt_tokens"],
+            completion_tokens=usage["completion_tokens"],
+            total_tokens=usage["total_tokens"],
+            success=True,
+            fallback=True,
+            error=last_error,
+            purpose=purpose,
+            selected_model_id=selected_model_id,
+            attribute_cost_to_selected=True,
+        )
+        return content
+
+    LAST_LLM_ERROR[purpose] = last_error or reason
+    raise LLMProviderError(
+        last_error or f"All LLM fallbacks failed after primary model error ({reason})"
+    )
+
+
 def generate_llm_response(
     messages: list[dict[str, Any]],
     *,
@@ -1531,7 +1752,7 @@ def generate_llm_response(
         if not _allows_local_fallback(provider_mode):
             LAST_LLM_ERROR[purpose] = "OpenRouter API key is not configured"
             raise LLMProviderError(LAST_LLM_ERROR[purpose])
-        return _fallback_to_local(
+        return _fallback_after_failure(
             messages,
             reason="openrouter_missing_api_key",
             selected_model_id=selected_model_id,
@@ -1539,6 +1760,7 @@ def generate_llm_response(
             max_tokens=effective_max_tokens,
             error="OpenRouter API key is not configured",
             purpose=purpose,
+            online_unavailable=True,
             **kwargs,
         )
 
@@ -1547,7 +1769,7 @@ def generate_llm_response(
         if not _allows_local_fallback(provider_mode):
             LAST_LLM_ERROR[purpose] = disabled_msg
             raise LLMProviderError(LAST_LLM_ERROR[purpose])
-        return _fallback_to_local(
+        return _fallback_after_failure(
             messages,
             reason="openrouter_disabled_until",
             selected_model_id=selected_model_id,
@@ -1555,6 +1777,7 @@ def generate_llm_response(
             max_tokens=effective_max_tokens,
             error=disabled_msg,
             purpose=purpose,
+            online_unavailable=True,
             **kwargs,
         )
 
@@ -1564,16 +1787,14 @@ def generate_llm_response(
         purpose=purpose,
     )
     if limit_reason:
-        # Credit threshold and rate preflight always prefer local when fallback is allowed.
-        fallback_reason = (
-            "openrouter_credit_threshold"
-            if "credit usage" in limit_reason.casefold()
-            else limit_reason
-        )
+        # Credit threshold is account-wide; skip other OpenRouter models and go to local.
+        # Per-model rate preflight can still try another online fallback first.
+        is_credit = "credit usage" in limit_reason.casefold()
+        fallback_reason = "openrouter_credit_threshold" if is_credit else limit_reason
         if not _allows_local_fallback(provider_mode):
             LAST_LLM_ERROR[purpose] = limit_reason
             raise LLMProviderError(limit_reason)
-        return _fallback_to_local(
+        return _fallback_after_failure(
             messages,
             reason=fallback_reason,
             selected_model_id=selected_model_id,
@@ -1581,6 +1802,7 @@ def generate_llm_response(
             max_tokens=effective_max_tokens,
             error=limit_reason,
             purpose=purpose,
+            online_unavailable=is_credit,
             **kwargs,
         )
 
@@ -1620,7 +1842,7 @@ def generate_llm_response(
                 purpose=purpose,
             )
             raise LLMProviderError(f"OpenRouter request timed out: {ex}") from ex
-        return _fallback_to_local(
+        return _fallback_after_failure(
             messages,
             reason="openrouter_timeout",
             selected_model_id=selected_model_id,
@@ -1628,6 +1850,7 @@ def generate_llm_response(
             max_tokens=effective_max_tokens,
             error=str(ex),
             purpose=purpose,
+            respect_online_disabled=False,
             **kwargs,
         )
     except requests.RequestException as ex:
@@ -1648,7 +1871,7 @@ def generate_llm_response(
                 purpose=purpose,
             )
             raise LLMProviderError(f"OpenRouter request failed: {ex}") from ex
-        return _fallback_to_local(
+        return _fallback_after_failure(
             messages,
             reason="openrouter_exception",
             selected_model_id=selected_model_id,
@@ -1656,6 +1879,7 @@ def generate_llm_response(
             max_tokens=effective_max_tokens,
             error=str(ex),
             purpose=purpose,
+            respect_online_disabled=False,
             **kwargs,
         )
 
@@ -1681,7 +1905,7 @@ def generate_llm_response(
             msg = "OpenRouter credits exhausted" if response.status_code == 402 else "OpenRouter rate limited"
             LAST_LLM_ERROR[purpose] = msg
             raise LLMProviderError(msg)
-        return _fallback_to_local(
+        return _fallback_after_failure(
             messages,
             reason=reason,
             selected_model_id=selected_model_id,
@@ -1689,6 +1913,7 @@ def generate_llm_response(
             max_tokens=effective_max_tokens,
             error=error_text,
             purpose=purpose,
+            online_unavailable=True,
             **kwargs,
         )
 
@@ -1713,7 +1938,7 @@ def generate_llm_response(
         if not _allows_local_fallback(provider_mode):
             LAST_LLM_ERROR[purpose] = f"OpenRouter HTTP {response.status_code}"
             raise LLMProviderError(LAST_LLM_ERROR[purpose])
-        return _fallback_to_local(
+        return _fallback_after_failure(
             messages,
             reason="openrouter_http_error",
             selected_model_id=selected_model_id,
@@ -1721,6 +1946,7 @@ def generate_llm_response(
             max_tokens=effective_max_tokens,
             error=error_text,
             purpose=purpose,
+            respect_online_disabled=False,
             **kwargs,
         )
 
@@ -1754,7 +1980,7 @@ def generate_llm_response(
         if not _allows_local_fallback(provider_mode):
             LAST_LLM_ERROR[purpose] = friendly
             raise LLMProviderError(friendly)
-        return _fallback_to_local(
+        return _fallback_after_failure(
             messages,
             reason=reason,
             selected_model_id=selected_model_id,
@@ -1762,6 +1988,7 @@ def generate_llm_response(
             max_tokens=effective_max_tokens,
             error=friendly,
             purpose=purpose,
+            respect_online_disabled=False,
             **kwargs,
         )
 
@@ -1789,9 +2016,11 @@ def select_llm_model(
     model_id: str,
     provider_mode: str | None = None,
     purpose: str = DEFAULT_PURPOSE,
+    fallback_model_ids: Any = None,
 ) -> dict[str, Any]:
-    global CURRENT_LLM_MODEL_ID, LLM_PROVIDER_MODE
+    global CURRENT_LLM_MODEL_ID, LLM_PROVIDER_MODE, CHAT_FALLBACK_MODEL_IDS
     global CONTENT_CREATION_MODEL_ID, CONTENT_CREATION_PROVIDER_MODE
+    global CONTENT_CREATION_FALLBACK_MODEL_IDS
 
     purpose = _normalize_purpose(purpose)
 
@@ -1812,6 +2041,15 @@ def select_llm_model(
             raise ValueError(f"Invalid provider_mode: {provider_mode}")
         provider_mode = normalized_mode
 
+    update_fallbacks = fallback_model_ids is not None
+    normalized_fallbacks: list[str] | None = None
+    if update_fallbacks:
+        normalized_fallbacks = _normalize_fallback_model_ids(
+            fallback_model_ids,
+            purpose=purpose,
+            primary_model_id=model_id,
+        )
+
     with _STATE_LOCK:
         if purpose == PURPOSE_CONTENT_CREATION:
             CONTENT_CREATION_MODEL_ID = model_id
@@ -1819,16 +2057,34 @@ def select_llm_model(
                 CONTENT_CREATION_PROVIDER_MODE = provider_mode
             if model_id == "local":
                 CONTENT_CREATION_PROVIDER_MODE = "local"
+            if update_fallbacks:
+                CONTENT_CREATION_FALLBACK_MODEL_IDS = list(normalized_fallbacks or [])
+            else:
+                CONTENT_CREATION_FALLBACK_MODEL_IDS = _normalize_fallback_model_ids(
+                    CONTENT_CREATION_FALLBACK_MODEL_IDS,
+                    purpose=purpose,
+                    primary_model_id=CONTENT_CREATION_MODEL_ID,
+                )
             result_model_id = CONTENT_CREATION_MODEL_ID
             result_provider_mode = CONTENT_CREATION_PROVIDER_MODE
+            result_fallbacks = list(CONTENT_CREATION_FALLBACK_MODEL_IDS)
         else:
             CURRENT_LLM_MODEL_ID = model_id
             if provider_mode is not None:
                 LLM_PROVIDER_MODE = provider_mode
             if model_id == "local":
                 LLM_PROVIDER_MODE = "local"
+            if update_fallbacks:
+                CHAT_FALLBACK_MODEL_IDS = list(normalized_fallbacks or [])
+            else:
+                CHAT_FALLBACK_MODEL_IDS = _normalize_fallback_model_ids(
+                    CHAT_FALLBACK_MODEL_IDS,
+                    purpose=purpose,
+                    primary_model_id=CURRENT_LLM_MODEL_ID,
+                )
             result_model_id = CURRENT_LLM_MODEL_ID
             result_provider_mode = LLM_PROVIDER_MODE
+            result_fallbacks = list(CHAT_FALLBACK_MODEL_IDS)
 
         LAST_FALLBACK_REASON[purpose] = None
         LAST_LLM_ERROR[purpose] = None
@@ -1839,6 +2095,7 @@ def select_llm_model(
             "purpose": purpose,
             "model_id": result_model_id,
             "provider_mode": result_provider_mode,
+            "fallback_model_ids": result_fallbacks,
             "selected_model": _public_model_entry(result_model_id),
         }
 
@@ -2128,6 +2385,7 @@ def _purpose_status(purpose: str) -> dict[str, Any]:
     return {
         "model_id": selected_model_id,
         "provider_mode": provider_mode,
+        "fallback_model_ids": _get_purpose_fallback_model_ids(purpose),
         "selected_model": selected_model,
         "active_provider": LAST_ACTIVE_PROVIDER.get(purpose, "local"),
         "active_model_id": LAST_ACTIVE_MODEL_ID.get(purpose, "local"),
@@ -2209,8 +2467,8 @@ def get_llm_models_payload() -> dict[str, Any]:
             {
                 "id": "openrouter_with_local_fallback",
                 "label": (
-                    "openrouter_with_local_fallback — try OpenRouter, fall back to local "
-                    "(also auto-falls back at 80% credit usage)"
+                    "openrouter_with_local_fallback — try primary + fallback models "
+                    "(local last by default; also at 80% credit usage)"
                 ),
             },
         ],
@@ -2221,11 +2479,13 @@ def get_llm_models_payload() -> dict[str, Any]:
             PURPOSE_CHAT: {
                 "current_model_id": CURRENT_LLM_MODEL_ID,
                 "provider_mode": LLM_PROVIDER_MODE,
+                "fallback_model_ids": list(CHAT_FALLBACK_MODEL_IDS),
                 "models": _public_model_list(PURPOSE_CHAT),
             },
             PURPOSE_CONTENT_CREATION: {
                 "current_model_id": CONTENT_CREATION_MODEL_ID,
                 "provider_mode": CONTENT_CREATION_PROVIDER_MODE,
+                "fallback_model_ids": list(CONTENT_CREATION_FALLBACK_MODEL_IDS),
                 "models": _public_model_list(PURPOSE_CONTENT_CREATION),
             },
         },

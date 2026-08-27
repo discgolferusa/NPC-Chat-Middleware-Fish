@@ -23,28 +23,39 @@ def test_catalog_offers_openrouter_gpt_oss_20b():
 
 
 @pytest.mark.parametrize(
-    ("model_id", "openrouter_model", "label_fragment"),
+    ("model_id", "openrouter_model", "label_fragment", "provider_slug"),
     [
         (
             "openrouter-nemotron-3.5-lightning-coreweave",
             "nvidia/nemotron-3.5-lightning",
             "Nemotron 3.5 Lightning",
+            "coreweave",
+        ),
+        (
+            "openrouter-nemotron-3.5-lightning-deepinfra",
+            "nvidia/nemotron-3.5-lightning",
+            "Nemotron 3.5 Lightning",
+            "deepinfra",
         ),
         (
             "openrouter-deepseek-v4-flash-0731-coreweave",
             "deepseek/deepseek-v4-flash-0731",
             "DeepSeek V4 Flash 0731",
+            "coreweave",
         ),
     ],
 )
-def test_catalog_offers_coreweave_openrouter_models(model_id, openrouter_model, label_fragment):
+def test_catalog_offers_provider_pinned_openrouter_models(
+    model_id, openrouter_model, label_fragment, provider_slug
+):
     entry = llm_router.LLM_MODELS[model_id]
     assert entry["model"] == openrouter_model
     assert entry["provider"] == "openrouter"
-    assert entry["provider_order"] == ["coreweave"]
+    assert entry["provider_order"] == [provider_slug]
     assert entry["online"] is True
     assert label_fragment in entry["label"]
-    assert "CoreWeave" in entry["label"]
+    assert entry["provider_label"]
+    assert entry["provider_label"] in entry["label"]
     assert "chat" in entry["purposes"]
     assert "content_creation" in entry["purposes"]
 
@@ -99,10 +110,12 @@ def test_models_for_purpose_include_openrouter_and_local():
         "local",
         "openrouter-gpt-oss-20b",
         "openrouter-nemotron-3.5-lightning-coreweave",
+        "openrouter-nemotron-3.5-lightning-deepinfra",
         "openrouter-deepseek-v4-flash-0731-coreweave",
     ):
         assert shared in chat_models
         assert shared in creation_models
+
 
 
 def test_credit_snapshot_from_key_limit():
@@ -316,8 +329,10 @@ def isolated_selection(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(llm_router, "CURRENT_LLM_MODEL_ID", "local")
     monkeypatch.setattr(llm_router, "LLM_PROVIDER_MODE", "local")
+    monkeypatch.setattr(llm_router, "CHAT_FALLBACK_MODEL_IDS", [])
     monkeypatch.setattr(llm_router, "CONTENT_CREATION_MODEL_ID", "local")
     monkeypatch.setattr(llm_router, "CONTENT_CREATION_PROVIDER_MODE", "local")
+    monkeypatch.setattr(llm_router, "CONTENT_CREATION_FALLBACK_MODEL_IDS", [])
     return tmp_path
 
 
@@ -329,6 +344,35 @@ def test_select_accepts_openrouter_model(isolated_selection):
     )
     assert result["model_id"] == "openrouter-gpt-oss-20b"
     assert result["provider_mode"] == "openrouter_with_local_fallback"
+
+
+def test_select_persists_fallback_model_ids(isolated_selection):
+    result = llm_router.select_llm_model(
+        "openrouter-nemotron-3.5-lightning-coreweave",
+        provider_mode="openrouter_with_local_fallback",
+        purpose="chat",
+        fallback_model_ids=[
+            "openrouter-nemotron-3.5-lightning-deepinfra",
+            "openrouter-deepseek-v4-flash-0731-coreweave",
+            "local",
+        ],
+    )
+    assert result["fallback_model_ids"] == [
+        "openrouter-nemotron-3.5-lightning-deepinfra",
+        "openrouter-deepseek-v4-flash-0731-coreweave",
+        "local",
+    ]
+    assert llm_router.CHAT_FALLBACK_MODEL_IDS == result["fallback_model_ids"]
+
+
+def test_select_fallback_ids_exclude_primary(isolated_selection):
+    result = llm_router.select_llm_model(
+        "openrouter-gpt-oss-20b",
+        provider_mode="openrouter_with_local_fallback",
+        purpose="chat",
+        fallback_model_ids=["openrouter-gpt-oss-20b", "local"],
+    )
+    assert result["fallback_model_ids"] == ["local"]
 
 
 def test_select_accepts_legacy_groq_mode_alias(isolated_selection):
@@ -410,19 +454,23 @@ def test_llm_models_endpoint_returns_openrouter_catalog(api):
     served = {m["id"] for m in payload["models"]}
     assert "openrouter-gpt-oss-20b" in served
     assert "openrouter-nemotron-3.5-lightning-coreweave" in served
+    assert "openrouter-nemotron-3.5-lightning-deepinfra" in served
     assert "openrouter-deepseek-v4-flash-0731-coreweave" in served
     assert "local" in served
     assert "groq-compound" not in served
 
     by_id = {m["id"]: m for m in payload["models"]}
     assert by_id["openrouter-nemotron-3.5-lightning-coreweave"]["provider_order"] == ["coreweave"]
+    assert by_id["openrouter-nemotron-3.5-lightning-deepinfra"]["provider_order"] == ["deepinfra"]
     assert by_id["openrouter-deepseek-v4-flash-0731-coreweave"]["provider_order"] == ["coreweave"]
+    assert "—" in by_id["openrouter-gpt-oss-20b"]["label"]
 
     for purpose in ("chat", "content_creation"):
         purpose_ids = {m["id"] for m in payload["purposes"][purpose]["models"]}
         assert "openrouter-nemotron-3.5-lightning-coreweave" in purpose_ids
+        assert "openrouter-nemotron-3.5-lightning-deepinfra" in purpose_ids
         assert "openrouter-deepseek-v4-flash-0731-coreweave" in purpose_ids
-
+        assert "fallback_model_ids" in payload["purposes"][purpose]
     mode_ids = {m["id"] for m in payload["provider_modes"]}
     assert "openrouter_with_local_fallback" in mode_ids
     assert "groq" not in mode_ids
@@ -432,6 +480,7 @@ def test_llm_models_endpoint_returns_openrouter_catalog(api):
     "model_id",
     [
         "openrouter-nemotron-3.5-lightning-coreweave",
+        "openrouter-nemotron-3.5-lightning-deepinfra",
         "openrouter-deepseek-v4-flash-0731-coreweave",
     ],
 )
@@ -446,10 +495,13 @@ def test_llm_select_endpoint_accepts_coreweave_models(api, isolated_selection, m
             "model_id": model_id,
             "provider_mode": "openrouter_with_local_fallback",
             "purpose": purpose,
+            "fallback_model_ids": ["local"],
         },
     )
     assert response.status_code == 200
-    assert response.get_json()["model_id"] == model_id
+    body = response.get_json()
+    assert body["model_id"] == model_id
+    assert body["fallback_model_ids"] == ["local"]
 
 
 def test_llm_select_endpoint_accepts_openrouter(api, isolated_selection):
@@ -650,6 +702,96 @@ def test_call_openrouter_pins_deepseek_coreweave(monkeypatch):
     assert captured["json"]["provider"]["only"] == ["coreweave"]
     assert captured["json"]["provider"]["allow_fallbacks"] is False
     assert captured["json"].get("reasoning_effort") == "low"
+
+
+def test_call_openrouter_pins_nemotron_deepinfra(monkeypatch):
+    monkeypatch.setattr(llm_router, "OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setenv("OPENROUTER_PROVIDER_ORDER", "amazon-bedrock,novita")
+
+    captured: dict = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {
+                "choices": [{"message": {"content": "Hello"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            }
+
+    def fake_post(url, headers, json, timeout):
+        captured["json"] = json
+        return FakeResponse()
+
+    monkeypatch.setattr(llm_router.requests, "post", fake_post)
+    llm_router.call_openrouter_chat_completions(
+        [{"role": "user", "content": "hi"}],
+        "nvidia/nemotron-3.5-lightning",
+        model_id="openrouter-nemotron-3.5-lightning-deepinfra",
+    )
+    assert captured["json"]["provider"] == {
+        "order": ["deepinfra"],
+        "allow_fallbacks": False,
+        "only": ["deepinfra"],
+    }
+
+
+def test_generate_tries_online_fallback_before_local(monkeypatch):
+    calls = {"openrouter": [], "local": 0}
+
+    monkeypatch.setattr(llm_router, "CURRENT_LLM_MODEL_ID", "openrouter-nemotron-3.5-lightning-coreweave")
+    monkeypatch.setattr(llm_router, "LLM_PROVIDER_MODE", "openrouter_with_local_fallback")
+    monkeypatch.setattr(
+        llm_router,
+        "CHAT_FALLBACK_MODEL_IDS",
+        ["openrouter-nemotron-3.5-lightning-deepinfra", "local"],
+    )
+    monkeypatch.setattr(llm_router, "OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setattr(llm_router, "ONLINE_DISABLED_UNTIL", None)
+    monkeypatch.setattr(llm_router, "openrouter_credit_threshold_reason", lambda: None)
+    monkeypatch.setattr(llm_router, "_would_exceed_online_limits", lambda *a, **k: None)
+    monkeypatch.setattr(llm_router, "record_llm_usage", lambda **kwargs: None)
+
+    class FailPrimary:
+        status_code = 503
+        text = "provider down"
+
+        def json(self):
+            return {}
+
+    class OkFallback:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {
+                "choices": [{"message": {"content": "fallback-ok"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                "provider": "DeepInfra",
+            }
+
+    def fake_openrouter(messages, model_name, **kwargs):
+        mid = kwargs.get("model_id")
+        calls["openrouter"].append(mid)
+        if mid == "openrouter-nemotron-3.5-lightning-coreweave":
+            return "", {}, FailPrimary()
+        return "fallback-ok", {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}, OkFallback()
+
+    def fake_local(messages, **kwargs):
+        calls["local"] += 1
+        return "local-ok", {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+
+    monkeypatch.setattr(llm_router, "call_openrouter_chat_completions", fake_openrouter)
+    monkeypatch.setattr(llm_router, "call_local_chat_completions", fake_local)
+
+    result = llm_router.generate_llm_response([{"role": "user", "content": "hi"}])
+    assert result == "fallback-ok"
+    assert calls["openrouter"] == [
+        "openrouter-nemotron-3.5-lightning-coreweave",
+        "openrouter-nemotron-3.5-lightning-deepinfra",
+    ]
+    assert calls["local"] == 0
+    assert llm_router.LAST_ACTIVE_MODEL_ID["chat"] == "openrouter-nemotron-3.5-lightning-deepinfra"
 
 def test_llm_status_exposes_openrouter_provider_order(api, monkeypatch):
     client, _server, headers = api
