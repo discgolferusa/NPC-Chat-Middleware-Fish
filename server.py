@@ -3800,7 +3800,10 @@ def llm_select():
         return jsonify({"error": "Missing model_id"}), 400
 
     try:
-        result = select_llm_model(model_id, provider_mode=provider_mode, purpose=purpose)
+        select_kwargs = {"provider_mode": provider_mode, "purpose": purpose}
+        if "fallback_model_ids" in body:
+            select_kwargs["fallback_model_ids"] = body.get("fallback_model_ids")
+        result = select_llm_model(model_id, **select_kwargs)
         result["status"] = get_llm_status()
         return jsonify(result)
     except ValueError as ex:

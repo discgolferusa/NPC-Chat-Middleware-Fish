@@ -22,6 +22,44 @@ def test_catalog_offers_openrouter_gpt_oss_20b():
     assert "content_creation" in entry["purposes"]
 
 
+@pytest.mark.parametrize(
+    ("model_id", "openrouter_model", "label_fragment", "provider_slug"),
+    [
+        (
+            "openrouter-nemotron-3.5-lightning-coreweave",
+            "nvidia/nemotron-3.5-lightning",
+            "Nemotron 3.5 Lightning",
+            "coreweave",
+        ),
+        (
+            "openrouter-nemotron-3.5-lightning-deepinfra",
+            "nvidia/nemotron-3.5-lightning",
+            "Nemotron 3.5 Lightning",
+            "deepinfra",
+        ),
+        (
+            "openrouter-deepseek-v4-flash-0731-coreweave",
+            "deepseek/deepseek-v4-flash-0731",
+            "DeepSeek V4 Flash 0731",
+            "coreweave",
+        ),
+    ],
+)
+def test_catalog_offers_provider_pinned_openrouter_models(
+    model_id, openrouter_model, label_fragment, provider_slug
+):
+    entry = llm_router.LLM_MODELS[model_id]
+    assert entry["model"] == openrouter_model
+    assert entry["provider"] == "openrouter"
+    assert entry["provider_order"] == [provider_slug]
+    assert entry["online"] is True
+    assert label_fragment in entry["label"]
+    assert entry["provider_label"]
+    assert entry["provider_label"] in entry["label"]
+    assert "chat" in entry["purposes"]
+    assert "content_creation" in entry["purposes"]
+
+
 def test_default_openrouter_model_env_matches_catalog():
     assert llm_router.OPENROUTER_MODEL == "openai/gpt-oss-20b"
 
@@ -68,9 +106,16 @@ def test_groq_provider_modes_alias_to_openrouter():
 def test_models_for_purpose_include_openrouter_and_local():
     chat_models = llm_router.models_for_purpose("chat")
     creation_models = llm_router.models_for_purpose("content_creation")
-    for shared in ("local", "openrouter-gpt-oss-20b"):
+    for shared in (
+        "local",
+        "openrouter-gpt-oss-20b",
+        "openrouter-nemotron-3.5-lightning-coreweave",
+        "openrouter-nemotron-3.5-lightning-deepinfra",
+        "openrouter-deepseek-v4-flash-0731-coreweave",
+    ):
         assert shared in chat_models
         assert shared in creation_models
+
 
 
 def test_credit_snapshot_from_key_limit():
@@ -284,8 +329,10 @@ def isolated_selection(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(llm_router, "CURRENT_LLM_MODEL_ID", "local")
     monkeypatch.setattr(llm_router, "LLM_PROVIDER_MODE", "local")
+    monkeypatch.setattr(llm_router, "CHAT_FALLBACK_MODEL_IDS", [])
     monkeypatch.setattr(llm_router, "CONTENT_CREATION_MODEL_ID", "local")
     monkeypatch.setattr(llm_router, "CONTENT_CREATION_PROVIDER_MODE", "local")
+    monkeypatch.setattr(llm_router, "CONTENT_CREATION_FALLBACK_MODEL_IDS", [])
     return tmp_path
 
 
@@ -297,6 +344,35 @@ def test_select_accepts_openrouter_model(isolated_selection):
     )
     assert result["model_id"] == "openrouter-gpt-oss-20b"
     assert result["provider_mode"] == "openrouter_with_local_fallback"
+
+
+def test_select_persists_fallback_model_ids(isolated_selection):
+    result = llm_router.select_llm_model(
+        "openrouter-nemotron-3.5-lightning-coreweave",
+        provider_mode="openrouter_with_local_fallback",
+        purpose="chat",
+        fallback_model_ids=[
+            "openrouter-nemotron-3.5-lightning-deepinfra",
+            "openrouter-deepseek-v4-flash-0731-coreweave",
+            "local",
+        ],
+    )
+    assert result["fallback_model_ids"] == [
+        "openrouter-nemotron-3.5-lightning-deepinfra",
+        "openrouter-deepseek-v4-flash-0731-coreweave",
+        "local",
+    ]
+    assert llm_router.CHAT_FALLBACK_MODEL_IDS == result["fallback_model_ids"]
+
+
+def test_select_fallback_ids_exclude_primary(isolated_selection):
+    result = llm_router.select_llm_model(
+        "openrouter-gpt-oss-20b",
+        provider_mode="openrouter_with_local_fallback",
+        purpose="chat",
+        fallback_model_ids=["openrouter-gpt-oss-20b", "local"],
+    )
+    assert result["fallback_model_ids"] == ["local"]
 
 
 def test_select_accepts_legacy_groq_mode_alias(isolated_selection):
@@ -377,12 +453,55 @@ def test_llm_models_endpoint_returns_openrouter_catalog(api):
 
     served = {m["id"] for m in payload["models"]}
     assert "openrouter-gpt-oss-20b" in served
+    assert "openrouter-nemotron-3.5-lightning-coreweave" in served
+    assert "openrouter-nemotron-3.5-lightning-deepinfra" in served
+    assert "openrouter-deepseek-v4-flash-0731-coreweave" in served
     assert "local" in served
     assert "groq-compound" not in served
 
+    by_id = {m["id"]: m for m in payload["models"]}
+    assert by_id["openrouter-nemotron-3.5-lightning-coreweave"]["provider_order"] == ["coreweave"]
+    assert by_id["openrouter-nemotron-3.5-lightning-deepinfra"]["provider_order"] == ["deepinfra"]
+    assert by_id["openrouter-deepseek-v4-flash-0731-coreweave"]["provider_order"] == ["coreweave"]
+    assert "—" in by_id["openrouter-gpt-oss-20b"]["label"]
+
+    for purpose in ("chat", "content_creation"):
+        purpose_ids = {m["id"] for m in payload["purposes"][purpose]["models"]}
+        assert "openrouter-nemotron-3.5-lightning-coreweave" in purpose_ids
+        assert "openrouter-nemotron-3.5-lightning-deepinfra" in purpose_ids
+        assert "openrouter-deepseek-v4-flash-0731-coreweave" in purpose_ids
+        assert "fallback_model_ids" in payload["purposes"][purpose]
     mode_ids = {m["id"] for m in payload["provider_modes"]}
     assert "openrouter_with_local_fallback" in mode_ids
     assert "groq" not in mode_ids
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        "openrouter-nemotron-3.5-lightning-coreweave",
+        "openrouter-nemotron-3.5-lightning-deepinfra",
+        "openrouter-deepseek-v4-flash-0731-coreweave",
+    ],
+)
+@pytest.mark.parametrize("purpose", ["chat", "content_creation"])
+def test_llm_select_endpoint_accepts_coreweave_models(api, isolated_selection, model_id, purpose):
+    client, _server, headers = api
+
+    response = client.post(
+        "/llm/select",
+        headers=headers,
+        json={
+            "model_id": model_id,
+            "provider_mode": "openrouter_with_local_fallback",
+            "purpose": purpose,
+            "fallback_model_ids": ["local"],
+        },
+    )
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["model_id"] == model_id
+    assert body["fallback_model_ids"] == ["local"]
 
 
 def test_llm_select_endpoint_accepts_openrouter(api, isolated_selection):
@@ -516,6 +635,288 @@ def test_call_openrouter_allow_fallbacks_omits_only(monkeypatch):
     assert captured["json"]["provider"]["allow_fallbacks"] is True
     assert "only" not in captured["json"]["provider"]
 
+
+def test_call_openrouter_uses_catalog_provider_order_for_coreweave(monkeypatch):
+    monkeypatch.setattr(llm_router, "OPENROUTER_API_KEY", "test-key")
+    # Env still prefers Bedrock; catalog pin must win for CoreWeave models.
+    monkeypatch.setenv("OPENROUTER_PROVIDER_ORDER", "amazon-bedrock,novita")
+    monkeypatch.setenv("OPENROUTER_PROVIDER_ALLOW_FALLBACKS", "true")
+
+    captured: dict = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {
+                "choices": [{"message": {"content": "Hello"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                "provider": "CoreWeave",
+            }
+
+    def fake_post(url, headers, json, timeout):
+        captured["json"] = json
+        return FakeResponse()
+
+    monkeypatch.setattr(llm_router.requests, "post", fake_post)
+    llm_router.call_openrouter_chat_completions(
+        [{"role": "user", "content": "hi"}],
+        "nvidia/nemotron-3.5-lightning",
+        model_id="openrouter-nemotron-3.5-lightning-coreweave",
+    )
+    assert captured["json"]["model"] == "nvidia/nemotron-3.5-lightning"
+    assert captured["json"]["provider"] == {
+        "order": ["coreweave"],
+        "allow_fallbacks": False,
+        "only": ["coreweave"],
+    }
+    assert captured["json"].get("reasoning_effort") == "low"
+
+
+def test_call_openrouter_pins_deepseek_coreweave(monkeypatch):
+    monkeypatch.setattr(llm_router, "OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setenv("OPENROUTER_PROVIDER_ORDER", "amazon-bedrock,novita")
+
+    captured: dict = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {
+                "choices": [{"message": {"content": "Hello"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            }
+
+    def fake_post(url, headers, json, timeout):
+        captured["json"] = json
+        return FakeResponse()
+
+    monkeypatch.setattr(llm_router.requests, "post", fake_post)
+    llm_router.call_openrouter_chat_completions(
+        [{"role": "user", "content": "hi"}],
+        "deepseek/deepseek-v4-flash-0731",
+        model_id="openrouter-deepseek-v4-flash-0731-coreweave",
+    )
+    assert captured["json"]["provider"]["order"] == ["coreweave"]
+    assert captured["json"]["provider"]["only"] == ["coreweave"]
+    assert captured["json"]["provider"]["allow_fallbacks"] is False
+    assert captured["json"].get("reasoning_effort") == "low"
+
+
+def test_call_openrouter_pins_nemotron_deepinfra(monkeypatch):
+    monkeypatch.setattr(llm_router, "OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setenv("OPENROUTER_PROVIDER_ORDER", "amazon-bedrock,novita")
+
+    captured: dict = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {
+                "choices": [{"message": {"content": "Hello"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            }
+
+    def fake_post(url, headers, json, timeout):
+        captured["json"] = json
+        return FakeResponse()
+
+    monkeypatch.setattr(llm_router.requests, "post", fake_post)
+    llm_router.call_openrouter_chat_completions(
+        [{"role": "user", "content": "hi"}],
+        "nvidia/nemotron-3.5-lightning",
+        model_id="openrouter-nemotron-3.5-lightning-deepinfra",
+    )
+    assert captured["json"]["provider"] == {
+        "order": ["deepinfra"],
+        "allow_fallbacks": False,
+        "only": ["deepinfra"],
+    }
+
+
+def test_generate_tries_online_fallback_before_local(monkeypatch):
+    calls = {"openrouter": [], "local": 0}
+    usage_records = []
+
+    monkeypatch.setattr(llm_router, "CURRENT_LLM_MODEL_ID", "openrouter-nemotron-3.5-lightning-coreweave")
+    monkeypatch.setattr(llm_router, "LLM_PROVIDER_MODE", "openrouter_with_local_fallback")
+    monkeypatch.setattr(
+        llm_router,
+        "CHAT_FALLBACK_MODEL_IDS",
+        ["openrouter-nemotron-3.5-lightning-deepinfra", "local"],
+    )
+    monkeypatch.setattr(llm_router, "OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setattr(llm_router, "ONLINE_DISABLED_UNTIL", None)
+    monkeypatch.setattr(llm_router, "openrouter_credit_threshold_reason", lambda: None)
+    monkeypatch.setattr(llm_router, "_would_exceed_online_limits", lambda *a, **k: None)
+    monkeypatch.setattr(llm_router, "record_llm_usage", lambda **kwargs: usage_records.append(kwargs))
+
+    class FailPrimary:
+        status_code = 503
+        text = "provider down"
+
+        def json(self):
+            return {}
+
+    class OkFallback:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {
+                "choices": [{"message": {"content": "fallback-ok"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                "provider": "DeepInfra",
+            }
+
+    def fake_openrouter(messages, model_name, **kwargs):
+        mid = kwargs.get("model_id")
+        calls["openrouter"].append(mid)
+        if mid == "openrouter-nemotron-3.5-lightning-coreweave":
+            return "", {}, FailPrimary()
+        return "fallback-ok", {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}, OkFallback()
+
+    def fake_local(messages, **kwargs):
+        calls["local"] += 1
+        return "local-ok", {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+
+    monkeypatch.setattr(llm_router, "call_openrouter_chat_completions", fake_openrouter)
+    monkeypatch.setattr(llm_router, "call_local_chat_completions", fake_local)
+
+    result = llm_router.generate_llm_response([{"role": "user", "content": "hi"}])
+    assert result == "fallback-ok"
+    assert calls["openrouter"] == [
+        "openrouter-nemotron-3.5-lightning-coreweave",
+        "openrouter-nemotron-3.5-lightning-deepinfra",
+    ]
+    assert calls["local"] == 0
+    assert llm_router.LAST_ACTIVE_MODEL_ID["chat"] == "openrouter-nemotron-3.5-lightning-deepinfra"
+    # Per-model 5xx must not circuit-break OpenRouter for later turns.
+    assert llm_router.ONLINE_DISABLED_UNTIL is None
+    success = [r for r in usage_records if r.get("success")]
+    assert len(success) == 1
+    assert success[0]["model_id"] == "openrouter-nemotron-3.5-lightning-deepinfra"
+    assert success[0].get("attribute_cost_to_selected") is False
+
+
+def test_generate_after_primary_5xx_still_tries_openrouter_next_turn(monkeypatch):
+    """Regression: a prior primary 5xx must not force later turns to local-only."""
+    calls = {"openrouter": []}
+
+    monkeypatch.setattr(llm_router, "CURRENT_LLM_MODEL_ID", "openrouter-nemotron-3.5-lightning-coreweave")
+    monkeypatch.setattr(llm_router, "LLM_PROVIDER_MODE", "openrouter_with_local_fallback")
+    monkeypatch.setattr(
+        llm_router,
+        "CHAT_FALLBACK_MODEL_IDS",
+        ["openrouter-nemotron-3.5-lightning-deepinfra", "local"],
+    )
+    monkeypatch.setattr(llm_router, "OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setattr(llm_router, "ONLINE_DISABLED_UNTIL", None)
+    monkeypatch.setattr(llm_router, "openrouter_credit_threshold_reason", lambda: None)
+    monkeypatch.setattr(llm_router, "_would_exceed_online_limits", lambda *a, **k: None)
+    monkeypatch.setattr(llm_router, "record_llm_usage", lambda **kwargs: None)
+
+    class FailPrimary:
+        status_code = 503
+        text = "provider down"
+
+        def json(self):
+            return {}
+
+    class OkFallback:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {
+                "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            }
+
+    def fake_openrouter(messages, model_name, **kwargs):
+        mid = kwargs.get("model_id")
+        calls["openrouter"].append(mid)
+        if mid == "openrouter-nemotron-3.5-lightning-coreweave":
+            return "", {}, FailPrimary()
+        return "ok", {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}, OkFallback()
+
+    monkeypatch.setattr(llm_router, "call_openrouter_chat_completions", fake_openrouter)
+    monkeypatch.setattr(
+        llm_router,
+        "call_local_chat_completions",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("local should not run")),
+    )
+
+    assert llm_router.generate_llm_response([{"role": "user", "content": "one"}]) == "ok"
+    assert llm_router.ONLINE_DISABLED_UNTIL is None
+    assert llm_router.generate_llm_response([{"role": "user", "content": "two"}]) == "ok"
+    # Both turns attempt primary then DeepInfra — not skipped via online_unavailable.
+    assert calls["openrouter"] == [
+        "openrouter-nemotron-3.5-lightning-coreweave",
+        "openrouter-nemotron-3.5-lightning-deepinfra",
+        "openrouter-nemotron-3.5-lightning-coreweave",
+        "openrouter-nemotron-3.5-lightning-deepinfra",
+    ]
+
+
+def test_openrouter_success_does_not_clear_402_cooldown(monkeypatch):
+    """In-flight work that already passed the disabled gate must not wipe Retry-After."""
+    from datetime import timedelta
+
+    disabled_until = llm_router._utc_now() + timedelta(minutes=5)
+    monkeypatch.setattr(llm_router, "CURRENT_LLM_MODEL_ID", "openrouter-gpt-oss-20b")
+    monkeypatch.setattr(llm_router, "LLM_PROVIDER_MODE", "openrouter_with_local_fallback")
+    monkeypatch.setattr(llm_router, "CHAT_FALLBACK_MODEL_IDS", ["local"])
+    monkeypatch.setattr(llm_router, "OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setattr(llm_router, "ONLINE_DISABLED_UNTIL", None)
+    monkeypatch.setattr(llm_router, "openrouter_credit_threshold_reason", lambda: None)
+    monkeypatch.setattr(llm_router, "_would_exceed_online_limits", lambda *a, **k: None)
+    monkeypatch.setattr(llm_router, "record_llm_usage", lambda **kwargs: None)
+
+    class OkResponse:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {
+                "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            }
+
+    def fake_openrouter(messages, model_name, **kwargs):
+        # Another request hit 402 while this in-flight call was already past the gate.
+        llm_router.ONLINE_DISABLED_UNTIL = disabled_until
+        return (
+            "ok",
+            {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            OkResponse(),
+        )
+
+    monkeypatch.setattr(llm_router, "call_openrouter_chat_completions", fake_openrouter)
+
+    assert llm_router.generate_llm_response([{"role": "user", "content": "hi"}]) == "ok"
+    assert llm_router.ONLINE_DISABLED_UNTIL == disabled_until
+
+    # Online fallback success must preserve the cooldown as well.
+    monkeypatch.setattr(llm_router, "ONLINE_DISABLED_UNTIL", disabled_until)
+    monkeypatch.setattr(
+        llm_router,
+        "CHAT_FALLBACK_MODEL_IDS",
+        ["openrouter-gpt-oss-20b", "local"],
+    )
+    content = llm_router._fallback_after_failure(
+        [{"role": "user", "content": "hi"}],
+        reason="openrouter_http_error",
+        selected_model_id="openrouter-nemotron-3.5-lightning-coreweave",
+        temperature=None,
+        max_tokens=180,
+        purpose="chat",
+        respect_online_disabled=False,
+    )
+    assert content == "ok"
+    assert llm_router.ONLINE_DISABLED_UNTIL == disabled_until
 
 def test_llm_status_exposes_openrouter_provider_order(api, monkeypatch):
     client, _server, headers = api
