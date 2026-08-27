@@ -103,7 +103,7 @@ PROVIDER_MODE_ALIASES: dict[str, str] = {
 ONLINE_PROVIDER_MODES = frozenset({"openrouter", "openrouter_with_local_fallback"})
 ONLINE_WITH_FALLBACK_MODE = "openrouter_with_local_fallback"
 ONLINE_STRICT_MODE = "openrouter"
-REASONING_MODEL_MARKERS = ("gpt-oss", "qwen3")
+REASONING_MODEL_MARKERS = ("gpt-oss", "qwen3", "nemotron", "deepseek-v4")
 
 PURPOSE_CHAT = "chat"
 PURPOSE_CONTENT_CREATION = "content_creation"
@@ -112,6 +112,8 @@ DEFAULT_PURPOSE = PURPOSE_CHAT
 
 # OpenRouter catalog. Credit budget (not RPM/TPM) gates online vs local fallback.
 # `purposes` gates which Admin -> LLM dropdown offers the model.
+# Optional `provider_order` pins OpenRouter routing for that catalog entry
+# (overrides OPENROUTER_PROVIDER_ORDER for that model only).
 LLM_MODELS: dict[str, dict[str, Any]] = {
     "local": {
         "id": "local",
@@ -128,6 +130,26 @@ LLM_MODELS: dict[str, dict[str, Any]] = {
         "label": "OpenRouter GPT-OSS 20B",
         "provider": "openrouter",
         "model": "openai/gpt-oss-20b",
+        "online": True,
+        "limits": None,
+        "purposes": [PURPOSE_CHAT, PURPOSE_CONTENT_CREATION],
+    },
+    "openrouter-nemotron-3.5-lightning-coreweave": {
+        "id": "openrouter-nemotron-3.5-lightning-coreweave",
+        "label": "Nemotron 3.5 Lightning — CoreWeave",
+        "provider": "openrouter",
+        "model": "nvidia/nemotron-3.5-lightning",
+        "provider_order": ["coreweave"],
+        "online": True,
+        "limits": None,
+        "purposes": [PURPOSE_CHAT, PURPOSE_CONTENT_CREATION],
+    },
+    "openrouter-deepseek-v4-flash-0731-coreweave": {
+        "id": "openrouter-deepseek-v4-flash-0731-coreweave",
+        "label": "DeepSeek V4 Flash 0731 — CoreWeave",
+        "provider": "openrouter",
+        "model": "deepseek/deepseek-v4-flash-0731",
+        "provider_order": ["coreweave"],
         "online": True,
         "limits": None,
         "purposes": [PURPOSE_CHAT, PURPOSE_CONTENT_CREATION],
@@ -168,10 +190,12 @@ ONLINE_DISABLED_UNTIL: datetime | None = None
 USAGE_RETENTION_HOURS = int(os.getenv("LLM_USAGE_RETENTION_HOURS", str(24 * 30)))
 
 # Alpha OpenRouter list prices (USD per 1M tokens). Not billed by us — estimation only.
-# Source: https://openrouter.ai/openai/gpt-oss-20b/pricing (weighted floor ~$0.03/$0.13).
+# Source: OpenRouter endpoint pricing (CoreWeave rows for pinned catalog entries).
 ONLINE_ON_DEMAND_PRICES_USD: dict[str, dict[str, float]] = {
     "local": {"input": 0.0, "output": 0.0},
     "openrouter-gpt-oss-20b": {"input": 0.03, "output": 0.13},
+    "openrouter-nemotron-3.5-lightning-coreweave": {"input": 0.10, "output": 0.25},
+    "openrouter-deepseek-v4-flash-0731-coreweave": {"input": 0.13, "output": 0.28},
 }
 # Backward-compatible alias for older imports/tests.
 GROQ_ON_DEMAND_PRICES_USD = ONLINE_ON_DEMAND_PRICES_USD
@@ -768,6 +792,10 @@ def _apply_reasoning_options(payload: dict[str, Any], *, model_id: str, model_na
         payload.setdefault("reasoning_effort", "low")
     elif "qwen3" in name or "qwen3" in mid:
         payload.setdefault("reasoning_effort", "none")
+    elif "nemotron" in name or "nemotron" in mid:
+        payload.setdefault("reasoning_effort", "low")
+    elif "deepseek-v4" in name or "deepseek-v4" in mid:
+        payload.setdefault("reasoning_effort", "low")
 
 
 _apply_groq_reasoning_options = _apply_reasoning_options
@@ -1246,14 +1274,31 @@ def _openrouter_provider_order() -> list[str]:
     return [part.strip() for part in parts if part.strip()]
 
 
+def _catalog_provider_order(model_id: str | None) -> list[str] | None:
+    """Return a catalog-pinned provider order, or None to use the env default."""
+    if not model_id:
+        return None
+    entry = LLM_MODELS.get(model_id) or {}
+    raw = entry.get("provider_order")
+    if not isinstance(raw, (list, tuple)):
+        return None
+    order = [str(part).strip() for part in raw if str(part).strip()]
+    return order or None
+
+
 def _openrouter_allow_fallbacks() -> bool:
     if "OPENROUTER_PROVIDER_ALLOW_FALLBACKS" in os.environ:
         return _parse_allow_fallbacks(os.getenv("OPENROUTER_PROVIDER_ALLOW_FALLBACKS"), default=False)
     return OPENROUTER_PROVIDER_ALLOW_FALLBACKS
 
 
-def _apply_openrouter_provider_preferences(payload: dict[str, Any]) -> None:
-    order = _openrouter_provider_order()
+def _apply_openrouter_provider_preferences(
+    payload: dict[str, Any],
+    *,
+    model_id: str | None = None,
+) -> None:
+    catalog_order = _catalog_provider_order(model_id)
+    order = catalog_order if catalog_order is not None else _openrouter_provider_order()
     if not order:
         print(
             "[LLM] openrouter provider order empty — OpenRouter will price load-balance "
@@ -1262,6 +1307,9 @@ def _apply_openrouter_provider_preferences(payload: dict[str, Any]) -> None:
         )
         return
     allow_fallbacks = _openrouter_allow_fallbacks()
+    # Catalog pins (e.g. CoreWeave-only entries) must not spill to other providers.
+    if catalog_order is not None:
+        allow_fallbacks = False
     provider: dict[str, Any] = {
         "order": order,
         "allow_fallbacks": allow_fallbacks,
@@ -1272,7 +1320,8 @@ def _apply_openrouter_provider_preferences(payload: dict[str, Any]) -> None:
     payload["provider"] = provider
     print(
         f"[LLM] openrouter provider preferences order={order} "
-        f"allow_fallbacks={allow_fallbacks} only={provider.get('only')}",
+        f"allow_fallbacks={allow_fallbacks} only={provider.get('only')} "
+        f"model_id={model_id or '(none)'}",
         flush=True,
     )
 
@@ -1315,7 +1364,7 @@ def call_openrouter_chat_completions(
         "max_tokens": effective_max,
     }
     _apply_reasoning_options(payload, model_id=model_id or "", model_name=model_name)
-    _apply_openrouter_provider_preferences(payload)
+    _apply_openrouter_provider_preferences(payload, model_id=model_id)
 
     response = requests.post(
         OPENROUTER_BASE_URL,

@@ -22,6 +22,33 @@ def test_catalog_offers_openrouter_gpt_oss_20b():
     assert "content_creation" in entry["purposes"]
 
 
+@pytest.mark.parametrize(
+    ("model_id", "openrouter_model", "label_fragment"),
+    [
+        (
+            "openrouter-nemotron-3.5-lightning-coreweave",
+            "nvidia/nemotron-3.5-lightning",
+            "Nemotron 3.5 Lightning",
+        ),
+        (
+            "openrouter-deepseek-v4-flash-0731-coreweave",
+            "deepseek/deepseek-v4-flash-0731",
+            "DeepSeek V4 Flash 0731",
+        ),
+    ],
+)
+def test_catalog_offers_coreweave_openrouter_models(model_id, openrouter_model, label_fragment):
+    entry = llm_router.LLM_MODELS[model_id]
+    assert entry["model"] == openrouter_model
+    assert entry["provider"] == "openrouter"
+    assert entry["provider_order"] == ["coreweave"]
+    assert entry["online"] is True
+    assert label_fragment in entry["label"]
+    assert "CoreWeave" in entry["label"]
+    assert "chat" in entry["purposes"]
+    assert "content_creation" in entry["purposes"]
+
+
 def test_default_openrouter_model_env_matches_catalog():
     assert llm_router.OPENROUTER_MODEL == "openai/gpt-oss-20b"
 
@@ -68,7 +95,12 @@ def test_groq_provider_modes_alias_to_openrouter():
 def test_models_for_purpose_include_openrouter_and_local():
     chat_models = llm_router.models_for_purpose("chat")
     creation_models = llm_router.models_for_purpose("content_creation")
-    for shared in ("local", "openrouter-gpt-oss-20b"):
+    for shared in (
+        "local",
+        "openrouter-gpt-oss-20b",
+        "openrouter-nemotron-3.5-lightning-coreweave",
+        "openrouter-deepseek-v4-flash-0731-coreweave",
+    ):
         assert shared in chat_models
         assert shared in creation_models
 
@@ -377,12 +409,47 @@ def test_llm_models_endpoint_returns_openrouter_catalog(api):
 
     served = {m["id"] for m in payload["models"]}
     assert "openrouter-gpt-oss-20b" in served
+    assert "openrouter-nemotron-3.5-lightning-coreweave" in served
+    assert "openrouter-deepseek-v4-flash-0731-coreweave" in served
     assert "local" in served
     assert "groq-compound" not in served
+
+    by_id = {m["id"]: m for m in payload["models"]}
+    assert by_id["openrouter-nemotron-3.5-lightning-coreweave"]["provider_order"] == ["coreweave"]
+    assert by_id["openrouter-deepseek-v4-flash-0731-coreweave"]["provider_order"] == ["coreweave"]
+
+    for purpose in ("chat", "content_creation"):
+        purpose_ids = {m["id"] for m in payload["purposes"][purpose]["models"]}
+        assert "openrouter-nemotron-3.5-lightning-coreweave" in purpose_ids
+        assert "openrouter-deepseek-v4-flash-0731-coreweave" in purpose_ids
 
     mode_ids = {m["id"] for m in payload["provider_modes"]}
     assert "openrouter_with_local_fallback" in mode_ids
     assert "groq" not in mode_ids
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        "openrouter-nemotron-3.5-lightning-coreweave",
+        "openrouter-deepseek-v4-flash-0731-coreweave",
+    ],
+)
+@pytest.mark.parametrize("purpose", ["chat", "content_creation"])
+def test_llm_select_endpoint_accepts_coreweave_models(api, isolated_selection, model_id, purpose):
+    client, _server, headers = api
+
+    response = client.post(
+        "/llm/select",
+        headers=headers,
+        json={
+            "model_id": model_id,
+            "provider_mode": "openrouter_with_local_fallback",
+            "purpose": purpose,
+        },
+    )
+    assert response.status_code == 200
+    assert response.get_json()["model_id"] == model_id
 
 
 def test_llm_select_endpoint_accepts_openrouter(api, isolated_selection):
@@ -516,6 +583,73 @@ def test_call_openrouter_allow_fallbacks_omits_only(monkeypatch):
     assert captured["json"]["provider"]["allow_fallbacks"] is True
     assert "only" not in captured["json"]["provider"]
 
+
+def test_call_openrouter_uses_catalog_provider_order_for_coreweave(monkeypatch):
+    monkeypatch.setattr(llm_router, "OPENROUTER_API_KEY", "test-key")
+    # Env still prefers Bedrock; catalog pin must win for CoreWeave models.
+    monkeypatch.setenv("OPENROUTER_PROVIDER_ORDER", "amazon-bedrock,novita")
+    monkeypatch.setenv("OPENROUTER_PROVIDER_ALLOW_FALLBACKS", "true")
+
+    captured: dict = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {
+                "choices": [{"message": {"content": "Hello"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                "provider": "CoreWeave",
+            }
+
+    def fake_post(url, headers, json, timeout):
+        captured["json"] = json
+        return FakeResponse()
+
+    monkeypatch.setattr(llm_router.requests, "post", fake_post)
+    llm_router.call_openrouter_chat_completions(
+        [{"role": "user", "content": "hi"}],
+        "nvidia/nemotron-3.5-lightning",
+        model_id="openrouter-nemotron-3.5-lightning-coreweave",
+    )
+    assert captured["json"]["model"] == "nvidia/nemotron-3.5-lightning"
+    assert captured["json"]["provider"] == {
+        "order": ["coreweave"],
+        "allow_fallbacks": False,
+        "only": ["coreweave"],
+    }
+    assert captured["json"].get("reasoning_effort") == "low"
+
+
+def test_call_openrouter_pins_deepseek_coreweave(monkeypatch):
+    monkeypatch.setattr(llm_router, "OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setenv("OPENROUTER_PROVIDER_ORDER", "amazon-bedrock,novita")
+
+    captured: dict = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {
+                "choices": [{"message": {"content": "Hello"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            }
+
+    def fake_post(url, headers, json, timeout):
+        captured["json"] = json
+        return FakeResponse()
+
+    monkeypatch.setattr(llm_router.requests, "post", fake_post)
+    llm_router.call_openrouter_chat_completions(
+        [{"role": "user", "content": "hi"}],
+        "deepseek/deepseek-v4-flash-0731",
+        model_id="openrouter-deepseek-v4-flash-0731-coreweave",
+    )
+    assert captured["json"]["provider"]["order"] == ["coreweave"]
+    assert captured["json"]["provider"]["only"] == ["coreweave"]
+    assert captured["json"]["provider"]["allow_fallbacks"] is False
+    assert captured["json"].get("reasoning_effort") == "low"
 
 def test_llm_status_exposes_openrouter_provider_order(api, monkeypatch):
     client, _server, headers = api
