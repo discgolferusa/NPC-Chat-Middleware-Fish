@@ -44,10 +44,22 @@ def test_pitch_wins_over_age_for_ambiguous_wording():
         ("female, high-pitched", "feminine"),
         ("male voice", "masculine"),
         ("androgynous", "neutral"),
+        # LibriTTS-P's own hyphenated label. The word-level fallback splits on
+        # spaces only, so this has to match as a whole descriptor or the
+        # speaker gets a free-form tag and the gender filter loses them.
+        ("gender-neutral", "neutral"),
+        ("gender neutral, calm", "neutral"),
     ],
 )
 def test_gender_synonyms_collapse(annotation, expected):
     assert parse_speaker_traits(annotation)["gender"] == expected
+
+
+def test_hyphenated_gender_neutral_is_a_facet_not_a_tag():
+    traits = parse_speaker_traits("gender-neutral, warm")
+    assert traits["gender"] == "neutral"
+    assert "gender-neutral" not in traits["tags"]
+    assert traits["tags"] == ["warm"]
 
 
 def test_unknown_descriptors_survive_as_tags():

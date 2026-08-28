@@ -175,6 +175,11 @@ _GENDER_DESCRIPTORS: dict[str, str] = {
     "woman": "feminine",
     "androgynous": "neutral",
     "neutral": "neutral",
+    # LibriTTS-P writes this one hyphenated. The word-level fallback below only
+    # splits on spaces, so without these it lands in tags and the gender filter
+    # silently omits every speaker labelled this way.
+    "gender-neutral": "neutral",
+    "gender neutral": "neutral",
 }
 
 _AGE_DESCRIPTORS: dict[str, str] = {
