@@ -141,6 +141,7 @@ from tts_processing import (
     build_af_filter,
     clean_for_tts,
     curated_defaults_for_quality,
+    infer_model_language,
     load_piper_model_meta,
     options_from_request_and_npc,
     resolve_tts_options,
@@ -467,6 +468,8 @@ def _build_voice_inventory() -> tuple[list[dict[str, Any]], dict[str, Path]]:
             "path": rel,
             "dataset": meta["dataset"],
             "quality": quality,
+            # Additive: the editor derived this client-side from the path.
+            "language": infer_model_language(rel),
             "num_speakers": meta["num_speakers"],
             "speakers": meta["speakers"],
             "has_speaker_map": meta["has_speaker_map"],

@@ -162,6 +162,172 @@ def speaker_annotation_sidecar_path(model_path: Path) -> Path:
     return Path(str(model_path) + ".speakers.json")
 
 
+# LibriTTS-P style annotations are comma-separated descriptor lists such as
+# "masculine, calm, low-pitched, adult". Only descriptors in these curated maps
+# become facets; anything else is kept verbatim as a free-form tag so the editor
+# can still show it without this vocabulary having to be exhaustive.
+_GENDER_DESCRIPTORS: dict[str, str] = {
+    "masculine": "masculine",
+    "male": "masculine",
+    "man": "masculine",
+    "feminine": "feminine",
+    "female": "feminine",
+    "woman": "feminine",
+    "androgynous": "neutral",
+    "neutral": "neutral",
+}
+
+_AGE_DESCRIPTORS: dict[str, str] = {
+    "child": "child",
+    "kid": "child",
+    "youthful": "young",
+    "young": "young",
+    "teenage": "young",
+    "teen": "young",
+    "adult": "adult",
+    "middle-aged": "middle-aged",
+    "middle aged": "middle-aged",
+    "mature": "middle-aged",
+    "elderly": "elderly",
+    "old": "elderly",
+    "aged": "elderly",
+}
+
+_PITCH_DESCRIPTORS: dict[str, str] = {
+    "low-pitched": "low",
+    "low pitched": "low",
+    "very low-pitched": "low",
+    "deep": "low",
+    "bass": "low",
+    "moderate pitch": "medium",
+    "medium-pitched": "medium",
+    "medium pitched": "medium",
+    "high-pitched": "high",
+    "high pitched": "high",
+    "very high-pitched": "high",
+    "shrill": "high",
+}
+
+# Descriptors worth filtering on. Everything else still survives as a tag.
+_TAG_DESCRIPTORS: frozenset[str] = frozenset(
+    {
+        "bright", "calm", "clear", "cool", "confident", "crisp", "dark",
+        "energetic", "friendly", "gentle", "gravelly", "halting", "hoarse",
+        "husky", "intense", "lively", "measured", "modest", "muffled",
+        "nasal", "powerful", "raspy", "refreshing", "relaxed", "reserved",
+        "rough", "sharp", "shy", "sincere", "smooth", "soft", "solemn",
+        "strict", "strong", "sweet", "tense", "thin", "warm", "weak",
+        "whispery", "wobbly",
+    }
+)
+
+
+def _split_descriptors(annotation: str) -> list[str]:
+    parts = re.split(r"[,;/]|\band\b", str(annotation).lower())
+    cleaned = []
+    for part in parts:
+        text = re.sub(r"\s+", " ", part).strip(" .")
+        # "adult-like" and "youthful-sounding" describe the same facet as the bare word.
+        text = re.sub(r"[- ](?:like|sounding|ish)$", "", text)
+        cleaned.append(text)
+    return cleaned
+
+
+def parse_speaker_traits(annotation: Any) -> dict[str, Any]:
+    """
+    Map a free-text speaker annotation to structured, filterable traits.
+
+    Returns ``{"gender": str|None, "age": str|None, "pitch": str|None, "tags": [str]}``.
+    Unrecognized descriptors become tags rather than being dropped, so the editor
+    can surface them even when this vocabulary lags the source data.
+    """
+    traits: dict[str, Any] = {"gender": None, "age": None, "pitch": None, "tags": []}
+    if not annotation or not isinstance(annotation, (str, int, float)):
+        return traits
+
+    tags: list[str] = []
+    for descriptor in _split_descriptors(str(annotation)):
+        if not descriptor:
+            continue
+
+        # Whole descriptor first, then its individual words, so phrasings like
+        # "male voice" still resolve without listing every variation.
+        candidates = [descriptor, *descriptor.split()] if " " in descriptor else [descriptor]
+
+        matched = False
+        for candidate in candidates:
+            if traits["gender"] is None and candidate in _GENDER_DESCRIPTORS:
+                traits["gender"] = _GENDER_DESCRIPTORS[candidate]
+                matched = True
+                break
+            # Pitch before age: "very low-pitched" must not be read as an age word.
+            if traits["pitch"] is None and candidate in _PITCH_DESCRIPTORS:
+                traits["pitch"] = _PITCH_DESCRIPTORS[candidate]
+                matched = True
+                break
+            if traits["age"] is None and candidate in _AGE_DESCRIPTORS:
+                traits["age"] = _AGE_DESCRIPTORS[candidate]
+                matched = True
+                break
+
+        if not matched and descriptor not in tags:
+            tags.append(descriptor)
+
+    # Curated tags first so the common facets sort to the top of the filter list.
+    traits["tags"] = sorted(
+        tags, key=lambda tag: (tag not in _TAG_DESCRIPTORS, tag)
+    )
+    return traits
+
+
+def normalize_speaker_traits(value: Any) -> dict[str, Any] | None:
+    """
+    Accept an author-supplied ``traits`` object from a sidecar, keeping only the
+    known shape. Returns None when there is nothing usable.
+    """
+    if not isinstance(value, dict):
+        return None
+
+    out: dict[str, Any] = {"gender": None, "age": None, "pitch": None, "tags": []}
+    for key in ("gender", "age", "pitch"):
+        raw = value.get(key)
+        if raw is not None and str(raw).strip():
+            out[key] = str(raw).strip().lower()
+
+    raw_tags = value.get("tags")
+    if isinstance(raw_tags, str):
+        raw_tags = _split_descriptors(raw_tags)
+    if isinstance(raw_tags, (list, tuple)):
+        seen: list[str] = []
+        for tag in raw_tags:
+            text = str(tag).strip().lower()
+            if text and text not in seen:
+                seen.append(text)
+        out["tags"] = seen
+
+    if not any(out[key] for key in ("gender", "age", "pitch", "tags")):
+        return None
+    return out
+
+
+def infer_model_language(model_path: Path | str) -> str:
+    """
+    Read the language tag out of a Piper model's standard path layout
+    (``en/en_US/...`` or an ``en_US-`` filename prefix). Empty when absent.
+    """
+    normalized = str(model_path).replace("\\", "/")
+    for part in reversed([p for p in normalized.split("/") if p]):
+        match = re.fullmatch(r"([a-z]{2})[_-]([A-Z]{2})", part)
+        if match:
+            return f"{match.group(1)}_{match.group(2)}"
+
+    filename = normalized.rsplit("/", 1)[-1]
+    match = re.match(r"^([a-z]{2})[_-]([A-Z]{2})-", filename)
+    if match:
+        return f"{match.group(1)}_{match.group(2)}"
+    return ""
+
+
 def _annotation_text_from_entry(entry: Any) -> str:
     if entry is None:
         return ""
@@ -185,7 +351,7 @@ def _display_name_from_entry(entry: Any) -> str:
     return ""
 
 
-def load_speaker_annotation_sidecar(model_path: Path) -> dict[int, dict[str, str]]:
+def load_speaker_annotation_sidecar(model_path: Path) -> dict[int, dict[str, Any]]:
     """
     Load optional human annotation overlay for multi-speaker Piper models.
 
@@ -213,7 +379,7 @@ def load_speaker_annotation_sidecar(model_path: Path) -> dict[int, dict[str, str
     if not isinstance(raw, dict):
         return {}
 
-    out: dict[int, dict[str, str]] = {}
+    out: dict[int, dict[str, Any]] = {}
     for key, entry in raw.items():
         try:
             sid = int(key)
@@ -221,20 +387,26 @@ def load_speaker_annotation_sidecar(model_path: Path) -> dict[int, dict[str, str
             continue
         annotation = _annotation_text_from_entry(entry)
         name = _display_name_from_entry(entry)
-        if not annotation and not name:
+        # An explicit traits object is authoritative; the parser is the fallback.
+        traits = normalize_speaker_traits(entry.get("traits")) if isinstance(entry, dict) else None
+        if traits is None and annotation:
+            traits = parse_speaker_traits(annotation)
+        if not annotation and not name and not traits:
             continue
-        payload: dict[str, str] = {}
+        payload: dict[str, Any] = {}
         if name:
             payload["name"] = name
         if annotation:
             payload["annotation"] = annotation
+        if traits:
+            payload["traits"] = traits
         out[sid] = payload
     return out
 
 
 def apply_speaker_annotation_sidecar(
     speakers: list[dict[str, Any]],
-    sidecar: dict[int, dict[str, str]],
+    sidecar: dict[int, dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """
     Merge sidecar name/annotation onto existing inventory speaker rows (by id).
@@ -262,6 +434,8 @@ def apply_speaker_annotation_sidecar(
                     out["name"] = overlay["name"]
             if overlay.get("annotation"):
                 out["annotation"] = overlay["annotation"]
+            if overlay.get("traits"):
+                out["traits"] = overlay["traits"]
         merged.append(out)
     return merged
 
