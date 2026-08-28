@@ -13,6 +13,7 @@ HeaderSteps = "X-Timing-Steps"
 HeaderPhases = "X-Timing-Phases"
 HeaderLlmModelId = "X-Llm-Model-Id"
 HeaderLlmSelectedModelId = "X-Llm-Selected-Model-Id"
+HeaderLlmProvider = "X-Llm-Provider"
 
 VOICE_PRE_LLM_LABELS = frozenset(
     {
@@ -51,12 +52,14 @@ def begin_request_timing() -> None:
     g._timing_start = time.perf_counter()
     g._timing_llm_model_id = None
     g._timing_llm_selected_model_id = None
+    g._timing_llm_provider = None
 
 
 def note_request_llm_model(
     *,
     active_model_id: str | None,
     selected_model_id: str | None = None,
+    provider: str | None = None,
     purpose: str | None = None,
 ) -> None:
     """Bind the model used for this HTTP request (first chat write wins).
@@ -79,12 +82,17 @@ def note_request_llm_model(
 
     active = str(active_model_id or "").strip() or None
     selected = str(selected_model_id or "").strip() or None
+    provider_name = str(provider or "").strip() or None
     if not active and not selected:
         return
 
     # First chat LLM in this request owns turn attribution (NPC reply, not memory).
-    if active and not getattr(g, "_timing_llm_model_id", None):
+    already_attributed = bool(getattr(g, "_timing_llm_model_id", None))
+    if active and not already_attributed:
         g._timing_llm_model_id = active
+        # Provider travels with the model that won attribution, so a later
+        # fallback hop cannot relabel the host that actually served the turn.
+        g._timing_llm_provider = provider_name
     if selected and not getattr(g, "_timing_llm_selected_model_id", None):
         g._timing_llm_selected_model_id = selected
 
@@ -150,14 +158,15 @@ def log_timing(request_id: str, label: str, start_time: float) -> float:
     return time.perf_counter()
 
 
-def _request_llm_model_headers() -> tuple[str | None, str | None]:
-    """Return (active_model_id, selected_model_id) from this request only."""
+def _request_llm_model_headers() -> tuple[str | None, str | None, str | None]:
+    """Return (active_model_id, selected_model_id, provider) from this request only."""
     try:
         active = str(getattr(g, "_timing_llm_model_id", None) or "").strip() or None
         selected = str(getattr(g, "_timing_llm_selected_model_id", None) or "").strip() or None
-        return active, selected
+        provider = str(getattr(g, "_timing_llm_provider", None) or "").strip() or None
+        return active, selected, provider
     except Exception:
-        return None, None
+        return None, None, None
 
 
 def attach_timing_headers(
@@ -174,11 +183,13 @@ def attach_timing_headers(
         response.headers[HeaderTotalMs] = str(max(0, middleware_total_ms))
 
     steps = getattr(g, "_timing_steps", None)
-    active_model_id, selected_model_id = _request_llm_model_headers()
+    active_model_id, selected_model_id, provider = _request_llm_model_headers()
     if active_model_id:
         response.headers[HeaderLlmModelId] = active_model_id
     if selected_model_id:
         response.headers[HeaderLlmSelectedModelId] = selected_model_id
+    if provider:
+        response.headers[HeaderLlmProvider] = provider
 
     if isinstance(steps, list) and steps:
         compact = "|".join(steps[:24])
@@ -195,6 +206,8 @@ def attach_timing_headers(
                 phases["model_id"] = active_model_id
             if selected_model_id:
                 phases["selected_model_id"] = selected_model_id
+            if provider:
+                phases["provider"] = provider
             phases_json = json.dumps(phases, separators=(",", ":"))
             if len(phases_json) <= 1800:
                 response.headers[HeaderPhases] = phases_json
