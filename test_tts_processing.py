@@ -130,11 +130,23 @@ def test_load_model_meta_merges_speaker_annotation_sidecar(tmp_path):
             "id": 0,
             "name": "Benjamin Parker",
             "annotation": "masculine, adult-like, cool, sincere",
+            "traits": {
+                "gender": "masculine",
+                "age": "adult",
+                "pitch": None,
+                "tags": ["cool", "sincere"],
+            },
         },
         {
             "id": 1,
             "name": "Teresa Richardson",
             "annotation": "feminine, soft, kind",
+            "traits": {
+                "gender": "feminine",
+                "age": None,
+                "pitch": None,
+                "tags": ["soft", "kind"],
+            },
         },
     ]
     assert meta["num_speakers"] == 2

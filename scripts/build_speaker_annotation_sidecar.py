@@ -19,6 +19,11 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from tts_processing import parse_speaker_traits  # noqa: E402
 
 
 ANNOTATOR_PRIORITY = ("Annotator 3", "Annotator 1", "Annotator 2")
@@ -84,7 +89,7 @@ def build_sidecar(xlsx: Path, onnx_json: Path) -> dict:
         if key not in idx:
             raise SystemExit(f"XLSX missing required column: {key}")
 
-    speakers: dict[str, dict[str, str]] = {}
+    speakers: dict[str, dict[str, Any]] = {}
     mismatches: list[str] = []
     skipped_unknown: list[int] = []
     for row in rows[1:]:
@@ -101,11 +106,14 @@ def build_sidecar(xlsx: Path, onnx_json: Path) -> dict:
         json_name = by_id[sid]
         if friendly and json_name != friendly:
             mismatches.append(f"id={sid} xlsx={friendly!r} json={json_name!r}")
-        entry: dict[str, str] = {
+        entry: dict[str, Any] = {
             "name": json_name or friendly or f"speaker_{sid}",
         }
         if annotation:
             entry["annotation"] = annotation
+            # Written at build time so the runtime parse is only a fallback, and
+            # so these can be hand-corrected in the sidecar without code changes.
+            entry["traits"] = parse_speaker_traits(annotation)
         speakers[str(sid)] = entry
 
     if skipped_unknown:
