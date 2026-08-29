@@ -309,14 +309,9 @@ def get_default_party_member(campaign_id: str | None = None) -> dict[str, Any]:
     return member
 
 
-def get_character_options(campaign_id: str | None = None, party_id: str | None = None) -> list[dict[str, Any]]:
-    campaign_id = (campaign_id or "").strip()
-    party_id = (party_id or "").strip()
-
+def _character_options_for_parties(party_ids: list[str], campaign_id: str) -> list[dict[str, Any]]:
     options: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
-
-    party_ids = [party_id] if party_id else [item["party_id"] for item in list_parties(campaign_id=campaign_id or None)]
 
     for current_party_id in party_ids:
         party = load_party(current_party_id)
@@ -330,8 +325,34 @@ def get_character_options(campaign_id: str | None = None, party_id: str | None =
             seen_ids.add(player_id)
             options.append({
                 **member,
+                # The list can span several parties, so each option has to carry
+                # the party it actually came from; callers use it to place a
+                # selected character rather than assuming the requested party.
+                "party_id": member.get("party_id") or party.get("party_id") or current_party_id,
+                "campaign_id": member.get("campaign_id") or party.get("campaign_id") or campaign_id,
                 "label": f"{member.get('name')} ({member.get('race')} {member.get('class')})",
             })
+
+    return options
+
+
+def _campaign_party_ids(campaign_id: str) -> list[str]:
+    return [item["party_id"] for item in list_parties(campaign_id=campaign_id or None)]
+
+
+def get_character_options(campaign_id: str | None = None, party_id: str | None = None) -> list[dict[str, Any]]:
+    campaign_id = (campaign_id or "").strip()
+    party_id = (party_id or "").strip()
+
+    if party_id:
+        options = _character_options_for_parties([party_id], campaign_id)
+        # A restart resets the play session to the placeholder party id, which
+        # resolves to nothing. Widening to the campaign keeps real characters
+        # in the list instead of collapsing it to the default party.
+        if not options:
+            options = _character_options_for_parties(_campaign_party_ids(campaign_id), campaign_id)
+    else:
+        options = _character_options_for_parties(_campaign_party_ids(campaign_id), campaign_id)
 
     if not options:
         default_member = get_default_party_member(campaign_id)
@@ -523,15 +544,21 @@ def select_character(player_id: str, *, party_id: str | None = None) -> dict[str
         campaign_id=new_campaign_id or None,
         party_id=new_party_id or None,
     )
-    valid_ids = {character["player_id"] for character in characters}
-    if player_id not in valid_ids:
-        member = find_member_anywhere(player_id)
-        if member:
-            new_party_id = member.get("party_id") or new_party_id
-            if member.get("campaign_id"):
-                new_campaign_id = member["campaign_id"]
-        elif player_id != DEFAULT_PLAYER_ID:
-            raise ValueError(f"Unknown player_id: {player_id}")
+    # Being listed does not mean the character belongs to the requested party:
+    # the list widens to the whole campaign when that party resolves to nothing.
+    # Take the party from the chosen character so a placeholder party id from a
+    # rebuilt play session is never persisted as their party.
+    chosen = next(
+        (character for character in characters if character.get("player_id") == player_id),
+        None,
+    ) or find_member_anywhere(player_id)
+
+    if chosen:
+        new_party_id = chosen.get("party_id") or new_party_id
+        if chosen.get("campaign_id"):
+            new_campaign_id = chosen["campaign_id"]
+    elif player_id != DEFAULT_PLAYER_ID:
+        raise ValueError(f"Unknown player_id: {player_id}")
 
     if not new_campaign_id:
         raise ValueError("campaign_id is required to select a character")
