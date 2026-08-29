@@ -2583,6 +2583,69 @@ def resolve_voice_model_paths_for_turn(
     return paths
 
 
+def warm_piper_at_startup() -> None:
+    """
+    Load the Piper models the server will almost certainly need before any turn
+    arrives.
+
+    Warming during a turn is self-defeating: the replica loaders saturate the CPU
+    that speech-to-text is running on, so the turn waits out the whole fan-out to
+    save a fraction of that on synthesis. Paying the cost at startup keeps it off
+    the first player's turn.
+    """
+    if str(os.environ.get("PIPER_USE_SUBPROCESS", "")).strip().lower() in ("1", "true", "yes"):
+        return
+    if str(os.environ.get("PIPER_WARM_AT_STARTUP", "1")).strip().lower() in ("0", "false", "no"):
+        return
+
+    paths: list[Path] = []
+    seen: set[str] = set()
+
+    def _add(voice_model: Any) -> None:
+        if not voice_model:
+            return
+        try:
+            resolved = resolve_voice_model_path(voice_model)
+        except Exception:
+            return
+        key = str(resolved)
+        if key in seen:
+            return
+        seen.add(key)
+        paths.append(resolved)
+
+    try:
+        narrator = get_narrator_tts_settings()
+        _add(narrator.get("resolved_voice_model") or narrator.get("voice_model"))
+    except Exception as ex:
+        print(f"[PIPER-POOL] startup_narrator_unresolved error={ex!r}", flush=True)
+
+    # Any voice already assigned to an NPC is a voice a turn can ask for. There
+    # is no request context at startup, so this reads the on-disk NPC directory
+    # rather than the tenant-scoped listing.
+    try:
+        npc_files = sorted(list(NPC_DIR.glob("*.yaml")) + list(NPC_DIR.glob("*.yml")))
+        for path in npc_files:
+            try:
+                _add(pick_npc_voice_model(load_npc(path.stem), None))
+            except Exception:
+                continue
+    except Exception as ex:
+        print(f"[PIPER-POOL] startup_npc_scan_failed error={ex!r}", flush=True)
+
+    if not paths:
+        return
+
+    try:
+        piper_pool.warm_voice_models(paths, request_id="startup")
+        print(
+            "[PIPER-POOL] startup warm models=" + ", ".join(p.name for p in paths),
+            flush=True,
+        )
+    except Exception as ex:
+        print(f"[PIPER-POOL] startup_warm_failed error={ex!r}", flush=True)
+
+
 def schedule_piper_warm_for_voice_turn(
     npc_id: str,
     voice_override: str | None,
@@ -5033,6 +5096,9 @@ print(
 
 
 if __name__ == "__main__":
+    # Load the voice models now so the first turn is not competing with the
+    # replica loaders for CPU while speech-to-text runs.
+    warm_piper_at_startup()
     # threaded=True keeps /health, /campaigns, etc. responsive during long voice/LLM turns
     print(
         f"[GAME_API] listening on {GAME_API_HOST}:{GAME_API_PORT} "
