@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -98,6 +100,7 @@ MEMORY_DB = CONFIG.sqlite_path or _DEFAULT_SQLITE_PATH
 def refresh_memory_db_config() -> MemoryDbConfig:
     """Re-read env and update module-level CONFIG / MEMORY_DB."""
     global CONFIG, MEMORY_DB
+    close_connection_pools()
     CONFIG = resolve_memory_db_config()
     MEMORY_DB = CONFIG.sqlite_path or _DEFAULT_SQLITE_PATH
     return CONFIG
@@ -123,55 +126,360 @@ def _qmark_to_percent(sql: str) -> str:
 class _CursorResult:
     """Thin wrapper so callers can use ``cur.lastrowid`` / ``.fetchall()``."""
 
-    def __init__(self, cursor: Any):
+    def __init__(self, cursor: Any, on_close=None):
         self._cursor = cursor
+        self._on_close = on_close
+        self._closed = False
         self.lastrowid = getattr(cursor, "lastrowid", None)
         self.rowcount = getattr(cursor, "rowcount", -1)
 
     def fetchall(self) -> list[Any]:
-        return list(self._cursor.fetchall())
+        try:
+            return list(self._cursor.fetchall())
+        finally:
+            self.close()
 
     def fetchone(self) -> Any:
-        return self._cursor.fetchone()
+        try:
+            return self._cursor.fetchone()
+        finally:
+            self.close()
 
     def __iter__(self):
         return iter(self.fetchall())
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            close = getattr(self._cursor, "close", None)
+            if callable(close):
+                close()
+        finally:
+            if self._on_close is not None:
+                on_close = self._on_close
+                self._on_close = None
+                on_close(self)
+
+
+@dataclass
+class _PoolEntry:
+    raw: Any
+    created_at: float
+    returned_at: float
+
+
+class _MySqlConnectionPool:
+    """Small bounded, thread-safe pool for PyMySQL connections."""
+
+    def __init__(
+        self,
+        config: MemoryDbConfig,
+        *,
+        max_size: int,
+        acquire_timeout: float,
+        recycle_seconds: float,
+        ping_interval_seconds: float,
+    ) -> None:
+        self.config = config
+        self.max_size = max(1, int(max_size))
+        self.acquire_timeout = max(0.01, float(acquire_timeout))
+        self.recycle_seconds = max(0.0, float(recycle_seconds))
+        self.ping_interval_seconds = max(0.0, float(ping_interval_seconds))
+        self._condition = threading.Condition()
+        self._idle: list[_PoolEntry] = []
+        self._total = 0
+        self._closed = False
+
+    def _new_raw_connection(self) -> Any:
+        cfg = self.config
+        return pymysql.connect(
+            host=cfg.mysql_host,
+            port=cfg.mysql_port,
+            user=cfg.mysql_user,
+            password=cfg.mysql_password,
+            database=cfg.mysql_database,
+            charset=cfg.mysql_charset,
+            autocommit=False,
+            cursorclass=DictCursor,
+            connect_timeout=_positive_int_env("MEMORY_MYSQL_CONNECT_TIMEOUT_SECONDS", 10),
+            read_timeout=_positive_int_env("MEMORY_MYSQL_READ_TIMEOUT_SECONDS", 30),
+            write_timeout=_positive_int_env("MEMORY_MYSQL_WRITE_TIMEOUT_SECONDS", 30),
+        )
+
+    def _discard(self, entry: _PoolEntry) -> None:
+        try:
+            entry.raw.close()
+        except Exception:
+            pass
+        with self._condition:
+            self._total = max(0, self._total - 1)
+            self._condition.notify()
+
+    def _entry_is_usable(self, entry: _PoolEntry, now: float) -> bool:
+        if self.recycle_seconds and now - entry.created_at >= self.recycle_seconds:
+            return False
+        if not bool(getattr(entry.raw, "open", True)):
+            return False
+        idle_seconds = now - entry.returned_at
+        ping = getattr(entry.raw, "ping", None)
+        if (
+            callable(ping)
+            and self.ping_interval_seconds
+            and idle_seconds >= self.ping_interval_seconds
+        ):
+            try:
+                # Reconnect is deliberately disabled so the pool retains an exact
+                # count and can discard/recreate failed connections itself.
+                ping(reconnect=False)
+            except Exception:
+                return False
+        return True
+
+    def acquire(self) -> _PoolEntry:
+        deadline = time.monotonic() + self.acquire_timeout
+        while True:
+            create_new = False
+            with self._condition:
+                if self._closed:
+                    raise RuntimeError("MySQL connection pool is closed")
+                if self._idle:
+                    entry = self._idle.pop()
+                elif self._total < self.max_size:
+                    # Reserve the slot before connecting outside the lock so two
+                    # WSGI threads cannot both exceed max_size.
+                    self._total += 1
+                    create_new = True
+                    entry = None
+                else:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError(
+                            "Timed out waiting for a MySQL connection from the "
+                            f"pool (size={self.max_size}, timeout={self.acquire_timeout:.2f}s)"
+                        )
+                    self._condition.wait(timeout=remaining)
+                    continue
+
+            if create_new:
+                try:
+                    connect_started = time.monotonic()
+                    raw = self._new_raw_connection()
+                    now = time.monotonic()
+                    print(
+                        "[MEMORY-DB] pooled MySQL connection opened "
+                        f"elapsed={now - connect_started:.3f}s",
+                        flush=True,
+                    )
+                    return _PoolEntry(raw=raw, created_at=now, returned_at=now)
+                except Exception:
+                    with self._condition:
+                        self._total = max(0, self._total - 1)
+                        self._condition.notify()
+                    raise
+
+            assert entry is not None
+            now = time.monotonic()
+            if self._entry_is_usable(entry, now):
+                return entry
+            self._discard(entry)
+
+    def release(self, entry: _PoolEntry, *, invalid: bool = False) -> None:
+        if invalid or not bool(getattr(entry.raw, "open", True)):
+            self._discard(entry)
+            return
+
+        entry.returned_at = time.monotonic()
+        with self._condition:
+            if self._closed:
+                should_discard = True
+            else:
+                self._idle.append(entry)
+                self._condition.notify()
+                should_discard = False
+        if should_discard:
+            self._discard(entry)
+
+    def close(self) -> None:
+        with self._condition:
+            self._closed = True
+            idle = list(self._idle)
+            self._idle.clear()
+            self._condition.notify_all()
+        for entry in idle:
+            self._discard(entry)
+
+    def status(self) -> dict[str, int]:
+        with self._condition:
+            idle = len(self._idle)
+            total = self._total
+            return {
+                "max_size": self.max_size,
+                "total": total,
+                "idle": idle,
+                "in_use": max(0, total - idle),
+            }
+
+
+_MYSQL_POOLS_LOCK = threading.Lock()
+_MYSQL_POOLS: dict[MemoryDbConfig, _MySqlConnectionPool] = {}
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    try:
+        return max(1, int((os.environ.get(name) or str(default)).strip()))
+    except ValueError:
+        return default
+
+
+def _nonnegative_float_env(name: str, default: float) -> float:
+    try:
+        return max(0.0, float((os.environ.get(name) or str(default)).strip()))
+    except ValueError:
+        return default
+
+
+def _pool_for_config(config: MemoryDbConfig) -> _MySqlConnectionPool:
+    with _MYSQL_POOLS_LOCK:
+        pool = _MYSQL_POOLS.get(config)
+        if pool is None:
+            pool = _MySqlConnectionPool(
+                config,
+                max_size=_positive_int_env("MEMORY_MYSQL_POOL_SIZE", 10),
+                acquire_timeout=_nonnegative_float_env(
+                    "MEMORY_MYSQL_POOL_TIMEOUT_SECONDS", 10.0
+                ),
+                recycle_seconds=_nonnegative_float_env(
+                    "MEMORY_MYSQL_POOL_RECYCLE_SECONDS", 1800.0
+                ),
+                ping_interval_seconds=_nonnegative_float_env(
+                    "MEMORY_MYSQL_POOL_PING_INTERVAL_SECONDS", 30.0
+                ),
+            )
+            _MYSQL_POOLS[config] = pool
+            print(
+                "[MEMORY-DB] MySQL connection pool ready "
+                f"size={pool.max_size} timeout={pool.acquire_timeout:.1f}s "
+                f"recycle={pool.recycle_seconds:.1f}s",
+                flush=True,
+            )
+        return pool
+
+
+def close_connection_pools() -> None:
+    """Close idle pooled connections; checked-out connections close on return."""
+    with _MYSQL_POOLS_LOCK:
+        pools = list(_MYSQL_POOLS.values())
+        _MYSQL_POOLS.clear()
+    for pool in pools:
+        pool.close()
+
+
+def connection_pool_status(config: MemoryDbConfig | None = None) -> dict[str, int]:
+    """Return non-secret pool counters for diagnostics and tests."""
+    cfg = config or CONFIG
+    if not cfg.is_mysql:
+        return {"max_size": 0, "total": 0, "idle": 0, "in_use": 0}
+    return _pool_for_config(cfg).status()
 
 
 class DbConnection:
     """sqlite3-like connection: ``execute(sql, params)``, commit, context manager."""
 
-    def __init__(self, config: MemoryDbConfig, raw: Any):
+    def __init__(
+        self,
+        config: MemoryDbConfig,
+        raw: Any,
+        *,
+        pool: _MySqlConnectionPool | None = None,
+        pool_entry: _PoolEntry | None = None,
+    ):
         self.config = config
         self._raw = raw
+        self._pool = pool
+        self._pool_entry = pool_entry
+        self._closed = False
+        self._results: set[_CursorResult] = set()
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("Database connection is already closed")
+
+    def _forget_result(self, result: _CursorResult) -> None:
+        self._results.discard(result)
+
+    def _close_results(self) -> None:
+        for result in list(self._results):
+            try:
+                result.close()
+            except Exception:
+                pass
+        self._results.clear()
+
+    def _finish(self, *, invalid: bool = False) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._close_results()
+        if self._pool is not None and self._pool_entry is not None:
+            self._pool.release(self._pool_entry, invalid=invalid)
+        else:
+            self._raw.close()
 
     def execute(self, sql: str, params: Sequence[Any] | None = None) -> _CursorResult:
+        self._ensure_open()
         params = params or ()
         if self.config.is_mysql:
             cursor = self._raw.cursor()
             cursor.execute(_qmark_to_percent(sql), tuple(params))
-            return _CursorResult(cursor)
+            result = _CursorResult(cursor, self._forget_result)
+            self._results.add(result)
+            return result
         cursor = self._raw.execute(sql, params)
-        return _CursorResult(cursor)
+        result = _CursorResult(cursor, self._forget_result)
+        self._results.add(result)
+        return result
 
     def executemany(self, sql: str, seq_of_params: Iterable[Sequence[Any]]) -> _CursorResult:
+        self._ensure_open()
         if self.config.is_mysql:
             cursor = self._raw.cursor()
             cursor.executemany(_qmark_to_percent(sql), list(seq_of_params))
-            return _CursorResult(cursor)
+            result = _CursorResult(cursor, self._forget_result)
+            self._results.add(result)
+            return result
         cursor = self._raw.executemany(sql, seq_of_params)
-        return _CursorResult(cursor)
+        result = _CursorResult(cursor, self._forget_result)
+        self._results.add(result)
+        return result
 
     def commit(self) -> None:
+        self._ensure_open()
         self._raw.commit()
 
     def close(self) -> None:
-        self._raw.close()
+        if self._closed:
+            return
+        invalid = False
+        if self._pool is not None:
+            try:
+                # Explicit close without a context-manager exit must not leak an
+                # unfinished transaction into the next request.
+                self._raw.rollback()
+            except Exception:
+                invalid = True
+        self._finish(invalid=invalid)
 
     def __enter__(self) -> DbConnection:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
+        if self._closed:
+            # close() already released the raw connection back to the pool;
+            # another request may own it now, so never commit/rollback here.
+            return
+        invalid = False
         try:
             if exc_type is None:
                 self._raw.commit()
@@ -179,9 +487,12 @@ class DbConnection:
                 try:
                     self._raw.rollback()
                 except Exception:
-                    pass
+                    invalid = True
+        except Exception:
+            invalid = True
+            raise
         finally:
-            self._raw.close()
+            self._finish(invalid=invalid)
 
 
 def connect(config: MemoryDbConfig | None = None) -> DbConnection:
@@ -193,17 +504,9 @@ def connect(config: MemoryDbConfig | None = None) -> DbConnection:
                 "PyMySQL is required for MEMORY_MYSQL_HOST. "
                 "Install with: pip install PyMySQL"
             )
-        raw = pymysql.connect(
-            host=cfg.mysql_host,
-            port=cfg.mysql_port,
-            user=cfg.mysql_user,
-            password=cfg.mysql_password,
-            database=cfg.mysql_database,
-            charset=cfg.mysql_charset,
-            autocommit=False,
-            cursorclass=DictCursor,
-        )
-        return DbConnection(cfg, raw)
+        pool = _pool_for_config(cfg)
+        entry = pool.acquire()
+        return DbConnection(cfg, entry.raw, pool=pool, pool_entry=entry)
 
     path = cfg.sqlite_path or _DEFAULT_SQLITE_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
