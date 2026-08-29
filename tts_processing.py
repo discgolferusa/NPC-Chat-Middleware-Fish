@@ -587,6 +587,127 @@ def asterisk_body_tts_type(_inner: str) -> str:
     return "narrator"
 
 
+_DASH_BREAK = re.compile(r"\s*(?:—|–|--+)\s*")
+
+# A first clip short enough to start playing almost immediately, then longer
+# ones: past the first, chunk boundaries only cost overhead, and Piper reads a
+# paragraph more naturally than a string of one-liners.
+FIRST_STREAM_CHUNK_MAX_CHARS = 140
+STREAM_CHUNK_MAX_CHARS = 320
+
+
+def dashes_to_sentence_breaks(text: str) -> str:
+    """
+    Speak an em dash as a beat.
+
+    Writers (and the LLM) use "—" for a pause mid-thought, but espeak-ng runs
+    straight through it, so "partial to it myself — been here my whole life"
+    arrives as one breathless line. Making it a sentence boundary hands the
+    pause to Piper's own ``sentence_silence``, which each NPC already tunes.
+    """
+    parts = _DASH_BREAK.split(text or "")
+    if len(parts) == 1:
+        return text
+
+    out = parts[0].strip()
+    for part in parts[1:]:
+        nxt = part.strip()
+        if not out:
+            out = nxt
+            continue
+        if not nxt:
+            continue
+        # A number range ("5–10") is not a pause, it is a span.
+        if out[-1].isdigit() and nxt[0].isdigit():
+            out += ", " + nxt
+            continue
+        out = out.rstrip(" ,;:")
+        if out and out[-1] not in ".!?…":
+            out += "."
+        out += " " + nxt
+    return out
+
+
+def split_into_sentences(text: str) -> list[str]:
+    """
+    Split spoken text on sentence ends, keeping the punctuation.
+
+    Runs on already-cleaned text, so "Dr." and friends are words by now.
+    Two things are deliberately not boundaries: a trailing-off "...", which is
+    one thought rather than two, and a decimal point, which has no space after
+    it.
+    """
+    text = (text or "").strip()
+    if not text:
+        return []
+
+    sentences: list[str] = []
+    start = 0
+    for match in re.finditer(r"[.!?…]+[\"')\]\u2019\u201d]*", text):
+        run = match.group(0)
+        if run.startswith("..") or run.startswith("…"):
+            continue
+        end = match.end()
+        if end < len(text) and not text[end].isspace():
+            continue
+        piece = text[start:end].strip()
+        if piece:
+            sentences.append(piece)
+        start = end
+
+    tail = text[start:].strip()
+    if tail:
+        sentences.append(tail)
+    return sentences
+
+
+def chunk_sentences_for_streaming(
+    sentences: list[str],
+    *,
+    first_max_chars: int = FIRST_STREAM_CHUNK_MAX_CHARS,
+    max_chars: int = STREAM_CHUNK_MAX_CHARS,
+) -> list[str]:
+    """
+    Group sentences into clips, smallest first.
+
+    Time-to-first-audio is the whole point, so the opening clip stays short; the
+    rest are packed to keep the per-clip synth and FFmpeg overhead down. A
+    sentence longer than the budget is never split — a clip always ends where a
+    sentence does.
+    """
+    chunks: list[str] = []
+    current = ""
+    for sentence in sentences:
+        if not sentence:
+            continue
+        budget = first_max_chars if not chunks else max_chars
+        if not current:
+            current = sentence
+        elif len(current) + 1 + len(sentence) <= budget:
+            current = f"{current} {sentence}"
+        else:
+            chunks.append(current)
+            current = sentence
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def split_text_for_streaming(
+    text: str,
+    *,
+    first_max_chars: int = FIRST_STREAM_CHUNK_MAX_CHARS,
+    max_chars: int = STREAM_CHUNK_MAX_CHARS,
+) -> list[str]:
+    """Cleaned text -> the clips it should be synthesized as, in order."""
+    chunks = chunk_sentences_for_streaming(
+        split_into_sentences(text),
+        first_max_chars=first_max_chars,
+        max_chars=max_chars,
+    )
+    return chunks or ([text.strip()] if text and text.strip() else [])
+
+
 def clean_for_tts(text: str, pronunciation: dict[str, str] | None = None) -> str:
     """Normalize LLM output into Piper-friendly spoken text."""
     text = re.sub(r"\*([^*]{1,500})\*", r"\1", text)
@@ -609,6 +730,7 @@ def clean_for_tts(text: str, pronunciation: dict[str, str] | None = None) -> str
 
     text = expand_simple_numbers(text)
     text = apply_pronunciation(text, pronunciation)
+    text = dashes_to_sentence_breaks(text)
     text = re.sub(r"\s+", " ", text).strip()
     text = ensure_sentence_ending(text)
     return text
