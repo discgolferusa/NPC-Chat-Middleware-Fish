@@ -151,6 +151,36 @@ def test_explicit_close_rolls_back_before_pool_return(mysql_config, fake_connect
     assert fake_connect[0].rollbacks == 1
 
 
+def test_exit_after_explicit_close_does_not_touch_pooled_connection(
+    mysql_config, fake_connect
+):
+    with memory_db.connect(mysql_config) as conn:
+        conn.close()
+
+    raw = fake_connect[0]
+    assert (raw.commits, raw.rollbacks) == (0, 1)
+
+    # The connection is back in the pool and usable by the next caller.
+    with memory_db.connect(mysql_config) as second:
+        second.execute("SELECT ?", (1,)).fetchall()
+
+    assert len(fake_connect) == 1
+    assert (raw.commits, raw.rollbacks) == (1, 1)
+
+
+def test_exit_after_explicit_close_with_exception_does_not_roll_back(
+    mysql_config, fake_connect
+):
+    with pytest.raises(ValueError, match="boom"):
+        with memory_db.connect(mysql_config) as conn:
+            conn.close()
+            raise ValueError("boom")
+
+    raw = fake_connect[0]
+    assert (raw.commits, raw.rollbacks) == (0, 1)
+    assert memory_db.connection_pool_status(mysql_config)["idle"] == 1
+
+
 def test_pool_blocks_at_capacity_then_reuses_released_connection(
     monkeypatch,
     mysql_config,

@@ -475,6 +475,10 @@ class DbConnection:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
+        if self._closed:
+            # close() already released the raw connection back to the pool;
+            # another request may own it now, so never commit/rollback here.
+            return
         invalid = False
         try:
             if exc_type is None:
