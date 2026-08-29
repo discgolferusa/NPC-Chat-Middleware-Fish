@@ -201,7 +201,11 @@ def _start_loaders_locked(entry: _ModelEntry, request_id: str | None) -> list[th
     return threads
 
 
-def _store_loaded_replica(key: str, voice: Any) -> list[threading.Thread]:
+def _store_loaded_replica(
+    key: str,
+    voice: Any,
+    request_id: str | None,
+) -> list[threading.Thread]:
     """Store a loaded replica and return any top-up loader threads to start."""
     with _POOL_LOCK:
         entry = _MODELS.get(key)
@@ -219,8 +223,9 @@ def _store_loaded_replica(key: str, voice: Any) -> list[threading.Thread]:
         entry.error = None
         entry.ready.set()
         entry.free.put(instance)
-        # First replica is ready — fill remaining slots in the background.
-        return _start_loaders_locked(entry, None)
+        # First replica is ready — fill remaining slots in the background. Keep
+        # the originating request id so startup top-ups are identifiable in logs.
+        return _start_loaders_locked(entry, request_id)
 
 
 def _store_load_error(key: str, error: BaseException) -> None:
@@ -229,7 +234,7 @@ def _store_load_error(key: str, error: BaseException) -> None:
         if entry is None:
             return
         entry.inflight = max(0, entry.inflight - 1)
-        if not entry.instances and entry.inflight == 0:
+        if entry.inflight == 0 and len(entry.instances) < entry.target_count:
             entry.error = error
             entry.ready.set()
 
@@ -238,7 +243,7 @@ def _load_voice_replica(model_path: Path, request_id: str | None) -> None:
     key = _voice_key(model_path)
     try:
         voice = _create_piper_voice(model_path)
-        topup_threads = _store_loaded_replica(key, voice)
+        topup_threads = _store_loaded_replica(key, voice, request_id)
         for thread in topup_threads:
             thread.start()
         with _POOL_LOCK:
@@ -259,8 +264,74 @@ def _load_voice_replica(model_path: Path, request_id: str | None) -> None:
         )
 
 
-def warm_voice_models(model_paths: list[Path], *, request_id: str | None = None) -> None:
-    """Register models, rebalance slot targets, and warm replicas in the background."""
+def pool_status() -> dict[str, dict[str, Any]]:
+    """Return a thread-safe snapshot of replica targets and loading state."""
+    with _POOL_LOCK:
+        return {
+            key: {
+                "model_path": str(entry.model_path),
+                "ready": len(entry.instances),
+                "target": entry.target_count,
+                "inflight": entry.inflight,
+                "error": repr(entry.error) if entry.error is not None else None,
+            }
+            for key, entry in _MODELS.items()
+        }
+
+
+def wait_until_ready(*, timeout_seconds: float = 300.0) -> dict[str, dict[str, Any]]:
+    """Block until every registered model has reached its replica target.
+
+    Startup callers use this to ensure WSGI does not begin accepting requests while
+    Piper is still loading. A failed replica or timeout is fatal rather than silently
+    moving the loading delay onto the first player turn.
+    """
+    timeout_seconds = max(0.1, float(timeout_seconds))
+    deadline = time.perf_counter() + timeout_seconds
+
+    while True:
+        status = pool_status()
+        pending = {
+            key: item
+            for key, item in status.items()
+            if int(item["ready"]) < int(item["target"])
+        }
+        if not pending:
+            return status
+
+        failed = {
+            key: item
+            for key, item in pending.items()
+            if item["error"] is not None and int(item["inflight"]) == 0
+        }
+        if failed:
+            details = ", ".join(
+                f"{Path(key).name}={item['ready']}/{item['target']} error={item['error']}"
+                for key, item in failed.items()
+            )
+            raise RuntimeError(f"Piper pool warm-up failed: {details}")
+
+        if time.perf_counter() >= deadline:
+            details = ", ".join(
+                f"{Path(key).name}={item['ready']}/{item['target']} "
+                f"inflight={item['inflight']}"
+                for key, item in pending.items()
+            )
+            raise TimeoutError(
+                f"Timed out after {timeout_seconds:.1f}s warming Piper pool: {details}"
+            )
+
+        time.sleep(0.05)
+
+
+def warm_voice_models(
+    model_paths: list[Path],
+    *,
+    request_id: str | None = None,
+    wait_for_ready: bool = False,
+    timeout_seconds: float = 300.0,
+) -> dict[str, dict[str, Any]] | None:
+    """Register models and warm replicas, optionally waiting for full readiness."""
     unique: list[Path] = []
     seen: set[str] = set()
     for raw in model_paths:
@@ -283,6 +354,10 @@ def warm_voice_models(model_paths: list[Path], *, request_id: str | None = None)
 
     for thread in threads:
         thread.start()
+
+    if wait_for_ready:
+        return wait_until_ready(timeout_seconds=timeout_seconds)
+    return None
 
 
 def _kick_loaders(model_path: Path, *, clear_error: bool = False) -> _ModelEntry:

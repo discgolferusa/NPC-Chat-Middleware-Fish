@@ -16,6 +16,8 @@ import array
 import threading
 import time
 import shutil
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 
 from request_timing import (
     attach_timing_headers,
@@ -212,6 +214,17 @@ CACHE_LOCK = threading.Lock()
 NPC_CACHE = {}
 LOCATION_CACHE = {}
 PRELOADED_CONTEXTS = {}
+
+# Context pieces are mostly independent I/O reads. A bounded, process-wide pool
+# lets them overlap without creating a fresh set of threads for every turn.
+NPC_CONTEXT_LOAD_WORKERS = max(
+    4,
+    int(os.environ.get("NPC_CONTEXT_LOAD_WORKERS", "8")),
+)
+NPC_CONTEXT_EXECUTOR = ThreadPoolExecutor(
+    max_workers=NPC_CONTEXT_LOAD_WORKERS,
+    thread_name_prefix="npc-context",
+)
 
 # Good first choice. If accuracy is poor, change to "small.en".
 # If latency is too high, change to "tiny.en".
@@ -1019,22 +1032,95 @@ def get_npc_context(
     """
     Load all context pieces used for an NPC turn.
 
-    Static YAML pieces are mtime-cached. Memories/recent turns stay live because they
-    change during play.
+    Independent reads overlap in the context worker pool. Location and scene reads
+    begin as soon as the NPC load provides its location_id. Static YAML pieces are
+    mtime-cached. Memories/recent turns stay live because they change during play.
     """
-    npc = load_npc(npc_id)
-    location = load_location(npc.get("location_id"))
+    overall_started = time.perf_counter()
     party_context = party_context or build_party_context(player_id=player_id)
     resolved_campaign_id = normalize_campaign_id(
         campaign_id if campaign_id is not None else party_context.get("campaign_id")
     )
-    memories = load_memories(
-        npc_id, player_id, limit=MEMORY_PROMPT_LIMIT, campaign_id=resolved_campaign_id
+
+    def submit_timed(name: str, func, *args, **kwargs):
+        # Context variables do not automatically cross thread boundaries. Give each
+        # task its own snapshot so tenant/campaign context remains available to
+        # content-pack and scene-state helpers.
+        caller_context = copy_context()
+
+        def worker():
+            started = time.perf_counter()
+            value = caller_context.run(func, *args, **kwargs)
+            return name, value, time.perf_counter() - started
+
+        return NPC_CONTEXT_EXECUTOR.submit(worker)
+
+    futures = []
+    task_seconds: dict[str, float] = {}
+
+    npc_future = submit_timed("npc", load_npc, npc_id)
+    memories_future = submit_timed(
+        "memories",
+        load_memories,
+        npc_id,
+        player_id,
+        limit=MEMORY_PROMPT_LIMIT,
+        campaign_id=resolved_campaign_id,
     )
-    recent_turns = load_recent_turns(
-        npc_id, player_id, limit=RECENT_TURN_LIMIT, campaign_id=resolved_campaign_id
+    recent_turns_future = submit_timed(
+        "recent_turns",
+        load_recent_turns,
+        npc_id,
+        player_id,
+        limit=RECENT_TURN_LIMIT,
+        campaign_id=resolved_campaign_id,
     )
-    scene_context = build_scene_context(npc.get("location_id"))
+    dm_context_future = submit_timed(
+        "dm_context",
+        get_dm_context,
+        npc_id,
+        player_id,
+        campaign_id=resolved_campaign_id,
+    )
+    futures.extend(
+        [npc_future, memories_future, recent_turns_future, dm_context_future]
+    )
+
+    try:
+        name, npc, elapsed = npc_future.result()
+        task_seconds[name] = elapsed
+
+        # These two reads depend only on location_id, so start them together as
+        # soon as the NPC is available while the database reads continue.
+        location_id = npc.get("location_id")
+        location_future = submit_timed("location", load_location, location_id)
+        scene_context_future = submit_timed(
+            "scene_context", build_scene_context, location_id
+        )
+        futures.extend([location_future, scene_context_future])
+
+        name, memories, elapsed = memories_future.result()
+        task_seconds[name] = elapsed
+        name, recent_turns, elapsed = recent_turns_future.result()
+        task_seconds[name] = elapsed
+        name, dm_context, elapsed = dm_context_future.result()
+        task_seconds[name] = elapsed
+        name, location, elapsed = location_future.result()
+        task_seconds[name] = elapsed
+        name, scene_context, elapsed = scene_context_future.result()
+        task_seconds[name] = elapsed
+    except Exception:
+        for future in futures:
+            future.cancel()
+        raise
+
+    wall_seconds = time.perf_counter() - overall_started
+    print(
+        f"[CONTEXT] npc={npc_id} player={player_id} campaign={resolved_campaign_id} "
+        f"parallel_wall={wall_seconds:.3f}s "
+        f"tasks={json.dumps({key: round(value, 3) for key, value in task_seconds.items()})}",
+        flush=True,
+    )
 
     context = {
         "npc_id": npc_id,
@@ -1047,7 +1133,7 @@ def get_npc_context(
         "location": location,
         "memories": memories,
         "recent_turns": recent_turns,
-        "dm_context": get_dm_context(npc_id, player_id, campaign_id=resolved_campaign_id),
+        "dm_context": dm_context,
     }
 
     with CACHE_LOCK:
@@ -2583,6 +2669,10 @@ def resolve_voice_model_paths_for_turn(
     return paths
 
 
+_PIPER_STARTUP_WARM_LOCK = threading.Lock()
+_PIPER_STARTUP_WARM_COMPLETE = False
+
+
 def warm_piper_at_startup() -> None:
     """
     Load the Piper models the server will almost certainly need before any turn
@@ -2593,57 +2683,107 @@ def warm_piper_at_startup() -> None:
     save a fraction of that on synthesis. Paying the cost at startup keeps it off
     the first player's turn.
     """
+    global _PIPER_STARTUP_WARM_COMPLETE
+
     if str(os.environ.get("PIPER_USE_SUBPROCESS", "")).strip().lower() in ("1", "true", "yes"):
+        print("[PIPER-POOL] startup warm skipped: subprocess mode enabled", flush=True)
         return
     if str(os.environ.get("PIPER_WARM_AT_STARTUP", "1")).strip().lower() in ("0", "false", "no"):
+        print("[PIPER-POOL] startup warm disabled by PIPER_WARM_AT_STARTUP", flush=True)
         return
 
-    paths: list[Path] = []
-    seen: set[str] = set()
-
-    def _add(voice_model: Any) -> None:
-        if not voice_model:
+    with _PIPER_STARTUP_WARM_LOCK:
+        if _PIPER_STARTUP_WARM_COMPLETE:
             return
-        try:
-            resolved = resolve_voice_model_path(voice_model)
-        except Exception:
-            return
-        key = str(resolved)
-        if key in seen:
-            return
-        seen.add(key)
-        paths.append(resolved)
 
-    try:
-        narrator = get_narrator_tts_settings()
-        _add(narrator.get("resolved_voice_model") or narrator.get("voice_model"))
-    except Exception as ex:
-        print(f"[PIPER-POOL] startup_narrator_unresolved error={ex!r}", flush=True)
+        paths: list[Path] = []
+        seen: set[str] = set()
 
-    # Any voice already assigned to an NPC is a voice a turn can ask for. There
-    # is no request context at startup, so this reads the on-disk NPC directory
-    # rather than the tenant-scoped listing.
-    try:
-        npc_files = sorted(list(NPC_DIR.glob("*.yaml")) + list(NPC_DIR.glob("*.yml")))
-        for path in npc_files:
+        def _add(voice_model: Any) -> None:
+            if not voice_model:
+                return
             try:
-                _add(pick_npc_voice_model(load_npc(path.stem), None))
-            except Exception:
-                continue
-    except Exception as ex:
-        print(f"[PIPER-POOL] startup_npc_scan_failed error={ex!r}", flush=True)
+                resolved = resolve_voice_model_path(voice_model)
+            except Exception as ex:
+                print(
+                    f"[PIPER-POOL] startup_voice_unresolved "
+                    f"voice={str(voice_model)!r} error={ex!r}",
+                    flush=True,
+                )
+                return
+            key = str(resolved)
+            if key in seen:
+                return
+            seen.add(key)
+            paths.append(resolved)
 
-    if not paths:
-        return
+        # NPCs without an explicit voice fall back to this model at synthesis time.
+        _add(DEFAULT_VOICE_MODEL)
 
-    try:
-        piper_pool.warm_voice_models(paths, request_id="startup")
+        try:
+            narrator = get_narrator_tts_settings()
+            _add(narrator.get("resolved_voice_model") or narrator.get("voice_model"))
+        except Exception as ex:
+            print(f"[PIPER-POOL] startup_narrator_unresolved error={ex!r}", flush=True)
+
+        # Any voice already assigned to an NPC is a voice a turn can ask for. There
+        # is no request context at startup, so this reads the on-disk NPC directory
+        # rather than the tenant-scoped listing.
+        try:
+            npc_files = sorted(list(NPC_DIR.glob("*.yaml")) + list(NPC_DIR.glob("*.yml")))
+            for path in npc_files:
+                try:
+                    _add(pick_npc_voice_model(load_npc(path.stem), None))
+                except Exception as ex:
+                    print(
+                        f"[PIPER-POOL] startup_npc_voice_unresolved "
+                        f"npc={path.stem} error={ex!r}",
+                        flush=True,
+                    )
+        except Exception as ex:
+            print(f"[PIPER-POOL] startup_npc_scan_failed error={ex!r}", flush=True)
+
+        if not paths:
+            raise RuntimeError(
+                "Piper startup warming is enabled, but no usable voice models were found."
+            )
+
+        try:
+            timeout_seconds = max(
+                1.0,
+                float(os.environ.get("PIPER_WARM_TIMEOUT_SECONDS", "300")),
+            )
+        except ValueError:
+            timeout_seconds = 300.0
+
+        started = time.perf_counter()
         print(
-            "[PIPER-POOL] startup warm models=" + ", ".join(p.name for p in paths),
+            f"[PIPER-POOL] startup blocking warm begin "
+            f"models={', '.join(p.name for p in paths)} "
+            f"slot_budget={piper_pool.pool_slot_budget()} "
+            f"timeout={timeout_seconds:.1f}s",
             flush=True,
         )
-    except Exception as ex:
-        print(f"[PIPER-POOL] startup_warm_failed error={ex!r}", flush=True)
+        try:
+            status = piper_pool.warm_voice_models(
+                paths,
+                request_id="startup",
+                wait_for_ready=True,
+                timeout_seconds=timeout_seconds,
+            ) or {}
+        except Exception as ex:
+            print(f"[PIPER-POOL] startup_warm_failed error={ex!r}", flush=True)
+            raise
+
+        ready_count = sum(int(item.get("ready") or 0) for item in status.values())
+        target_count = sum(int(item.get("target") or 0) for item in status.values())
+        _PIPER_STARTUP_WARM_COMPLETE = True
+        print(
+            f"[PIPER-POOL] startup blocking warm complete "
+            f"replicas={ready_count}/{target_count} "
+            f"models={len(status)} elapsed={time.perf_counter() - started:.3f}s",
+            flush=True,
+        )
 
 
 def schedule_piper_warm_for_voice_turn(
@@ -5094,11 +5234,11 @@ print(
     flush=True,
 )
 
+# WSGI servers import ``app`` rather than executing this module as __main__.
+# Keep the import blocked until every configured Piper replica is actually ready.
+warm_piper_at_startup()
 
 if __name__ == "__main__":
-    # Load the voice models now so the first turn is not competing with the
-    # replica loaders for CPU while speech-to-text runs.
-    warm_piper_at_startup()
     # threaded=True keeps /health, /campaigns, etc. responsive during long voice/LLM turns
     print(
         f"[GAME_API] listening on {GAME_API_HOST}:{GAME_API_PORT} "
