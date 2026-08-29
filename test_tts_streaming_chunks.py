@@ -38,6 +38,19 @@ def test_dash_variants_all_count():
 
 def test_a_number_range_is_a_span_not_a_pause():
     assert dashes_to_sentence_breaks("5–10 coppers") == "5, 10 coppers"
+    assert dashes_to_sentence_breaks("It costs 5 – 10 coppers.") == "It costs 5, 10 coppers."
+
+
+def test_spelled_numbers_are_treated_as_words_not_a_range():
+    # "one — two" is far more often someone counting out loud than a span, so
+    # the guard stays on digits and the dash keeps its beat.
+    assert dashes_to_sentence_breaks("one — two") == "one. two"
+
+
+def test_cleaning_keeps_a_range_together_once_the_numbers_are_spelled():
+    # Spelling ran first, so by the time the dash was examined the digits were
+    # gone and the span became "five. ten".
+    assert clean_for_tts("It costs 5–10 coppers.") == "It costs five, ten coppers."
 
 
 def test_hyphenated_words_are_left_alone():

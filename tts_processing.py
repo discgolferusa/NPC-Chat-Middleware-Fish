@@ -596,6 +596,23 @@ FIRST_STREAM_CHUNK_MAX_CHARS = 140
 STREAM_CHUNK_MAX_CHARS = 320
 
 
+def _is_number_token(word: str) -> bool:
+    token = word.strip(".,;:!?\"'()[]")
+    return bool(token) and token.isdigit()
+
+
+def _spans_a_number_range(before: str, after: str) -> bool:
+    """
+    A dash between two numbers is a span ("5-10 coppers"), not a pause.
+
+    Digits only, deliberately: "one — two" is far more often someone counting
+    out loud than a range, and this runs before the numbers are spelled.
+    """
+    tail = before.split()[-1] if before.split() else ""
+    lead = after.split()[0] if after.split() else ""
+    return _is_number_token(tail) and _is_number_token(lead)
+
+
 def dashes_to_sentence_breaks(text: str) -> str:
     """
     Speak an em dash as a beat.
@@ -617,8 +634,7 @@ def dashes_to_sentence_breaks(text: str) -> str:
             continue
         if not nxt:
             continue
-        # A number range ("5–10") is not a pause, it is a span.
-        if out[-1].isdigit() and nxt[0].isdigit():
+        if _spans_a_number_range(out, nxt):
             out += ", " + nxt
             continue
         out = out.rstrip(" ,;:")
@@ -728,9 +744,11 @@ def clean_for_tts(text: str, pronunciation: dict[str, str] | None = None) -> str
     for pattern, replacement in _ABBREVIATIONS:
         text = pattern.sub(replacement, text)
 
+    # Before the numbers are spelled out: a span is recognized by its digits,
+    # and "5-10" reads as "five-ten" by the time expansion has run.
+    text = dashes_to_sentence_breaks(text)
     text = expand_simple_numbers(text)
     text = apply_pronunciation(text, pronunciation)
-    text = dashes_to_sentence_breaks(text)
     text = re.sub(r"\s+", " ", text).strip()
     text = ensure_sentence_ending(text)
     return text
