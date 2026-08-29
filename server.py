@@ -1028,6 +1028,8 @@ def get_npc_context(
     player_id: str = DEFAULT_PLAYER_ID,
     party_context: dict | None = None,
     campaign_id: str | None = None,
+    *,
+    include_dm_context: bool = True,
 ) -> dict:
     """
     Load all context pieces used for an NPC turn.
@@ -1035,6 +1037,8 @@ def get_npc_context(
     Independent reads overlap in the context worker pool. Location and scene reads
     begin as soon as the NPC load provides its location_id. Static YAML pieces are
     mtime-cached. Memories/recent turns stay live because they change during play.
+    Turn routes can skip DM context because they must reload it after processing the
+    player's newest claim; preload callers can still request it here.
     """
     overall_started = time.perf_counter()
     party_context = party_context or build_party_context(player_id=player_id)
@@ -1075,16 +1079,18 @@ def get_npc_context(
         limit=RECENT_TURN_LIMIT,
         campaign_id=resolved_campaign_id,
     )
-    dm_context_future = submit_timed(
-        "dm_context",
-        get_dm_context,
-        npc_id,
-        player_id,
-        campaign_id=resolved_campaign_id,
-    )
-    futures.extend(
-        [npc_future, memories_future, recent_turns_future, dm_context_future]
-    )
+    dm_context_future = None
+    if include_dm_context:
+        dm_context_future = submit_timed(
+            "dm_context",
+            get_dm_context,
+            npc_id,
+            player_id,
+            campaign_id=resolved_campaign_id,
+        )
+    futures.extend([npc_future, memories_future, recent_turns_future])
+    if dm_context_future is not None:
+        futures.append(dm_context_future)
 
     try:
         name, npc, elapsed = npc_future.result()
@@ -1103,8 +1109,10 @@ def get_npc_context(
         task_seconds[name] = elapsed
         name, recent_turns, elapsed = recent_turns_future.result()
         task_seconds[name] = elapsed
-        name, dm_context, elapsed = dm_context_future.result()
-        task_seconds[name] = elapsed
+        dm_context = {}
+        if dm_context_future is not None:
+            name, dm_context, elapsed = dm_context_future.result()
+            task_seconds[name] = elapsed
         name, location, elapsed = location_future.result()
         task_seconds[name] = elapsed
         name, scene_context, elapsed = scene_context_future.result()
@@ -1573,7 +1581,11 @@ def run_dm_ruling_auto_response(
         )
 
         context = get_npc_context(
-            npc_id, player_id, party_context=party_context, campaign_id=campaign_id
+            npc_id,
+            player_id,
+            party_context=party_context,
+            campaign_id=campaign_id,
+            include_dm_context=False,
         )
         npc = context["npc"]
         memories = context["memories"]
@@ -2641,7 +2653,7 @@ def resolve_voice_model_paths_for_turn(
     paths: list[Path] = []
     seen: set[str] = set()
 
-    def _add(voice_model: str | None) -> None:
+    def _add(voice_model: str | Path | None) -> None:
         if not voice_model or not str(voice_model).strip():
             return
         resolved = resolve_voice_model_path(voice_model)
@@ -2653,7 +2665,7 @@ def resolve_voice_model_paths_for_turn(
 
     try:
         npc = load_npc(npc_id)
-        _add(pick_npc_voice_model(npc, voice_override))
+        _add(pick_npc_voice_model(npc, voice_override) or DEFAULT_VOICE_MODEL)
     except Exception as ex:
         print(
             f"[PIPER-POOL] npc_voice_unresolved npc_id={npc_id} error={ex!r}",
@@ -2671,6 +2683,14 @@ def resolve_voice_model_paths_for_turn(
 
 _PIPER_STARTUP_WARM_LOCK = threading.Lock()
 _PIPER_STARTUP_WARM_COMPLETE = False
+
+
+def piper_startup_voice_directory() -> Path:
+    """Folder whose ONNX models are all loaded before WSGI starts listening."""
+    configured = str(os.environ.get("PIPER_WARM_VOICE_DIR", "")).strip()
+    if configured:
+        return Path(configured)
+    return VOICES_DIR
 
 
 def warm_piper_at_startup() -> None:
@@ -2699,6 +2719,13 @@ def warm_piper_at_startup() -> None:
         paths: list[Path] = []
         seen: set[str] = set()
 
+        def _add_resolved(resolved: Path) -> None:
+            key = os.path.normcase(os.path.normpath(str(resolved)))
+            if key in seen:
+                return
+            seen.add(key)
+            paths.append(resolved)
+
         def _add(voice_model: Any) -> None:
             if not voice_model:
                 return
@@ -2711,11 +2738,29 @@ def warm_piper_at_startup() -> None:
                     flush=True,
                 )
                 return
-            key = str(resolved)
-            if key in seen:
-                return
-            seen.add(key)
-            paths.append(resolved)
+            _add_resolved(resolved)
+
+        # The configured voice folder is the authoritative startup inventory. These
+        # paths already came from our configured VOICES_DIR, so add them directly
+        # instead of feeding absolute paths through the request-path resolver.
+        warm_voice_dir = piper_startup_voice_directory()
+        if warm_voice_dir.is_dir():
+            discovered = sorted(
+                warm_voice_dir.rglob("*.onnx"),
+                key=lambda path: str(path).lower(),
+            )
+            for model_path in discovered:
+                _add_resolved(model_path)
+            print(
+                f"[PIPER-POOL] startup voice scan dir={warm_voice_dir} "
+                f"models={len(discovered)}",
+                flush=True,
+            )
+        else:
+            print(
+                f"[PIPER-POOL] startup voice scan directory not found: {warm_voice_dir}",
+                flush=True,
+            )
 
         # NPCs without an explicit voice fall back to this model at synthesis time.
         _add(DEFAULT_VOICE_MODEL)
@@ -3072,11 +3117,16 @@ def npc_turn():
         )
 
         set_turn_progress(request_id, "loading_context")
-        context = get_npc_context(npc_id, player_id, party_context=party_context, campaign_id=campaign_id)
+        context = get_npc_context(
+            npc_id,
+            player_id,
+            party_context=party_context,
+            campaign_id=campaign_id,
+            include_dm_context=False,
+        )
         npc = context["npc"]
         memories = context["memories"]
         location = context["location"]
-        dm_context = context["dm_context"]
         scene_context = context["scene_context"]
         step_start = log_timing(request_id, "load npc context", step_start)
 
@@ -3350,12 +3400,17 @@ def npc_voice_turn():
         )
 
         set_turn_progress(request_id, "loading_context")
-        context = get_npc_context(npc_id, player_id, party_context=party_context, campaign_id=campaign_id)
+        context = get_npc_context(
+            npc_id,
+            player_id,
+            party_context=party_context,
+            campaign_id=campaign_id,
+            include_dm_context=False,
+        )
         npc = context["npc"]
         memories = context["memories"]
         recent_turns = context["recent_turns"]
         location = context["location"]
-        dm_context = context["dm_context"]
         scene_context = context["scene_context"]
         step_start = log_timing(request_id, "load npc/location/memory/recent turns", step_start)
 
@@ -3708,12 +3763,17 @@ def npc_voice_turn_debug():
             player_text=player_text,
         )
 
-        context = get_npc_context(npc_id, player_id, party_context=party_context, campaign_id=campaign_id)
+        context = get_npc_context(
+            npc_id,
+            player_id,
+            party_context=party_context,
+            campaign_id=campaign_id,
+            include_dm_context=False,
+        )
         npc = context["npc"]
         memories = context["memories"]
         recent_turns = context["recent_turns"]
         location = context["location"]
-        dm_context = context["dm_context"]
         scene_context = context["scene_context"]
         step_start = log_timing(request_id, "debug load npc/location/memory/recent turns", step_start)
 
@@ -4884,6 +4944,7 @@ def dm_speak():
             player_id,
             party_context=session.get("party_context"),
             campaign_id=campaign_id,
+            include_dm_context=False,
         )
         npc = context["npc"]
         campaign_id = context.get("campaign_id") or campaign_id

@@ -42,6 +42,32 @@ def dm_sqlite(tmp_path, monkeypatch):
     return dm_channel, mem_db
 
 
+def test_get_dm_context_reuses_one_database_connection(dm_sqlite, monkeypatch):
+    dm_channel, _mem_db = dm_sqlite
+    original_get_db = dm_channel.get_db
+    calls = {"count": 0}
+
+    def counted_get_db():
+        calls["count"] += 1
+        return original_get_db()
+
+    monkeypatch.setattr(dm_channel, "get_db", counted_get_db)
+
+    context = dm_channel.get_dm_context(
+        "captain_varra",
+        "player_alden",
+        campaign_id="greyhaven_intro",
+    )
+
+    assert calls["count"] == 1
+    assert context == {
+        "campaign_id": "greyhaven_intro",
+        "messages": [],
+        "pending_checks": [],
+        "rulings": [],
+    }
+
+
 def test_strip_dm_check_tag_extracts_claim():
     spoken, claim = strip_dm_check_tag("I open the door. [DM CHECK: door is unlocked]")
     assert "open the door" in spoken.lower()

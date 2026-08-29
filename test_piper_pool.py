@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
+import pytest
+
 import piper_pool
 
 
@@ -87,6 +89,54 @@ def test_warm_voice_models_loads_in_background(monkeypatch, tmp_path):
     assert piper_pool.model_replica_counts_for_tests()[str(model_path)] >= 1
 
 
+def test_blocking_warm_returns_only_after_full_replica_target(monkeypatch, tmp_path):
+    piper_pool.clear_pool_for_tests()
+    model_path = _write_onnx_with_speakers(tmp_path / "blocking.onnx", 1)
+    calls = {"count": 0}
+    calls_lock = threading.Lock()
+
+    def fake_create(path: Path):
+        time.sleep(0.03)
+        with calls_lock:
+            calls["count"] += 1
+        return _FakeVoice(path)
+
+    monkeypatch.setattr(piper_pool, "_create_piper_voice", fake_create)
+    monkeypatch.setenv("PIPER_POOL_SLOTS", "3")
+
+    status = piper_pool.warm_voice_models(
+        [model_path],
+        request_id="startup",
+        wait_for_ready=True,
+        timeout_seconds=2.0,
+    )
+
+    assert calls["count"] == 3
+    assert status is not None
+    assert status[str(model_path)]["ready"] == 3
+    assert status[str(model_path)]["target"] == 3
+    assert status[str(model_path)]["inflight"] == 0
+
+
+def test_blocking_warm_raises_if_a_replica_cannot_load(monkeypatch, tmp_path):
+    piper_pool.clear_pool_for_tests()
+    model_path = _write_onnx_with_speakers(tmp_path / "broken.onnx", 1)
+
+    def fail_create(_path: Path):
+        raise OSError("invalid ONNX model")
+
+    monkeypatch.setattr(piper_pool, "_create_piper_voice", fail_create)
+    monkeypatch.setenv("PIPER_POOL_SLOTS", "1")
+
+    with pytest.raises(RuntimeError, match="Piper pool warm-up failed"):
+        piper_pool.warm_voice_models(
+            [model_path],
+            request_id="startup",
+            wait_for_ready=True,
+            timeout_seconds=1.0,
+        )
+
+
 def test_warm_voice_models_is_idempotent(monkeypatch, tmp_path):
     piper_pool.clear_pool_for_tests()
     model_path = _write_onnx_with_speakers(tmp_path / "npc.onnx", 1)
@@ -136,6 +186,9 @@ def test_warm_splits_slots_by_speaker_count(monkeypatch, tmp_path):
     assert piper_pool.model_targets_for_tests()[str(small)] == 1
     assert piper_pool.model_replica_counts_for_tests()[str(big)] == 9
     assert piper_pool.model_replica_counts_for_tests()[str(small)] == 1
+    status = piper_pool.pool_status()
+    assert status[str(big)]["speaker_count"] == 90
+    assert status[str(small)]["speaker_count"] == 10
 
 
 def test_cold_warm_loads_one_replica_before_topup(monkeypatch, tmp_path):
