@@ -1,5 +1,6 @@
 """
-Admin-tunable prompt size caps for location and peer-NPC context.
+Admin-tunable prompt size caps for location and peer-NPC context, plus the
+completion budget for spoken NPC replies.
 
 Stored in ServerSettings/prompt_caps.yaml on the middleware host.
 """
@@ -31,6 +32,12 @@ DEFAULT_PROMPT_CAPS: dict[str, int] = {
     "location_rumors_max_items": 5,
     "location_tone_max_items": 5,
     "location_knowledge_rules_max_items": 5,
+    # Completion budget for a spoken NPC reply. Too low and the model is cut
+    # off mid-sentence, which reads as the NPC ending abruptly.
+    "chat_reply_max_tokens": 512,
+    # Reasoning models spend this same budget on chain-of-thought before any
+    # visible text, so they need noticeably more room for the same reply length.
+    "chat_reply_reasoning_max_tokens": 1536,
 }
 
 _LOCK = threading.Lock()

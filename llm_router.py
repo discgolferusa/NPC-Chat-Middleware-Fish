@@ -29,6 +29,8 @@ from typing import Any
 
 import requests
 
+from prompt_caps import get_prompt_caps
+
 BASE_DIR = Path(__file__).resolve().parent
 
 LOCAL_LLM_URL = os.getenv("LOCAL_LLM_URL", "http://127.0.0.1:8080/v1/chat/completions")
@@ -80,8 +82,10 @@ OPENROUTER_PROVIDER_ALLOW_FALLBACKS = _OPENROUTER_PROVIDER_ALLOW_FALLBACKS_ENV.s
     "off",
 }
 
-# Spoken NPC replies are short, but reasoning models spend completion tokens on
-# chain-of-thought first. max_tokens=180 with gpt-oss often yields empty
+# Floors used when prompt_caps.yaml is missing or unreadable. The live budget is
+# admin-tunable (Admin -> Prompt size caps); these were the old hard-coded values
+# and are deliberately small, because reasoning models spend completion tokens on
+# chain-of-thought first: max_tokens=180 with gpt-oss often yields empty
 # message.content (finish_reason=length) -> "I have nothing more to say."
 DEFAULT_MAX_TOKENS = 180
 REASONING_MAX_TOKENS = int(os.getenv("LLM_REASONING_MAX_TOKENS", "768"))
@@ -869,6 +873,20 @@ def _is_reasoning_model(model_id: str | None = None, model_name: str | None = No
     return any(marker in blob for marker in REASONING_MODEL_MARKERS)
 
 
+def _chat_reply_cap(key: str, fallback: int) -> int:
+    """Admin-tunable spoken-reply budget from ServerSettings/prompt_caps.yaml.
+
+    A missing file, an unreadable one, or a 0 (the caps form's "unset") all fall
+    back to the built-in value: a zero budget would truncate every reply to
+    nothing, which is worse than the abrupt endings this setting exists to fix.
+    """
+    try:
+        value = int(get_prompt_caps().get(key, 0) or 0)
+    except Exception:
+        return fallback
+    return value if value > 0 else fallback
+
+
 def _effective_max_tokens(
     model_id: str | None,
     max_tokens: int | None,
@@ -881,8 +899,33 @@ def _effective_max_tokens(
     if purpose == PURPOSE_CONTENT_CREATION:
         return CONTENT_CREATION_DEFAULT_MAX_TOKENS
     if _is_reasoning_model(model_id, model_name):
-        return REASONING_MAX_TOKENS
-    return DEFAULT_MAX_TOKENS
+        return _chat_reply_cap("chat_reply_reasoning_max_tokens", REASONING_MAX_TOKENS)
+    return _chat_reply_cap("chat_reply_max_tokens", DEFAULT_MAX_TOKENS)
+
+
+def _warn_if_length_capped(
+    provider: str,
+    model_name: str | None,
+    finish_reason: Any,
+    completion_tokens: int,
+    effective_max: int,
+) -> None:
+    """Say so when a reply was cut off by the budget rather than by the model.
+
+    Only empty completions used to be logged. A reply stopped at the cap comes
+    back as ordinary text — and the stage-direction pass appends a period to it —
+    so mid-sentence endings reached the table with nothing in the log to explain
+    them.
+    """
+    if str(finish_reason or "").casefold() != "length":
+        return
+    print(
+        f"[LLM] {provider} reply hit the token cap model={model_name} "
+        f"completion_tokens={completion_tokens} max_tokens={effective_max} — "
+        "the reply is cut mid-sentence. Raise Admin → Prompt size caps → "
+        "NPC reply max tokens.",
+        flush=True,
+    )
 
 
 def _extract_chat_content(message: dict[str, Any] | None) -> str:
@@ -1368,13 +1411,15 @@ def call_local_chat_completions(
     completion_tokens = int(usage.get("completion_tokens") or max(1, len(content) // 4))
     total_tokens = int(usage.get("total_tokens") or prompt_tokens + completion_tokens)
 
+    finish = (data.get("choices") or [{}])[0].get("finish_reason")
     if not content:
-        finish = (data.get("choices") or [{}])[0].get("finish_reason")
         print(
             f"[LLM] local empty content finish={finish!r} "
             f"completion_tokens={completion_tokens} max_tokens={effective_max}",
             flush=True,
         )
+    else:
+        _warn_if_length_capped("local", LOCAL_LLM_MODEL, finish, completion_tokens, effective_max)
 
     return content, {
         "prompt_tokens": prompt_tokens,
@@ -1527,6 +1572,10 @@ def call_openrouter_chat_completions(
             f"completion_tokens={completion_tokens} max_tokens={effective_max} "
             f"reasoning_effort={payload.get('reasoning_effort')!r}",
             flush=True,
+        )
+    else:
+        _warn_if_length_capped(
+            "openrouter", model_name, choice.get("finish_reason"), completion_tokens, effective_max
         )
 
     return content, {
