@@ -309,14 +309,9 @@ def get_default_party_member(campaign_id: str | None = None) -> dict[str, Any]:
     return member
 
 
-def get_character_options(campaign_id: str | None = None, party_id: str | None = None) -> list[dict[str, Any]]:
-    campaign_id = (campaign_id or "").strip()
-    party_id = (party_id or "").strip()
-
+def _character_options_for_parties(party_ids: list[str], campaign_id: str) -> list[dict[str, Any]]:
     options: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
-
-    party_ids = [party_id] if party_id else [item["party_id"] for item in list_parties(campaign_id=campaign_id or None)]
 
     for current_party_id in party_ids:
         party = load_party(current_party_id)
@@ -332,6 +327,27 @@ def get_character_options(campaign_id: str | None = None, party_id: str | None =
                 **member,
                 "label": f"{member.get('name')} ({member.get('race')} {member.get('class')})",
             })
+
+    return options
+
+
+def _campaign_party_ids(campaign_id: str) -> list[str]:
+    return [item["party_id"] for item in list_parties(campaign_id=campaign_id or None)]
+
+
+def get_character_options(campaign_id: str | None = None, party_id: str | None = None) -> list[dict[str, Any]]:
+    campaign_id = (campaign_id or "").strip()
+    party_id = (party_id or "").strip()
+
+    if party_id:
+        options = _character_options_for_parties([party_id], campaign_id)
+        # A restart resets the play session to the placeholder party id, which
+        # resolves to nothing. Widening to the campaign keeps real characters
+        # in the list instead of collapsing it to the default party.
+        if not options:
+            options = _character_options_for_parties(_campaign_party_ids(campaign_id), campaign_id)
+    else:
+        options = _character_options_for_parties(_campaign_party_ids(campaign_id), campaign_id)
 
     if not options:
         default_member = get_default_party_member(campaign_id)
