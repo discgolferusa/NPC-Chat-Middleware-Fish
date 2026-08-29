@@ -161,6 +161,10 @@ def build_voice_timing_phases(steps: list[str]) -> dict[str, Any]:
         "post_llm_ms": post_llm,
         "tts_ms": tts,
         "other_ms": other,
+        # Everything the labelled steps account for. The buckets only see work
+        # wrapped in log_timing, so comparing this against the wall clock is the
+        # only way to see time no step is measuring.
+        "tracked_ms": middleware_total,
         "middleware_total_ms": middleware_total,
         "cumulative_ms": {
             "pre_llm": cum_pre,
@@ -231,6 +235,12 @@ def attach_timing_headers(
             if middleware_total_ms is not None:
                 phases["middleware_total_ms"] = middleware_total_ms
                 phases["cumulative_ms"]["middleware"] = middleware_total_ms
+                # Wall clock minus what the steps measured. A large value means
+                # the turn is spending its time somewhere no log_timing call
+                # wraps, which the phase breakdown alone cannot show.
+                phases["unaccounted_ms"] = max(
+                    0, middleware_total_ms - int(phases.get("tracked_ms") or 0)
+                )
             if active_model_id:
                 phases["model_id"] = active_model_id
             if selected_model_id:
