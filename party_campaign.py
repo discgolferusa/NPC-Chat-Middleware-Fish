@@ -325,6 +325,11 @@ def _character_options_for_parties(party_ids: list[str], campaign_id: str) -> li
             seen_ids.add(player_id)
             options.append({
                 **member,
+                # The list can span several parties, so each option has to carry
+                # the party it actually came from; callers use it to place a
+                # selected character rather than assuming the requested party.
+                "party_id": member.get("party_id") or party.get("party_id") or current_party_id,
+                "campaign_id": member.get("campaign_id") or party.get("campaign_id") or campaign_id,
                 "label": f"{member.get('name')} ({member.get('race')} {member.get('class')})",
             })
 
@@ -539,15 +544,21 @@ def select_character(player_id: str, *, party_id: str | None = None) -> dict[str
         campaign_id=new_campaign_id or None,
         party_id=new_party_id or None,
     )
-    valid_ids = {character["player_id"] for character in characters}
-    if player_id not in valid_ids:
-        member = find_member_anywhere(player_id)
-        if member:
-            new_party_id = member.get("party_id") or new_party_id
-            if member.get("campaign_id"):
-                new_campaign_id = member["campaign_id"]
-        elif player_id != DEFAULT_PLAYER_ID:
-            raise ValueError(f"Unknown player_id: {player_id}")
+    # Being listed does not mean the character belongs to the requested party:
+    # the list widens to the whole campaign when that party resolves to nothing.
+    # Take the party from the chosen character so a placeholder party id from a
+    # rebuilt play session is never persisted as their party.
+    chosen = next(
+        (character for character in characters if character.get("player_id") == player_id),
+        None,
+    ) or find_member_anywhere(player_id)
+
+    if chosen:
+        new_party_id = chosen.get("party_id") or new_party_id
+        if chosen.get("campaign_id"):
+            new_campaign_id = chosen["campaign_id"]
+    elif player_id != DEFAULT_PLAYER_ID:
+        raise ValueError(f"Unknown player_id: {player_id}")
 
     if not new_campaign_id:
         raise ValueError("campaign_id is required to select a character")

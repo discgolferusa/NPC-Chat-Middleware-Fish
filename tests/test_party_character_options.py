@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 import party_campaign as pc
 
 HEROES = {
@@ -77,6 +79,61 @@ def test_default_party_is_the_last_resort(monkeypatch):
     assert len(options) == 1
     assert options[0]["is_default"] is True
     assert options[0]["name"] == "The Party"
+
+
+def test_options_carry_the_party_they_came_from(monkeypatch):
+    # Members in party YAML need not repeat their own party id.
+    bare = {
+        "party_id": "heroes",
+        "campaign_id": "greyhaven_intro",
+        "members": [{"player_id": "player_alden", "name": "Alden", "race": "Human", "class": "Fighter"}],
+    }
+    _stub_parties(monkeypatch, {"heroes": bare})
+
+    options = pc.get_character_options(campaign_id="greyhaven_intro", party_id=pc.DEFAULT_PARTY_ID)
+
+    assert options[0]["party_id"] == "heroes"
+    assert options[0]["campaign_id"] == "greyhaven_intro"
+
+
+def test_selecting_after_a_restart_keeps_the_characters_real_party(monkeypatch):
+    _stub_parties(monkeypatch, {"heroes": HEROES})
+    monkeypatch.setattr(pc, "_save_runtime_config", lambda: None)
+    monkeypatch.setattr(pc, "load_campaign", lambda campaign_id: {"campaign_id": campaign_id})
+
+    with pc._STATE_LOCK:
+        pc._PLAY_SESSIONS.clear()
+
+    from session_context import set_request_context
+
+    set_request_context("owner-1", "greyhaven_intro")
+    try:
+        # The rebuilt play session offers only the placeholder party id.
+        assert pc._current_play_ids()["party_id"] == pc.DEFAULT_PARTY_ID
+
+        status = pc.select_character("player_alden")
+
+        assert status["party_id"] == "heroes"
+        assert status["player_id"] == "player_alden"
+        assert pc._current_play_ids()["party_id"] == "heroes"
+    finally:
+        from session_context import clear_request_context
+
+        clear_request_context()
+
+
+def test_selecting_an_unknown_player_still_raises(monkeypatch):
+    _stub_parties(monkeypatch, {"heroes": HEROES})
+    monkeypatch.setattr(pc, "find_member_anywhere", lambda player_id: None)
+
+    from session_context import clear_request_context, set_request_context
+
+    set_request_context("owner-1", "greyhaven_intro")
+    try:
+        with pytest.raises(ValueError):
+            pc.select_character("player_nobody")
+    finally:
+        clear_request_context()
 
 
 def test_party_characters_endpoint_recovers_after_a_restart(api, monkeypatch):
