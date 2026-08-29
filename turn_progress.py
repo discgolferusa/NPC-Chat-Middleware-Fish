@@ -271,6 +271,33 @@ def ensure_turn_in_progress(request_id: str) -> dict[str, Any]:
         return public_progress(entry)
 
 
+def _clip_key(clip: dict[str, Any]) -> Any:
+    index = clip.get("index")
+    return index if isinstance(index, int) else clip.get("url")
+
+
+def _merge_clips(
+    existing: list[dict[str, Any]] | None,
+    incoming: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """
+    Union of what has been published, in play order.
+
+    Clips are synthesized on a background thread while the request thread is
+    still finishing its own bookkeeping, so an older snapshot can arrive last.
+    Replacing the list with it hid clips the poller had not fetched yet, and
+    nothing later re-announced them: the reply simply stopped mid-way.
+    """
+    merged: dict[Any, dict[str, Any]] = {}
+    for clip in list(existing or []) + list(incoming or []):
+        if isinstance(clip, dict):
+            merged[_clip_key(clip)] = clip
+    return sorted(
+        merged.values(),
+        key=lambda clip: clip.get("index") if isinstance(clip.get("index"), int) else 0,
+    )
+
+
 def set_turn_progress(
     request_id: str,
     step_key: str,
@@ -311,7 +338,7 @@ def set_turn_progress(
         if dialogue_text is not None:
             entry["dialogue_text"] = dialogue_text
         if clips is not None:
-            entry["clips"] = list(clips)
+            entry["clips"] = _merge_clips(entry.get("clips"), clips)
         entry["updated_at"] = _utc_now_iso()
         entry["expires_at"] = time.time() + PROGRESS_TTL_SECONDS
         return public_progress(entry)
