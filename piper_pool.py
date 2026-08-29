@@ -270,6 +270,7 @@ def pool_status() -> dict[str, dict[str, Any]]:
         return {
             key: {
                 "model_path": str(entry.model_path),
+                "speaker_count": entry.weight,
                 "ready": len(entry.instances),
                 "target": entry.target_count,
                 "inflight": entry.inflight,
@@ -345,12 +346,26 @@ def warm_voice_models(
         unique.append(path)
 
     threads: list[threading.Thread] = []
+    allocation_plan = ""
+    model_count = 0
     with _POOL_LOCK:
         for model_path in unique:
             _register_model_locked(model_path)
         _recompute_targets_locked()
+        allocation_plan = "; ".join(
+            f"{entry.model_path} speakers={entry.weight} target={entry.target_count}"
+            for entry in _MODELS.values()
+        )
+        model_count = len(_MODELS)
         for entry in _MODELS.values():
             threads.extend(_start_loaders_locked(entry, request_id))
+
+    if request_id == "startup":
+        print(
+            f"[PIPER-POOL] allocation slot_budget={pool_slot_budget()} "
+            f"models={model_count} plan={allocation_plan}",
+            flush=True,
+        )
 
     for thread in threads:
         thread.start()

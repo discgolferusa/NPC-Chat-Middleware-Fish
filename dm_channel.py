@@ -5,6 +5,7 @@ Dedicated DM channel: messages, pending verification checks, and automatic rulin
 from __future__ import annotations
 
 import re
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from typing import Any
 
@@ -825,9 +826,10 @@ def load_dm_messages(
     limit: int = 50,
     *,
     campaign_id: str = "",
+    connection: memory_db.DbConnection | None = None,
 ) -> list[dict[str, Any]]:
     campaign_id = normalize_campaign_id(campaign_id)
-    with get_db() as conn:
+    with (nullcontext(connection) if connection is not None else get_db()) as conn:
         rows = conn.execute("""
             SELECT id, content, detected_verdict, detected_claim, detection_confidence, created_at
             FROM dm_messages
@@ -858,6 +860,7 @@ def load_pending_checks(
     status: str | None = "pending",
     limit: int = 20,
     campaign_id: str = "",
+    connection: memory_db.DbConnection | None = None,
 ) -> list[dict[str, Any]]:
     campaign_id = normalize_campaign_id(campaign_id)
     query = """
@@ -877,7 +880,7 @@ def load_pending_checks(
     query += " ORDER BY id DESC LIMIT ?"
     params.append(limit)
 
-    with get_db() as conn:
+    with (nullcontext(connection) if connection is not None else get_db()) as conn:
         rows = conn.execute(query, params).fetchall()
 
     return [_pending_row_to_dict(row) for row in reversed(rows)]
@@ -948,9 +951,10 @@ def load_rulings(
     limit: int = 20,
     *,
     campaign_id: str = "",
+    connection: memory_db.DbConnection | None = None,
 ) -> list[dict[str, Any]]:
     campaign_id = normalize_campaign_id(campaign_id)
-    with get_db() as conn:
+    with (nullcontext(connection) if connection is not None else get_db()) as conn:
         rows = conn.execute("""
             SELECT id, campaign_id, npc_id, player_id, claim_summary, verdict, ruling_text,
                    source, pending_check_id, created_at
@@ -1034,14 +1038,35 @@ def load_ruling_by_id(ruling_id: int) -> dict[str, Any] | None:
 
 def get_dm_context(npc_id: str, player_id: str, campaign_id: str = "") -> dict[str, Any]:
     campaign_id = normalize_campaign_id(campaign_id)
-    return {
-        "campaign_id": campaign_id,
-        "messages": load_dm_messages(npc_id, player_id, limit=10, campaign_id=campaign_id),
-        "pending_checks": load_pending_checks(
-            npc_id, player_id, status="pending", limit=10, campaign_id=campaign_id
-        ),
-        "rulings": load_rulings(npc_id, player_id, limit=10, campaign_id=campaign_id),
-    }
+    # These are three independent SELECTs over the same database. Opening one
+    # connection here avoids paying connection setup three times (especially
+    # noticeable with MySQL) while preserving the existing query order/results.
+    with get_db() as conn:
+        return {
+            "campaign_id": campaign_id,
+            "messages": load_dm_messages(
+                npc_id,
+                player_id,
+                limit=10,
+                campaign_id=campaign_id,
+                connection=conn,
+            ),
+            "pending_checks": load_pending_checks(
+                npc_id,
+                player_id,
+                status="pending",
+                limit=10,
+                campaign_id=campaign_id,
+                connection=conn,
+            ),
+            "rulings": load_rulings(
+                npc_id,
+                player_id,
+                limit=10,
+                campaign_id=campaign_id,
+                connection=conn,
+            ),
+        }
 
 
 def format_dm_context_for_prompt(dm_context: dict[str, Any] | None) -> str:

@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import importlib
+import os
 import sys
 from pathlib import Path
 from types import ModuleType
 
 import pytest
+
+# Importing server is the WSGI startup path, so production deliberately blocks
+# while Piper fills its pool. Unit tests opt out unless a startup-warm test
+# explicitly enables it; otherwise test collection would load real ONNX models.
+os.environ.setdefault("PIPER_WARM_AT_STARTUP", "0")
 
 pytest.importorskip("flask")
 
