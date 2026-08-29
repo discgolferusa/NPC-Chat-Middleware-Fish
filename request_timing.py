@@ -11,6 +11,7 @@ from flask import g
 HeaderTotalMs = "X-Timing-Total-Ms"
 HeaderSteps = "X-Timing-Steps"
 HeaderPhases = "X-Timing-Phases"
+HeaderFirstAudioMs = "X-First-Audio-Ms"
 HeaderLlmModelId = "X-Llm-Model-Id"
 HeaderLlmSelectedModelId = "X-Llm-Selected-Model-Id"
 HeaderLlmProvider = "X-Llm-Provider"
@@ -50,9 +51,32 @@ VOICE_TTS_LABELS = frozenset(
 def begin_request_timing() -> None:
     g._timing_steps = []
     g._timing_start = time.perf_counter()
+    g._timing_first_audio_ms = None
     g._timing_llm_model_id = None
     g._timing_llm_selected_model_id = None
     g._timing_llm_provider = None
+
+
+def note_first_audio_ms() -> None:
+    """
+    Mark the moment the first playable clip exists.
+
+    Replies are synthesized clip by clip and published as they finish, so the
+    turn total says nothing about how long the table waited to hear anything.
+    First one wins: later clips are the tail, not the wait.
+    """
+    try:
+        from flask import has_request_context
+
+        if not has_request_context():
+            return
+    except Exception:
+        return
+
+    start = getattr(g, "_timing_start", None)
+    if start is None or getattr(g, "_timing_first_audio_ms", None) is not None:
+        return
+    g._timing_first_audio_ms = max(0, int(round((time.perf_counter() - start) * 1000)))
 
 
 def note_request_llm_model(
@@ -199,6 +223,11 @@ def attach_timing_headers(
 
         if include_voice_phases:
             phases = build_voice_timing_phases(steps)
+            first_audio_ms = getattr(g, "_timing_first_audio_ms", None)
+            if first_audio_ms is not None:
+                phases["first_audio_ms"] = first_audio_ms
+                phases["cumulative_ms"]["first_audio"] = first_audio_ms
+                response.headers[HeaderFirstAudioMs] = str(first_audio_ms)
             if middleware_total_ms is not None:
                 phases["middleware_total_ms"] = middleware_total_ms
                 phases["cumulative_ms"]["middleware"] = middleware_total_ms

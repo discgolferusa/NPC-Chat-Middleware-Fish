@@ -17,7 +17,12 @@ import threading
 import time
 import shutil
 
-from request_timing import attach_timing_headers, begin_request_timing, log_timing
+from request_timing import (
+    attach_timing_headers,
+    begin_request_timing,
+    log_timing,
+    note_first_audio_ms,
+)
 from faster_whisper import WhisperModel
 
 from llm_router import (
@@ -145,6 +150,7 @@ from tts_processing import (
     load_piper_model_meta,
     options_from_request_and_npc,
     resolve_tts_options,
+    split_text_for_streaming,
 )
 from piper_paths import LEGACY_WINDOWS_PIPER_EXE, resolve_piper_exe
 import piper_pool
@@ -1975,6 +1981,8 @@ def transcribe_audio(audio_path: Path) -> str:
 def split_into_ordered_tts_segments(
     text: str,
     pronunciation: dict[str, str] | None = None,
+    *,
+    stream_sentences: bool = True,
 ) -> list[dict]:
     """
     Split raw model output into ordered TTS segments, preserving document order.
@@ -1982,6 +1990,10 @@ def split_into_ordered_tts_segments(
     Asterisk-wrapped text is narration and becomes a narrator clip whatever its
     length; plain text is NPC dialogue. Bare DM-wait copy (no asterisks) is also
     narrator so Piper never voices the hold line as the NPC.
+
+    Each run is then cut on sentence ends. A whole paragraph of dialogue is one
+    Piper call otherwise, so the player waits for the last word to be
+    synthesized before hearing the first; clips are published as they finish.
     """
     raw_text, _ = strip_dm_check_tag(text or "")
 
@@ -2001,8 +2013,13 @@ def split_into_ordered_tts_segments(
 
     def _append(segment_type: str, body: str) -> None:
         cleaned = clean_for_tts(body, pronunciation=pronunciation)
-        if cleaned:
+        if not cleaned:
+            return
+        if not stream_sentences:
             segments.append({"type": segment_type, "text": cleaned})
+            return
+        for chunk in split_text_for_streaming(cleaned):
+            segments.append({"type": segment_type, "text": chunk})
 
     for match in pattern.finditer(raw_text):
         before = raw_text[last_end:match.start()].strip()
@@ -2326,6 +2343,10 @@ def synthesize_segmented_speech_clips(
         "narration_path": None,
         "speech_path": None,
         "clips": [],
+        # Every clip in order. The legacy narration/speech pair keeps only the
+        # first narration and the last speech, which was the whole turn back
+        # when dialogue was one segment and is a fraction of it now.
+        "clip_paths": [],
         "lock": threading.Lock(),
     }
 
@@ -2390,7 +2411,11 @@ def synthesize_segmented_speech_clips(
                 "text": segment["text"],
             }
             state["clips"].append(clip)
+            state["clip_paths"].append((index, out_path))
             clips_snapshot = list(state["clips"])
+
+        if index == 0:
+            note_first_audio_ms()
 
         print(
             f"[PLAYER-AUDIO] clip_ready request_id={request_id} index={index} "
@@ -2409,12 +2434,15 @@ def synthesize_segmented_speech_clips(
             clips = list(state["clips"])
             narration_path = state["narration_path"]
             speech_path = state["speech_path"]
+            # Clips finish on their own thread, so order by index, not arrival.
+            clip_paths = [path for _, path in sorted(state["clip_paths"], key=lambda item: item[0])]
         return {
             "segments": segments,
             "narration_text": narration_text,
             "dialogue_text": dialogue_text,
             "narration_path": narration_path,
             "speech_path": speech_path,
+            "clip_paths": clip_paths,
             "clips": clips,
             "pending": pending,
         }
@@ -2494,7 +2522,9 @@ def synthesize_segmented_speech(
         npc_tts_options=npc_tts_options,
     )
 
-    paths = [p for p in (result.get("narration_path"), result.get("speech_path")) if p and p.exists()]
+    paths = [p for p in (result.get("clip_paths") or []) if p and p.exists()]
+    if not paths:
+        paths = [p for p in (result.get("narration_path"), result.get("speech_path")) if p and p.exists()]
     if not paths:
         raise RuntimeError("No TTS segments were produced.")
     if len(paths) == 1:
@@ -3584,7 +3614,9 @@ def npc_voice_turn_debug():
                 _tts_request_values_from_mapping(request.form),
             ),
         )
-        paths = [p for p in (clip_result.get("narration_path"), clip_result.get("speech_path")) if p]
+        paths = [p for p in (clip_result.get("clip_paths") or []) if p]
+        if not paths:
+            paths = [p for p in (clip_result.get("narration_path"), clip_result.get("speech_path")) if p]
         if len(paths) == 1:
             output_path.write_bytes(paths[0].read_bytes())
         elif paths:
