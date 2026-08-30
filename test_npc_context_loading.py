@@ -81,7 +81,7 @@ def test_dm_context_is_optional_but_remains_enabled_by_default(api, monkeypatch)
     assert calls["count"] == 1
 
 
-def test_npc_turn_loads_dm_once_after_processing_the_new_claim(api, monkeypatch):
+def test_npc_turn_uses_pre_llm_database_snapshot_for_prompt(api, monkeypatch):
     client, server, headers = api
     events: list[str] = []
     fresh_dm = {
@@ -91,13 +91,14 @@ def test_npc_turn_loads_dm_once_after_processing_the_new_claim(api, monkeypatch)
         "rulings": [],
     }
 
-    def process_player(*_args, **_kwargs):
-        events.append("process_player_message")
-        return None
-
-    def load_dm(*_args, **_kwargs):
-        events.append("get_dm_context")
-        return fresh_dm
+    def prepare_database(*_args, **_kwargs):
+        events.append("prepare_turn_database_phase")
+        return {
+            "memories": ["memory"],
+            "recent_turns": ["turn"],
+            "player_claim": None,
+            "dm_context": fresh_dm,
+        }
 
     def build_messages(*_args, **kwargs):
         events.append("build_prompt")
@@ -107,8 +108,7 @@ def test_npc_turn_loads_dm_once_after_processing_the_new_claim(api, monkeypatch)
             {"role": "user", "content": "Player prompt"},
         ]
 
-    monkeypatch.setattr(server, "process_player_message", process_player)
-    monkeypatch.setattr(server, "get_dm_context", load_dm)
+    monkeypatch.setattr(server, "prepare_turn_database_phase", prepare_database)
     monkeypatch.setattr(server, "build_npc_llm_messages", build_messages)
     monkeypatch.setattr(
         server,
@@ -129,4 +129,4 @@ def test_npc_turn_loads_dm_once_after_processing_the_new_claim(api, monkeypatch)
     )
 
     assert response.status_code == 200
-    assert events == ["process_player_message", "get_dm_context", "build_prompt"]
+    assert events == ["prepare_turn_database_phase", "build_prompt"]

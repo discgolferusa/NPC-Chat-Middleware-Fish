@@ -13,7 +13,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 BASE_DIR = Path(__file__).resolve().parent
 _DEFAULT_SQLITE_PATH = BASE_DIR / "npc_memory.db"
@@ -181,16 +181,28 @@ class _MySqlConnectionPool:
         acquire_timeout: float,
         recycle_seconds: float,
         ping_interval_seconds: float,
+        min_idle: int = 1,
+        maintenance_interval_seconds: float = 15.0,
+        maintenance_wait_fn: Callable[[threading.Event, float], bool] | None = None,
     ) -> None:
         self.config = config
         self.max_size = max(1, int(max_size))
         self.acquire_timeout = max(0.01, float(acquire_timeout))
         self.recycle_seconds = max(0.0, float(recycle_seconds))
         self.ping_interval_seconds = max(0.0, float(ping_interval_seconds))
+        self.min_idle = min(self.max_size, max(0, int(min_idle)))
+        self.maintenance_interval_seconds = max(
+            0.0, float(maintenance_interval_seconds)
+        )
         self._condition = threading.Condition()
         self._idle: list[_PoolEntry] = []
         self._total = 0
         self._closed = False
+        self._started = False
+        self._start_lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._maintenance_thread: threading.Thread | None = None
+        self._maintenance_wait_fn = maintenance_wait_fn
 
     def _new_raw_connection(self) -> Any:
         cfg = self.config
@@ -208,7 +220,22 @@ class _MySqlConnectionPool:
             write_timeout=_positive_int_env("MEMORY_MYSQL_WRITE_TIMEOUT_SECONDS", 30),
         )
 
-    def _discard(self, entry: _PoolEntry) -> None:
+    @staticmethod
+    def _log_discard(reason: str) -> None:
+        print(
+            f"[MEMORY-DB] pooled MySQL connection dropped reason={reason}",
+            flush=True,
+        )
+
+    def _discard(
+        self,
+        entry: _PoolEntry,
+        *,
+        reason: str,
+        reason_already_logged: bool = False,
+    ) -> None:
+        if not reason_already_logged:
+            self._log_discard(reason)
         try:
             entry.raw.close()
         except Exception:
@@ -217,11 +244,15 @@ class _MySqlConnectionPool:
             self._total = max(0, self._total - 1)
             self._condition.notify()
 
-    def _entry_is_usable(self, entry: _PoolEntry, now: float) -> bool:
+    def _entry_is_usable(
+        self,
+        entry: _PoolEntry,
+        now: float,
+    ) -> tuple[bool, str | None, bool]:
         if self.recycle_seconds and now - entry.created_at >= self.recycle_seconds:
-            return False
+            return False, "recycle-age", False
         if not bool(getattr(entry.raw, "open", True)):
-            return False
+            return False, "socket-closed", False
         idle_seconds = now - entry.returned_at
         ping = getattr(entry.raw, "ping", None)
         if (
@@ -234,8 +265,124 @@ class _MySqlConnectionPool:
                 # count and can discard/recreate failed connections itself.
                 ping(reconnect=False)
             except Exception:
-                return False
-        return True
+                # Log here, where the actual liveness failure is observed. The
+                # caller passes reason_already_logged to _discard so one failed
+                # ping produces exactly one non-secret line.
+                self._log_discard("ping-failed")
+                return False, "ping-failed", True
+        return True, None, False
+
+    def _open_reserved_entry(self) -> _PoolEntry:
+        """Open one connection after the caller has reserved a _total slot."""
+        try:
+            connect_started = time.monotonic()
+            raw = self._new_raw_connection()
+            now = time.monotonic()
+            print(
+                "[MEMORY-DB] pooled MySQL connection opened "
+                f"elapsed={now - connect_started:.3f}s",
+                flush=True,
+            )
+            return _PoolEntry(raw=raw, created_at=now, returned_at=now)
+        except Exception:
+            with self._condition:
+                self._total = max(0, self._total - 1)
+                self._condition.notify()
+            raise
+
+    def _top_up_min_idle(self, *, stage: str) -> None:
+        """Best-effort creation of idle entries, bounded by min_idle/max_size."""
+        while True:
+            with self._condition:
+                if self._closed:
+                    return
+                if len(self._idle) >= self.min_idle or self._total >= self.max_size:
+                    return
+                self._total += 1
+
+            try:
+                entry = self._open_reserved_entry()
+            except Exception as ex:
+                # Pool warming is an optimization. A transient database outage
+                # must not make merely starting the maintenance worker fatal.
+                print(
+                    f"[MEMORY-DB] MySQL pool {stage} failed "
+                    f"error={type(ex).__name__}",
+                    flush=True,
+                )
+                return
+            self.release(entry)
+
+    def _run_maintenance_cycle(self) -> None:
+        """Validate idle entries, recycle failures, then restore MIN_IDLE."""
+        with self._condition:
+            entries_to_check = len(self._idle)
+
+        for _ in range(entries_to_check):
+            with self._condition:
+                if self._closed or not self._idle:
+                    break
+                # Oldest first. Returning a validated entry appends it at the end,
+                # so this cycle cannot repeatedly select the same connection.
+                entry = self._idle.pop(0)
+
+            usable, reason, reason_logged = self._entry_is_usable(
+                entry, time.monotonic()
+            )
+            if usable:
+                self.release(entry)
+            else:
+                self._discard(
+                    entry,
+                    reason=reason or "socket-closed",
+                    reason_already_logged=reason_logged,
+                )
+
+        self._top_up_min_idle(stage="maintenance")
+
+    def _wait_for_maintenance(self) -> bool:
+        if self._maintenance_wait_fn is not None:
+            return bool(
+                self._maintenance_wait_fn(
+                    self._stop_event,
+                    self.maintenance_interval_seconds,
+                )
+            )
+        return self._stop_event.wait(self.maintenance_interval_seconds)
+
+    def _maintenance_loop(self) -> None:
+        while not self._wait_for_maintenance():
+            if self._stop_event.is_set():
+                break
+            try:
+                self._run_maintenance_cycle()
+            except Exception as ex:
+                # Keep a single unexpected maintenance error from permanently
+                # disabling future refresh cycles.
+                print(
+                    "[MEMORY-DB] MySQL pool maintenance cycle failed "
+                    f"error={type(ex).__name__}",
+                    flush=True,
+                )
+
+    def start(self) -> None:
+        """Non-fatally prewarm MIN_IDLE and start the daemon maintainer once."""
+        with self._start_lock:
+            if self._started or self._closed:
+                return
+            self._started = True
+
+            self._top_up_min_idle(stage="prewarm")
+            if self.maintenance_interval_seconds <= 0 or self._closed:
+                return
+
+            thread = threading.Thread(
+                target=self._maintenance_loop,
+                name="mysql-pool-maintenance",
+                daemon=True,
+            )
+            self._maintenance_thread = thread
+            thread.start()
 
     def acquire(self) -> _PoolEntry:
         deadline = time.monotonic() + self.acquire_timeout
@@ -263,31 +410,29 @@ class _MySqlConnectionPool:
                     continue
 
             if create_new:
-                try:
-                    connect_started = time.monotonic()
-                    raw = self._new_raw_connection()
-                    now = time.monotonic()
-                    print(
-                        "[MEMORY-DB] pooled MySQL connection opened "
-                        f"elapsed={now - connect_started:.3f}s",
-                        flush=True,
-                    )
-                    return _PoolEntry(raw=raw, created_at=now, returned_at=now)
-                except Exception:
-                    with self._condition:
-                        self._total = max(0, self._total - 1)
-                        self._condition.notify()
-                    raise
+                return self._open_reserved_entry()
 
             assert entry is not None
             now = time.monotonic()
-            if self._entry_is_usable(entry, now):
+            usable, reason, reason_logged = self._entry_is_usable(entry, now)
+            if usable:
                 return entry
-            self._discard(entry)
+            self._discard(
+                entry,
+                reason=reason or "socket-closed",
+                reason_already_logged=reason_logged,
+            )
 
     def release(self, entry: _PoolEntry, *, invalid: bool = False) -> None:
         if invalid or not bool(getattr(entry.raw, "open", True)):
-            self._discard(entry)
+            self._discard(
+                entry,
+                reason=(
+                    "socket-closed"
+                    if not bool(getattr(entry.raw, "open", True))
+                    else "transaction-reset-failed"
+                ),
+            )
             return
 
         entry.returned_at = time.monotonic()
@@ -299,16 +444,23 @@ class _MySqlConnectionPool:
                 self._condition.notify()
                 should_discard = False
         if should_discard:
-            self._discard(entry)
+            self._discard(entry, reason="pool-closed")
 
     def close(self) -> None:
+        self._stop_event.set()
         with self._condition:
             self._closed = True
             idle = list(self._idle)
             self._idle.clear()
             self._condition.notify_all()
         for entry in idle:
-            self._discard(entry)
+            self._discard(entry, reason="pool-closed")
+
+        thread = self._maintenance_thread
+        if thread is not None and thread is not threading.current_thread():
+            # _stop_event wakes the normal interval wait immediately. If a custom
+            # wait is injected for tests it must likewise observe stop_event.
+            thread.join()
 
     def status(self) -> dict[str, int]:
         with self._condition:
@@ -329,6 +481,13 @@ _MYSQL_POOLS: dict[MemoryDbConfig, _MySqlConnectionPool] = {}
 def _positive_int_env(name: str, default: int) -> int:
     try:
         return max(1, int((os.environ.get(name) or str(default)).strip()))
+    except ValueError:
+        return default
+
+
+def _nonnegative_int_env(name: str, default: int) -> int:
+    try:
+        return max(0, int((os.environ.get(name) or str(default)).strip()))
     except ValueError:
         return default
 
@@ -356,14 +515,21 @@ def _pool_for_config(config: MemoryDbConfig) -> _MySqlConnectionPool:
                 ping_interval_seconds=_nonnegative_float_env(
                     "MEMORY_MYSQL_POOL_PING_INTERVAL_SECONDS", 30.0
                 ),
+                min_idle=_nonnegative_int_env("MEMORY_MYSQL_POOL_MIN_IDLE", 1),
+                maintenance_interval_seconds=_nonnegative_float_env(
+                    "MEMORY_MYSQL_POOL_MAINTENANCE_INTERVAL_SECONDS", 15.0
+                ),
             )
             _MYSQL_POOLS[config] = pool
             print(
                 "[MEMORY-DB] MySQL connection pool ready "
                 f"size={pool.max_size} timeout={pool.acquire_timeout:.1f}s "
-                f"recycle={pool.recycle_seconds:.1f}s",
+                f"recycle={pool.recycle_seconds:.1f}s "
+                f"min_idle={pool.min_idle} "
+                f"maintenance={pool.maintenance_interval_seconds:.1f}s",
                 flush=True,
             )
+            pool.start()
         return pool
 
 
@@ -475,9 +641,9 @@ class DbConnection:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
+        # close() may already have returned this raw connection to the pool. Never
+        # touch it again: another WSGI request may have checked it out meanwhile.
         if self._closed:
-            # close() already released the raw connection back to the pool;
-            # another request may own it now, so never commit/rollback here.
             return
         invalid = False
         try:

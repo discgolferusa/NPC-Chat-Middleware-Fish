@@ -68,6 +68,111 @@ def test_get_dm_context_reuses_one_database_connection(dm_sqlite, monkeypatch):
     }
 
 
+def test_multi_check_response_loads_pending_and_rulings_once(dm_sqlite, monkeypatch):
+    dm_channel, _mem_db = dm_sqlite
+    import memory_db
+
+    original_execute = memory_db.DbConnection.execute
+    statements: list[str] = []
+
+    def counted_execute(self, sql, params=None):
+        statements.append(" ".join(sql.split()).lower())
+        return original_execute(self, sql, params)
+
+    monkeypatch.setattr(memory_db.DbConnection, "execute", counted_execute)
+
+    result = dm_channel.process_npc_response(
+        "npc_x",
+        "player_a",
+        "Hello friend",
+        "Wait. [DM CHECK: door is unlocked] [DM CHECK: bridge is safe]",
+        campaign_id="camp_1",
+    )
+
+    pending_selects = [
+        sql for sql in statements
+        if sql.startswith("select") and "from dm_pending_checks" in sql
+    ]
+    ruling_selects = [
+        sql for sql in statements
+        if sql.startswith("select") and "from dm_rulings" in sql
+    ]
+    assert len(result["pending_check_ids"]) == 2
+    assert len(pending_selects) == 1
+    assert len(ruling_selects) == 1
+
+
+def test_ruling_and_pending_resolution_share_one_transaction(dm_sqlite, monkeypatch):
+    dm_channel, _mem_db = dm_sqlite
+    pending_id = dm_channel.save_pending_check(
+        npc_id="captain_varra",
+        player_id="player_alden",
+        claim_summary="the gate may be opened",
+        campaign_id="greyhaven_intro",
+    )
+    original_get_db = dm_channel.get_db
+    calls = {"count": 0}
+
+    def counted_get_db():
+        calls["count"] += 1
+        return original_get_db()
+
+    monkeypatch.setattr(dm_channel, "get_db", counted_get_db)
+    ruling_id = dm_channel.save_ruling(
+        npc_id="captain_varra",
+        player_id="player_alden",
+        claim_summary="the gate may be opened",
+        verdict="confirmed",
+        ruling_text="Approved.",
+        source="manual",
+        pending_check_id=pending_id,
+        campaign_id="greyhaven_intro",
+    )
+
+    assert ruling_id
+    assert calls["count"] == 1
+    with original_get_db() as conn:
+        pending = conn.execute(
+            "SELECT status, ruling_id FROM dm_pending_checks WHERE id = ?",
+            (pending_id,),
+        ).fetchone()
+    assert pending["status"] == "confirmed"
+    assert pending["ruling_id"] == ruling_id
+
+
+def test_ruling_insert_rolls_back_when_resolution_fails(dm_sqlite, monkeypatch):
+    dm_channel, _mem_db = dm_sqlite
+    pending_id = dm_channel.save_pending_check(
+        npc_id="captain_varra",
+        player_id="player_alden",
+        claim_summary="the gate may be opened",
+        campaign_id="greyhaven_intro",
+    )
+
+    def fail_resolution(*_args, **_kwargs):
+        raise RuntimeError("simulated resolution failure")
+
+    monkeypatch.setattr(dm_channel, "resolve_pending_check", fail_resolution)
+    with pytest.raises(RuntimeError, match="simulated resolution failure"):
+        dm_channel.save_ruling(
+            npc_id="captain_varra",
+            player_id="player_alden",
+            claim_summary="the gate may be opened",
+            verdict="confirmed",
+            ruling_text="Approved.",
+            source="manual",
+            pending_check_id=pending_id,
+            campaign_id="greyhaven_intro",
+        )
+
+    assert dm_channel.load_rulings(
+        "captain_varra", "player_alden", campaign_id="greyhaven_intro"
+    ) == []
+    pending = dm_channel.load_pending_check_by_id(pending_id)
+    assert pending["status"] == "pending"
+    assert pending["ruling_id"] is None
+
+
 def test_strip_dm_check_tag_extracts_claim():
     spoken, claim = strip_dm_check_tag("I open the door. [DM CHECK: door is unlocked]")
     assert "open the door" in spoken.lower()

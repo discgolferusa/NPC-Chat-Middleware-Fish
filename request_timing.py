@@ -33,6 +33,7 @@ VOICE_LLM_LABELS = frozenset(
 )
 VOICE_POST_LLM_LABELS = frozenset(
     {
+        "post-llm database phase",
         "split tts segments",
         "save conversation turns",
         "schedule async memory extraction",
