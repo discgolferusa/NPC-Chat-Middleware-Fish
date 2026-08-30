@@ -38,6 +38,7 @@ class _FakeCursor:
 class _FakeRawConnection:
     def __init__(self) -> None:
         self.open = True
+        self.fail_ping = False
         self.commits = 0
         self.rollbacks = 0
         self.pings = 0
@@ -60,7 +61,7 @@ class _FakeRawConnection:
 
     def ping(self, reconnect=True):
         self.pings += 1
-        if not self.open:
+        if not self.open or self.fail_ping:
             raise RuntimeError("connection closed")
 
     def close(self):
@@ -74,6 +75,8 @@ def _clean_pool(monkeypatch):
     monkeypatch.setenv("MEMORY_MYSQL_POOL_TIMEOUT_SECONDS", "1")
     monkeypatch.setenv("MEMORY_MYSQL_POOL_RECYCLE_SECONDS", "300")
     monkeypatch.setenv("MEMORY_MYSQL_POOL_PING_INTERVAL_SECONDS", "300")
+    monkeypatch.setenv("MEMORY_MYSQL_POOL_MIN_IDLE", "0")
+    monkeypatch.setenv("MEMORY_MYSQL_POOL_MAINTENANCE_INTERVAL_SECONDS", "0")
     yield
     memory_db.close_connection_pools()
 
@@ -151,34 +154,33 @@ def test_explicit_close_rolls_back_before_pool_return(mysql_config, fake_connect
     assert fake_connect[0].rollbacks == 1
 
 
-def test_exit_after_explicit_close_does_not_touch_pooled_connection(
-    mysql_config, fake_connect
+@pytest.mark.parametrize("exit_with_error", [False, True])
+def test_exit_after_explicit_close_never_touches_reborrowed_connection(
+    monkeypatch,
+    mysql_config,
+    fake_connect,
+    exit_with_error,
 ):
-    with memory_db.connect(mysql_config) as conn:
-        conn.close()
+    """A closed wrapper must not commit/rollback its raw connection again."""
+    monkeypatch.setenv("MEMORY_MYSQL_POOL_SIZE", "1")
+    first = memory_db.connect(mysql_config)
+    first.__enter__()
+    first.close()
 
+    second = memory_db.connect(mysql_config)
     raw = fake_connect[0]
-    assert (raw.commits, raw.rollbacks) == (0, 1)
+    commits_before = raw.commits
+    rollbacks_before = raw.rollbacks
 
-    # The connection is back in the pool and usable by the next caller.
-    with memory_db.connect(mysql_config) as second:
-        second.execute("SELECT ?", (1,)).fetchall()
+    if exit_with_error:
+        first.__exit__(ValueError, ValueError("old request"), None)
+    else:
+        first.__exit__(None, None, None)
 
-    assert len(fake_connect) == 1
-    assert (raw.commits, raw.rollbacks) == (1, 1)
-
-
-def test_exit_after_explicit_close_with_exception_does_not_roll_back(
-    mysql_config, fake_connect
-):
-    with pytest.raises(ValueError, match="boom"):
-        with memory_db.connect(mysql_config) as conn:
-            conn.close()
-            raise ValueError("boom")
-
-    raw = fake_connect[0]
-    assert (raw.commits, raw.rollbacks) == (0, 1)
-    assert memory_db.connection_pool_status(mysql_config)["idle"] == 1
+    assert raw.commits == commits_before
+    assert raw.rollbacks == rollbacks_before
+    second.__exit__(None, None, None)
+    assert raw.commits == commits_before + 1
 
 
 def test_pool_blocks_at_capacity_then_reuses_released_connection(
@@ -253,3 +255,118 @@ def test_close_connection_pools_closes_idle_connections(mysql_config, fake_conne
     memory_db.close_connection_pools()
     assert raw.open is False
 
+
+def test_pool_prewarm_opens_configured_min_idle(
+    monkeypatch,
+    mysql_config,
+    fake_connect,
+):
+    monkeypatch.setenv("MEMORY_MYSQL_POOL_SIZE", "3")
+    monkeypatch.setenv("MEMORY_MYSQL_POOL_MIN_IDLE", "2")
+
+    pool = memory_db._pool_for_config(mysql_config)
+
+    assert len(fake_connect) == 2
+    assert pool.status() == {
+        "max_size": 3,
+        "total": 2,
+        "idle": 2,
+        "in_use": 0,
+    }
+
+
+def test_pool_prewarm_failure_is_nonfatal(
+    monkeypatch,
+    mysql_config,
+    capsys,
+):
+    monkeypatch.setenv("MEMORY_MYSQL_POOL_MIN_IDLE", "1")
+
+    def fail_connect(**kwargs):
+        raise OSError("database unavailable")
+
+    monkeypatch.setattr(memory_db.pymysql, "connect", fail_connect)
+
+    pool = memory_db._pool_for_config(mysql_config)
+
+    assert pool.status()["total"] == 0
+    assert "pool prewarm failed error=OSError" in capsys.readouterr().out
+
+
+def test_maintenance_replaces_ping_failure_before_acquire(
+    mysql_config,
+    fake_connect,
+    capsys,
+):
+    pool = memory_db._MySqlConnectionPool(
+        mysql_config,
+        max_size=2,
+        acquire_timeout=1,
+        recycle_seconds=300,
+        ping_interval_seconds=1,
+        min_idle=1,
+        maintenance_interval_seconds=0,
+    )
+    pool.start()
+    assert len(fake_connect) == 1
+
+    original = fake_connect[0]
+    original.fail_ping = True
+    with pool._condition:
+        pool._idle[0].returned_at -= 5
+
+    pool._run_maintenance_cycle()
+
+    assert original.open is False
+    assert len(fake_connect) == 2
+    assert pool.status()["idle"] == 1
+    assert "reason=ping-failed" in capsys.readouterr().out
+
+    entry = pool.acquire()
+    assert entry.raw is fake_connect[1]
+    assert len(fake_connect) == 2
+    pool.release(entry)
+    pool.close()
+
+
+def test_maintenance_thread_stops_on_pool_close(mysql_config, fake_connect):
+    waiter_entered = threading.Event()
+
+    def wait_until_stopped(stop_event, interval):
+        waiter_entered.set()
+        return stop_event.wait()
+
+    pool = memory_db._MySqlConnectionPool(
+        mysql_config,
+        max_size=2,
+        acquire_timeout=1,
+        recycle_seconds=300,
+        ping_interval_seconds=30,
+        min_idle=0,
+        maintenance_interval_seconds=15,
+        maintenance_wait_fn=wait_until_stopped,
+    )
+    pool.start()
+    thread = pool._maintenance_thread
+    assert thread is not None
+    assert waiter_entered.wait(timeout=1)
+
+    pool.close()
+
+    assert not thread.is_alive()
+
+
+def test_steady_state_acquire_opens_no_new_connection(
+    monkeypatch,
+    mysql_config,
+    fake_connect,
+):
+    monkeypatch.setenv("MEMORY_MYSQL_POOL_MIN_IDLE", "1")
+    pool = memory_db._pool_for_config(mysql_config)
+    assert len(fake_connect) == 1
+
+    entry = pool.acquire()
+
+    assert entry.raw is fake_connect[0]
+    assert len(fake_connect) == 1
+    pool.release(entry)

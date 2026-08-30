@@ -426,6 +426,8 @@ def _find_related_open_pending(
     player_text: str | None = None,
     *,
     campaign_id: str = "",
+    connection: memory_db.DbConnection | None = None,
+    pending_checks: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     """
     Find an open pending that is the same claim exchange.
@@ -434,9 +436,15 @@ def _find_related_open_pending(
     player turn must stay as separate pendings. Use merge_pending_id when a player
     claim and NPC tag intentionally refer to one exchange.
     """
-    pending_items = load_pending_checks(
-        npc_id, player_id, status="pending", campaign_id=campaign_id
-    )
+    pending_items = pending_checks
+    if pending_items is None:
+        pending_items = load_pending_checks(
+            npc_id,
+            player_id,
+            status="pending",
+            campaign_id=campaign_id,
+            connection=connection,
+        )
     if not pending_items:
         return None
 
@@ -458,6 +466,7 @@ def update_pending_check(
     player_text: str | None = None,
     npc_text: str | None = None,
     source: str | None = None,
+    connection: memory_db.DbConnection | None = None,
 ) -> int:
     fields = []
     values = []
@@ -479,12 +488,11 @@ def update_pending_check(
         return pending_check_id
 
     values.append(pending_check_id)
-    with get_db() as conn:
+    with (nullcontext(connection) if connection is not None else get_db()) as conn:
         conn.execute(
             f"UPDATE dm_pending_checks SET {', '.join(fields)} WHERE id = ?",
             values,
         )
-        conn.commit()
 
     return pending_check_id
 
@@ -495,6 +503,8 @@ def _claim_has_active_ruling(
     claim_summary: str,
     *,
     campaign_id: str = "",
+    connection: memory_db.DbConnection | None = None,
+    rulings: list[dict[str, Any]] | None = None,
 ) -> bool:
     """True when a confirmed/denied ruling already covers this claim.
 
@@ -503,8 +513,34 @@ def _claim_has_active_ruling(
     """
     from required_dm_checks import _ruling_covers_claim
 
-    rulings = load_rulings(npc_id, player_id, limit=50, campaign_id=campaign_id)
+    if rulings is None:
+        rulings = load_rulings(
+            npc_id,
+            player_id,
+            limit=50,
+            campaign_id=campaign_id,
+            connection=connection,
+        )
     return _ruling_covers_claim({"rulings": rulings}, claim_summary)
+
+
+def _update_pending_snapshot(
+    pending: dict[str, Any],
+    *,
+    claim_summary: str | None = None,
+    player_text: str | None = None,
+    npc_text: str | None = None,
+    source: str | None = None,
+) -> None:
+    """Keep the transaction's pending snapshot aligned with its writes."""
+    if claim_summary is not None:
+        pending["claim_summary"] = claim_summary.strip()
+    if player_text is not None:
+        pending["player_text"] = player_text
+    if npc_text is not None:
+        pending["npc_text"] = npc_text
+    if source is not None:
+        pending["source"] = source
 
 
 def save_pending_check(
@@ -517,83 +553,147 @@ def save_pending_check(
     source: str = "npc",
     merge_pending_id: int | None = None,
     campaign_id: str = "",
+    connection: memory_db.DbConnection | None = None,
+    pending_checks: list[dict[str, Any]] | None = None,
+    rulings: list[dict[str, Any]] | None = None,
 ) -> int | None:
     campaign_id = normalize_campaign_id(campaign_id)
     claim_summary = (claim_summary or "").strip()
     if not claim_summary:
         return None
 
-    if _claim_has_active_ruling(
-        npc_id, player_id, claim_summary, campaign_id=campaign_id
-    ):
-        print(
-            f"[DM] skip pending check (already ruled) npc={npc_id} player={player_id} "
-            f"campaign={campaign_id or '(none)'} source={source} claim={claim_summary[:120]!r}",
-            flush=True,
-        )
-        return None
-
-    if merge_pending_id is not None:
-        existing = next(
-            (
-                pending for pending in load_pending_checks(
-                    npc_id, player_id, status="pending", campaign_id=campaign_id
-                )
-                if pending["id"] == merge_pending_id
-            ),
-            None,
-        )
-        if existing:
-            merged_source = source
-            if existing.get("source") and existing["source"] != source:
-                merged_source = f"{existing['source']}+{source}"
-
-            update_pending_check(
-                merge_pending_id,
-                claim_summary=claim_summary,
-                player_text=player_text,
-                npc_text=npc_text,
-                source=merged_source,
+    with (nullcontext(connection) if connection is not None else get_db()) as conn:
+        # One locked snapshot replaces the former merge/duplicate/related reloads.
+        # Under MySQL this also serializes overlapping check-then-insert decisions.
+        if pending_checks is None:
+            pending_checks = load_pending_checks(
+                npc_id,
+                player_id,
+                status="pending",
+                limit=None,
+                campaign_id=campaign_id,
+                connection=conn,
+                for_update=True,
             )
+        if rulings is None:
+            rulings = load_rulings(
+                npc_id,
+                player_id,
+                limit=50,
+                campaign_id=campaign_id,
+                connection=conn,
+            )
+
+        if _claim_has_active_ruling(
+            npc_id,
+            player_id,
+            claim_summary,
+            campaign_id=campaign_id,
+            connection=conn,
+            rulings=rulings,
+        ):
             print(
-                f"[DM] merged pending check #{merge_pending_id} npc={npc_id} player={player_id} "
+                f"[DM] skip pending check (already ruled) npc={npc_id} player={player_id} "
                 f"campaign={campaign_id or '(none)'} source={source} claim={claim_summary[:120]!r}",
                 flush=True,
             )
-            return merge_pending_id
-        # Resolved/ignored merge targets must not be rewritten; fall through to normal insert.
+            return None
 
-    for pending in load_pending_checks(
-        npc_id, player_id, status="pending", campaign_id=campaign_id
-    ):
-        if _claims_same_exchange(
-            pending["claim_summary"],
-            claim_summary,
-            player_text=player_text or pending.get("player_text"),
-        ):
-            return update_pending_check(
-                pending["id"],
-                claim_summary=claim_summary,
-                player_text=player_text,
-                npc_text=npc_text,
-                source=source if pending.get("source") == source else f"{pending.get('source')}+{source}",
+        if merge_pending_id is not None:
+            existing = next(
+                (pending for pending in pending_checks if pending["id"] == merge_pending_id),
+                None,
             )
+            if existing:
+                merged_source = source
+                if existing.get("source") and existing["source"] != source:
+                    merged_source = f"{existing['source']}+{source}"
 
-    related = _find_related_open_pending(
-        npc_id, player_id, claim_summary, player_text, campaign_id=campaign_id
-    )
-    if related:
-        merged_source = source if related.get("source") == source else f"{related.get('source')}+{source}"
-        return update_pending_check(
-            related["id"],
-            claim_summary=claim_summary,
-            player_text=player_text or related.get("player_text"),
-            npc_text=npc_text,
-            source=merged_source,
+                update_pending_check(
+                    merge_pending_id,
+                    claim_summary=claim_summary,
+                    player_text=player_text,
+                    npc_text=npc_text,
+                    source=merged_source,
+                    connection=conn,
+                )
+                _update_pending_snapshot(
+                    existing,
+                    claim_summary=claim_summary,
+                    player_text=player_text,
+                    npc_text=npc_text,
+                    source=merged_source,
+                )
+                print(
+                    f"[DM] merged pending check #{merge_pending_id} npc={npc_id} player={player_id} "
+                    f"campaign={campaign_id or '(none)'} source={source} claim={claim_summary[:120]!r}",
+                    flush=True,
+                )
+                return merge_pending_id
+            # Resolved/ignored merge targets must not be rewritten; fall through.
+
+        for pending in pending_checks:
+            if _claims_same_exchange(
+                pending["claim_summary"],
+                claim_summary,
+                player_text=player_text or pending.get("player_text"),
+            ):
+                merged_source = (
+                    source
+                    if pending.get("source") == source
+                    else f"{pending.get('source')}+{source}"
+                )
+                update_pending_check(
+                    pending["id"],
+                    claim_summary=claim_summary,
+                    player_text=player_text,
+                    npc_text=npc_text,
+                    source=merged_source,
+                    connection=conn,
+                )
+                _update_pending_snapshot(
+                    pending,
+                    claim_summary=claim_summary,
+                    player_text=player_text,
+                    npc_text=npc_text,
+                    source=merged_source,
+                )
+                return pending["id"]
+
+        related = _find_related_open_pending(
+            npc_id,
+            player_id,
+            claim_summary,
+            player_text,
+            campaign_id=campaign_id,
+            connection=conn,
+            pending_checks=pending_checks,
         )
+        if related:
+            merged_source = (
+                source
+                if related.get("source") == source
+                else f"{related.get('source')}+{source}"
+            )
+            updated_player_text = player_text or related.get("player_text")
+            update_pending_check(
+                related["id"],
+                claim_summary=claim_summary,
+                player_text=updated_player_text,
+                npc_text=npc_text,
+                source=merged_source,
+                connection=conn,
+            )
+            _update_pending_snapshot(
+                related,
+                claim_summary=claim_summary,
+                player_text=updated_player_text,
+                npc_text=npc_text,
+                source=merged_source,
+            )
+            return related["id"]
 
-    created_at = _utc_now_iso()
-    with get_db() as conn:
+        created_at = _utc_now_iso()
         cur = conn.execute("""
             INSERT INTO dm_pending_checks
                 (campaign_id, npc_id, player_id, claim_summary, player_text, npc_text, source, status, created_at)
@@ -609,8 +709,21 @@ def save_pending_check(
             source,
             created_at,
         ))
-        conn.commit()
         pending_id = cur.lastrowid
+        pending_checks.append({
+            "id": pending_id,
+            "campaign_id": campaign_id,
+            "npc_id": npc_id,
+            "player_id": player_id,
+            "claim_summary": claim_summary,
+            "player_text": player_text,
+            "npc_text": npc_text,
+            "source": source,
+            "status": "pending",
+            "ruling_id": None,
+            "created_at": created_at,
+            "resolved_at": None,
+        })
 
     print(
         f"[DM] pending check #{pending_id} npc={npc_id} player={player_id} "
@@ -625,14 +738,14 @@ def resolve_pending_check(
     *,
     verdict: str,
     ruling_id: int,
+    connection: memory_db.DbConnection | None = None,
 ) -> None:
-    with get_db() as conn:
+    with (nullcontext(connection) if connection is not None else get_db()) as conn:
         conn.execute("""
             UPDATE dm_pending_checks
             SET status = ?, ruling_id = ?, resolved_at = ?
             WHERE id = ?
         """, (verdict, ruling_id, _utc_now_iso(), pending_check_id))
-        conn.commit()
 
 
 def dismiss_pending_check(pending_check_id: int) -> dict[str, Any]:
@@ -685,10 +798,19 @@ def _find_matching_pending(
     claim_hint: str | None,
     *,
     campaign_id: str = "",
+    connection: memory_db.DbConnection | None = None,
+    pending_checks: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
-    pending_items = load_pending_checks(
-        npc_id, player_id, status="pending", campaign_id=campaign_id
-    )
+    pending_items = pending_checks
+    if pending_items is None:
+        pending_items = load_pending_checks(
+            npc_id,
+            player_id,
+            status="pending",
+            campaign_id=campaign_id,
+            connection=connection,
+            for_update=connection is not None,
+        )
     if not pending_items:
         return None
 
@@ -710,10 +832,24 @@ def save_ruling(
     source: str,
     pending_check_id: int | None = None,
     campaign_id: str = "",
+    connection: memory_db.DbConnection | None = None,
+    pending_check_locked: bool = False,
 ) -> int:
     campaign_id = normalize_campaign_id(campaign_id)
     created_at = _utc_now_iso()
-    with get_db() as conn:
+    with (nullcontext(connection) if connection is not None else get_db()) as conn:
+        # Lock before inserting the ruling so two DM requests cannot both resolve
+        # the same pending check in overlapping transactions.
+        if pending_check_id and not pending_check_locked:
+            lock_sql = "SELECT status FROM dm_pending_checks WHERE id = ?"
+            if conn.config.is_mysql:
+                lock_sql += " FOR UPDATE"
+            pending_row = conn.execute(lock_sql, (pending_check_id,)).fetchone()
+            if not pending_row:
+                raise LookupError("Pending check not found")
+            if (pending_row["status"] or "").strip().lower() != "pending":
+                raise ValueError("Pending check is already resolved")
+
         cur = conn.execute("""
             INSERT INTO dm_rulings
                 (campaign_id, npc_id, player_id, claim_summary, verdict, ruling_text, source, pending_check_id, created_at)
@@ -730,11 +866,14 @@ def save_ruling(
             pending_check_id,
             created_at,
         ))
-        conn.commit()
         ruling_id = cur.lastrowid
-
-    if pending_check_id:
-        resolve_pending_check(pending_check_id, verdict=verdict, ruling_id=ruling_id)
+        if pending_check_id:
+            resolve_pending_check(
+                pending_check_id,
+                verdict=verdict,
+                ruling_id=ruling_id,
+                connection=conn,
+            )
 
     return ruling_id
 
@@ -758,6 +897,11 @@ def save_dm_message(
         raise ValueError("verdict must be confirmed, denied, or unclear")
 
     created_at = _utc_now_iso()
+    ruling_id = None
+    pending_check_id = None
+    claim_summary = detection.get("claim")
+
+    # The message, optional ruling, and pending resolution are one atomic unit.
     with get_db() as conn:
         cur = conn.execute("""
             INSERT INTO dm_messages
@@ -774,35 +918,35 @@ def save_dm_message(
             float(detection.get("confidence") or 0.0),
             created_at,
         ))
-        conn.commit()
         message_id = cur.lastrowid
+        if verdict in ("confirmed", "denied"):
+            pending = _find_matching_pending(
+                npc_id,
+                player_id,
+                claim_summary,
+                campaign_id=campaign_id,
+                connection=conn,
+            )
+            if pending:
+                pending_check_id = pending["id"]
+                if not claim_summary:
+                    claim_summary = pending["claim_summary"]
 
-    ruling_id = None
-    pending_check_id = None
-    claim_summary = detection.get("claim")
-
-    if verdict in ("confirmed", "denied"):
-        pending = _find_matching_pending(
-            npc_id, player_id, claim_summary, campaign_id=campaign_id
-        )
-        if pending:
-            pending_check_id = pending["id"]
             if not claim_summary:
-                claim_summary = pending["claim_summary"]
+                claim_summary = _summarize_claim(content)
 
-        if not claim_summary:
-            claim_summary = _summarize_claim(content)
-
-        ruling_id = save_ruling(
-            npc_id=npc_id,
-            player_id=player_id,
-            claim_summary=claim_summary,
-            verdict=verdict,
-            ruling_text=content,
-            source="manual" if verdict_override else "auto",
-            pending_check_id=pending_check_id,
-            campaign_id=campaign_id,
-        )
+            ruling_id = save_ruling(
+                npc_id=npc_id,
+                player_id=player_id,
+                claim_summary=claim_summary,
+                verdict=verdict,
+                ruling_text=content,
+                source="manual" if verdict_override else "auto",
+                pending_check_id=pending_check_id,
+                campaign_id=campaign_id,
+                connection=conn,
+                pending_check_locked=pending is not None,
+            )
 
     return {
         "id": message_id,
@@ -858,9 +1002,10 @@ def load_pending_checks(
     player_id: str,
     *,
     status: str | None = "pending",
-    limit: int = 20,
+    limit: int | None = 20,
     campaign_id: str = "",
     connection: memory_db.DbConnection | None = None,
+    for_update: bool = False,
 ) -> list[dict[str, Any]]:
     campaign_id = normalize_campaign_id(campaign_id)
     query = """
@@ -877,10 +1022,14 @@ def load_pending_checks(
         query += " AND status = ?"
         params.append(status)
 
-    query += " ORDER BY id DESC LIMIT ?"
-    params.append(limit)
+    query += " ORDER BY id DESC"
+    if limit is not None:
+        query += " LIMIT ?"
+        params.append(limit)
 
     with (nullcontext(connection) if connection is not None else get_db()) as conn:
+        if for_update and conn.config.is_mysql:
+            query += " FOR UPDATE"
         rows = conn.execute(query, params).fetchall()
 
     return [_pending_row_to_dict(row) for row in reversed(rows)]
@@ -1138,6 +1287,9 @@ def process_player_message(
     player_text: str,
     *,
     campaign_id: str = "",
+    connection: memory_db.DbConnection | None = None,
+    pending_checks: list[dict[str, Any]] | None = None,
+    rulings: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     detected = detect_player_claim(player_text)
     if not detected:
@@ -1150,6 +1302,9 @@ def process_player_message(
         player_text=player_text,
         source="player",
         campaign_id=campaign_id,
+        connection=connection,
+        pending_checks=pending_checks,
+        rulings=rulings,
     )
 
     return {
@@ -1164,17 +1319,22 @@ def _should_hold_spoken_for_dm(
     *,
     campaign_id: str = "",
     pending_ids: list[int] | None = None,
+    connection: memory_db.DbConnection | None = None,
+    pending_checks: list[dict[str, Any]] | None = None,
 ) -> bool:
     """True when this speaker already has (or just created) an unruled DM check."""
     if pending_ids:
         return True
-    existing = load_pending_checks(
-        npc_id,
-        player_id,
-        status="pending",
-        campaign_id=campaign_id,
-        limit=20,
-    )
+    existing = pending_checks
+    if existing is None:
+        existing = load_pending_checks(
+            npc_id,
+            player_id,
+            status="pending",
+            campaign_id=campaign_id,
+            limit=20,
+            connection=connection,
+        )
     return bool(existing)
 
 
@@ -1188,7 +1348,28 @@ def process_npc_response(
     campaign_id: str = "",
     create_pending_checks: bool = True,
     npc: dict[str, Any] | None = None,
+    connection: memory_db.DbConnection | None = None,
+    pending_checks: list[dict[str, Any]] | None = None,
+    rulings: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    if create_pending_checks and connection is None:
+        # Standalone callers keep the same API, but all pending work now occurs
+        # in one short transaction instead of opening per claim/query.
+        with get_db() as conn:
+            return process_npc_response(
+                npc_id,
+                player_id,
+                player_text,
+                npc_text,
+                player_pending_id=player_pending_id,
+                campaign_id=campaign_id,
+                create_pending_checks=create_pending_checks,
+                npc=npc,
+                connection=conn,
+                pending_checks=pending_checks,
+                rulings=rulings,
+            )
+
     spoken_text, dm_check_claims = extract_dm_check_tags(npc_text)
     # Safety net for paths that skip generate_npc_reply_text (e.g. /dm/speak).
     # Discord/browser still label speakers from npc_name; this only cleans the body.
@@ -1201,6 +1382,34 @@ def process_npc_response(
     merge_pending_id = player_pending_id
     all_claims = list(dm_check_claims)
 
+    if create_pending_checks and pending_checks is None:
+        pending_checks = load_pending_checks(
+            npc_id,
+            player_id,
+            status="pending",
+            limit=None,
+            campaign_id=campaign_id,
+            connection=connection,
+            for_update=True,
+        )
+
+    # Compute the heuristic once; it used to be repeated again for the result.
+    deferral = detect_npc_deferral(npc_text) or detect_npc_deferral(spoken_text)
+    player_claim = detect_player_claim(player_text) if create_pending_checks else None
+    auth_exchange = (
+        _looks_like_authorization_exchange(player_text) if create_pending_checks else False
+    )
+    if create_pending_checks and rulings is None and (
+        dm_check_claims or (deferral and (player_claim or auth_exchange))
+    ):
+        rulings = load_rulings(
+            npc_id,
+            player_id,
+            limit=50,
+            campaign_id=campaign_id,
+            connection=connection,
+        )
+
     if create_pending_checks and dm_check_claims:
         for index, claim in enumerate(dm_check_claims):
             created_id = save_pending_check(
@@ -1212,6 +1421,9 @@ def process_npc_response(
                 source="npc",
                 merge_pending_id=merge_pending_id if index == 0 else None,
                 campaign_id=campaign_id,
+                connection=connection,
+                pending_checks=pending_checks,
+                rulings=rulings,
             )
             if created_id is not None:
                 pending_ids.append(created_id)
@@ -1221,9 +1433,6 @@ def process_npc_response(
     # Situational / heuristic deferral still runs even when other tags were present,
     # so an authority claim is not dropped just because a different [DM CHECK] fired.
     if create_pending_checks:
-        deferral = detect_npc_deferral(npc_text) or detect_npc_deferral(spoken_text)
-        player_claim = detect_player_claim(player_text)
-        auth_exchange = _looks_like_authorization_exchange(player_text)
         if deferral and (player_claim or auth_exchange):
             claim_summary = infer_claim_summary(player_text, spoken_text)
             already = any(_claims_match(claim_summary, existing) for existing in all_claims)
@@ -1237,6 +1446,9 @@ def process_npc_response(
                     source="npc_deferral",
                     merge_pending_id=merge_pending_id if not pending_ids else None,
                     campaign_id=campaign_id,
+                    connection=connection,
+                    pending_checks=pending_checks,
+                    rulings=rulings,
                 )
                 if created_id is not None:
                     pending_ids.append(created_id)
@@ -1253,6 +1465,8 @@ def process_npc_response(
         player_id,
         campaign_id=campaign_id,
         pending_ids=pending_ids,
+        connection=connection,
+        pending_checks=pending_checks,
     ):
         held_spoken_text = spoken_text
         spoken_text = DM_PENDING_WAIT_NARRATION
@@ -1267,7 +1481,7 @@ def process_npc_response(
         "pending_check_ids": pending_ids,
         "pending_source": pending_source,
         "merged_player_pending_id": player_pending_id if pending_id == player_pending_id else None,
-        "npc_deferral_detected": bool(detect_npc_deferral(npc_text) or detect_npc_deferral(spoken_text)),
+        "npc_deferral_detected": bool(deferral),
     }
 
 
@@ -1316,26 +1530,35 @@ def create_manual_ruling(
 
     ruling_text = (notes or "").strip() or f"DM ruling: {verdict} for {claim_summary}"
 
-    if pending_check_id is None:
-        pending = _find_matching_pending(
-            npc_id, player_id, claim_summary, campaign_id=campaign_id
-        )
-        if pending:
-            pending_check_id = pending["id"]
-
-    ruling_id = save_ruling(
-        npc_id=npc_id,
-        player_id=player_id,
-        claim_summary=claim_summary,
-        verdict=verdict,
-        ruling_text=ruling_text,
-        source="manual",
-        pending_check_id=pending_check_id,
-        campaign_id=campaign_id,
-    )
-
     created_at = _utc_now_iso()
+    # Matching, ruling, pending resolution, and audit message commit together.
     with get_db() as conn:
+        pending_check_locked = False
+        if pending_check_id is None:
+            pending = _find_matching_pending(
+                npc_id,
+                player_id,
+                claim_summary,
+                campaign_id=campaign_id,
+                connection=conn,
+            )
+            if pending:
+                pending_check_id = pending["id"]
+                pending_check_locked = True
+
+        ruling_id = save_ruling(
+            npc_id=npc_id,
+            player_id=player_id,
+            claim_summary=claim_summary,
+            verdict=verdict,
+            ruling_text=ruling_text,
+            source="manual",
+            pending_check_id=pending_check_id,
+            campaign_id=campaign_id,
+            connection=conn,
+            pending_check_locked=pending_check_locked,
+        )
+
         cur = conn.execute("""
             INSERT INTO dm_messages
                 (campaign_id, npc_id, player_id, content, detected_verdict, detected_claim, detection_confidence, created_at)
@@ -1351,7 +1574,6 @@ def create_manual_ruling(
             1.0,
             created_at,
         ))
-        conn.commit()
         message_id = cur.lastrowid
 
     return {
@@ -1377,6 +1599,7 @@ def log_dm_turn(
     player_claim: dict | None = None,
     npc_response: dict | None = None,
     campaign_id: str = "",
+    pending_count: int | None = None,
 ) -> None:
     campaign_id = normalize_campaign_id(campaign_id)
     parts = [
@@ -1404,10 +1627,11 @@ def log_dm_turn(
         parts.append(f"pending_check_id={npc_response.get('pending_check_id')}")
 
     if stage in ("complete", "summary"):
-        pending = load_pending_checks(
-            npc_id, player_id, status="pending", limit=50, campaign_id=campaign_id
-        )
-        parts.append(f"pending_count={len(pending)}")
+        if pending_count is None:
+            pending_count = len(load_pending_checks(
+                npc_id, player_id, status="pending", limit=50, campaign_id=campaign_id
+            ))
+        parts.append(f"pending_count={pending_count}")
 
     print(" ".join(str(part) for part in parts), flush=True)
 

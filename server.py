@@ -17,6 +17,7 @@ import threading
 import time
 import shutil
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from contextvars import copy_context
 
 from request_timing import (
@@ -651,13 +652,21 @@ def init_memory_db():
     init_dm_tables()
 
 
-def save_turn(npc_id: str, player_id: str, role: str, content: str, campaign_id: str = ""):
+def save_turn(
+    npc_id: str,
+    player_id: str,
+    role: str,
+    content: str,
+    campaign_id: str = "",
+    *,
+    connection: memory_db.DbConnection | None = None,
+):
     campaign_id = normalize_campaign_id(campaign_id)
     content = (content or "").strip()
     if not content:
         return
 
-    with get_db() as conn:
+    with (nullcontext(connection) if connection is not None else get_db()) as conn:
         conn.execute("""
             INSERT INTO conversation_turns
                 (campaign_id, npc_id, player_id, role, content, created_at)
@@ -671,7 +680,6 @@ def save_turn(npc_id: str, player_id: str, role: str, content: str, campaign_id:
             content,
             datetime.utcnow().isoformat()
         ))
-        conn.commit()
 
 
 def save_player_npc_conversation_turns(
@@ -682,6 +690,7 @@ def save_player_npc_conversation_turns(
     *,
     campaign_id: str = "",
     save_user: bool = True,
+    connection: memory_db.DbConnection | None = None,
 ) -> str:
     """Persist the player line and in-character NPC draft, never wait-narration.
 
@@ -690,16 +699,37 @@ def save_player_npc_conversation_turns(
     history for DM auto-response follow-ups.
     """
     if save_user:
-        save_turn(npc_id, player_id, "user", player_text, campaign_id=campaign_id)
+        save_turn(
+            npc_id,
+            player_id,
+            "user",
+            player_text,
+            campaign_id=campaign_id,
+            connection=connection,
+        )
     history_text = assistant_history_text(npc_response)
     if history_text:
-        save_turn(npc_id, player_id, "assistant", history_text, campaign_id=campaign_id)
+        save_turn(
+            npc_id,
+            player_id,
+            "assistant",
+            history_text,
+            campaign_id=campaign_id,
+            connection=connection,
+        )
     return history_text
 
 
-def load_recent_turns(npc_id: str, player_id: str, limit: int = 10, campaign_id: str = ""):
+def load_recent_turns(
+    npc_id: str,
+    player_id: str,
+    limit: int = 10,
+    campaign_id: str = "",
+    *,
+    connection: memory_db.DbConnection | None = None,
+):
     campaign_id = normalize_campaign_id(campaign_id)
-    with get_db() as conn:
+    with (nullcontext(connection) if connection is not None else get_db()) as conn:
         rows = conn.execute("""
             SELECT role, content
             FROM conversation_turns
@@ -775,9 +805,16 @@ def save_memory_if_new(npc_id: str, player_id: str, memory: str, campaign_id: st
     save_memory(npc_id, player_id, memory, campaign_id=campaign_id)
 
 
-def load_memories(npc_id: str, player_id: str, limit: int = 20, campaign_id: str = ""):
+def load_memories(
+    npc_id: str,
+    player_id: str,
+    limit: int = 20,
+    campaign_id: str = "",
+    *,
+    connection: memory_db.DbConnection | None = None,
+):
     campaign_id = normalize_campaign_id(campaign_id)
-    with get_db() as conn:
+    with (nullcontext(connection) if connection is not None else get_db()) as conn:
         rows = conn.execute("""
             SELECT memory
             FROM npc_memories
@@ -789,6 +826,158 @@ def load_memories(npc_id: str, player_id: str, limit: int = 20, campaign_id: str
         """, (campaign_id, npc_id, player_id, limit)).fetchall()
 
     return [row["memory"] for row in reversed(rows)]
+
+
+def prepare_turn_database_phase(
+    npc_id: str,
+    player_id: str,
+    player_text: str | None,
+    *,
+    campaign_id: str = "",
+    save_player_turn: bool = True,
+    detect_player_claim: bool = True,
+) -> dict[str, Any]:
+    """Run all mutable pre-LLM database work in one short transaction.
+
+    The returned values are plain Python data. The connection is returned to the
+    pool before prompt construction and, critically, before the LLM wait starts.
+    """
+    campaign_id = normalize_campaign_id(campaign_id)
+    with get_db() as conn:
+        memories = load_memories(
+            npc_id,
+            player_id,
+            limit=MEMORY_PROMPT_LIMIT,
+            campaign_id=campaign_id,
+            connection=conn,
+        )
+        recent_turns = load_recent_turns(
+            npc_id,
+            player_id,
+            limit=RECENT_TURN_LIMIT,
+            campaign_id=campaign_id,
+            connection=conn,
+        )
+        dm_messages = load_dm_messages(
+            npc_id,
+            player_id,
+            limit=10,
+            campaign_id=campaign_id,
+            connection=conn,
+        )
+        pending_checks = load_pending_checks(
+            npc_id,
+            player_id,
+            status="pending",
+            limit=None,
+            campaign_id=campaign_id,
+            connection=conn,
+            for_update=True,
+        )
+        rulings = load_rulings(
+            npc_id,
+            player_id,
+            limit=50,
+            campaign_id=campaign_id,
+            connection=conn,
+        )
+
+        player_claim = None
+        if detect_player_claim and player_text:
+            player_claim = process_player_message(
+                npc_id,
+                player_id,
+                player_text,
+                campaign_id=campaign_id,
+                connection=conn,
+                pending_checks=pending_checks,
+                rulings=rulings,
+            )
+
+        if save_player_turn and player_text:
+            save_turn(
+                npc_id,
+                player_id,
+                "user",
+                player_text,
+                campaign_id=campaign_id,
+                connection=conn,
+            )
+
+    return {
+        "memories": memories,
+        "recent_turns": recent_turns,
+        "player_claim": player_claim,
+        "dm_context": {
+            "campaign_id": campaign_id,
+            "messages": dm_messages[-10:],
+            "pending_checks": pending_checks[-10:],
+            "rulings": rulings[-10:],
+        },
+    }
+
+
+def finalize_turn_database_phase(
+    npc_id: str,
+    player_id: str,
+    player_text: str,
+    npc_text: str,
+    *,
+    player_pending_id: int | None = None,
+    campaign_id: str = "",
+    npc: dict[str, Any] | None = None,
+    create_pending_checks: bool = True,
+    fallback_spoken_text: str = "",
+) -> dict[str, Any]:
+    """Process and persist an NPC reply, returning one pending snapshot.
+
+    This is intentionally complete before any Piper work. Logging, JSON payloads,
+    and response headers reuse the returned snapshot instead of querying again.
+    """
+    campaign_id = normalize_campaign_id(campaign_id)
+    with get_db() as conn:
+        pending_checks = []
+        if create_pending_checks:
+            pending_checks = load_pending_checks(
+                npc_id,
+                player_id,
+                status="pending",
+                limit=None,
+                campaign_id=campaign_id,
+                connection=conn,
+                for_update=True,
+            )
+        npc_response = process_npc_response(
+            npc_id,
+            player_id,
+            player_text,
+            npc_text,
+            player_pending_id=player_pending_id,
+            campaign_id=campaign_id,
+            create_pending_checks=create_pending_checks,
+            npc=npc,
+            connection=conn,
+            pending_checks=pending_checks,
+        )
+        if not npc_response.get("spoken_text") and fallback_spoken_text:
+            npc_response["spoken_text"] = fallback_spoken_text
+        history_npc_text = assistant_history_text(npc_response)
+        if history_npc_text:
+            save_turn(
+                npc_id,
+                player_id,
+                "assistant",
+                history_npc_text,
+                campaign_id=campaign_id,
+                connection=conn,
+            )
+
+    return {
+        "npc_response": npc_response,
+        "history_npc_text": history_npc_text,
+        "pending_items": pending_checks,
+        "pending_count": len(pending_checks),
+    }
 
 
 def clear_memories(
@@ -1030,6 +1219,7 @@ def get_npc_context(
     campaign_id: str | None = None,
     *,
     include_dm_context: bool = True,
+    include_database_context: bool = True,
 ) -> dict:
     """
     Load all context pieces used for an NPC turn.
@@ -1037,8 +1227,9 @@ def get_npc_context(
     Independent reads overlap in the context worker pool. Location and scene reads
     begin as soon as the NPC load provides its location_id. Static YAML pieces are
     mtime-cached. Memories/recent turns stay live because they change during play.
-    Turn routes can skip DM context because they must reload it after processing the
-    player's newest claim; preload callers can still request it here.
+    Turn routes can skip all database context because their pre-LLM database phase
+    loads one consistent snapshot and saves the player line in one transaction.
+    Preload and legacy callers retain the original defaults.
     """
     overall_started = time.perf_counter()
     party_context = party_context or build_party_context(player_id=player_id)
@@ -1063,24 +1254,27 @@ def get_npc_context(
     task_seconds: dict[str, float] = {}
 
     npc_future = submit_timed("npc", load_npc, npc_id)
-    memories_future = submit_timed(
-        "memories",
-        load_memories,
-        npc_id,
-        player_id,
-        limit=MEMORY_PROMPT_LIMIT,
-        campaign_id=resolved_campaign_id,
-    )
-    recent_turns_future = submit_timed(
-        "recent_turns",
-        load_recent_turns,
-        npc_id,
-        player_id,
-        limit=RECENT_TURN_LIMIT,
-        campaign_id=resolved_campaign_id,
-    )
+    memories_future = None
+    recent_turns_future = None
+    if include_database_context:
+        memories_future = submit_timed(
+            "memories",
+            load_memories,
+            npc_id,
+            player_id,
+            limit=MEMORY_PROMPT_LIMIT,
+            campaign_id=resolved_campaign_id,
+        )
+        recent_turns_future = submit_timed(
+            "recent_turns",
+            load_recent_turns,
+            npc_id,
+            player_id,
+            limit=RECENT_TURN_LIMIT,
+            campaign_id=resolved_campaign_id,
+        )
     dm_context_future = None
-    if include_dm_context:
+    if include_dm_context and include_database_context:
         dm_context_future = submit_timed(
             "dm_context",
             get_dm_context,
@@ -1088,7 +1282,11 @@ def get_npc_context(
             player_id,
             campaign_id=resolved_campaign_id,
         )
-    futures.extend([npc_future, memories_future, recent_turns_future])
+    futures.append(npc_future)
+    if memories_future is not None:
+        futures.append(memories_future)
+    if recent_turns_future is not None:
+        futures.append(recent_turns_future)
     if dm_context_future is not None:
         futures.append(dm_context_future)
 
@@ -1105,10 +1303,14 @@ def get_npc_context(
         )
         futures.extend([location_future, scene_context_future])
 
-        name, memories, elapsed = memories_future.result()
-        task_seconds[name] = elapsed
-        name, recent_turns, elapsed = recent_turns_future.result()
-        task_seconds[name] = elapsed
+        memories = []
+        recent_turns = []
+        if memories_future is not None:
+            name, memories, elapsed = memories_future.result()
+            task_seconds[name] = elapsed
+        if recent_turns_future is not None:
+            name, recent_turns, elapsed = recent_turns_future.result()
+            task_seconds[name] = elapsed
         dm_context = {}
         if dm_context_future is not None:
             name, dm_context, elapsed = dm_context_future.result()
@@ -1152,6 +1354,44 @@ def get_npc_context(
 
 def preload_npc_context(npc_id: str, player_id: str = DEFAULT_PLAYER_ID) -> dict:
     return get_npc_context(npc_id, player_id)
+
+
+def load_turn_pre_llm_context(
+    npc_id: str,
+    player_id: str,
+    *,
+    player_text: str | None,
+    party_context: dict | None,
+    campaign_id: str,
+    save_player_turn: bool = True,
+    detect_player_claim: bool = True,
+) -> dict[str, Any]:
+    """Overlap static context I/O with the short pre-LLM DB transaction."""
+    database_future = NPC_CONTEXT_EXECUTOR.submit(
+        prepare_turn_database_phase,
+        npc_id,
+        player_id,
+        player_text,
+        campaign_id=campaign_id,
+        save_player_turn=save_player_turn,
+        detect_player_claim=detect_player_claim,
+    )
+    try:
+        static_context = get_npc_context(
+            npc_id,
+            player_id,
+            party_context=party_context,
+            campaign_id=campaign_id,
+            include_dm_context=False,
+            include_database_context=False,
+        )
+        database_context = database_future.result()
+    except Exception:
+        database_future.cancel()
+        raise
+
+    # Do not mutate the static-only entry stored in PRELOADED_CONTEXTS.
+    return {**static_context, **database_context}
 
 
 def run_memory_extraction_background(
@@ -1580,19 +1820,21 @@ def run_dm_ruling_auto_response(
             message="The DM ruled — the NPC is responding to your last exchange...",
         )
 
-        context = get_npc_context(
+        context = load_turn_pre_llm_context(
             npc_id,
             player_id,
+            player_text=None,
             party_context=party_context,
             campaign_id=campaign_id,
-            include_dm_context=False,
+            save_player_turn=False,
+            detect_player_claim=False,
         )
         npc = context["npc"]
-        memories = context["memories"]
-        recent_turns = context["recent_turns"]
         location = context["location"]
         campaign_id = context["campaign_id"]
-        dm_context = get_dm_context(npc_id, player_id, campaign_id=campaign_id)
+        memories = context["memories"]
+        recent_turns = context["recent_turns"]
+        dm_context = context["dm_context"]
         party_context = context.get("party_context") or party_context
         scene_context = context.get("scene_context")
 
@@ -1616,8 +1858,9 @@ def run_dm_ruling_auto_response(
             player_text=None,
             enforce_required_dm_checks=False,
         )
+        ensure_turn_in_progress(request_id)
         set_turn_progress(request_id, "processing_response")
-        npc_response = process_npc_response(
+        post_llm_db = finalize_turn_database_phase(
             npc_id,
             player_id,
             "",
@@ -1625,16 +1868,12 @@ def run_dm_ruling_auto_response(
             campaign_id=campaign_id,
             create_pending_checks=False,
             npc=npc,
+            fallback_spoken_text="Very well.",
         )
+        npc_response = post_llm_db["npc_response"]
         npc_text = npc_response["spoken_text"]
 
-        if not npc_text:
-            npc_text = "Very well."
-
         ensure_turn_in_progress(request_id)
-        history_text = assistant_history_text(npc_response) or npc_text
-        if not is_dm_wait_narration(history_text):
-            save_turn(npc_id, player_id, "assistant", history_text, campaign_id=campaign_id)
 
         tts_segments = split_narration_and_dialogue(npc_text)
         tts_text = " ".join(segment["text"] for segment in tts_segments).strip()
@@ -3117,25 +3356,20 @@ def npc_turn():
         )
 
         set_turn_progress(request_id, "loading_context")
-        context = get_npc_context(
+        context = load_turn_pre_llm_context(
             npc_id,
             player_id,
+            player_text=player_text,
             party_context=party_context,
             campaign_id=campaign_id,
-            include_dm_context=False,
         )
         npc = context["npc"]
-        memories = context["memories"]
         location = context["location"]
         scene_context = context["scene_context"]
+        memories = context["memories"]
+        player_claim = context["player_claim"]
+        dm_context = context["dm_context"]
         step_start = log_timing(request_id, "load npc context", step_start)
-
-        player_claim = process_player_message(npc_id, player_id, player_text, campaign_id=campaign_id)
-        dm_context = get_dm_context(npc_id, player_id, campaign_id=campaign_id)
-
-        # Persist the player line before the LLM wait so a DM Confirm/Deny that
-        # force-supersedes this turn still leaves the utterance in history.
-        save_turn(npc_id, player_id, "user", player_text, campaign_id=campaign_id)
 
         set_turn_progress(request_id, "preparing_prompt")
         messages = build_npc_llm_messages(
@@ -3166,7 +3400,7 @@ def npc_turn():
 
         ensure_turn_in_progress(request_id)
         set_turn_progress(request_id, "processing_response")
-        npc_response = process_npc_response(
+        post_llm_db = finalize_turn_database_phase(
             npc_id,
             player_id,
             player_text,
@@ -3175,19 +3409,12 @@ def npc_turn():
             campaign_id=campaign_id,
             npc=npc,
         )
+        npc_response = post_llm_db["npc_response"]
         npc_text = npc_response["spoken_text"]
-
-        ensure_turn_in_progress(request_id)
-        save_player_npc_conversation_turns(
-            npc_id,
-            player_id,
-            player_text,
-            npc_response,
-            campaign_id=campaign_id,
-            save_user=False,
-        )
-        history_npc_text = assistant_history_text(npc_response)
-        step_start = log_timing(request_id, "save text conversation turns", step_start)
+        history_npc_text = post_llm_db["history_npc_text"]
+        pending_items = post_llm_db["pending_items"]
+        pending_count = post_llm_db["pending_count"]
+        step_start = log_timing(request_id, "post-llm database phase", step_start)
 
         saved_memories = []
         memory_extraction_mode = "disabled"
@@ -3227,6 +3454,7 @@ def npc_turn():
             player_claim=player_claim,
             npc_response=npc_response,
             campaign_id=campaign_id,
+            pending_count=pending_count,
         )
 
         include_audio = _json_body_flag(body.get("include_audio"), False)
@@ -3284,7 +3512,7 @@ def npc_turn():
             "dm_pending_check_id": npc_response.get("pending_check_id"),
             "dm_pending_check_ids": npc_response.get("pending_check_ids"),
             "detected_player_claim": player_claim,
-            "dm_pending": load_pending_checks(npc_id, player_id, status="pending", limit=5, campaign_id=campaign_id),
+            "dm_pending": pending_items[-5:],
         }
         if include_audio:
             payload["audio_url"] = audio_url
@@ -3400,26 +3628,21 @@ def npc_voice_turn():
         )
 
         set_turn_progress(request_id, "loading_context")
-        context = get_npc_context(
+        context = load_turn_pre_llm_context(
             npc_id,
             player_id,
+            player_text=player_text,
             party_context=party_context,
             campaign_id=campaign_id,
-            include_dm_context=False,
         )
         npc = context["npc"]
-        memories = context["memories"]
-        recent_turns = context["recent_turns"]
         location = context["location"]
         scene_context = context["scene_context"]
+        memories = context["memories"]
+        recent_turns = context["recent_turns"]
+        player_claim = context["player_claim"]
+        dm_context = context["dm_context"]
         step_start = log_timing(request_id, "load npc/location/memory/recent turns", step_start)
-
-        player_claim = process_player_message(npc_id, player_id, player_text, campaign_id=campaign_id)
-        dm_context = get_dm_context(npc_id, player_id, campaign_id=campaign_id)
-
-        # Persist the player line before the LLM wait so a DM Confirm/Deny that
-        # force-supersedes this turn still leaves the utterance in history.
-        save_turn(npc_id, player_id, "user", player_text, campaign_id=campaign_id)
 
         set_turn_progress(request_id, "preparing_prompt")
         messages = build_npc_llm_messages(
@@ -3450,7 +3673,7 @@ def npc_voice_turn():
 
         ensure_turn_in_progress(request_id)
         set_turn_progress(request_id, "processing_response")
-        npc_response = process_npc_response(
+        post_llm_db = finalize_turn_database_phase(
             npc_id,
             player_id,
             player_text,
@@ -3459,7 +3682,11 @@ def npc_voice_turn():
             campaign_id=campaign_id,
             npc=npc,
         )
+        npc_response = post_llm_db["npc_response"]
         npc_text = npc_response["spoken_text"]
+        history_npc_text = post_llm_db["history_npc_text"]
+        pending_count = post_llm_db["pending_count"]
+        step_start = log_timing(request_id, "post-llm database phase", step_start)
 
         tts_segments = split_into_ordered_tts_segments(npc_text)
         tts_text = " ".join(segment["text"] for segment in tts_segments).strip()
@@ -3490,18 +3717,6 @@ def npc_voice_turn():
                 narration_text="",
                 dialogue_text=tts_text,
             )
-
-        ensure_turn_in_progress(request_id)
-        save_player_npc_conversation_turns(
-            npc_id,
-            player_id,
-            player_text,
-            npc_response,
-            campaign_id=campaign_id,
-            save_user=False,
-        )
-        step_start = log_timing(request_id, "save conversation turns", step_start)
-        history_npc_text = assistant_history_text(npc_response)
 
         memory_extraction_mode = "disabled"
         if history_npc_text and AUTO_MEMORY_EXTRACTION_ENABLED and AUTO_MEMORY_EXTRACTION_ASYNC:
@@ -3627,7 +3842,6 @@ def npc_voice_turn():
             flush=True
         )
 
-        pending_items = load_pending_checks(npc_id, player_id, status="pending", limit=10, campaign_id=campaign_id)
         log_dm_turn(
             request_id=request_id,
             route="/npc-voice-turn",
@@ -3638,6 +3852,7 @@ def npc_voice_turn():
             player_claim=player_claim,
             npc_response=npc_response,
             campaign_id=campaign_id,
+            pending_count=pending_count,
         )
 
         if not streaming:
@@ -3653,7 +3868,7 @@ def npc_voice_turn():
         response.headers["X-Turn-Request-Id"] = request_id
         if streaming:
             response.headers["X-Turn-Streaming"] = "1"
-        response.headers["X-DM-Pending-Count"] = str(len(pending_items))
+        response.headers["X-DM-Pending-Count"] = str(pending_count)
         pending_id = npc_response.get("pending_check_id") or (
             player_claim.get("pending_check_id") if player_claim else None
         )
@@ -3763,22 +3978,21 @@ def npc_voice_turn_debug():
             player_text=player_text,
         )
 
-        context = get_npc_context(
+        context = load_turn_pre_llm_context(
             npc_id,
             player_id,
+            player_text=player_text,
             party_context=party_context,
             campaign_id=campaign_id,
-            include_dm_context=False,
         )
         npc = context["npc"]
-        memories = context["memories"]
-        recent_turns = context["recent_turns"]
         location = context["location"]
         scene_context = context["scene_context"]
+        memories = context["memories"]
+        recent_turns = context["recent_turns"]
+        player_claim = context["player_claim"]
+        dm_context = context["dm_context"]
         step_start = log_timing(request_id, "debug load npc/location/memory/recent turns", step_start)
-
-        player_claim = process_player_message(npc_id, player_id, player_text, campaign_id=campaign_id)
-        dm_context = get_dm_context(npc_id, player_id, campaign_id=campaign_id)
 
         messages = build_npc_llm_messages(
             npc,
@@ -3804,7 +4018,7 @@ def npc_voice_turn_debug():
         )
         step_start = log_timing(request_id, "debug llm npc response", step_start)
 
-        npc_response = process_npc_response(
+        post_llm_db = finalize_turn_database_phase(
             npc_id,
             player_id,
             player_text,
@@ -3813,7 +4027,12 @@ def npc_voice_turn_debug():
             campaign_id=campaign_id,
             npc=npc,
         )
+        npc_response = post_llm_db["npc_response"]
         npc_text = npc_response["spoken_text"]
+        history_npc_text = post_llm_db["history_npc_text"]
+        pending_items = post_llm_db["pending_items"]
+        pending_count = post_llm_db["pending_count"]
+        step_start = log_timing(request_id, "debug post-llm database phase", step_start)
 
         tts_segments = split_narration_and_dialogue(npc_text)
         tts_text = " ".join(segment["text"] for segment in tts_segments).strip()
@@ -3829,16 +4048,6 @@ def npc_voice_turn_debug():
             flush=True
         )
         step_start = log_timing(request_id, "debug split tts segments", step_start)
-
-        save_player_npc_conversation_turns(
-            npc_id,
-            player_id,
-            player_text,
-            npc_response,
-            campaign_id=campaign_id,
-        )
-        step_start = log_timing(request_id, "debug save conversation turns", step_start)
-        history_npc_text = assistant_history_text(npc_response)
 
         saved_memories = []
         memory_extraction_mode = "disabled"
@@ -3903,6 +4112,7 @@ def npc_voice_turn_debug():
             player_claim=player_claim,
             npc_response=npc_response,
             campaign_id=campaign_id,
+            pending_count=pending_count,
         )
 
         return jsonify({
@@ -3933,7 +4143,7 @@ def npc_voice_turn_debug():
             "dm_pending_check_id": npc_response.get("pending_check_id"),
             "dm_pending_check_ids": npc_response.get("pending_check_ids"),
             "detected_player_claim": player_claim,
-            "dm_pending": load_pending_checks(npc_id, player_id, status="pending", limit=5, campaign_id=campaign_id),
+            "dm_pending": pending_items[-5:],
         })
 
     except Exception as ex:
