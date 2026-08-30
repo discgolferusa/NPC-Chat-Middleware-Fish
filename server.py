@@ -1366,9 +1366,21 @@ def load_turn_pre_llm_context(
     save_player_turn: bool = True,
     detect_player_claim: bool = True,
 ) -> dict[str, Any]:
-    """Overlap static context I/O with the short pre-LLM DB transaction."""
-    database_future = NPC_CONTEXT_EXECUTOR.submit(
-        prepare_turn_database_phase,
+    """Validate static context before starting the mutating pre-LLM phase.
+
+    The database phase saves the player turn and may create a pending DM check,
+    so it must never run speculatively. ``Future.cancel()`` cannot stop a worker
+    that has already started and therefore cannot provide rollback semantics.
+    """
+    static_context = get_npc_context(
+        npc_id,
+        player_id,
+        party_context=party_context,
+        campaign_id=campaign_id,
+        include_dm_context=False,
+        include_database_context=False,
+    )
+    database_context = prepare_turn_database_phase(
         npc_id,
         player_id,
         player_text,
@@ -1376,19 +1388,6 @@ def load_turn_pre_llm_context(
         save_player_turn=save_player_turn,
         detect_player_claim=detect_player_claim,
     )
-    try:
-        static_context = get_npc_context(
-            npc_id,
-            player_id,
-            party_context=party_context,
-            campaign_id=campaign_id,
-            include_dm_context=False,
-            include_database_context=False,
-        )
-        database_context = database_future.result()
-    except Exception:
-        database_future.cancel()
-        raise
 
     # Do not mutate the static-only entry stored in PRELOADED_CONTEXTS.
     return {**static_context, **database_context}

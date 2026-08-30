@@ -4,6 +4,79 @@ from __future__ import annotations
 
 import io
 
+import pytest
+
+
+@pytest.mark.parametrize("failure_stage", ["npc", "location"])
+def test_static_context_failure_persists_no_pre_llm_writes(
+    api, monkeypatch, failure_stage
+):
+    _client, server, _headers = api
+
+    def fail_static_load(*_args, **_kwargs):
+        raise LookupError(f"missing {failure_stage}")
+
+    if failure_stage == "npc":
+        monkeypatch.setattr(server, "load_npc", fail_static_load)
+    else:
+        monkeypatch.setattr(
+            server,
+            "load_npc",
+            lambda _npc_id: {"id": "missing_location_npc", "location_id": "missing"},
+        )
+        monkeypatch.setattr(server, "load_location", fail_static_load)
+        monkeypatch.setattr(server, "build_scene_context", lambda _location_id: {})
+
+    with pytest.raises(LookupError, match=f"missing {failure_stage}"):
+        server.load_turn_pre_llm_context(
+            "missing_npc",
+            "player_alden",
+            player_text="We have a letter from the mayor allowing us to enter.",
+            party_context={"party_id": "default_party", "campaign_id": "greyhaven_intro"},
+            campaign_id="greyhaven_intro",
+        )
+
+    with server.get_db() as conn:
+        turn_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM conversation_turns"
+        ).fetchone()["count"]
+        pending_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM dm_pending_checks"
+        ).fetchone()["count"]
+    assert turn_count == 0
+    assert pending_count == 0
+
+
+def test_pre_llm_database_phase_starts_only_after_static_context(api, monkeypatch):
+    _client, server, _headers = api
+    events: list[str] = []
+
+    def static_context(*_args, **_kwargs):
+        events.append("static_complete")
+        return {"npc": {}, "location": {}, "scene_context": {}}
+
+    def database_phase(*_args, **_kwargs):
+        events.append("database_phase")
+        return {
+            "memories": [],
+            "recent_turns": [],
+            "player_claim": None,
+            "dm_context": {},
+        }
+
+    monkeypatch.setattr(server, "get_npc_context", static_context)
+    monkeypatch.setattr(server, "prepare_turn_database_phase", database_phase)
+
+    server.load_turn_pre_llm_context(
+        "captain_varra",
+        "player_alden",
+        player_text="Hello.",
+        party_context={"party_id": "default_party", "campaign_id": "greyhaven_intro"},
+        campaign_id="greyhaven_intro",
+    )
+
+    assert events == ["static_complete", "database_phase"]
+
 
 def test_pre_llm_phase_uses_one_connection_and_saves_player(api, monkeypatch):
     _client, server, _headers = api
