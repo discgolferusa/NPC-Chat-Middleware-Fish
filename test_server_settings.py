@@ -1,5 +1,8 @@
 """Unit tests for narrator TTS defaults in server_settings."""
 
+import pytest
+
+import server_settings
 from content_pack import install_content_pack
 from server_settings import format_llm_rules, get_narrator_tts_settings, load_global_llm_rules
 from session_context import clear_request_context, set_request_campaign, set_request_owner
@@ -107,3 +110,31 @@ def test_load_global_llm_rules_falls_back_to_local_file(tmp_path):
 
     assert "- Local fallback rule" in formatted
     assert format_llm_rules({"llm_rules": ["Local fallback rule"]}) == formatted
+
+
+@pytest.mark.parametrize(
+    "empty_pack_rules",
+    [
+        {},
+        [],
+        {"llm_rules": None},
+    ],
+    ids=["empty-object", "empty-list", "yaml-with-empty-llm-rules"],
+)
+def test_load_global_llm_rules_falls_back_when_pack_rules_are_empty(
+    tmp_path, monkeypatch, empty_pack_rules
+):
+    local_path = tmp_path / "llm_rules.yaml"
+    local_path.write_text(
+        "llm_rules:\n  - Local fallback rule\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        server_settings,
+        "_resolve_pack_llm_rules",
+        lambda: empty_pack_rules,
+    )
+
+    formatted = load_global_llm_rules(local_path)
+
+    assert formatted == "- Local fallback rule"

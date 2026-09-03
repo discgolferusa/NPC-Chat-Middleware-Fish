@@ -126,9 +126,9 @@ def load_global_llm_rules(path: Path | None = None) -> str:
     Prefers the campaign owner's content-pack `llm_rules` when installed; otherwise
     middleware-local ServerSettings/llm_rules.yaml.
     """
-    pack_rules = _resolve_pack_llm_rules()
-    if pack_rules is not None:
-        return format_llm_rules(pack_rules)
+    formatted_pack_rules = format_llm_rules(_resolve_pack_llm_rules())
+    if formatted_pack_rules:
+        return formatted_pack_rules
 
     rules_path = path or DEFAULT_LLM_RULES_FILE
     if not rules_path.exists():
