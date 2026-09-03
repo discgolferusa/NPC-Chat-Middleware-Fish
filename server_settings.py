@@ -3,6 +3,9 @@ Server-wide settings loaded from YAML in ServerSettings/.
 
 Narrator TTS prefers the campaign owner's content-pack `tts` (per-user) when present;
 otherwise falls back to middleware-local ServerSettings/tts.yaml.
+
+Global LLM rules prefer the content-pack `llm_rules` when present; otherwise fall
+back to middleware-local ServerSettings/llm_rules.yaml.
 """
 
 from __future__ import annotations
@@ -94,11 +97,39 @@ def _load_yaml_cached(path: Path, cache: dict[str, Any], cache_key: str) -> dict
     return deepcopy(data)
 
 
+def _resolve_pack_tts() -> dict[str, Any] | None:
+    """Prefer per-owner TTS from the active content pack (request owner + campaign)."""
+    try:
+        from content_pack import get_pack_tts
+        from session_context import get_request_campaign, get_request_owner
+
+        return get_pack_tts(get_request_owner(), get_request_campaign())
+    except Exception:
+        return None
+
+
+def _resolve_pack_llm_rules() -> Any | None:
+    """Prefer global llm_rules from the active content pack (request owner + campaign)."""
+    try:
+        from content_pack import get_pack_llm_rules
+        from session_context import get_request_campaign, get_request_owner
+
+        return get_pack_llm_rules(get_request_owner(), get_request_campaign())
+    except Exception:
+        return None
+
+
 def load_global_llm_rules(path: Path | None = None) -> str:
     """
-    Load and format global LLM rules from ServerSettings/llm_rules.yaml.
-    Reloads automatically when the file changes on disk.
+    Load and format global LLM rules.
+
+    Prefers the campaign owner's content-pack `llm_rules` when installed; otherwise
+    middleware-local ServerSettings/llm_rules.yaml.
     """
+    pack_rules = _resolve_pack_llm_rules()
+    if pack_rules is not None:
+        return format_llm_rules(pack_rules)
+
     rules_path = path or DEFAULT_LLM_RULES_FILE
     if not rules_path.exists():
         return ""
@@ -165,17 +196,6 @@ def load_tts_settings(path: Path | None = None) -> dict[str, Any]:
         return _default_tts_settings()
 
     return _load_yaml_cached(settings_path, _TTS_SETTINGS_CACHE, str(settings_path))
-
-
-def _resolve_pack_tts() -> dict[str, Any] | None:
-    """Prefer per-owner TTS from the active content pack (request owner + campaign)."""
-    try:
-        from content_pack import get_pack_tts
-        from session_context import get_request_campaign, get_request_owner
-
-        return get_pack_tts(get_request_owner(), get_request_campaign())
-    except Exception:
-        return None
 
 
 def get_narrator_tts_settings(path: Path | None = None) -> dict[str, Any]:

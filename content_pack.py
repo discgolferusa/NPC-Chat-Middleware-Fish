@@ -43,6 +43,7 @@ def _empty_pack(owner_user_id: str, campaign_id: str = "") -> dict[str, Any]:
         "locations": {},
         "parties": {},
         "tts": None,
+        "llm_rules": None,
         "indexes": {
             "npc_ids_by_location": {},
             "npc_aliases": {},
@@ -134,7 +135,7 @@ def install_content_pack(
     Replace the in-memory pack for this owner+campaign.
 
     Accepts either:
-    - content_pack: { campaigns|npcs|locations|parties: { id: doc|yaml_string }, tts?: doc|yaml_string }
+    - content_pack: { campaigns|npcs|locations|parties: { id: doc|yaml_string }, tts?: doc|yaml_string, llm_rules?: doc|yaml_string }
     - files: [{ kind, filename, content|yaml }]  (parsed into memory only)
     """
     owner = (owner_user_id or "").strip()
@@ -176,6 +177,7 @@ def install_content_pack(
                     pack[bucket][resolved] = doc
 
         pack["tts"] = _normalize_tts(content_pack.get("tts"))
+        pack["llm_rules"] = _normalize_llm_rules(content_pack.get("llm_rules"))
 
     for raw in files or []:
         if not isinstance(raw, dict):
@@ -215,6 +217,7 @@ def install_content_pack(
             "locations": len(pack["locations"]),
             "parties": len(pack["parties"]),
             "has_tts": pack.get("tts") is not None,
+            "has_llm_rules": pack.get("llm_rules") is not None,
             "locations_indexed": len(pack["indexes"].get("npc_ids_by_location") or {}),
         },
     }
@@ -269,6 +272,19 @@ def _normalize_tts(raw: Any) -> dict[str, Any] | None:
     return None
 
 
+def _normalize_llm_rules(raw: Any) -> Any | None:
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return None
+        return yaml.safe_load(text)
+    if isinstance(raw, (dict, list)):
+        return deepcopy(raw)
+    return None
+
+
 def get_pack_tts(
     owner_user_id: str | None = None,
     campaign_id: str | None = None,
@@ -279,6 +295,20 @@ def get_pack_tts(
         return None
     tts = pack.get("tts")
     return deepcopy(tts) if isinstance(tts, dict) else None
+
+
+def get_pack_llm_rules(
+    owner_user_id: str | None = None,
+    campaign_id: str | None = None,
+) -> Any | None:
+    """Return global llm_rules from the installed content pack, if any."""
+    pack = get_pack(owner_user_id, campaign_id)
+    if not pack:
+        return None
+    rules = pack.get("llm_rules")
+    if rules is None:
+        return None
+    return deepcopy(rules)
 
 
 def lookup_document(
