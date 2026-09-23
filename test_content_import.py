@@ -277,6 +277,8 @@ def test_destroyer_moonside_seeds_major_location_sites(monkeypatch):
         assert expected in names, expected
     # Room-scale headers must not become top-level stubs.
     assert "Hangar 01" not in names
+    assert result["campaign"]["genre"] == "sci_fi"
+    assert result["campaign"]["rpg_system"] == "Alien RPG"
     assert "The Gate" not in names
     assert "Landing Pad A" not in names
     assert any("moonside" in w.lower() or "location site" in w.lower() for w in result["warnings"])
@@ -1422,12 +1424,45 @@ def test_normalize_campaign_meta_preserves_merge_campaign_id():
     assert meta["rpg_system"] == "Alien RPG"
 
 
-def test_normalize_campaign_meta_defaults_genre_when_missing():
+def test_normalize_campaign_meta_leaves_genre_empty_when_missing():
     meta = content_import._normalize_campaign_meta({"name": "Multi Test"})
     assert meta["campaign_id"] == "multi_test"
-    assert meta["genre"] == "fantasy"
+    assert meta["genre"] == ""
     assert meta["rpg_system"] == ""
 
+
+def test_apply_imported_campaign_setting_alien_fast_path_is_sci_fi():
+    campaign = {"campaign_id": "destroyer", "name": "Destroyer", "genre": "", "rpg_system": ""}
+    content_import._apply_imported_campaign_setting(
+        campaign, document_text="", alien_fast_path=True
+    )
+    assert campaign["genre"] == "sci_fi"
+    assert campaign["rpg_system"] == "Alien RPG"
+
+
+def test_apply_imported_campaign_setting_does_not_invent_fantasy():
+    campaign = {"campaign_id": "camp", "name": "Camp", "genre": "", "rpg_system": ""}
+    content_import._apply_imported_campaign_setting(
+        campaign, document_text="A quiet village market.", alien_fast_path=False
+    )
+    assert campaign["genre"] == ""
+    assert campaign["rpg_system"] == ""
+
+
+def test_stat_block_fast_path_outline_stamps_sci_fi_setting(monkeypatch):
+    text = (
+        "Table of Contents\n"
+        "Non-Player Characters ........ 12\n\n"
+        + _load_chariot_pdfpig_fixture()
+    )
+
+    def fake_call_llm_json(*args, **kwargs):
+        raise AssertionError("stat-block outline must skip the LLM")
+
+    monkeypatch.setattr(content_import, "_call_llm_json", fake_call_llm_json)
+    result = content_import.outline_campaign_document(text, "create_new")
+    assert result["campaign"]["genre"] == "sci_fi"
+    assert result["campaign"]["rpg_system"] == "Alien RPG"
 
 def test_normalize_npc_stubs_empty_location_stays_empty():
     stubs = content_import._normalize_npc_stubs(

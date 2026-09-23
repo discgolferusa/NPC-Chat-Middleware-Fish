@@ -4600,7 +4600,7 @@ def _normalize_outline(
         "campaign_id": campaign_id,
         "name": str(campaign_raw.get("name") or campaign_id.replace("_", " ").title()).strip(),
         "description": str(campaign_raw.get("description") or "").strip(),
-        "genre": normalize_campaign_genre(campaign_raw.get("genre")) or "fantasy",
+        "genre": normalize_campaign_genre(campaign_raw.get("genre")),
         "rpg_system": str(campaign_raw.get("rpg_system") or "").strip(),
     }
 
@@ -5213,6 +5213,11 @@ def outline_campaign_document(
         existing_npc_names=existing_npc_names,
         warnings=warnings,
     )
+    _apply_imported_campaign_setting(
+        campaign,
+        document_text=full_document_text,
+        alien_fast_path=use_stat_block_fast_path or use_location_site_fast_path,
+    )
 
     if (
         mode == "create_new"
@@ -5266,6 +5271,62 @@ def outline_campaign_document(
     }
 
 
+def _infer_genre_from_rpg_system(rpg_system: str) -> str:
+    """Best-effort genre from a free-text RPG system label (empty when unknown)."""
+    text = (rpg_system or "").strip().casefold()
+    if not text:
+        return ""
+    if "alien" in text:
+        return "sci_fi"
+    if "cthulhu" in text or text in {"coc", "call of cthulhu"}:
+        return "horror"
+    if "shadowrun" in text or "cyberpunk" in text or "traveller" in text:
+        return "sci_fi"
+    if "d&d" in text or "dnd" in text or "dungeons" in text or "pathfinder" in text:
+        return "fantasy"
+    if "vampire" in text or "werewolf" in text or "world of darkness" in text:
+        return "horror"
+    return ""
+
+
+def _apply_imported_campaign_setting(
+    campaign: dict[str, Any],
+    *,
+    document_text: str = "",
+    alien_fast_path: bool = False,
+) -> None:
+    """Fill genre/rpg_system for imports without inventing fantasy by default.
+
+    Alien RPG stat-block / moonside fast paths skip the outline LLM, so missing
+    genre must not fall back to fantasy (that would force a stay-in-fantasy rule).
+    """
+    genre = normalize_campaign_genre(campaign.get("genre"))
+    rpg_system = str(campaign.get("rpg_system") or "").strip()
+
+    if alien_fast_path:
+        if not genre:
+            genre = "sci_fi"
+        if not rpg_system:
+            rpg_system = "Alien RPG"
+    elif not genre and rpg_system:
+        genre = _infer_genre_from_rpg_system(rpg_system)
+    elif not genre and document_text:
+        sample = (document_text or "")[:12000].casefold()
+        if (
+            "alien rpg" in sample
+            or "free league" in sample
+            or "uscss" in sample
+            or "xenomorph" in sample
+            or "moonside locations" in sample
+        ):
+            genre = "sci_fi"
+            if not rpg_system:
+                rpg_system = "Alien RPG"
+
+    campaign["genre"] = genre
+    campaign["rpg_system"] = rpg_system
+
+
 def _normalize_campaign_meta(campaign: dict[str, Any] | None) -> dict[str, Any]:
     """Normalize campaign fields for detail hops without rewriting assigned ids.
 
@@ -5283,7 +5344,7 @@ def _normalize_campaign_meta(campaign: dict[str, Any] | None) -> dict[str, Any]:
         "campaign_id": campaign_id,
         "name": str(raw.get("name") or campaign_id.replace("_", " ").title()).strip(),
         "description": str(raw.get("description") or "").strip(),
-        "genre": normalize_campaign_genre(raw.get("genre")) or "fantasy",
+        "genre": normalize_campaign_genre(raw.get("genre")),
         "rpg_system": str(raw.get("rpg_system") or "").strip(),
     }
 
