@@ -1409,14 +1409,24 @@ def test_detail_npc_batch_rejects_oversized_batch():
 
 def test_normalize_campaign_meta_preserves_merge_campaign_id():
     meta = content_import._normalize_campaign_meta(
-        {"campaign_id": "MultiTest", "name": "Multi Test", "description": ""}
+        {
+            "campaign_id": "MultiTest",
+            "name": "Multi Test",
+            "description": "",
+            "genre": "sci_fi",
+            "rpg_system": "Alien RPG",
+        }
     )
     assert meta["campaign_id"] == "MultiTest"
+    assert meta["genre"] == "sci_fi"
+    assert meta["rpg_system"] == "Alien RPG"
 
 
-def test_normalize_campaign_meta_snake_cases_when_id_missing():
+def test_normalize_campaign_meta_defaults_genre_when_missing():
     meta = content_import._normalize_campaign_meta({"name": "Multi Test"})
     assert meta["campaign_id"] == "multi_test"
+    assert meta["genre"] == "fantasy"
+    assert meta["rpg_system"] == ""
 
 
 def test_normalize_npc_stubs_empty_location_stays_empty():

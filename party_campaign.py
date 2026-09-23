@@ -658,6 +658,12 @@ def format_party_context_for_prompt(party_context: dict[str, Any] | None) -> str
         campaign_name = campaign.get("name") or campaign_id
         campaign_desc = (campaign.get("description") or "").strip()
         lines.append(f"Active campaign: {campaign_name} ({campaign_id})")
+        genre = _campaign_genre_label(campaign)
+        rpg_system = _campaign_rpg_system(campaign)
+        if genre:
+            lines.append(f"Campaign genre/setting: {genre}")
+        if rpg_system:
+            lines.append(f"RPG system: {rpg_system}")
         if campaign_desc:
             lines.append(f"Campaign summary: {campaign_desc}")
 
@@ -687,6 +693,78 @@ def format_party_context_for_prompt(party_context: dict[str, Any] | None) -> str
         "or familiarity may affect tone even when a non-speaking party member's race or class is relevant."
     )
 
+    return "\n".join(lines)
+
+
+_CAMPAIGN_GENRE_LABELS = {
+    "fantasy": "fantasy",
+    "sci_fi": "sci-fi",
+    "modern": "modern",
+    "horror": "horror",
+    "other": "other",
+}
+
+_CAMPAIGN_GENRE_ALIASES = {
+    "scifi": "sci_fi",
+    "science_fiction": "sci_fi",
+    "sciencefiction": "sci_fi",
+    "sci-fi": "sci_fi",
+}
+
+
+def normalize_campaign_genre(raw: Any) -> str:
+    """Normalize campaign YAML genre to a known slug (empty if unset)."""
+    text = str(raw or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if not text:
+        return ""
+    text = _CAMPAIGN_GENRE_ALIASES.get(text, text)
+    if text in _CAMPAIGN_GENRE_LABELS:
+        return text
+    return "other"
+
+
+def _campaign_genre_label(campaign: dict[str, Any] | None) -> str:
+    slug = normalize_campaign_genre((campaign or {}).get("genre"))
+    return _CAMPAIGN_GENRE_LABELS.get(slug, "")
+
+
+def _campaign_rpg_system(campaign: dict[str, Any] | None) -> str:
+    return str((campaign or {}).get("rpg_system") or "").strip()
+
+
+def format_campaign_setting_rule(party_context: dict[str, Any] | None) -> str:
+    """Hard LLM rule: stay in the campaign's genre/setting and RPG system.
+
+    Returns empty string when neither genre nor rpg_system is set so legacy
+    campaigns without these fields do not get a vacuous rule.
+    """
+    campaign = (party_context or {}).get("campaign") or {}
+    genre_label = _campaign_genre_label(campaign)
+    rpg_system = _campaign_rpg_system(campaign)
+    if not genre_label and not rpg_system:
+        return ""
+
+    lines = [
+        "Campaign setting rule (REQUIRED — do not violate):",
+    ]
+    if genre_label:
+        lines.append(f"- Genre/setting: {genre_label}")
+    if rpg_system:
+        lines.append(f"- RPG system: {rpg_system}")
+    lines.append(
+        "- Keep all dialogue, tone, technology, magic, creatures, factions, and world "
+        "details consistent with this genre/setting."
+    )
+    if rpg_system:
+        lines.append(
+            f"- Prefer terminology, expectations, and genre conventions appropriate to "
+            f"{rpg_system}; do not invent mechanics or jargon from unrelated RPG systems."
+        )
+    lines.append(
+        "- Do not introduce anachronisms or wrong-genre tropes (for example: lasers in "
+        "high fantasy, or medieval knights in hard sci-fi) unless the DM explicitly "
+        "authorizes an exception in the DM channel context."
+    )
     return "\n".join(lines)
 
 

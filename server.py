@@ -79,6 +79,7 @@ import dm_channel
 from party_campaign import (
     DEFAULT_PLAYER_ID,
     build_party_context,
+    format_campaign_setting_rule,
     format_party_context_for_prompt,
     format_player_message_content,
     get_character_options,
@@ -1541,6 +1542,8 @@ NPC-specific rules for {npc["name"]} (these override conflicting global rules):
 {npc_rules_text}"""
 
     required_checks_block = format_required_dm_checks_prompt_block(npc, dm_context)
+    campaign_setting_rule = format_campaign_setting_rule(party_context)
+    campaign_setting_block = f"\n{campaign_setting_rule}\n" if campaign_setting_rule else "\n"
 
     return f"""
 You are portraying an NPC in a tabletop RPG.
@@ -1581,8 +1584,7 @@ Party and campaign context:
 DM channel context:
 {dm_context_text}
 {required_checks_block}
-Rules:
-{global_rules_text}{npc_rules_block}
+Rules:{campaign_setting_block}{global_rules_text}{npc_rules_block}
 """.strip()
 
 

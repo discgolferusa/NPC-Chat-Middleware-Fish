@@ -33,6 +33,7 @@ import json
 import re
 from typing import Any
 
+from party_campaign import normalize_campaign_genre
 from llm_router import (
     LLMProviderError,
     content_creation_max_input_chars,
@@ -4530,7 +4531,9 @@ def _build_outline_prompt(
         "this shape:\n\n"
         "{\n"
         '  "campaign": {"campaign_id": "snake_case_id", "name": "Display Name", '
-        '"description": "1-3 sentence summary"},\n'
+        '"description": "1-3 sentence summary", '
+        '"genre": "fantasy|sci_fi|modern|horror|other", '
+        '"rpg_system": "e.g. D&D 5e, Call of Cthulhu, Alien RPG"},\n'
         '  "locations": [{"id": "snake_case_id", "name": "Display Name", '
         '"type": "city|town|dungeon|forest|building|ship|region|other"}],\n'
         '  "npcs": [{"name": "Display Name", "role": "short role or title", '
@@ -4565,6 +4568,9 @@ def _build_outline_prompt(
         "do not create a separate top-level location for every room.\n"
         "- other_location_ids should only be non-empty for NPCs who travel or appear in more "
         "than one place in the text.\n"
+        "- Set campaign.genre from the document's tone (fantasy, sci_fi, modern, horror, or "
+        "other). Set campaign.rpg_system to the named ruleset when stated (e.g. D&D 5e, "
+        "Call of Cthulhu, Alien RPG); otherwise leave rpg_system as an empty string.\n"
         f"{mode_guidance}"
         "- Output ONLY the JSON object described above. No prose, no markdown fences.\n\n"
         "Campaign document text:\n"
@@ -4594,6 +4600,8 @@ def _normalize_outline(
         "campaign_id": campaign_id,
         "name": str(campaign_raw.get("name") or campaign_id.replace("_", " ").title()).strip(),
         "description": str(campaign_raw.get("description") or "").strip(),
+        "genre": normalize_campaign_genre(campaign_raw.get("genre")) or "fantasy",
+        "rpg_system": str(campaign_raw.get("rpg_system") or "").strip(),
     }
 
     existing_location_set: set[str] = {
@@ -5275,6 +5283,8 @@ def _normalize_campaign_meta(campaign: dict[str, Any] | None) -> dict[str, Any]:
         "campaign_id": campaign_id,
         "name": str(raw.get("name") or campaign_id.replace("_", " ").title()).strip(),
         "description": str(raw.get("description") or "").strip(),
+        "genre": normalize_campaign_genre(raw.get("genre")) or "fantasy",
+        "rpg_system": str(raw.get("rpg_system") or "").strip(),
     }
 
 
