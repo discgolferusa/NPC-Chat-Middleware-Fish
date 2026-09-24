@@ -1449,6 +1449,31 @@ def test_apply_imported_campaign_setting_does_not_invent_fantasy():
     assert campaign["rpg_system"] == ""
 
 
+def test_apply_imported_campaign_setting_ignores_free_league_alone():
+    """Free League publishes many lines — publisher credit must not stamp Alien RPG."""
+    campaign = {"campaign_id": "vaesen", "name": "Vaesen", "genre": "", "rpg_system": ""}
+    content_import._apply_imported_campaign_setting(
+        campaign,
+        document_text=(
+            "VAESEN\nPublished by Free League Publishing.\n"
+            "A Nordic horror mystery in 19th century Scandinavia."
+        ),
+        alien_fast_path=False,
+    )
+    assert campaign["genre"] == ""
+    assert campaign["rpg_system"] == ""
+
+
+def test_apply_imported_campaign_setting_alien_markers_still_detect():
+    campaign = {"campaign_id": "chariot", "name": "Chariot", "genre": "", "rpg_system": ""}
+    content_import._apply_imported_campaign_setting(
+        campaign,
+        document_text="Aboard the USCSS Cronus, a xenomorph outbreak begins.",
+        alien_fast_path=False,
+    )
+    assert campaign["genre"] == "sci_fi"
+    assert campaign["rpg_system"] == "Alien RPG"
+
 def test_stat_block_fast_path_outline_stamps_sci_fi_setting(monkeypatch):
     text = (
         "Table of Contents\n"

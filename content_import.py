@@ -5312,9 +5312,10 @@ def _apply_imported_campaign_setting(
         genre = _infer_genre_from_rpg_system(rpg_system)
     elif not genre and document_text:
         sample = (document_text or "")[:12000].casefold()
+        # Alien-specific markers only — never "Free League" alone (they publish
+        # Vaesen, Forbidden Lands, Twilight 2000, etc.).
         if (
             "alien rpg" in sample
-            or "free league" in sample
             or "uscss" in sample
             or "xenomorph" in sample
             or "moonside locations" in sample
