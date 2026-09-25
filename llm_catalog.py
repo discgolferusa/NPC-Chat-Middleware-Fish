@@ -486,14 +486,20 @@ def set_model_order(
         return list(MODEL_ORDER[purpose])
 
 
-def _prune_orders(*, restore_ids: list[str] | None = None) -> None:
+def _eligible_purposes(entry: dict[str, Any]) -> set[str]:
+    purposes = entry.get("purposes") or []
+    if not purposes:
+        return set(VALID_PURPOSES)
+    return {p for p in purposes if p in VALID_PURPOSES}
+
+
+def _prune_orders(*, restore_by_purpose: dict[str, list[str]] | None = None) -> None:
     """Drop invalid ids from MODEL_ORDER without re-adding admin-excluded models.
 
-    ``restore_ids`` are appended (end of each eligible purpose list) when an entry
-    is newly created, re-enabled, or gains a purpose — so it becomes selectable
-    again without reshuffling the rest of the admin precedence.
+    ``restore_by_purpose`` maps purpose → entry ids to append only onto that
+    purpose's list (new rows, re-enables, or newly gained purposes).
     """
-    restore = [mid for mid in (restore_ids or []) if mid]
+    restore_by_purpose = restore_by_purpose or {}
     for purpose in VALID_PURPOSES:
         order = _normalize_order(
             MODEL_ORDER.get(purpose),
@@ -501,39 +507,47 @@ def _prune_orders(*, restore_ids: list[str] | None = None) -> None:
             purpose=purpose,
             append_missing=False,
         )
-        for mid in restore:
+        for mid in restore_by_purpose.get(purpose, []):
             entry = CATALOG_ENTRIES.get(mid)
             if (
                 entry
                 and entry.get("enabled") is not False
                 and mid not in order
+                and purpose in _eligible_purposes(entry)
             ):
-                purposes = entry.get("purposes") or []
-                if not purposes or purpose in purposes:
-                    order.append(mid)
+                order.append(mid)
         MODEL_ORDER[purpose] = order
 
 
-def _entry_should_restore_to_order(
+def _purposes_to_restore(
     previous: dict[str, Any] | None,
     entry: dict[str, Any],
     *,
     is_new: bool,
-) -> bool:
-    """Whether upsert should append ``entry`` back onto purpose precedence lists."""
-    if is_new:
-        return True
+) -> list[str]:
+    """Purpose lists that should gain ``entry`` after an upsert.
+
+    New / re-enabled rows restore onto every eligible purpose. Gaining a purpose
+    only restores onto the *newly* eligible lists so admin-excluded lists stay
+    untouched (e.g. chat walk left without a model still stays without it when
+    content_creation is added).
+    """
     if entry.get("enabled") is False:
-        return False
+        return []
+    eligible = _eligible_purposes(entry)
+    if is_new:
+        return sorted(eligible)
     prev = previous or {}
-    if prev.get("enabled") is False and entry.get("enabled") is not False:
-        return True
-    prev_purposes = set(prev.get("purposes") or [])
-    new_purposes = set(entry.get("purposes") or [])
-    # Purpose list became empty (= universal) or gained a purpose.
-    if prev_purposes and (not new_purposes or bool(new_purposes - prev_purposes)):
-        return True
-    return False
+    if prev.get("enabled") is False:
+        return sorted(eligible)
+    prev_eligible = _eligible_purposes(prev) if prev else set()
+    return sorted(eligible - prev_eligible)
+
+
+def _restore_map_for_entry(entry_id: str, purposes: list[str]) -> dict[str, list[str]] | None:
+    if not purposes:
+        return None
+    return {purpose: [entry_id] for purpose in purposes}
 
 
 def upsert_entry(
