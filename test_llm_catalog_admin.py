@@ -331,12 +331,20 @@ def test_adding_purpose_restores_model_to_that_order(isolated_selection):
         },
         fetch_pricing=False,
     )
+    # Admin intentionally left gpt-oss out of the chat walk list.
+    llm_catalog.set_model_order(
+        "chat",
+        ["openrouter-nemotron-3.5-lightning-coreweave", "local"],
+        llm_models=llm_router.LLM_MODELS,
+        prices=llm_router.ONLINE_ON_DEMAND_PRICES_USD,
+    )
     llm_catalog.set_model_order(
         "content_creation",
         ["local"],
         llm_models=llm_router.LLM_MODELS,
         prices=llm_router.ONLINE_ON_DEMAND_PRICES_USD,
     )
+    assert "openrouter-gpt-oss-20b" not in llm_catalog.get_model_order("chat")
     assert "openrouter-gpt-oss-20b" not in llm_catalog.get_model_order("content_creation")
     llm_router.upsert_llm_catalog_entry(
         {
@@ -348,4 +356,6 @@ def test_adding_purpose_restores_model_to_that_order(isolated_selection):
         },
         fetch_pricing=False,
     )
+    # Only the newly gained purpose list is restored — chat exclusion is preserved.
+    assert "openrouter-gpt-oss-20b" not in llm_catalog.get_model_order("chat")
     assert "openrouter-gpt-oss-20b" in llm_catalog.get_model_order("content_creation")

@@ -572,12 +572,12 @@ def upsert_entry(
             }
             entry = _normalize_entry(merged, entry_id="local")
             CATALOG_ENTRIES["local"] = entry
-            restore = (
-                ["local"]
-                if _entry_should_restore_to_order(previous, entry, is_new=False)
-                else None
+            _prune_orders(
+                restore_by_purpose=_restore_map_for_entry(
+                    "local",
+                    _purposes_to_restore(previous, entry, is_new=False),
+                )
             )
-            _prune_orders(restore_ids=restore)
             apply_to_router(llm_models, prices)
             save_catalog()
             return deepcopy(entry)
@@ -625,12 +625,12 @@ def upsert_entry(
 
     with _CATALOG_LOCK:
         CATALOG_ENTRIES[entry_id] = entry
-        restore = (
-            [entry_id]
-            if _entry_should_restore_to_order(previous, entry, is_new=is_new)
-            else None
+        _prune_orders(
+            restore_by_purpose=_restore_map_for_entry(
+                entry_id,
+                _purposes_to_restore(previous, entry, is_new=is_new),
+            )
         )
-        _prune_orders(restore_ids=restore)
         apply_to_router(llm_models, prices)
         save_catalog()
         return deepcopy(entry)
