@@ -38,7 +38,7 @@ from llm_router import (
     LLMProviderError,
     content_creation_max_input_chars,
     content_creation_zero_budget_error_message,
-    generate_llm_response,
+    generate_llm_response_with_usage,
 )
 
 MAX_INPUT_CHARS = 120_000
@@ -274,6 +274,252 @@ def _as_str_list(value: Any) -> list[str]:
 
 def _batches(items: list[Any], size: int) -> list[list[Any]]:
     return [items[i : i + size] for i in range(0, len(items), size)] if items else []
+
+
+_TEMP_KEY_PATTERN = re.compile(r"^(campaign|location|npc)_\d{3,}$", re.IGNORECASE)
+_VALID_SIGNIFICANCE = frozenset({"conversational", "secondary", "ignore"})
+
+
+def _empty_usage(*, model_id: str | None = None) -> dict[str, Any]:
+    return {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "estimated_cost_usd": None,
+        "model_id": model_id,
+    }
+
+
+def _merge_usage(acc: dict[str, Any], usage: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(usage, dict):
+        return acc
+    acc["prompt_tokens"] = int(acc.get("prompt_tokens") or 0) + int(usage.get("prompt_tokens") or 0)
+    acc["completion_tokens"] = int(acc.get("completion_tokens") or 0) + int(
+        usage.get("completion_tokens") or 0
+    )
+    left = acc.get("estimated_cost_usd")
+    right = usage.get("estimated_cost_usd")
+    if left is None and right is None:
+        acc["estimated_cost_usd"] = None
+    else:
+        acc["estimated_cost_usd"] = round(float(left or 0) + float(right or 0), 6)
+    model_id = usage.get("model_id")
+    if model_id:
+        acc["model_id"] = model_id
+    return acc
+
+
+def _looks_like_temp_key(value: Any) -> bool:
+    return bool(_TEMP_KEY_PATTERN.match(str(value or "").strip()))
+
+
+def _normalize_significance(value: Any) -> str:
+    raw = str(value or "").strip().casefold()
+    if raw in _VALID_SIGNIFICANCE:
+        return raw
+    return "conversational"
+
+
+def _validate_temporary_keys(
+    campaign: dict[str, Any],
+    locations: list[dict[str, Any]],
+    npcs: list[dict[str, Any]],
+) -> list[str]:
+    """Return warnings for duplicate temporary keys across the discovery payload."""
+    warnings: list[str] = []
+    seen: dict[str, str] = {}
+
+    def _check(kind: str, key: str) -> None:
+        key = str(key or "").strip()
+        if not key:
+            warnings.append(f"{kind} is missing temporary_key.")
+            return
+        prior = seen.get(key)
+        if prior:
+            warnings.append(f"Duplicate temporary_key '{key}' on {kind} (also on {prior}).")
+        else:
+            seen[key] = kind
+
+    _check("campaign", str(campaign.get("temporary_key") or ""))
+    for loc in locations:
+        _check("location", str(loc.get("temporary_key") or loc.get("id") or ""))
+    for npc in npcs:
+        _check("npc", str(npc.get("temporary_key") or npc.get("id") or ""))
+    return warnings
+
+
+def _entity_ref_aliases(entity: dict[str, Any]) -> list[str]:
+    """Identifiers that may appear in LLM/deterministic refs for one entity."""
+    aliases: list[str] = []
+    for key in (
+        entity.get("temporary_key"),
+        entity.get("id"),
+        entity.get("name"),
+        snake_case(entity.get("name")),
+    ):
+        text = str(key or "").strip()
+        if text and text not in aliases:
+            aliases.append(text)
+        folded = text.casefold()
+        if folded and folded not in aliases:
+            aliases.append(folded)
+    return aliases
+
+
+def _stamp_discovery_temporary_keys(
+    campaign: dict[str, Any],
+    locations: list[dict[str, Any]],
+    npcs: list[dict[str, Any]],
+    *,
+    mode: str,
+    existing_campaign_id: str | None,
+    warnings: list[str],
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Assign authoritative temporary keys and remap location refs."""
+    title = str(campaign.get("title") or campaign.get("name") or "").strip()
+    name = str(campaign.get("name") or title or "Campaign").strip()
+    stamped_campaign: dict[str, Any] = {
+        "temporary_key": "campaign_001",
+        "title": title or name,
+        "name": name,
+        "description": str(campaign.get("description") or "").strip(),
+        "genre": normalize_campaign_genre(campaign.get("genre")),
+        "rpg_system": str(campaign.get("rpg_system") or "").strip(),
+        "premise": str(campaign.get("premise") or "").strip(),
+        "themes": _as_str_list(campaign.get("themes")),
+        "tone": str(campaign.get("tone") or "").strip(),
+        "factions": _as_str_list(campaign.get("factions")),
+        "important_context": _as_str_list(campaign.get("important_context")),
+        "starting_situation": str(campaign.get("starting_situation") or "").strip(),
+    }
+    if mode == "merge" and existing_campaign_id:
+        # Detail hops / editor still need the existing permanent campaign id.
+        stamped_campaign["campaign_id"] = existing_campaign_id.strip()
+
+    loc_alias_to_key: dict[str, str] = {}
+    stamped_locations: list[dict[str, Any]] = []
+    for index, loc in enumerate(locations, start=1):
+        temp_key = f"location_{index:03d}"
+        for alias in _entity_ref_aliases(loc):
+            loc_alias_to_key[alias] = temp_key
+            loc_alias_to_key[snake_case(alias)] = temp_key
+        parent_raw = loc.get("parent_temporary_key")
+        if parent_raw in (None, "", "null"):
+            parent_key = None
+        else:
+            parent_key = str(parent_raw).strip() or None
+        stamped_locations.append(
+            {
+                "temporary_key": temp_key,
+                # Legacy: keep id equal to temporary_key during transition.
+                "id": temp_key,
+                "name": str(loc.get("name") or temp_key).strip(),
+                "type": str(loc.get("type") or "other").strip() or "other",
+                "parent_temporary_key": parent_key,
+                "summary_hint": str(loc.get("summary_hint") or "").strip(),
+                "associated_npc_keys": _as_str_list(loc.get("associated_npc_keys")),
+                "source_refs": _as_list(loc.get("source_refs")),
+                "seeded_from_stat_blocks": bool(loc.get("seeded_from_stat_blocks")),
+                "seeded_from_location_sites": bool(loc.get("seeded_from_location_sites")),
+            }
+        )
+
+    def _resolve_loc_ref(ref: Any) -> str:
+        text = str(ref or "").strip()
+        if not text:
+            return ""
+        if text in loc_alias_to_key:
+            return loc_alias_to_key[text]
+        folded = text.casefold()
+        if folded in loc_alias_to_key:
+            return loc_alias_to_key[folded]
+        snaked = snake_case(text)
+        if snaked in loc_alias_to_key:
+            return loc_alias_to_key[snaked]
+        # Preserve unresolved refs (merge-mode existing campaign location ids).
+        return text
+
+    for loc in stamped_locations:
+        parent = loc.get("parent_temporary_key")
+        if parent:
+            resolved = _resolve_loc_ref(parent)
+            loc["parent_temporary_key"] = resolved or None
+
+    stamped_npcs: list[dict[str, Any]] = []
+    npc_alias_to_key: dict[str, str] = {}
+    for index, npc in enumerate(npcs, start=1):
+        temp_key = f"npc_{index:03d}"
+        for alias in _entity_ref_aliases(npc):
+            npc_alias_to_key[alias] = temp_key
+            npc_alias_to_key[snake_case(alias)] = temp_key
+        primary = (
+            npc.get("primary_location_key")
+            or npc.get("first_location_id")
+            or ""
+        )
+        primary_key = _resolve_loc_ref(primary)
+        if not primary_key and stamped_locations:
+            primary_key = stamped_locations[0]["temporary_key"]
+        other_keys: list[str] = []
+        other_raw = npc.get("other_location_keys")
+        if other_raw is None:
+            other_raw = npc.get("other_location_ids")
+        for ref in _as_list(other_raw):
+            resolved = _resolve_loc_ref(ref)
+            if resolved and resolved != primary_key and resolved not in other_keys:
+                other_keys.append(resolved)
+        stamped_npcs.append(
+            {
+                "temporary_key": temp_key,
+                "id": temp_key,
+                "name": str(npc.get("name") or "").strip(),
+                "role": str(npc.get("role") or "").strip(),
+                "primary_location_key": primary_key,
+                "other_location_keys": other_keys,
+                # Legacy aliases used by detail hops / older editor code.
+                "first_location_id": primary_key,
+                "other_location_ids": list(other_keys),
+                "significance": _normalize_significance(npc.get("significance")),
+                "source_refs": _as_list(npc.get("source_refs")),
+                "seeded_from_stat_blocks": bool(npc.get("seeded_from_stat_blocks")),
+                "seed_personality": str(npc.get("seed_personality") or "").strip(),
+                "seed_personal_agenda": str(npc.get("seed_personal_agenda") or "").strip(),
+            }
+        )
+
+    def _resolve_npc_ref(ref: Any) -> str:
+        text = str(ref or "").strip()
+        if not text:
+            return ""
+        if text in npc_alias_to_key:
+            return npc_alias_to_key[text]
+        folded = text.casefold()
+        if folded in npc_alias_to_key:
+            return npc_alias_to_key[folded]
+        snaked = snake_case(text)
+        if snaked in npc_alias_to_key:
+            return npc_alias_to_key[snaked]
+        return ""
+
+    # Remap associated_npc_keys onto stamped npc_NNN handles (or rebuild from primaries).
+    npcs_by_loc: dict[str, list[str]] = {}
+    for npc in stamped_npcs:
+        loc_key = str(npc.get("primary_location_key") or "")
+        if loc_key:
+            npcs_by_loc.setdefault(loc_key, []).append(npc["temporary_key"])
+    for index, loc in enumerate(stamped_locations):
+        raw_assoc = _as_str_list(locations[index].get("associated_npc_keys")) if index < len(locations) else []
+        remapped: list[str] = []
+        for ref in raw_assoc:
+            resolved = _resolve_npc_ref(ref)
+            if resolved and resolved not in remapped:
+                remapped.append(resolved)
+        if remapped:
+            loc["associated_npc_keys"] = remapped
+        else:
+            loc["associated_npc_keys"] = list(npcs_by_loc.get(loc["temporary_key"]) or [])
+
+    warnings.extend(_validate_temporary_keys(stamped_campaign, stamped_locations, stamped_npcs))
+    return stamped_campaign, stamped_locations, stamped_npcs
 
 
 def _collapse_spaced_caps(text: str) -> str:
@@ -994,9 +1240,18 @@ def _ensure_locations_for_npc_hints(
     npc_stubs: list[dict[str, Any]],
     *,
     warnings: list[str],
+    existing_location_ids: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Add minimal location stubs referenced by NPC first_location_id hints."""
-    known = {loc["id"] for loc in location_stubs}
+    known = {
+        str(loc.get("temporary_key") or loc.get("id") or "") for loc in location_stubs
+    }
+    known |= {snake_case(loc.get("name")) for loc in location_stubs}
+    for existing in existing_location_ids or []:
+        existing = str(existing or "").strip()
+        if existing:
+            known.add(existing)
+            known.add(snake_case(existing))
     defaults = {
         "uscss_cronus": ("USCSS Cronus", "ship"),
         "sotillo": ("Sotillo", "ship"),
@@ -1006,19 +1261,27 @@ def _ensure_locations_for_npc_hints(
     }
     added: list[str] = []
     for npc in npc_stubs:
-        loc_id = str(npc.get("first_location_id") or "").strip()
-        if not loc_id or loc_id in known:
+        loc_id = str(
+            npc.get("primary_location_key") or npc.get("first_location_id") or ""
+        ).strip()
+        if not loc_id or loc_id in known or snake_case(loc_id) in known:
             continue
         name, loc_type = defaults.get(loc_id, (loc_id.replace("_", " ").title(), "other"))
         location_stubs.append(
             {
+                "temporary_key": loc_id,
                 "id": loc_id,
                 "name": name,
                 "type": loc_type,
+                "parent_temporary_key": None,
+                "summary_hint": "",
+                "associated_npc_keys": [],
+                "source_refs": [],
                 "seeded_from_stat_blocks": True,
             }
         )
         known.add(loc_id)
+        known.add(snake_case(name))
         added.append(loc_id)
     if added:
         warnings.append(
@@ -1268,9 +1531,14 @@ def _extract_alien_location_site_stubs(text: str) -> list[dict[str, Any]]:
         seen.add(loc_id)
         found.append(
             {
+                "temporary_key": loc_id,
                 "id": loc_id,
                 "name": display_name,
                 "type": loc_type,
+                "parent_temporary_key": None,
+                "summary_hint": "",
+                "associated_npc_keys": [],
+                "source_refs": [],
                 "seeded_from_location_sites": True,
                 "seeded_from_stat_blocks": False,
             }
@@ -1298,15 +1566,22 @@ def _merge_outline_locations_with_sites(
         return llm_locations
 
     existing = {snake_case(x) for x in existing_location_ids if str(x).strip()}
-    existing |= {loc["id"] for loc in llm_locations if loc.get("id")}
+    existing |= {
+        str(loc.get("temporary_key") or loc.get("id") or "")
+        for loc in llm_locations
+        if loc.get("temporary_key") or loc.get("id")
+    }
+    existing |= {snake_case(loc.get("name")) for loc in llm_locations}
 
     merged = list(llm_locations)
     added: list[str] = []
     for stub in site_stubs:
-        loc_id = stub["id"]
-        if mode == "merge" and loc_id in existing:
+        loc_id = stub.get("temporary_key") or stub["id"]
+        if mode == "merge" and (loc_id in existing or snake_case(stub["name"]) in existing):
             continue
-        if any(loc.get("id") == loc_id for loc in merged):
+        if any(
+            (loc.get("temporary_key") or loc.get("id")) == loc_id for loc in merged
+        ):
             continue
         # Soft match on name against LLM stubs.
         name_key = stub["name"].casefold()
@@ -1314,6 +1589,7 @@ def _merge_outline_locations_with_sites(
             continue
         merged.append(stub)
         existing.add(loc_id)
+        existing.add(snake_case(stub["name"]))
         added.append(stub["name"])
 
     if added:
@@ -1591,11 +1867,16 @@ def _npc_stubs_from_stat_blocks(
         agenda = str(row.get("personal_agenda") or "").strip()
         stubs.append(
             {
+                "temporary_key": snake_case(row["name"]),
                 "id": snake_case(row["name"]),
                 "name": row["name"],
                 "role": row.get("role") or "",
+                "primary_location_key": loc,
+                "other_location_keys": [],
                 "first_location_id": loc,
                 "other_location_ids": [],
+                "significance": "conversational",
+                "source_refs": [],
                 "seeded_from_stat_blocks": True,
                 "seed_personality": personality,
                 "seed_personal_agenda": agenda,
@@ -2669,11 +2950,16 @@ def _npc_stubs_from_cubicle7_callouts(
     for row in parsed:
         stubs.append(
             {
+                "temporary_key": snake_case(row["name"]),
                 "id": snake_case(row["name"]),
                 "name": row["name"],
                 "role": row.get("role") or "",
+                "primary_location_key": loc,
+                "other_location_keys": [],
                 "first_location_id": loc,
                 "other_location_ids": [],
+                "significance": "conversational",
+                "source_refs": [],
                 "seeded_from_stat_blocks": True,
                 "seed_personality": "",
                 "seed_personal_agenda": "",
@@ -4418,7 +4704,7 @@ def _coerce_container(data: Any, key: str) -> list[dict[str, Any]]:
         if isinstance(value, dict):
             return [value]
         # Bare object at the top level (single entity without the wrapper key).
-        if "id" in data or "name" in data:
+        if "id" in data or "name" in data or "temporary_key" in data:
             return [data]
     return []
 
@@ -4427,33 +4713,56 @@ def _index_details_by_stub_id(
     detail_items: list[dict[str, Any]],
     stubs: list[dict[str, Any]],
 ) -> dict[str, dict[str, Any]]:
-    """Map detail objects onto stub ids, including one-item bare-object batches.
+    """Map detail objects onto stub ids / temporary keys.
 
     Detail passes often echo ids with different casing/spacing than the outline
-    stubs (which are always snake_case). Normalize before indexing so lookups
-    do not fall through to empty defaults.
+    stubs. Normalize before indexing so lookups do not fall through to empty defaults.
     """
     details_by_id: dict[str, dict[str, Any]] = {}
     for item in detail_items:
-        raw_id = str(item.get("id") or "").strip()
+        raw_id = str(item.get("temporary_key") or item.get("id") or "").strip()
         if raw_id:
+            details_by_id[raw_id] = item
             details_by_id[snake_case(raw_id)] = item
         # NPCs frequently return the display name as id; index by name too.
         raw_name = str(item.get("name") or "").strip()
         if raw_name:
+            details_by_id.setdefault(raw_name.casefold(), item)
             details_by_id.setdefault(snake_case(raw_name), item)
 
-    if len(stubs) == 1 and len(detail_items) == 1 and stubs[0]["id"] not in details_by_id:
-        details_by_id[stubs[0]["id"]] = detail_items[0]
-        return details_by_id
+    def _stub_keys(stub: dict[str, Any]) -> list[str]:
+        keys = [
+            str(stub.get("temporary_key") or "").strip(),
+            str(stub.get("id") or "").strip(),
+            snake_case(stub.get("name")),
+            str(stub.get("name") or "").strip().casefold(),
+        ]
+        return [k for k in keys if k]
 
-    # Positional fallback when counts match and some stubs still unresolved
-    # (model returned fields but mismatched/missing ids).
+    if len(stubs) == 1 and len(detail_items) == 1:
+        stub_id = str(stubs[0].get("temporary_key") or stubs[0].get("id") or "")
+        if stub_id and stub_id not in details_by_id and snake_case(stub_id) not in details_by_id:
+            details_by_id[stub_id] = detail_items[0]
+            return details_by_id
+
+    # Positional fallback when counts match and some stubs still unresolved.
     if len(detail_items) == len(stubs) and len(stubs) > 1:
         for stub, item in zip(stubs, detail_items):
-            stub_id = str(stub.get("id") or "")
-            if stub_id and stub_id not in details_by_id:
+            stub_id = str(stub.get("temporary_key") or stub.get("id") or "")
+            if stub_id and stub_id not in details_by_id and snake_case(stub_id) not in details_by_id:
                 details_by_id[stub_id] = item
+
+    # Remap name-keyed details onto stub temporary keys for callers that look up by id.
+    for stub in stubs:
+        stub_id = str(stub.get("temporary_key") or stub.get("id") or "")
+        if not stub_id:
+            continue
+        if stub_id in details_by_id or snake_case(stub_id) in details_by_id:
+            continue
+        for key in _stub_keys(stub):
+            if key in details_by_id:
+                details_by_id[stub_id] = details_by_id[key]
+                break
 
     return details_by_id
 
@@ -4464,17 +4773,20 @@ def _call_llm_json(
     *,
     warnings: list[str],
     step: str,
+    usage_acc: dict[str, Any] | None = None,
 ) -> Any:
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
-    raw = generate_llm_response(
+    raw, usage = generate_llm_response_with_usage(
         messages,
         purpose="content_creation",
         max_tokens=OUTLINE_MAX_TOKENS if step == "outline" else IMPORT_MAX_TOKENS,
         temperature=IMPORT_TEMPERATURE,
     )
+    if usage_acc is not None:
+        _merge_usage(usage_acc, usage)
     try:
         return extract_json(raw)
     except ContentImportError as ex:
@@ -4506,44 +4818,71 @@ def _build_outline_prompt(
     if mode == "merge" and existing_campaign_id:
         mode_guidance = (
             f"This document is being merged into the EXISTING campaign \"{existing_campaign_id}\". "
-            f"Set campaign.campaign_id to exactly \"{existing_campaign_id}\".\n"
+            "Do NOT invent a new permanent campaign id. Discovery still uses temporary_key values "
+            f"for new entities; the application will stamp campaign_id=\"{existing_campaign_id}\" "
+            "onto the campaign object.\n"
         )
         if existing_location_ids:
             mode_guidance += (
                 "These location ids already exist in the campaign: "
                 f"{', '.join(existing_location_ids)}. If the document clearly describes one of "
-                "these same locations, reuse that exact id; otherwise invent a new distinct id.\n"
+                "these same locations, skip emitting a new location stub for it; otherwise invent "
+                "a new temporary_key (location_NNN).\n"
             )
         if existing_npc_names:
             mode_guidance += (
                 "These NPC names already exist in the campaign: "
                 f"{', '.join(existing_npc_names)}. If the document clearly describes one of these "
-                "same NPCs, reuse that exact name; otherwise invent a new distinct name.\n"
+                "same NPCs, skip them; otherwise invent a new temporary_key (npc_NNN).\n"
             )
     else:
         mode_guidance = (
-            "This is a brand new campaign. Invent a short, memorable campaign_id and name from "
-            "the document's title or setting if one is not explicitly given.\n"
+            "This is a brand new campaign. Do NOT invent a permanent campaign_id, location id, "
+            "or npc id. Use temporary_key values only (campaign_001, location_001, npc_001, …). "
+            "Provide campaign title/name/description/genre/rpg_system from the document.\n"
         )
 
     return (
-        "Read the campaign document text below and produce an outline as JSON with exactly "
-        "this shape:\n\n"
+        "Read the campaign document text below and produce a discovery outline as JSON with "
+        "exactly this shape:\n\n"
         "{\n"
-        '  "campaign": {"campaign_id": "snake_case_id", "name": "Display Name", '
-        '"description": "1-3 sentence summary", '
-        '"genre": "fantasy|sci_fi|modern|horror|other", '
-        '"rpg_system": "e.g. D&D 5e, Call of Cthulhu, Alien RPG"},\n'
-        '  "locations": [{"id": "snake_case_id", "name": "Display Name", '
-        '"type": "city|town|dungeon|forest|building|ship|region|other"}],\n'
-        '  "npcs": [{"name": "Display Name", "role": "short role or title", '
-        '"first_location_id": "snake_case id of the location where this NPC is first '
-        'encountered", "other_location_ids": ["snake_case_id", ...]}]\n'
+        '  "campaign": {\n'
+        '    "temporary_key": "campaign_001",\n'
+        '    "title": "Display Title",\n'
+        '    "name": "Display Name",\n'
+        '    "description": "1-3 sentence summary",\n'
+        '    "genre": "fantasy|sci_fi|modern|horror|other",\n'
+        '    "rpg_system": "e.g. D&D 5e, Call of Cthulhu, Alien RPG"\n'
+        "  },\n"
+        '  "locations": [{\n'
+        '    "temporary_key": "location_001",\n'
+        '    "name": "Display Name",\n'
+        '    "type": "city|town|dungeon|forest|building|ship|region|other",\n'
+        '    "parent_temporary_key": null,\n'
+        '    "summary_hint": "",\n'
+        '    "associated_npc_keys": [],\n'
+        '    "source_refs": []\n'
+        "  }],\n"
+        '  "npcs": [{\n'
+        '    "temporary_key": "npc_001",\n'
+        '    "name": "Display Name",\n'
+        '    "role": "short role or title",\n'
+        '    "primary_location_key": "location_001",\n'
+        '    "other_location_keys": [],\n'
+        '    "significance": "conversational|secondary|ignore",\n'
+        '    "source_refs": []\n'
+        "  }]\n"
         "}\n\n"
         "Rules:\n"
-        "- Use snake_case for every id (lowercase letters, digits, underscores only).\n"
-        "- Every id used as an NPC's first_location_id or in other_location_ids MUST also "
-        "appear in the locations list.\n"
+        "- temporary_key values are opaque handles (campaign_001 / location_001 / npc_001). "
+        "The application may renumber them; prefer unique keys within this response.\n"
+        "- Do NOT invent permanent NPCNarrator campaign_id / location id / npc id values.\n"
+        "- Every primary_location_key / other_location_keys entry MUST reference a location "
+        "temporary_key from the locations list.\n"
+        "- parent_temporary_key: set for sublocations that nest under another location "
+        "(major sites have null). Prefer major sites as top-level locations.\n"
+        "- significance: conversational (talkative named cast), secondary (named but minor), "
+        "ignore (generic enemies/monsters/mooks). Prefer ignore for unnamed enemy groups.\n"
         "- If the document has a NON-PLAYER CHARACTERS (or NPCs / Supporting Cast) section, "
         "that section is the authoritative NPC list. List every stat-block NPC there and do "
         "NOT list names only mentioned in intro text, movie quotes, sidebars, or player "
@@ -4566,7 +4905,7 @@ def _build_outline_prompt(
         "- If the document centers on a ship or vessel, list the ship as one location "
         "(type ship) and put individual decks/rooms in later important_locations detail — "
         "do not create a separate top-level location for every room.\n"
-        "- other_location_ids should only be non-empty for NPCs who travel or appear in more "
+        "- other_location_keys should only be non-empty for NPCs who travel or appear in more "
         "than one place in the text.\n"
         "- Set campaign.genre from the document's tone (fantasy, sci_fi, modern, horror, or "
         "other). Set campaign.rpg_system to the named ruleset when stated (e.g. D&D 5e, "
@@ -4591,92 +4930,121 @@ def _normalize_outline(
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
     campaign_raw = outline.get("campaign") if isinstance(outline.get("campaign"), dict) else {}
 
-    if mode == "merge" and existing_campaign_id:
-        campaign_id = existing_campaign_id.strip()
-    else:
-        campaign_id = snake_case(campaign_raw.get("campaign_id") or campaign_raw.get("name") or "campaign")
-
-    campaign = {
-        "campaign_id": campaign_id,
-        "name": str(campaign_raw.get("name") or campaign_id.replace("_", " ").title()).strip(),
+    title = str(campaign_raw.get("title") or campaign_raw.get("name") or "").strip()
+    name = str(campaign_raw.get("name") or title or "").strip()
+    campaign: dict[str, Any] = {
+        "temporary_key": str(campaign_raw.get("temporary_key") or "campaign_001").strip()
+        or "campaign_001",
+        "title": title or name or "Campaign",
+        "name": name or title or "Campaign",
         "description": str(campaign_raw.get("description") or "").strip(),
         "genre": normalize_campaign_genre(campaign_raw.get("genre")),
         "rpg_system": str(campaign_raw.get("rpg_system") or "").strip(),
+        "premise": str(campaign_raw.get("premise") or "").strip(),
+        "themes": _as_str_list(campaign_raw.get("themes")),
+        "tone": str(campaign_raw.get("tone") or "").strip(),
+        "factions": _as_str_list(campaign_raw.get("factions")),
+        "important_context": _as_str_list(campaign_raw.get("important_context")),
+        "starting_situation": str(campaign_raw.get("starting_situation") or "").strip(),
     }
+    if mode == "merge" and existing_campaign_id:
+        campaign["campaign_id"] = existing_campaign_id.strip()
 
     existing_location_set: set[str] = {
         loc_id.strip() for loc_id in existing_location_ids if loc_id and loc_id.strip()
     }
-    # Tracks ids already claimed by locations we will emit (write). Existing
-    # campaign ids are intentionally NOT pre-seeded here so merge mode can reuse
-    # them for NPC location refs without inventing greyhaven_2.
-    taken_location_ids: set[str] = set()
-    id_remap: dict[str, str] = {}
+    # Provisional keys before final stamp — preserve LLM temp keys / legacy ids for remapping.
+    taken_location_keys: set[str] = set()
+    key_remap: dict[str, str] = {}
     locations: list[dict[str, Any]] = []
 
     for raw_loc in _as_list(outline.get("locations")):
         if not isinstance(raw_loc, dict):
             continue
         name = str(raw_loc.get("name") or "").strip()
-        raw_id = str(raw_loc.get("id") or name or "location").strip()
-        base_id = snake_case(raw_id)
-        if not base_id:
+        raw_key = str(
+            raw_loc.get("temporary_key") or raw_loc.get("id") or name or "location"
+        ).strip()
+        provisional = raw_key if _looks_like_temp_key(raw_key) else snake_case(raw_key)
+        if not provisional:
             continue
 
-        # Merge: model reused an existing campaign location — keep the id for
-        # NPC refs, but do not re-emit it for writing (editor won't overwrite).
-        if mode == "merge" and base_id in existing_location_set:
-            id_remap[raw_id] = base_id
-            if base_id not in id_remap:
-                id_remap[base_id] = base_id
+        # Merge: model reused an existing campaign location — keep the ref for
+        # NPC location keys, but do not re-emit it for writing.
+        if mode == "merge" and (
+            provisional in existing_location_set or snake_case(name) in existing_location_set
+        ):
+            keep = provisional if provisional in existing_location_set else snake_case(name)
+            key_remap[raw_key] = keep
+            key_remap[provisional] = keep
+            if name:
+                key_remap[name] = keep
+                key_remap[name.casefold()] = keep
             warnings.append(
-                f"Location id '{base_id}' already exists in the campaign; "
+                f"Location '{name or provisional}' already exists in the campaign; "
                 "reusing it for references and skipping regeneration."
             )
             continue
 
-        final_id = base_id
-        if final_id in taken_location_ids:
-            # Within-document collision (two outline rows share a snake_case id).
-            # Keep id_remap[base_id] pointing at the FIRST location; only the
-            # later raw_id maps to the renamed final_id.
-            final_id = _unique_id(base_id, taken_location_ids)
+        final_key = provisional
+        if final_key in taken_location_keys:
+            final_key = _unique_id(provisional, taken_location_keys)
             warnings.append(
-                f"Location id '{base_id}' collided with another outline location; "
-                f"renamed later entry to '{final_id}'."
+                f"Location temporary_key '{provisional}' collided with another outline "
+                f"location; renamed later entry to '{final_key}'."
             )
         else:
-            taken_location_ids.add(final_id)
+            taken_location_keys.add(final_key)
 
-        id_remap[raw_id] = final_id
-        # Prefer the first claimant of the snake_case key so NPC refs that use
-        # the base id keep pointing at the original location.
-        if base_id not in id_remap:
-            id_remap[base_id] = final_id
+        key_remap[raw_key] = final_key
+        key_remap[provisional] = final_key
+        if name:
+            key_remap[name] = final_key
+            key_remap[name.casefold()] = final_key
+            key_remap[snake_case(name)] = final_key
+
+        parent_raw = raw_loc.get("parent_temporary_key")
+        if parent_raw in (None, "", "null"):
+            parent_key: str | None = None
+        else:
+            parent_key = str(parent_raw).strip() or None
 
         locations.append(
             {
-                "id": final_id,
-                "name": name or final_id.replace("_", " ").title(),
+                "temporary_key": final_key,
+                "id": final_key,
+                "name": name or final_key.replace("_", " ").title(),
                 "type": str(raw_loc.get("type") or "other").strip() or "other",
+                "parent_temporary_key": parent_key,
+                "summary_hint": str(raw_loc.get("summary_hint") or "").strip(),
+                "associated_npc_keys": _as_str_list(raw_loc.get("associated_npc_keys")),
+                "source_refs": _as_list(raw_loc.get("source_refs")),
             }
         )
 
-    # Existing locations remain valid NPC targets even when not re-emitted.
-    known_location_ids = {loc["id"] for loc in locations} | existing_location_set
+    known_location_keys = {loc["temporary_key"] for loc in locations} | existing_location_set
 
-    def _resolve_location_ref(ref: str) -> str | None:
+    def _resolve_location_ref(ref: Any) -> str | None:
         ref = str(ref or "").strip()
         if not ref:
             return None
-        if ref in id_remap:
-            return id_remap[ref]
+        if ref in key_remap:
+            return key_remap[ref]
+        if ref.casefold() in key_remap:
+            return key_remap[ref.casefold()]
         candidate = snake_case(ref)
-        if candidate in id_remap:
-            return id_remap[candidate]
-        if candidate in known_location_ids:
-            return candidate
+        if candidate in key_remap:
+            return key_remap[candidate]
+        if candidate in known_location_keys or ref in known_location_keys:
+            return candidate if candidate in known_location_keys else ref
         return None
+
+    # Resolve parents after key_remap is complete (including merge-skipped existing ids).
+    for loc in locations:
+        parent = loc.get("parent_temporary_key")
+        if parent:
+            resolved = _resolve_location_ref(parent)
+            loc["parent_temporary_key"] = resolved
 
     existing_npc_name_keys: set[str] = {
         n.strip().casefold() for n in existing_npc_names if n and n.strip()
@@ -4684,7 +5052,7 @@ def _normalize_outline(
     existing_npc_id_set: set[str] = {
         snake_case(n) for n in existing_npc_names if n and n.strip()
     }
-    taken_npc_ids: set[str] = set()
+    taken_npc_keys: set[str] = set()
     npcs: list[dict[str, Any]] = []
 
     for raw_npc in _as_list(outline.get("npcs")):
@@ -4693,13 +5061,13 @@ def _normalize_outline(
         name = str(raw_npc.get("name") or "").strip()
         if not name:
             continue
-        base_id = snake_case(name)
-        if not base_id:
+        raw_key = str(raw_npc.get("temporary_key") or raw_npc.get("id") or name).strip()
+        provisional = raw_key if _looks_like_temp_key(raw_key) else snake_case(name)
+        if not provisional:
             continue
 
-        # Merge: reuse existing NPC identity — skip regeneration/write.
         if mode == "merge" and (
-            name.casefold() in existing_npc_name_keys or base_id in existing_npc_id_set
+            name.casefold() in existing_npc_name_keys or snake_case(name) in existing_npc_id_set
         ):
             warnings.append(
                 f"NPC '{name}' already exists in the campaign; "
@@ -4707,36 +5075,55 @@ def _normalize_outline(
             )
             continue
 
-        final_id = base_id
-        if final_id in taken_npc_ids:
-            final_id = _unique_id(base_id, taken_npc_ids)
+        final_key = provisional
+        if final_key in taken_npc_keys:
+            final_key = _unique_id(provisional, taken_npc_keys)
             warnings.append(
-                f"NPC id '{base_id}' collided with another outline NPC; "
-                f"renamed later entry to '{final_id}'."
+                f"NPC temporary_key '{provisional}' collided with another outline NPC; "
+                f"renamed later entry to '{final_key}'."
             )
         else:
-            taken_npc_ids.add(final_id)
+            taken_npc_keys.add(final_key)
 
-        first_location_id = _resolve_location_ref(raw_npc.get("first_location_id"))
-        other_location_ids: list[str] = []
-        for ref in _as_list(raw_npc.get("other_location_ids")):
+        primary_ref = (
+            raw_npc.get("primary_location_key")
+            or raw_npc.get("first_location_id")
+            or ""
+        )
+        primary_location_key = _resolve_location_ref(primary_ref)
+        other_location_keys: list[str] = []
+        other_raw = raw_npc.get("other_location_keys")
+        if other_raw is None:
+            other_raw = raw_npc.get("other_location_ids")
+        for ref in _as_list(other_raw):
             resolved = _resolve_location_ref(ref)
-            if resolved and resolved != first_location_id and resolved not in other_location_ids:
-                other_location_ids.append(resolved)
+            if (
+                resolved
+                and resolved != primary_location_key
+                and resolved not in other_location_keys
+            ):
+                other_location_keys.append(resolved)
 
-        if raw_npc.get("first_location_id") and not first_location_id:
+        if primary_ref and not primary_location_key:
             warnings.append(
-                f"NPC '{name}': could not resolve first_location_id "
-                f"'{raw_npc.get('first_location_id')}' to a known location."
+                f"NPC '{name}': could not resolve primary_location_key "
+                f"'{primary_ref}' to a known location."
             )
 
+        default_loc = locations[0]["temporary_key"] if locations else ""
+        primary_final = primary_location_key or default_loc
         npcs.append(
             {
-                "id": final_id,
+                "temporary_key": final_key,
+                "id": final_key,
                 "name": name,
                 "role": str(raw_npc.get("role") or "").strip(),
-                "first_location_id": first_location_id or (locations[0]["id"] if locations else ""),
-                "other_location_ids": other_location_ids,
+                "primary_location_key": primary_final,
+                "other_location_keys": other_location_keys,
+                "first_location_id": primary_final,
+                "other_location_ids": list(other_location_keys),
+                "significance": _normalize_significance(raw_npc.get("significance")),
+                "source_refs": _as_list(raw_npc.get("source_refs")),
             }
         )
 
@@ -4755,7 +5142,11 @@ def _build_location_detail_prompt(
     *,
     is_retry: bool = False,
 ) -> str:
-    location_list = "\n".join(f"- id: {loc['id']} | name: {loc['name']} | type: {loc['type']}" for loc in batch)
+    location_list = "\n".join(
+        f"- temporary_key: {loc.get('temporary_key') or loc['id']} | name: {loc['name']} | "
+        f"type: {loc['type']}"
+        for loc in batch
+    )
     ship_batch = any(
         _location_looks_like_ship(
             str(loc.get("name") or ""),
@@ -4788,8 +5179,13 @@ def _build_location_detail_prompt(
             "- Junction codes like A-1 / B-2 also imply the matching deck letter.\n"
             "- Do not invent rooms that lack a subheader or clear room prose in the excerpts.\n\n"
         )
+    campaign_label = str(campaign.get("name") or "Campaign")
+    campaign_handle = str(
+        campaign.get("temporary_key") or campaign.get("campaign_id") or ""
+    ).strip()
+    campaign_ref = f'"{campaign_label}"' + (f" ({campaign_handle})" if campaign_handle else "")
     return (
-        f'Campaign: "{campaign["name"]}" ({campaign["campaign_id"]}).\n\n'
+        f"Campaign: {campaign_ref}.\n\n"
         f"{retry_note}"
         f"{ship_note}"
         "Fill in details for EACH location below from the SOURCE EXCERPTS only.\n"
@@ -4811,7 +5207,7 @@ def _build_location_detail_prompt(
         "- What locals or visitors typically know or must not know → knowledge_rules.\n\n"
         'Respond with exactly {"locations": [ ... ]} where each item has this shape:\n\n'
         "{\n"
-        '  "id": "<exact id from the list below>",\n'
+        '  "temporary_key": "<exact temporary_key from the list below>",\n'
         '  "summary": "faithful overview; keep concrete sensory and plot details from the source; '
         'use as many sentences as needed (typically 2-8)",\n'
         '  "current_events": ["ongoing situations from the source; include all that are stated"],\n'
@@ -4823,6 +5219,7 @@ def _build_location_detail_prompt(
         '  "knowledge_rules": ["rules about what NPCs here generally do or do not know"]\n'
         "}\n\n"
         "CRITICAL EXTRACTION RULES:\n"
+        "- Echo the exact temporary_key from the list. Do NOT invent permanent location ids.\n"
         "- Prefer copying concrete names, objects, factions, and plot facts from the source.\n"
         "- Do NOT invent major plot facts. If a field has no source support, use [] or \"\".\n"
         "- Keep fidelity high: longer accurate lists beat short generic ones.\n"
@@ -4883,7 +5280,8 @@ def _merge_location_detail(
         important_locations = cleaned
 
     return {
-        "id": stub["id"],
+        "temporary_key": stub.get("temporary_key") or stub["id"],
+        "id": stub.get("temporary_key") or stub["id"],
         "campaign_id": campaign_id,
         "name": stub["name"],
         "type": stub["type"],
@@ -4910,12 +5308,15 @@ def _build_npc_detail_prompt(
 ) -> str:
     npc_lines = []
     for npc in batch:
-        locations_note = npc["first_location_id"]
-        if npc["other_location_ids"]:
-            locations_note += f" (also appears at: {', '.join(npc['other_location_ids'])})"
+        primary = npc.get("primary_location_key") or npc.get("first_location_id") or ""
+        other = npc.get("other_location_keys") or npc.get("other_location_ids") or []
+        locations_note = str(primary)
+        if other:
+            locations_note += f" (also appears at: {', '.join(other)})"
+        temp_key = npc.get("temporary_key") or npc.get("id")
         npc_lines.append(
-            f"- id: {npc['id']} | name: {npc['name']} | role: {npc['role'] or 'unspecified'} | "
-            f"location(s): {locations_note}"
+            f"- temporary_key: {temp_key} | name: {npc['name']} | "
+            f"role: {npc['role'] or 'unspecified'} | location(s): {locations_note}"
         )
     npc_list = "\n".join(npc_lines)
 
@@ -4927,8 +5328,14 @@ def _build_npc_detail_prompt(
             "Extract every concrete beat you can; do not return empty lists if the text has substance.\n\n"
         )
 
+    campaign_label = str(campaign.get("name") or "Campaign")
+    campaign_handle = str(
+        campaign.get("temporary_key") or campaign.get("campaign_id") or ""
+    ).strip()
+    campaign_ref = f'"{campaign_label}"' + (f" ({campaign_handle})" if campaign_handle else "")
+
     return (
-        f'Campaign: "{campaign["name"]}" ({campaign["campaign_id"]}).\n\n'
+        f"Campaign: {campaign_ref}.\n\n"
         f"{retry_note}"
         "Fill in roleplay details for EACH NPC below from the SOURCE EXCERPTS only.\n"
         "Published modules and GM notes use many layouts. Do not require a particular game's "
@@ -4952,7 +5359,7 @@ def _build_npc_detail_prompt(
         "- Attribute/skill numbers are optional; prefer roleplay substance over statting.\n\n"
         'Respond with exactly {"npcs": [ ... ]} where each array item has this shape:\n\n'
         "{\n"
-        '  "id": "<exact id from the list below>",\n'
+        '  "temporary_key": "<exact temporary_key from the list below>",\n'
         '  "pronouns": {"subject":"she","object":"her","possessive_adjective":"her",'
         '"possessive_pronoun":"hers","reflexive":"herself"},\n'
         '  "race": "species/ancestry if stated, else \\"unknown\\"",\n'
@@ -4965,6 +5372,7 @@ def _build_npc_detail_prompt(
         '  "llm_rules": ["actionable play guidance from the source"]\n'
         "}\n\n"
         "CRITICAL EXTRACTION RULES:\n"
+        "- Echo the exact temporary_key from the list. Do NOT invent permanent npc ids.\n"
         "- EXTRACT over invent. Copy concrete facts from the source; do not replace them with generics.\n"
         "- Empty lists only when the source truly has nothing for that field.\n"
         "- If the source says she/her (or uses she/her language), pronouns and gender must match.\n"
@@ -5004,14 +5412,20 @@ def _merge_npc_detail(stub: dict[str, Any], detail: dict[str, Any], campaign_id:
         warnings.append(f"NPC '{stub['name']}': added a default [DM CHECK] rule for its secrets.")
 
     role = stub["role"] or str(detail.get("role") or "").strip()
+    temp_key = stub.get("temporary_key") or stub["id"]
+    primary = stub.get("primary_location_key") or stub.get("first_location_id") or ""
+    other = stub.get("other_location_keys") or stub.get("other_location_ids") or []
 
     return {
-        "id": stub["id"],
+        "temporary_key": temp_key,
+        "id": temp_key,
         "campaign_id": campaign_id,
         "name": stub["name"],
         "role": role,
-        "location_id": stub["first_location_id"],
-        "other_location_ids": stub["other_location_ids"],
+        "location_id": primary,
+        "other_location_ids": list(other),
+        "primary_location_key": primary,
+        "other_location_keys": list(other),
         "gender": gender,
         "race": str(detail.get("race") or "unknown").strip() or "unknown",
         "pronouns": _normalize_pronouns(detail.get("pronouns"), gender),
@@ -5071,6 +5485,7 @@ def _fetch_location_details(
     warnings: list[str],
     *,
     is_retry: bool = False,
+    usage_acc: dict[str, Any] | None = None,
 ) -> dict[str, dict[str, Any]]:
     # One location per hop today; still build a focused parent+TOC+Exploring excerpt.
     if len(batch) == 1:
@@ -5078,15 +5493,24 @@ def _fetch_location_details(
     else:
         needles: list[str] = []
         for loc in batch:
-            needles.extend(_distinctive_name_needles(loc["name"], loc["id"]))
+            needles.extend(
+                _distinctive_name_needles(loc["name"], loc.get("temporary_key") or loc["id"])
+            )
         excerpt = _relevant_excerpts(document_text, needles)
     prompt = _build_location_detail_prompt(batch, excerpt, campaign, is_retry=is_retry)
     try:
-        detail_raw = _call_llm_json(_SYSTEM_PROMPT, prompt, warnings=warnings, step="location detail")
+        detail_raw = _call_llm_json(
+            _SYSTEM_PROMPT,
+            prompt,
+            warnings=warnings,
+            step="location detail",
+            usage_acc=usage_acc,
+        )
         detail_items = _coerce_container(detail_raw, "locations")
         return _index_details_by_stub_id(detail_items, batch)
     except Exception as ex:
-        warnings.append(f"Location detail batch failed ({[loc['id'] for loc in batch]}): {ex}")
+        keys = [loc.get("temporary_key") or loc["id"] for loc in batch]
+        warnings.append(f"Location detail batch failed ({keys}): {ex}")
         return {}
 
 
@@ -5097,6 +5521,7 @@ def _fetch_npc_details(
     warnings: list[str],
     *,
     is_retry: bool = False,
+    usage_acc: dict[str, Any] | None = None,
 ) -> dict[str, dict[str, Any]]:
     if len(batch) == 1:
         # Prefer the callout/stat writeup over early name-drops in scene prose.
@@ -5104,16 +5529,44 @@ def _fetch_npc_details(
     else:
         needles: list[str] = []
         for npc in batch:
-            needles.extend(_distinctive_name_needles(npc["name"], npc["id"]))
+            needles.extend(
+                _distinctive_name_needles(npc["name"], npc.get("temporary_key") or npc["id"])
+            )
         excerpt = _relevant_excerpts(document_text, needles)
     prompt = _build_npc_detail_prompt(batch, excerpt, campaign, is_retry=is_retry)
     try:
-        detail_raw = _call_llm_json(_SYSTEM_PROMPT, prompt, warnings=warnings, step="npc detail")
+        detail_raw = _call_llm_json(
+            _SYSTEM_PROMPT,
+            prompt,
+            warnings=warnings,
+            step="npc detail",
+            usage_acc=usage_acc,
+        )
         detail_items = _coerce_container(detail_raw, "npcs")
         return _index_details_by_stub_id(detail_items, batch)
     except Exception as ex:
-        warnings.append(f"NPC detail batch failed ({[npc['id'] for npc in batch]}): {ex}")
+        keys = [npc.get("temporary_key") or npc["id"] for npc in batch]
+        warnings.append(f"NPC detail batch failed ({keys}): {ex}")
         return {}
+
+
+def _stub_detail_key(stub: dict[str, Any]) -> str:
+    return str(stub.get("temporary_key") or stub.get("id") or "")
+
+
+def _lookup_stub_detail(
+    details_by_id: dict[str, dict[str, Any]], stub: dict[str, Any]
+) -> dict[str, Any]:
+    key = _stub_detail_key(stub)
+    if key in details_by_id:
+        return details_by_id[key]
+    snaked = snake_case(key)
+    if snaked in details_by_id:
+        return details_by_id[snaked]
+    name_key = str(stub.get("name") or "").strip().casefold()
+    if name_key and name_key in details_by_id:
+        return details_by_id[name_key]
+    return {}
 
 
 def _resolve_import_mode(
@@ -5140,11 +5593,13 @@ def outline_campaign_document(
     existing_location_ids: list[str] | None = None,
     existing_npc_names: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Pass 1: campaign + location/NPC stubs (no detail LLM sweeps).
+    """Pass 1: campaign + location/NPC stubs with temporary keys (no detail sweeps).
 
     Used by the editor as a short Funnel hop before per-batch detail calls.
+    Alias: ``discover_campaign_document``.
     """
     warnings: list[str] = []
+    usage = _empty_usage()
     mode, existing_campaign_id = _resolve_import_mode(
         mode, existing_campaign_id=existing_campaign_id, warnings=warnings
     )
@@ -5195,7 +5650,11 @@ def outline_campaign_document(
         )
         try:
             outline_raw = _call_llm_json(
-                _SYSTEM_PROMPT, outline_prompt, warnings=warnings, step="outline"
+                _SYSTEM_PROMPT,
+                outline_prompt,
+                warnings=warnings,
+                step="outline",
+                usage_acc=usage,
             )
         except Exception as ex:
             if isinstance(ex, LLMProviderError):
@@ -5219,19 +5678,30 @@ def outline_campaign_document(
         alien_fast_path=use_stat_block_fast_path or use_location_site_fast_path,
     )
 
-    if (
-        mode == "create_new"
-        and campaign.get("campaign_id") in {"campaign", ""}
-        and (not campaign.get("name") or str(campaign.get("name")).strip().casefold() in {"campaign", ""})
-    ):
+    name_blank = not campaign.get("name") or str(campaign.get("name")).strip().casefold() in {
+        "campaign",
+        "",
+    }
+    title_blank = not campaign.get("title") or str(campaign.get("title")).strip().casefold() in {
+        "campaign",
+        "",
+    }
+    if mode == "create_new" and name_blank and title_blank:
         guessed = _guess_campaign_title(full_document_text)
         if guessed:
             campaign["name"] = guessed
-            campaign["campaign_id"] = snake_case(guessed)
-            warnings.append(f"Outline omitted campaign title; inferred '{guessed}' from the document head.")
+            campaign["title"] = guessed
+            warnings.append(
+                f"Outline omitted campaign title; inferred '{guessed}' from the document head."
+            )
 
     existing_location_set = {snake_case(loc_id) for loc_id in existing_location_ids}
-    location_ids = {loc["id"] for loc in location_stubs} | existing_location_set
+    location_ids = {
+        str(loc.get("temporary_key") or loc.get("id") or "") for loc in location_stubs
+    } | existing_location_set
+    # Also index provisional snake_case names so stat-block location hints resolve.
+    for loc in location_stubs:
+        location_ids.add(snake_case(loc.get("name")))
     npc_stubs = _merge_outline_npcs_with_stat_blocks(
         npc_stubs,
         document_for_deterministic_merge,
@@ -5249,7 +5719,10 @@ def outline_campaign_document(
         warnings=warnings,
     )
     location_stubs = _ensure_locations_for_npc_hints(
-        location_stubs, npc_stubs, warnings=warnings
+        location_stubs,
+        npc_stubs,
+        warnings=warnings,
+        existing_location_ids=existing_location_ids,
     )
     location_stubs = _merge_outline_locations_with_sites(
         location_stubs,
@@ -5259,16 +5732,52 @@ def outline_campaign_document(
         warnings=warnings,
     )
     for stub in npc_stubs:
-        hint = str(stub.get("first_location_id") or "").strip()
+        hint = str(
+            stub.get("primary_location_key") or stub.get("first_location_id") or ""
+        ).strip()
         if not hint and location_stubs:
-            stub["first_location_id"] = location_stubs[0]["id"]
+            first_key = location_stubs[0].get("temporary_key") or location_stubs[0]["id"]
+            stub["first_location_id"] = first_key
+            stub["primary_location_key"] = first_key
+
+    campaign, location_stubs, npc_stubs = _stamp_discovery_temporary_keys(
+        campaign,
+        location_stubs,
+        npc_stubs,
+        mode=mode,
+        existing_campaign_id=existing_campaign_id,
+        warnings=warnings,
+    )
+
+    relationships = list(outline_raw.get("relationships") or []) if isinstance(outline_raw, dict) else []
+    events = list(outline_raw.get("events") or []) if isinstance(outline_raw, dict) else []
 
     return {
         "campaign": campaign,
         "locations": location_stubs,
         "npcs": npc_stubs,
+        "relationships": relationships if isinstance(relationships, list) else [],
+        "events": events if isinstance(events, list) else [],
         "warnings": warnings,
+        "usage": usage,
     }
+
+
+def discover_campaign_document(
+    text: str,
+    mode: str,
+    existing_campaign_id: str | None = None,
+    existing_location_ids: list[str] | None = None,
+    existing_npc_names: list[str] | None = None,
+) -> dict[str, Any]:
+    """Alias for ``outline_campaign_document`` (temporary-key discovery)."""
+    return outline_campaign_document(
+        text,
+        mode,
+        existing_campaign_id=existing_campaign_id,
+        existing_location_ids=existing_location_ids,
+        existing_npc_names=existing_npc_names,
+    )
 
 
 def _infer_genre_from_rpg_system(rpg_system: str) -> str:
@@ -5329,35 +5838,51 @@ def _apply_imported_campaign_setting(
 
 
 def _normalize_campaign_meta(campaign: dict[str, Any] | None) -> dict[str, Any]:
-    """Normalize campaign fields for detail hops without rewriting assigned ids.
+    """Normalize campaign fields for detail hops without inventing permanent ids.
 
-    Merge mode and the editor pass a concrete ``campaign_id`` that must be stamped
-    onto locations/NPCs unchanged (e.g. ``MultiTest``). Only invent via snake_case
-    when no id was provided.
+    Prefer temporary_key from discovery. Merge mode may also carry an existing
+    ``campaign_id`` that must be stamped onto locations/NPCs unchanged.
     """
     raw = campaign if isinstance(campaign, dict) else {}
+    temp_key = str(raw.get("temporary_key") or "").strip()
     raw_id = str(raw.get("campaign_id") or "").strip()
-    if raw_id:
-        campaign_id = raw_id
-    else:
-        campaign_id = snake_case(raw.get("name") or "campaign")
-    return {
-        "campaign_id": campaign_id,
-        "name": str(raw.get("name") or campaign_id.replace("_", " ").title()).strip(),
+    name = str(raw.get("name") or raw.get("title") or "").strip()
+    title = str(raw.get("title") or name or "").strip()
+    # Prefer explicit permanent ids (merge). Do not invent snake_case campaign_id for
+    # create_new — the editor owns permanent ids. temporary_key is the discovery handle.
+    campaign_id = raw_id
+    if not name:
+        name = title or "Campaign"
+    result = {
+        "temporary_key": temp_key or "campaign_001",
+        "title": title or name,
+        "name": name,
         "description": str(raw.get("description") or "").strip(),
         "genre": normalize_campaign_genre(raw.get("genre")),
         "rpg_system": str(raw.get("rpg_system") or "").strip(),
+        "premise": str(raw.get("premise") or "").strip(),
+        "themes": _as_str_list(raw.get("themes")),
+        "tone": str(raw.get("tone") or "").strip(),
+        "factions": _as_str_list(raw.get("factions")),
+        "important_context": _as_str_list(raw.get("important_context")),
+        "starting_situation": str(raw.get("starting_situation") or "").strip(),
     }
+    if campaign_id:
+        result["campaign_id"] = campaign_id
+    return result
 
 
 def _optional_location_id(value: Any) -> str:
-    """Snake-case a location id, or return empty when the source had none.
+    """Return a location key as-is when present; empty when missing.
 
+    Temporary keys (location_001) must not be snake_cased into something else.
     ``snake_case("")`` yields ``\"unnamed\"``, which must not become a fake location.
     """
     raw = str(value or "").strip()
     if not raw:
         return ""
+    if _looks_like_temp_key(raw):
+        return raw
     return snake_case(raw)
 
 
@@ -5367,14 +5892,27 @@ def _normalize_location_stubs(raw_locations: Any) -> list[dict[str, Any]]:
         if not isinstance(raw, dict):
             continue
         name = str(raw.get("name") or "").strip()
-        loc_id = snake_case(raw.get("id") or name or "location")
-        if not loc_id:
+        temp_key = str(raw.get("temporary_key") or raw.get("id") or "").strip()
+        if not temp_key:
+            # Legacy callers may omit keys; keep a stable handle from the name.
+            temp_key = snake_case(name or "location")
+        if not temp_key:
             continue
+        parent_raw = raw.get("parent_temporary_key")
+        if parent_raw in (None, "", "null"):
+            parent_key = None
+        else:
+            parent_key = str(parent_raw).strip() or None
         stubs.append(
             {
-                "id": loc_id,
-                "name": name or loc_id.replace("_", " ").title(),
+                "temporary_key": temp_key,
+                "id": temp_key,
+                "name": name or temp_key.replace("_", " ").title(),
                 "type": str(raw.get("type") or "other").strip() or "other",
+                "parent_temporary_key": parent_key,
+                "summary_hint": str(raw.get("summary_hint") or "").strip(),
+                "associated_npc_keys": _as_str_list(raw.get("associated_npc_keys")),
+                "source_refs": _as_list(raw.get("source_refs")),
                 "seeded_from_stat_blocks": bool(raw.get("seeded_from_stat_blocks")),
                 "seeded_from_location_sites": bool(raw.get("seeded_from_location_sites")),
             }
@@ -5388,21 +5926,35 @@ def _normalize_npc_stubs(raw_npcs: Any) -> list[dict[str, Any]]:
         if not isinstance(raw, dict):
             continue
         name = str(raw.get("name") or "").strip()
-        npc_id = snake_case(raw.get("id") or name or "npc")
-        if not npc_id or not name:
+        temp_key = str(raw.get("temporary_key") or raw.get("id") or "").strip()
+        if not temp_key and name:
+            temp_key = snake_case(name)
+        if not temp_key or not name:
             continue
+        primary = _optional_location_id(
+            raw.get("primary_location_key") or raw.get("first_location_id")
+        )
+        other_raw = raw.get("other_location_keys")
+        if other_raw is None:
+            other_raw = raw.get("other_location_ids")
         other = [
             _optional_location_id(x)
-            for x in _as_list(raw.get("other_location_ids"))
+            for x in _as_list(other_raw)
             if str(x).strip()
         ]
+        other = [x for x in other if x]
         stubs.append(
             {
-                "id": npc_id,
+                "temporary_key": temp_key,
+                "id": temp_key,
                 "name": name,
                 "role": str(raw.get("role") or "").strip(),
-                "first_location_id": _optional_location_id(raw.get("first_location_id")),
-                "other_location_ids": [x for x in other if x],
+                "primary_location_key": primary,
+                "other_location_keys": other,
+                "first_location_id": primary,
+                "other_location_ids": list(other),
+                "significance": _normalize_significance(raw.get("significance")),
+                "source_refs": _as_list(raw.get("source_refs")),
                 "seeded_from_stat_blocks": bool(raw.get("seeded_from_stat_blocks")),
                 "seed_personality": str(raw.get("seed_personality") or "").strip(),
                 "seed_personal_agenda": str(raw.get("seed_personal_agenda") or "").strip(),
@@ -5425,9 +5977,13 @@ def detail_location_batch(
     sparse; only pass ``allow_seed_fallback=True`` after LLM retries are exhausted.
     """
     warnings: list[str] = []
+    usage = _empty_usage()
     if not text or not text.strip():
         raise ContentImportError("No document text provided")
     campaign = _normalize_campaign_meta(campaign)
+    campaign_stamp = str(
+        campaign.get("campaign_id") or campaign.get("temporary_key") or ""
+    ).strip()
     batch = _normalize_location_stubs(location_stubs)
     if not batch:
         raise ContentImportError("location-details requires at least one location stub")
@@ -5438,31 +5994,34 @@ def detail_location_batch(
 
     details_by_id: dict[str, dict[str, Any]] = {}
     details_by_id.update(
-        _fetch_location_details(batch, text, campaign, warnings, is_retry=is_retry)
+        _fetch_location_details(
+            batch, text, campaign, warnings, is_retry=is_retry, usage_acc=usage
+        )
     )
     for stub in batch:
-        detail = details_by_id.get(stub["id"], {})
+        key = _stub_detail_key(stub)
+        detail = _lookup_stub_detail(details_by_id, stub)
         if _location_detail_is_sparse(detail) and allow_seed_fallback:
-            details_by_id[stub["id"]] = _location_detail_from_seed(stub, text)
+            details_by_id[key] = _location_detail_from_seed(stub, text)
             warnings.append(
-                f"Location '{stub['id']}': detail sparse after LLM; fell back to "
+                f"Location '{key}': detail sparse after LLM; fell back to "
                 "minimal location defaults plus harvested sub-areas when available."
             )
         elif _location_detail_is_sparse(detail) and not detail:
             warnings.append(
-                f"Location '{stub['id']}': LLM detail sparse (editor may retry this hop)."
+                f"Location '{key}': LLM detail sparse (editor may retry this hop)."
             )
 
     locations = [
         _merge_location_detail(
             stub,
-            details_by_id.get(stub["id"], {}),
-            campaign["campaign_id"],
+            _lookup_stub_detail(details_by_id, stub),
+            campaign_stamp,
             document_text=text,
         )
         for stub in batch
     ]
-    return {"locations": locations, "warnings": warnings}
+    return {"locations": locations, "warnings": warnings, "usage": usage}
 
 
 def detail_npc_batch(
@@ -5480,9 +6039,13 @@ def detail_npc_batch(
     excerpt seeding only after LLM hops have failed.
     """
     warnings: list[str] = []
+    usage = _empty_usage()
     if not text or not text.strip():
         raise ContentImportError("No document text provided")
     campaign = _normalize_campaign_meta(campaign)
+    campaign_stamp = str(
+        campaign.get("campaign_id") or campaign.get("temporary_key") or ""
+    ).strip()
     batch = _normalize_npc_stubs(npc_stubs)
     if not batch:
         raise ContentImportError("npc-details requires at least one NPC stub")
@@ -5493,17 +6056,20 @@ def detail_npc_batch(
 
     details_by_id: dict[str, dict[str, Any]] = {}
     details_by_id.update(
-        _fetch_npc_details(batch, text, campaign, warnings, is_retry=is_retry)
+        _fetch_npc_details(
+            batch, text, campaign, warnings, is_retry=is_retry, usage_acc=usage
+        )
     )
     for stub in batch:
-        detail = details_by_id.get(stub["id"], {})
+        key = _stub_detail_key(stub)
+        detail = _lookup_stub_detail(details_by_id, stub)
         if not _npc_detail_is_sparse(detail):
             continue
         if allow_seed_fallback:
             if _npc_stub_has_stat_seed(stub):
-                details_by_id[stub["id"]] = _npc_detail_from_stat_seed(stub)
+                details_by_id[key] = _npc_detail_from_stat_seed(stub)
                 warnings.append(
-                    f"NPC '{stub['id']}': detail sparse after LLM; fell back to "
+                    f"NPC '{key}': detail sparse after LLM; fell back to "
                     "PERSONALITY / PERSONAL AGENDA from the stat block."
                 )
                 continue
@@ -5513,30 +6079,30 @@ def detail_npc_batch(
                 text,
             )
             if seeded is not None:
-                details_by_id[stub["id"]] = seeded
+                details_by_id[key] = seeded
                 warnings.append(
-                    f"NPC '{stub['id']}': detail sparse after LLM; seeded from "
+                    f"NPC '{key}': detail sparse after LLM; seeded from "
                     "document excerpts as a last resort."
                 )
                 continue
             if not detail:
                 warnings.append(
-                    f"NPC '{stub['id']}': no detail returned; using minimal defaults. "
+                    f"NPC '{key}': no detail returned; using minimal defaults. "
                     "Local small models often need content_creation set to Groq or a "
                     "stronger local model for dense NPC writeups."
                 )
         elif not detail:
             warnings.append(
-                f"NPC '{stub['id']}': LLM detail sparse (editor may retry this hop)."
+                f"NPC '{key}': LLM detail sparse (editor may retry this hop)."
             )
 
     npcs = [
         _merge_npc_detail(
-            stub, details_by_id.get(stub["id"], {}), campaign["campaign_id"], warnings
+            stub, _lookup_stub_detail(details_by_id, stub), campaign_stamp, warnings
         )
         for stub in batch
     ]
-    return {"npcs": npcs, "warnings": warnings}
+    return {"npcs": npcs, "warnings": warnings, "usage": usage}
 
 
 def analyze_campaign_document(
@@ -5554,7 +6120,7 @@ def analyze_campaign_document(
     Yaml Editor should call the chunked endpoints instead so Tailscale Funnel
     is not holding one HTTP request across every LLM pass.
 
-    Returns: {"campaign": {...}, "locations": [...], "npcs": [...], "warnings": [...]}
+    Returns: campaign/locations/npcs plus relationships/events/warnings/usage.
     Raises ContentImportError if the document cannot be analyzed at all.
     """
     outline = outline_campaign_document(
@@ -5565,6 +6131,7 @@ def analyze_campaign_document(
         existing_npc_names=existing_npc_names,
     )
     warnings = list(outline.get("warnings") or [])
+    usage = dict(outline.get("usage") or _empty_usage())
     campaign = outline["campaign"]
     location_stubs = list(outline.get("locations") or [])
     npc_stubs = list(outline.get("npcs") or [])
@@ -5572,24 +6139,30 @@ def analyze_campaign_document(
     locations: list[dict[str, Any]] = []
     for batch in _batches(location_stubs, MAX_LOCATIONS_PER_BATCH):
         result = detail_location_batch(text, campaign, batch)
+        _merge_usage(usage, result.get("usage"))
         if any(_location_detail_is_sparse(loc) for loc in (result.get("locations") or [])):
             result = detail_location_batch(text, campaign, batch, is_retry=True)
+            _merge_usage(usage, result.get("usage"))
         if any(_location_detail_is_sparse(loc) for loc in (result.get("locations") or [])):
             result = detail_location_batch(
                 text, campaign, batch, is_retry=True, allow_seed_fallback=True
             )
+            _merge_usage(usage, result.get("usage"))
         warnings.extend(result.get("warnings") or [])
         locations.extend(result.get("locations") or [])
 
     npcs: list[dict[str, Any]] = []
     for batch in _batches(npc_stubs, MAX_NPCS_PER_BATCH):
         result = detail_npc_batch(text, campaign, batch)
+        _merge_usage(usage, result.get("usage"))
         if any(_npc_detail_is_sparse(npc) for npc in (result.get("npcs") or [])):
             result = detail_npc_batch(text, campaign, batch, is_retry=True)
+            _merge_usage(usage, result.get("usage"))
         if any(_npc_detail_is_sparse(npc) for npc in (result.get("npcs") or [])):
             result = detail_npc_batch(
                 text, campaign, batch, is_retry=True, allow_seed_fallback=True
             )
+            _merge_usage(usage, result.get("usage"))
         warnings.extend(result.get("warnings") or [])
         npcs.extend(result.get("npcs") or [])
 
@@ -5597,5 +6170,8 @@ def analyze_campaign_document(
         "campaign": campaign,
         "locations": locations,
         "npcs": npcs,
+        "relationships": list(outline.get("relationships") or []),
+        "events": list(outline.get("events") or []),
         "warnings": warnings,
+        "usage": usage,
     }

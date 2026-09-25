@@ -41,7 +41,7 @@ from content_import import (
     analyze_campaign_document,
     detail_location_batch,
     detail_npc_batch,
-    outline_campaign_document,
+    discover_campaign_document,
 )
 from required_dm_checks import (
     format_required_dm_checks_prompt_block,
@@ -4366,9 +4366,9 @@ def content_import_analyze():
         return _client_error(ex, 500)
 
 
-@app.post("/content/import/outline")
-def content_import_outline():
-    """Short Funnel hop: campaign + location/NPC stubs only."""
+@app.post("/content/import/discover")
+def content_import_discover():
+    """Discovery hop: campaign + location/NPC stubs with temporary keys."""
     body = request.get_json(force=True, silent=True) or {}
 
     text = body.get("text")
@@ -4386,7 +4386,7 @@ def content_import_outline():
         return jsonify({"error": "existing_npc_names must be a list"}), 400
 
     try:
-        result = outline_campaign_document(
+        result = discover_campaign_document(
             text,
             mode,
             existing_campaign_id=existing_campaign_id,
@@ -4395,11 +4395,17 @@ def content_import_outline():
         )
         return jsonify(result)
     except ContentImportError as ex:
-        print(f"[CONTENT-IMPORT] outline rejected: {ex}", flush=True)
+        print(f"[CONTENT-IMPORT] discover rejected: {ex}", flush=True)
         return jsonify({"error": str(ex)}), 400
     except Exception as ex:
-        print(f"[CONTENT-IMPORT] outline failed: {ex!r}", flush=True)
+        print(f"[CONTENT-IMPORT] discover failed: {ex!r}", flush=True)
         return _client_error(ex, 500)
+
+
+@app.post("/content/import/outline")
+def content_import_outline():
+    """Short Funnel hop: thin wrapper over discover (temporary-key stubs)."""
+    return content_import_discover()
 
 
 @app.post("/content/import/location-details")

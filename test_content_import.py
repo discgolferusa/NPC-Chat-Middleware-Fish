@@ -313,7 +313,8 @@ THE INSURGENT COMPOUND
     assert "Oblivion Bar" in names
     # Map labels must not become the campaign title/id before the Destroyer fallback.
     assert result["campaign"]["name"] == "Destroyer of Worlds"
-    assert result["campaign"]["campaign_id"] == "destroyer_of_worlds"
+    assert result["campaign"]["temporary_key"] == "campaign_001"
+    assert "campaign_id" not in result["campaign"]
 
 
 def test_guess_campaign_title_skips_leading_moonside_map_labels():
@@ -520,7 +521,7 @@ def test_chariot_pdfpig_analyze_imports_all_npcs(monkeypatch):
     text = _load_chariot_pdfpig_fixture()
     calls: list[str] = []
 
-    def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step):
+    def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step, usage_acc=None, **kwargs):
         calls.append(step)
         if step == "outline":
             raise AssertionError("stat-block fast path should not call the outline LLM")
@@ -597,7 +598,7 @@ def test_chariot_pdf_extract_recovers_from_empty_llm_outline(monkeypatch):
     text = _load_chariot_pdf_extract_fixture()
     calls: list[str] = []
 
-    def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step):
+    def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step, usage_acc=None, **kwargs):
         calls.append(step)
         if step == "outline":
             raise AssertionError("stat-block fast path should not call the outline LLM")
@@ -614,9 +615,10 @@ def test_chariot_pdf_extract_recovers_from_empty_llm_outline(monkeypatch):
     assert "outline" not in calls
     assert "location detail" in calls
     assert "npc detail" in calls
-    assert "chariot" in result["campaign"]["campaign_id"].casefold() or "gods" in result[
-        "campaign"
-    ]["name"].casefold()
+    assert "chariot" in str(result["campaign"].get("name") or "").casefold() or "gods" in str(
+        result["campaign"].get("name") or ""
+    ).casefold()
+    assert result["campaign"]["temporary_key"] == "campaign_001"
     names = {npc["name"] for npc in result["npcs"]}
     for expected in CHARIOT_EXPECTED_NPCS:
         assert expected in names
@@ -624,12 +626,15 @@ def test_chariot_pdf_extract_recovers_from_empty_llm_outline(monkeypatch):
     johns = next(npc for npc in result["npcs"] if npc["name"] == "Albert Johns")
     assert johns["personality"]
     assert johns["secrets"] or johns["known_facts"]
-    loc_ids = {loc["id"] for loc in result["locations"]}
-    assert "uscss_cronus" in loc_ids or "sotillo" in loc_ids
+    loc_names = {loc["name"] for loc in result["locations"]}
+    assert any("cronus" in n.casefold() or "sotillo" in n.casefold() for n in loc_names)
+    assert all(str(loc.get("temporary_key") or "").startswith("location_") for loc in result["locations"])
     assert "Captain Miller" not in names
     warning_blob = " ".join(result.get("warnings") or []).lower()
     assert "skipping llm outline" in warning_blob
     assert "detail sweep still runs" in warning_blob
+    assert "usage" in result
+    assert "prompt_tokens" in result["usage"]
 
 
 def test_outline_failure_recovers_from_stat_blocks(monkeypatch):
@@ -637,7 +642,7 @@ def test_outline_failure_recovers_from_stat_blocks(monkeypatch):
     text = _load_chariot_pdf_extract_fixture()
     calls: list[str] = []
 
-    def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step):
+    def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step, usage_acc=None, **kwargs):
         calls.append(step)
         if step == "outline":
             raise RuntimeError("should not be called on stat-block fast path")
@@ -660,7 +665,7 @@ def test_stat_block_fast_path_uses_llm_npc_detail_when_rich(monkeypatch):
     """Detail sweep output should win over PERSONALITY/AGENDA seed stubs."""
     text = _load_chariot_pdf_extract_fixture()
 
-    def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step):
+    def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step, usage_acc=None, **kwargs):
         if step == "outline":
             raise AssertionError("outline must be skipped")
         if step == "location detail":
@@ -696,9 +701,13 @@ def test_stat_block_fast_path_uses_llm_npc_detail_when_rich(monkeypatch):
     johns = next(npc for npc in result["npcs"] if npc["name"] == "Albert Johns")
     assert "LLM-enriched submissive officer" in johns["personality"]
     assert any("third officer" in fact.casefold() for fact in johns["public_facts"])
-    cronus = next((loc for loc in result["locations"] if loc["id"] == "uscss_cronus"), None)
+    cronus = next(
+        (loc for loc in result["locations"] if "cronus" in str(loc.get("name") or "").casefold()),
+        None,
+    )
     if cronus is not None:
         assert "derelict" in cronus["summary"].casefold()
+        assert str(cronus.get("temporary_key") or "").startswith("location_")
 
 
 def test_truncate_preserving_npc_section_respects_max_chars():
@@ -792,7 +801,7 @@ def test_chariot_regression_replaces_movie_quote_outline_npcs(monkeypatch):
         ],
     }
 
-    def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step):
+    def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step, usage_acc=None, **kwargs):
         if step == "outline":
             return bad_outline
         if step == "location detail":
@@ -882,7 +891,7 @@ Owns the tavern.
         ],
     }
 
-    def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step):
+    def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step, usage_acc=None, **kwargs):
         if step == "outline":
             return outline
         if step == "location detail":
@@ -896,7 +905,10 @@ Owns the tavern.
     result = content_import.analyze_campaign_document(text, "create_new")
     names = {npc["name"] for npc in result["npcs"]}
     assert "Archdeacon Verity-9" in names
-    assert result["npcs"][0]["id"] == "archdeacon_verity_9"
+    assert result["npcs"][0]["temporary_key"] == "npc_001"
+    assert result["npcs"][0]["id"] == "npc_001"
+    assert "campaign_id" not in result["campaign"]
+    assert result["campaign"]["temporary_key"] == "campaign_001"
 
 
 def test_merge_mode_skips_existing_npcs_from_stat_blocks(monkeypatch):
@@ -912,7 +924,7 @@ def test_merge_mode_skips_existing_npcs_from_stat_blocks(monkeypatch):
         "npcs": [],
     }
 
-    def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step):
+    def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step, usage_acc=None, **kwargs):
         if step == "outline":
             return outline
         if step == "location detail":
@@ -949,7 +961,7 @@ def test_location_hints_resolve_existing_campaign_locations(monkeypatch):
         "npcs": [],
     }
 
-    def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step):
+    def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step, usage_acc=None, **kwargs):
         if step == "outline":
             return outline
         if step == "location detail":
@@ -976,7 +988,7 @@ def test_chunked_outline_then_detail_batches(monkeypatch):
     text = _load_chariot_pdf_extract_fixture()
     steps: list[str] = []
 
-    def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step):
+    def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step, usage_acc=None, **kwargs):
         steps.append(step)
         if step == "outline":
             raise AssertionError("stat-block outline must be skipped")
@@ -1041,7 +1053,7 @@ def test_detail_location_batch_does_not_sparse_retry(monkeypatch):
     """Funnel hops must be one LLM call; seed fallback is opt-in after editor retries."""
     calls: list[str] = []
 
-    def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step):
+    def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step, usage_acc=None, **kwargs):
         calls.append(step)
         return {"locations": []}
 
@@ -1304,7 +1316,7 @@ def test_location_detail_prompt_mentions_ship_deck_guidance():
 def test_location_detail_merges_ship_rooms_when_llm_omits_them(monkeypatch):
     text = _load_chariot_ship_rooms_fixture()
 
-    def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step):
+    def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step, usage_acc=None, **kwargs):
         assert "SHIP / VESSEL LAYOUT" in user_prompt
         return {
             "locations": [
@@ -1354,7 +1366,7 @@ def test_location_detail_excerpt_scopes_exploring_to_parent():
 def test_location_detail_merges_harvested_subareas_when_llm_omits_them(monkeypatch):
     text = _load_doctor_who_pdfpig_fixture()
 
-    def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step):
+    def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step, usage_acc=None, **kwargs):
         assert "important_locations" in user_prompt
         # Good hotel summary, but empty sub-areas — the common failure mode.
         return {
@@ -1413,6 +1425,7 @@ def test_normalize_campaign_meta_preserves_merge_campaign_id():
     meta = content_import._normalize_campaign_meta(
         {
             "campaign_id": "MultiTest",
+            "temporary_key": "campaign_001",
             "name": "Multi Test",
             "description": "",
             "genre": "sci_fi",
@@ -1420,13 +1433,25 @@ def test_normalize_campaign_meta_preserves_merge_campaign_id():
         }
     )
     assert meta["campaign_id"] == "MultiTest"
+    assert meta["temporary_key"] == "campaign_001"
     assert meta["genre"] == "sci_fi"
     assert meta["rpg_system"] == "Alien RPG"
 
 
+def test_normalize_campaign_meta_keeps_temporary_key():
+    meta = content_import._normalize_campaign_meta(
+        {"temporary_key": "campaign_001", "name": "Hope's Last Day"}
+    )
+    assert meta["temporary_key"] == "campaign_001"
+    assert "campaign_id" not in meta
+    assert meta["name"] == "Hope's Last Day"
+
+
 def test_normalize_campaign_meta_leaves_genre_empty_when_missing():
     meta = content_import._normalize_campaign_meta({"name": "Multi Test"})
-    assert meta["campaign_id"] == "multi_test"
+    assert "campaign_id" not in meta
+    assert meta["temporary_key"] == "campaign_001"
+    assert meta["name"] == "Multi Test"
     assert meta["genre"] == ""
     assert meta["rpg_system"] == ""
 
@@ -1498,7 +1523,7 @@ def test_normalize_npc_stubs_empty_location_stays_empty():
 
 
 def test_detail_npc_batch_preserves_campaign_id_and_empty_location(monkeypatch):
-    def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step):
+    def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step, usage_acc=None, **kwargs):
         return {"npcs": []}
 
     monkeypatch.setattr(content_import, "_call_llm_json", fake_call_llm_json)
@@ -1577,7 +1602,7 @@ def test_outline_seeds_callouts_when_llm_returns_empty(monkeypatch):
     # Fixture already includes Cat's EyE chrome + Majestic / callout NPCs.
     text = _load_doctor_who_pdfpig_fixture()
 
-    def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step):
+    def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step, usage_acc=None, **kwargs):
         return {"campaign": {}, "locations": [], "npcs": []}
 
     monkeypatch.setattr(content_import, "_call_llm_json", fake_call_llm_json)
@@ -1585,7 +1610,11 @@ def test_outline_seeds_callouts_when_llm_returns_empty(monkeypatch):
     assert result["campaign"]["name"] == "Cat's Eye"
     names = {npc["name"] for npc in result["npcs"]}
     assert names >= {"Kate Petersen", "Max Eddings", "Peter Hutchins", "Chad"}
-    assert any(loc["id"] == "majestic_hotel" for loc in result["locations"])
+    assert any(
+        (loc.get("name") or "").casefold() == "majestic hotel"
+        or "majestic" in (loc.get("name") or "").casefold()
+        for loc in result["locations"]
+    )
 
 
 def test_seed_and_callouts_still_tolerate_synthetic_glued_columns():
@@ -1604,7 +1633,7 @@ def test_seed_and_callouts_still_tolerate_synthetic_glued_columns():
 def test_outline_prefers_callouts_over_credit_hallucinations(monkeypatch):
     text = _load_doctor_who_callout_pdf_fixture()
 
-    def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step):
+    def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step, usage_acc=None, **kwargs):
         return {
             "campaign": {
                 "campaign_id": "cats_eye",
@@ -1703,7 +1732,7 @@ def test_bio_paragraphs_handle_pdf_single_newlines_and_split_names():
 def test_detail_npc_batch_seeds_doctor_who_when_llm_empty(monkeypatch):
     text = _load_doctor_who_catseye_fixture()
 
-    def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step):
+    def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step, usage_acc=None, **kwargs):
         return {"npcs": []}
 
     monkeypatch.setattr(content_import, "_call_llm_json", fake_call_llm_json)
@@ -1732,3 +1761,274 @@ def test_mention_indexes_tolerates_pdf_split_hutchins():
     hay = "Peter Hutc HiNs\nFriends: Hutchins has the majority"
     hits = content_import._mention_indexes(hay.casefold(), "Peter Hutchins")
     assert hits, "expected flexible match for PDF-split Hutchins"
+
+
+def test_create_new_normalize_ignores_llm_campaign_id_and_assigns_temp_keys():
+    """create_new must not treat LLM-invented campaign_id as authoritative."""
+    outline = {
+        "campaign": {
+            "campaign_id": "llm_invented_permanent_id",
+            "name": "Hope's Last Day",
+            "description": "A tense sci-fi one-shot.",
+            "genre": "sci_fi",
+            "rpg_system": "Alien RPG",
+        },
+        "locations": [
+            {"id": "hope_station", "name": "Hope Station", "type": "ship"},
+            {"name": "Medbay", "type": "building", "parent_temporary_key": "hope_station"},
+        ],
+        "npcs": [
+            {
+                "name": "Captain Reyes",
+                "role": "captain",
+                "first_location_id": "hope_station",
+                "significance": "conversational",
+            },
+            {
+                "name": "Facehugger Swarm",
+                "role": "xenomorph",
+                "first_location_id": "hope_station",
+                "significance": "ignore",
+            },
+        ],
+    }
+    warnings: list[str] = []
+    campaign, locations, npcs = content_import._normalize_outline(
+        outline,
+        mode="create_new",
+        existing_campaign_id=None,
+        existing_location_ids=[],
+        existing_npc_names=[],
+        warnings=warnings,
+    )
+    assert "campaign_id" not in campaign
+    assert campaign["name"] == "Hope's Last Day"
+    campaign, locations, npcs = content_import._stamp_discovery_temporary_keys(
+        campaign,
+        locations,
+        npcs,
+        mode="create_new",
+        existing_campaign_id=None,
+        warnings=warnings,
+    )
+    assert campaign["temporary_key"] == "campaign_001"
+    assert "campaign_id" not in campaign
+    assert [loc["temporary_key"] for loc in locations] == ["location_001", "location_002"]
+    assert all(loc["id"] == loc["temporary_key"] for loc in locations)
+    assert locations[1]["parent_temporary_key"] == "location_001"
+    assert [npc["temporary_key"] for npc in npcs] == ["npc_001", "npc_002"]
+    assert npcs[0]["primary_location_key"] == "location_001"
+    assert npcs[0]["first_location_id"] == "location_001"
+    assert npcs[1]["significance"] == "ignore"
+    assert "usage" not in warnings
+
+
+def test_stamp_remaps_associated_npc_keys_onto_temp_handles():
+    campaign = {"title": "Hope", "name": "Hope"}
+    locations = [
+        {
+            "name": "Hadley's Hope",
+            "type": "colony",
+            "associated_npc_keys": ["theodora", "operations_guard"],
+        },
+        {"name": "Operations", "type": "building", "parent_temporary_key": "Hadley's Hope"},
+    ]
+    npcs = [
+        {
+            "name": "Theodora",
+            "temporary_key": "theodora",
+            "primary_location_key": "Hadley's Hope",
+            "significance": "conversational",
+        },
+        {
+            "name": "Guard",
+            "temporary_key": "operations_guard",
+            "primary_location_key": "Operations",
+            "significance": "conversational",
+        },
+    ]
+    warnings: list[str] = []
+    _, stamped_locs, stamped_npcs = content_import._stamp_discovery_temporary_keys(
+        campaign,
+        locations,
+        npcs,
+        mode="create_new",
+        existing_campaign_id=None,
+        warnings=warnings,
+    )
+    assert stamped_locs[0]["associated_npc_keys"] == ["npc_001", "npc_002"]
+    assert stamped_npcs[0]["temporary_key"] == "npc_001"
+    assert stamped_npcs[1]["temporary_key"] == "npc_002"
+
+
+def test_normalize_outline_resolves_parent_when_merge_skips_existing():
+    outline = {
+        "campaign": {"name": "Existing Camp", "title": "Existing Camp"},
+        "locations": [
+            {"temporary_key": "old_town", "name": "Old Town", "type": "city"},
+            {
+                "name": "New Tavern",
+                "type": "building",
+                "parent_temporary_key": "old_town",
+            },
+        ],
+        "npcs": [],
+    }
+    warnings: list[str] = []
+    _, locations, _ = content_import._normalize_outline(
+        outline,
+        mode="merge",
+        existing_campaign_id="existing_camp",
+        existing_location_ids=["old_town"],
+        existing_npc_names=[],
+        warnings=warnings,
+    )
+    assert len(locations) == 1
+    assert locations[0]["name"] == "New Tavern"
+    assert locations[0]["parent_temporary_key"] == "old_town"
+
+
+def test_analyze_merges_usage_across_sparse_retries(monkeypatch):
+    """Sparse detail retries must accumulate tokens from every hop."""
+    calls = {"loc": 0}
+
+    def fake_outline(*_args, **_kwargs):
+        return {
+            "campaign": {"temporary_key": "campaign_001", "title": "T", "name": "T"},
+            "locations": [
+                {"temporary_key": "location_001", "name": "Town", "type": "city"}
+            ],
+            "npcs": [],
+            "warnings": [],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "estimated_cost_usd": 0.01,
+                "model_id": "outline",
+            },
+        }
+
+    def fake_detail_location(_text, _campaign, _batch, is_retry=False, allow_seed_fallback=False):
+        calls["loc"] += 1
+        sparse = calls["loc"] < 3
+        return {
+            "locations": [
+                {
+                    "temporary_key": "location_001",
+                    "id": "location_001",
+                    "name": "Town",
+                    "type": "city",
+                    "summary": "" if sparse else "A quiet town.",
+                    "current_events": [],
+                    "rumors": [],
+                    "local_tone": [],
+                    "knowledge_rules": [],
+                    "important_locations": [],
+                }
+            ],
+            "warnings": [],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 50,
+                "estimated_cost_usd": 0.02,
+                "model_id": "detail",
+            },
+        }
+
+    monkeypatch.setattr(content_import, "outline_campaign_document", fake_outline)
+    monkeypatch.setattr(content_import, "detail_location_batch", fake_detail_location)
+
+    result = content_import.analyze_campaign_document("x" * 80, "create_new")
+    # outline 10/5 + three detail hops 100/50 each
+    assert result["usage"]["prompt_tokens"] == 10 + 300
+    assert result["usage"]["completion_tokens"] == 5 + 150
+    assert calls["loc"] == 3
+
+
+def test_validate_temporary_keys_detects_duplicates():
+    warnings = content_import._validate_temporary_keys(
+        {"temporary_key": "campaign_001"},
+        [
+            {"temporary_key": "location_001", "name": "A"},
+            {"temporary_key": "location_001", "name": "B"},
+        ],
+        [{"temporary_key": "npc_001", "name": "X"}],
+    )
+    assert any("Duplicate temporary_key 'location_001'" in w for w in warnings)
+
+
+def test_outline_create_new_assigns_temp_keys_without_llm_campaign_id(monkeypatch):
+    def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step, usage_acc=None, **kwargs):
+        assert "Do NOT invent a permanent campaign_id" in user_prompt or "temporary_key" in user_prompt
+        assert "campaign_id" not in user_prompt.split("Rules:")[0] or "Do NOT invent" in user_prompt
+        if usage_acc is not None:
+            usage_acc["prompt_tokens"] = 11
+            usage_acc["completion_tokens"] = 7
+            usage_acc["model_id"] = "test-model"
+        return {
+            "campaign": {
+                "campaign_id": "should_be_ignored",
+                "title": "Hope's Last Day",
+                "name": "Hope's Last Day",
+                "description": "Desc",
+                "genre": "sci_fi",
+                "rpg_system": "Alien RPG",
+            },
+            "locations": [{"name": "Hope Station", "type": "ship"}],
+            "npcs": [
+                {
+                    "name": "Reyes",
+                    "role": "captain",
+                    "primary_location_key": "location_001",
+                    "significance": "conversational",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(content_import, "_call_llm_json", fake_call_llm_json)
+    result = content_import.outline_campaign_document(
+        "Hope's Last Day\nA short module about Hope Station.",
+        "create_new",
+    )
+    assert result["campaign"]["temporary_key"] == "campaign_001"
+    assert "campaign_id" not in result["campaign"]
+    assert result["campaign"]["name"] == "Hope's Last Day"
+    assert result["locations"][0]["temporary_key"] == "location_001"
+    assert result["npcs"][0]["temporary_key"] == "npc_001"
+    assert result["npcs"][0]["primary_location_key"] == "location_001"
+    assert result["usage"]["prompt_tokens"] == 11
+    assert result["usage"]["completion_tokens"] == 7
+    assert result["usage"]["model_id"] == "test-model"
+    assert result["relationships"] == []
+    assert result["events"] == []
+
+
+def test_detail_preserves_temporary_key(monkeypatch):
+    def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step, usage_acc=None, **kwargs):
+        if usage_acc is not None:
+            usage_acc["prompt_tokens"] = 3
+            usage_acc["completion_tokens"] = 2
+            usage_acc["model_id"] = "detail-model"
+        return {
+            "locations": [
+                {
+                    "temporary_key": "location_001",
+                    "summary": "A battered freighter.",
+                    "current_events": ["Life support flickering."],
+                }
+            ]
+        }
+
+    monkeypatch.setattr(content_import, "_call_llm_json", fake_call_llm_json)
+    result = content_import.detail_location_batch(
+        "Hope Station is a battered freighter with flickering life support.",
+        {"temporary_key": "campaign_001", "name": "Hope's Last Day"},
+        [{"temporary_key": "location_001", "name": "Hope Station", "type": "ship"}],
+    )
+    loc = result["locations"][0]
+    assert loc["temporary_key"] == "location_001"
+    assert loc["id"] == "location_001"
+    assert loc["campaign_id"] == "campaign_001"
+    assert "battered" in loc["summary"].casefold()
+    assert result["usage"]["prompt_tokens"] == 3
+
