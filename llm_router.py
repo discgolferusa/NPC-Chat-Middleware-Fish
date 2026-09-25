@@ -1026,6 +1026,23 @@ def _estimate_cost_usd(model_id: str, prompt_tokens: int, completion_tokens: int
     }
 
 
+def _response_usage_payload(
+    *,
+    prompt_tokens: int,
+    completion_tokens: int,
+    model_id: str | None,
+) -> dict[str, Any]:
+    """Compact usage dict for content-import (and similar) callers."""
+    costs = _estimate_cost_usd(model_id or "", prompt_tokens, completion_tokens)
+    total = costs["estimated_total_cost_usd"]
+    return {
+        "prompt_tokens": int(prompt_tokens or 0),
+        "completion_tokens": int(completion_tokens or 0),
+        "estimated_cost_usd": total if total > 0 else None,
+        "model_id": model_id,
+    }
+
+
 def record_llm_usage(
     *,
     provider: str,
@@ -1629,7 +1646,7 @@ def _fallback_to_local(
     error: str | None = None,
     purpose: str = DEFAULT_PURPOSE,
     **kwargs: Any,
-) -> str:
+) -> tuple[str, dict[str, Any]]:
     LAST_FALLBACK_REASON[purpose] = reason
     LAST_LLM_ERROR[purpose] = error
 
@@ -1659,7 +1676,11 @@ def _fallback_to_local(
         attribute_cost_to_selected=True,
     )
 
-    return content
+    return content, _response_usage_payload(
+        prompt_tokens=usage["prompt_tokens"],
+        completion_tokens=usage["completion_tokens"],
+        model_id="local",
+    )
 
 
 def _fallback_after_failure(
@@ -1674,7 +1695,7 @@ def _fallback_after_failure(
     online_unavailable: bool = False,
     respect_online_disabled: bool = True,
     **kwargs: Any,
-) -> str:
+) -> tuple[str, dict[str, Any]]:
     """Walk Admin-configured fallback models, then local when allowed.
 
     ``online_unavailable`` skips other OpenRouter catalog entries (credit threshold,
@@ -1785,7 +1806,11 @@ def _fallback_after_failure(
             # Bill the fallback catalog id that actually served tokens.
             attribute_cost_to_selected=False,
         )
-        return content
+        return content, _response_usage_payload(
+            prompt_tokens=usage["prompt_tokens"],
+            completion_tokens=usage["completion_tokens"],
+            model_id=fallback_id,
+        )
 
     LAST_LLM_ERROR[purpose] = last_error or reason
     raise LLMProviderError(
@@ -1801,6 +1826,24 @@ def generate_llm_response(
     purpose: str = DEFAULT_PURPOSE,
     **kwargs: Any,
 ) -> str:
+    content, _usage = generate_llm_response_with_usage(
+        messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        purpose=purpose,
+        **kwargs,
+    )
+    return content
+
+
+def generate_llm_response_with_usage(
+    messages: list[dict[str, Any]],
+    *,
+    temperature: float | None = None,
+    max_tokens: int | None = None,
+    purpose: str = DEFAULT_PURPOSE,
+    **kwargs: Any,
+) -> tuple[str, dict[str, Any]]:
     purpose = _normalize_purpose(purpose)
 
     with _STATE_LOCK:
@@ -1842,7 +1885,11 @@ def generate_llm_response(
             purpose=purpose,
             selected_model_id=selected_model_id,
         )
-        return content
+        return content, _response_usage_payload(
+            prompt_tokens=usage["prompt_tokens"],
+            completion_tokens=usage["completion_tokens"],
+            model_id="local",
+        )
 
     if not openrouter_is_configured():
         if not _allows_local_fallback(provider_mode):
@@ -2100,7 +2147,11 @@ def generate_llm_response(
         selected_model_id=selected_model_id,
     )
 
-    return content
+    return content, _response_usage_payload(
+        prompt_tokens=usage["prompt_tokens"],
+        completion_tokens=usage["completion_tokens"],
+        model_id=selected_model_id,
+    )
 
 
 def select_llm_model(
