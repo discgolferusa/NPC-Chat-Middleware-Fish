@@ -29,12 +29,16 @@ from request_timing import (
 from faster_whisper import WhisperModel
 
 from llm_router import (
+    delete_llm_catalog_entry,
     generate_llm_response,
     get_llm_models_payload,
     get_llm_status,
     get_llm_usage_cost_report,
+    refresh_llm_catalog_pricing,
     reset_usage_tracking,
     select_llm_model,
+    set_llm_model_order,
+    upsert_llm_catalog_entry,
 )
 from content_import import (
     ContentImportError,
@@ -4304,6 +4308,18 @@ def llm_select():
     model_id = body.get("model_id") or body.get("model")
     provider_mode = body.get("provider_mode")
     purpose = (body.get("purpose") or "chat").strip() or "chat"
+    model_order = body.get("model_order")
+
+    if model_order is not None:
+        try:
+            result = set_llm_model_order(purpose, model_order, provider_mode=provider_mode)
+            result["status"] = get_llm_status()
+            return jsonify(result)
+        except ValueError as ex:
+            return _client_error(ex, 400)
+        except Exception as ex:
+            print(f"[LLM] select(order) failed: {ex}", flush=True)
+            return _client_error(ex, 500)
 
     if not model_id:
         return jsonify({"error": "Missing model_id"}), 400
@@ -4319,6 +4335,69 @@ def llm_select():
         return _client_error(ex, 400)
     except Exception as ex:
         print(f"[LLM] select failed: {ex}", flush=True)
+        return _client_error(ex, 500)
+
+
+@app.put("/llm/catalog/entries")
+@app.post("/llm/catalog/entries")
+def llm_catalog_upsert():
+    body = request.get_json(force=True, silent=True) or {}
+    if not isinstance(body, dict):
+        return jsonify({"error": "Expected a catalog entry object."}), 400
+    fetch_pricing = body.pop("fetch_pricing", True)
+    try:
+        entry = upsert_llm_catalog_entry(body, fetch_pricing=bool(fetch_pricing))
+        return jsonify({"ok": True, "entry": entry, "models": get_llm_models_payload()})
+    except ValueError as ex:
+        return _client_error(ex, 400)
+    except Exception as ex:
+        print(f"[LLM] catalog upsert failed: {ex}", flush=True)
+        return _client_error(ex, 500)
+
+
+@app.delete("/llm/catalog/entries/<entry_id>")
+def llm_catalog_delete(entry_id: str):
+    try:
+        delete_llm_catalog_entry(entry_id)
+        return jsonify({"ok": True, "deleted": entry_id, "models": get_llm_models_payload()})
+    except ValueError as ex:
+        return _client_error(ex, 400)
+    except Exception as ex:
+        print(f"[LLM] catalog delete failed: {ex}", flush=True)
+        return _client_error(ex, 500)
+
+
+@app.put("/llm/catalog/order")
+@app.post("/llm/catalog/order")
+def llm_catalog_order():
+    body = request.get_json(force=True, silent=True) or {}
+    purpose = (body.get("purpose") or "chat").strip() or "chat"
+    model_ids = body.get("model_order") or body.get("model_ids")
+    provider_mode = body.get("provider_mode")
+    if model_ids is None:
+        return jsonify({"error": "model_order is required"}), 400
+    try:
+        result = set_llm_model_order(purpose, model_ids, provider_mode=provider_mode)
+        result["status"] = get_llm_status()
+        result["models"] = get_llm_models_payload()
+        return jsonify(result)
+    except ValueError as ex:
+        return _client_error(ex, 400)
+    except Exception as ex:
+        print(f"[LLM] catalog order failed: {ex}", flush=True)
+        return _client_error(ex, 500)
+
+
+@app.post("/llm/catalog/refresh-pricing")
+def llm_catalog_refresh_pricing():
+    body = request.get_json(force=True, silent=True) or {}
+    entry_id = body.get("id") or body.get("entry_id") or request.args.get("id")
+    try:
+        result = refresh_llm_catalog_pricing(entry_id=entry_id)
+        result["models"] = get_llm_models_payload()
+        return jsonify(result)
+    except Exception as ex:
+        print(f"[LLM] pricing refresh failed: {ex}", flush=True)
         return _client_error(ex, 500)
 
 
