@@ -486,6 +486,33 @@ def set_model_order(
         return list(MODEL_ORDER[purpose])
 
 
+def _prune_orders(*, append_new_id: str | None = None) -> None:
+    """Drop invalid ids from MODEL_ORDER without re-adding admin-excluded models.
+
+    When ``append_new_id`` is set (a newly created catalog row), append it to the
+    end of each purpose list it supports so it becomes selectable without
+    reshuffling the admin's existing precedence.
+    """
+    for purpose in VALID_PURPOSES:
+        order = _normalize_order(
+            MODEL_ORDER.get(purpose),
+            CATALOG_ENTRIES,
+            purpose=purpose,
+            append_missing=False,
+        )
+        if append_new_id:
+            entry = CATALOG_ENTRIES.get(append_new_id)
+            if (
+                entry
+                and entry.get("enabled") is not False
+                and append_new_id not in order
+            ):
+                purposes = entry.get("purposes") or []
+                if not purposes or purpose in purposes:
+                    order.append(append_new_id)
+        MODEL_ORDER[purpose] = order
+
+
 def upsert_entry(
     payload: dict[str, Any],
     *,
@@ -521,13 +548,7 @@ def upsert_entry(
             }
             entry = _normalize_entry(merged, entry_id="local")
             CATALOG_ENTRIES["local"] = entry
-            for purpose in VALID_PURPOSES:
-                MODEL_ORDER[purpose] = _normalize_order(
-                    MODEL_ORDER.get(purpose),
-                    CATALOG_ENTRIES,
-                    purpose=purpose,
-                    append_missing=True,
-                )
+            _prune_orders()
             apply_to_router(llm_models, prices)
             save_catalog()
             return deepcopy(entry)
@@ -543,6 +564,7 @@ def upsert_entry(
     if not model or not host:
         raise ValueError("model and host_provider are required")
 
+    is_new = entry_id not in CATALOG_ENTRIES
     with _CATALOG_LOCK:
         existing = CATALOG_ENTRIES.get(entry_id, {})
         merged = {
@@ -573,13 +595,7 @@ def upsert_entry(
 
     with _CATALOG_LOCK:
         CATALOG_ENTRIES[entry_id] = entry
-        for purpose in VALID_PURPOSES:
-            MODEL_ORDER[purpose] = _normalize_order(
-                MODEL_ORDER.get(purpose),
-                CATALOG_ENTRIES,
-                purpose=purpose,
-                append_missing=True,
-            )
+        _prune_orders(append_new_id=entry_id if is_new else None)
         apply_to_router(llm_models, prices)
         save_catalog()
         return deepcopy(entry)
@@ -601,13 +617,7 @@ def delete_entry(
             raise ValueError(f"Unknown catalog id: {mid}")
         del CATALOG_ENTRIES[mid]
         prices.pop(mid, None)
-        for purpose in VALID_PURPOSES:
-            MODEL_ORDER[purpose] = _normalize_order(
-                MODEL_ORDER.get(purpose),
-                CATALOG_ENTRIES,
-                purpose=purpose,
-                append_missing=True,
-            )
+        _prune_orders()
         apply_to_router(llm_models, prices)
         save_catalog()
 
@@ -684,30 +694,53 @@ def refresh_pricing(
     llm_models: dict[str, dict[str, Any]],
     prices: dict[str, dict[str, float]],
 ) -> dict[str, Any]:
-    updated: list[str] = []
-    failed: list[str] = []
+    """Refresh OpenRouter endpoint pricing without holding the catalog lock on HTTP I/O."""
     with _CATALOG_LOCK:
-        targets = (
-            [entry_id]
-            if entry_id
-            else [mid for mid, e in CATALOG_ENTRIES.items() if e.get("online")]
-        )
+        if entry_id:
+            targets = [entry_id]
+        else:
+            targets = [mid for mid, e in CATALOG_ENTRIES.items() if e.get("online")]
+        # Snapshot model/host outside the lock so fetches cannot block upsert/order.
+        snapshots: list[tuple[str, str, str]] = []
         for mid in targets:
-            if not mid or mid not in CATALOG_ENTRIES:
-                failed.append(str(mid or ""))
+            entry = CATALOG_ENTRIES.get(mid or "")
+            if not entry or not entry.get("online"):
                 continue
-            entry = CATALOG_ENTRIES[mid]
-            if not entry.get("online"):
-                continue
-            try:
-                pricing = fetch_endpoint_pricing(
+            snapshots.append(
+                (
+                    mid,
                     str(entry.get("model") or ""),
                     str(entry.get("host_provider") or ""),
                 )
-            except Exception as ex:  # noqa: BLE001
-                print(f"[LLM] pricing refresh failed for {mid}: {ex}", flush=True)
-                pricing = None
-            if not pricing:
+            )
+
+    fetched: dict[str, dict[str, Any]] = {}
+    failed: list[str] = []
+    for mid, model, host in snapshots:
+        try:
+            pricing = fetch_endpoint_pricing(model, host)
+        except Exception as ex:  # noqa: BLE001
+            print(f"[LLM] pricing refresh failed for {mid}: {ex}", flush=True)
+            pricing = None
+        if not pricing:
+            failed.append(mid)
+            continue
+        fetched[mid] = pricing
+
+    # Mark requested ids that vanished / were offline.
+    for mid in targets:
+        if not mid:
+            failed.append(str(mid or ""))
+            continue
+        if mid not in {s[0] for s in snapshots} and mid not in fetched:
+            if mid not in failed:
+                failed.append(mid)
+
+    updated: list[str] = []
+    with _CATALOG_LOCK:
+        for mid, pricing in fetched.items():
+            entry = CATALOG_ENTRIES.get(mid)
+            if not entry:
                 failed.append(mid)
                 continue
             entry["pricing"] = pricing

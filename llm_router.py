@@ -2270,14 +2270,39 @@ def select_llm_model(
         LAST_FALLBACK_REASON[purpose] = None
         LAST_LLM_ERROR[purpose] = None
 
-        # Keep catalog order aligned with primary + fallbacks when order wasn't the source.
-        if model_order is None:
+        # Keep catalog precedence aligned without truncating a longer admin order.
+        if model_order is not None:
+            pass  # already applied via set_model_order above
+        elif update_fallbacks:
+            # Explicit fallback_model_ids means the caller intends this full chain.
             llm_catalog.set_model_order(
                 purpose,
                 [result_model_id, *result_fallbacks],
                 llm_models=LLM_MODELS,
                 prices=ONLINE_ON_DEMAND_PRICES_USD,
             )
+        else:
+            # Primary/mode-only change: move primary to front, keep remaining order.
+            existing = llm_catalog.get_model_order(purpose)
+            merged = [result_model_id, *[m for m in existing if m != result_model_id]]
+            llm_catalog.set_model_order(
+                purpose,
+                merged,
+                llm_models=LLM_MODELS,
+                prices=ONLINE_ON_DEMAND_PRICES_USD,
+            )
+
+        # Fallbacks mirror the persisted precedence list (everything after primary).
+        full_order = llm_catalog.get_model_order(purpose)
+        if full_order:
+            result_model_id = full_order[0]
+            result_fallbacks = full_order[1:]
+            if purpose == PURPOSE_CONTENT_CREATION:
+                CONTENT_CREATION_MODEL_ID = result_model_id
+                CONTENT_CREATION_FALLBACK_MODEL_IDS = list(result_fallbacks)
+            else:
+                CURRENT_LLM_MODEL_ID = result_model_id
+                CHAT_FALLBACK_MODEL_IDS = list(result_fallbacks)
 
         _save_runtime_config()
 
@@ -2757,20 +2782,26 @@ def _reconcile_selection_after_catalog_change() -> None:
         _save_runtime_config()
 
 
-def _apply_runtime_selection_to_catalog_order() -> None:
-    """After loading llm_runtime_config, rebuild catalog order from primary+fallbacks."""
-    llm_catalog.set_model_order(
-        PURPOSE_CHAT,
-        [CURRENT_LLM_MODEL_ID, *CHAT_FALLBACK_MODEL_IDS],
-        llm_models=LLM_MODELS,
-        prices=ONLINE_ON_DEMAND_PRICES_USD,
-    )
-    llm_catalog.set_model_order(
-        PURPOSE_CONTENT_CREATION,
-        [CONTENT_CREATION_MODEL_ID, *CONTENT_CREATION_FALLBACK_MODEL_IDS],
-        llm_models=LLM_MODELS,
-        prices=ONLINE_ON_DEMAND_PRICES_USD,
-    )
+def _sync_selection_from_catalog_order() -> None:
+    """Apply persisted catalog precedence into runtime primary/fallback globals.
+
+    Catalog ``MODEL_ORDER`` is authoritative after load/seed. A short
+    ``llm_runtime_config.json`` (primary + one fallback) must not overwrite a
+    multi-model seeded precedence list on startup.
+    """
+    global CURRENT_LLM_MODEL_ID, CHAT_FALLBACK_MODEL_IDS
+    global CONTENT_CREATION_MODEL_ID, CONTENT_CREATION_FALLBACK_MODEL_IDS
+
+    with _STATE_LOCK:
+        for purpose in (PURPOSE_CHAT, PURPOSE_CONTENT_CREATION):
+            primary, fallbacks = llm_catalog.purpose_chain_from_order(purpose)
+            if purpose == PURPOSE_CONTENT_CREATION:
+                CONTENT_CREATION_MODEL_ID = primary
+                CONTENT_CREATION_FALLBACK_MODEL_IDS = list(fallbacks)
+            else:
+                CURRENT_LLM_MODEL_ID = primary
+                CHAT_FALLBACK_MODEL_IDS = list(fallbacks)
+        _save_runtime_config()
 
 
 def init_llm_router() -> None:
@@ -2794,8 +2825,9 @@ def init_llm_router() -> None:
         local_url=LOCAL_LLM_URL,
     )
 
+    # Runtime config still loads provider modes / remaps; precedence comes from catalog.
     _load_runtime_config()
-    _apply_runtime_selection_to_catalog_order()
+    _sync_selection_from_catalog_order()
 
     # Refresh local model metadata after env/secrets load.
     if "local" in LLM_MODELS:

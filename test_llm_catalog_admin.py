@@ -162,3 +162,106 @@ def test_select_model_order_via_select_llm_model(isolated_selection):
     assert result["model_id"] == "openrouter-gpt-oss-20b"
     assert result["fallback_model_ids"] == ["local"]
     assert result["model_order"][:2] == ["openrouter-gpt-oss-20b", "local"]
+
+
+def test_sync_selection_from_catalog_preserves_multi_model_order(isolated_selection, tmp_path):
+    """Short runtime primary+fallback must not wipe a seeded multi-model precedence."""
+    full_order = [
+        "openrouter-nemotron-3.5-lightning-coreweave",
+        "openrouter-nemotron-3.5-lightning-deepinfra",
+        "openrouter-gpt-oss-20b",
+        "local",
+    ]
+    llm_catalog.set_model_order(
+        "chat",
+        full_order,
+        llm_models=llm_router.LLM_MODELS,
+        prices=llm_router.ONLINE_ON_DEMAND_PRICES_USD,
+    )
+    # Simulate a short runtime config selection.
+    llm_router.CURRENT_LLM_MODEL_ID = "openrouter-gpt-oss-20b"
+    llm_router.CHAT_FALLBACK_MODEL_IDS = ["local"]
+    llm_router._sync_selection_from_catalog_order()
+    assert llm_catalog.get_model_order("chat") == full_order
+    assert llm_router.CURRENT_LLM_MODEL_ID == full_order[0]
+    assert llm_router.CHAT_FALLBACK_MODEL_IDS == full_order[1:]
+
+
+def test_select_primary_only_keeps_rest_of_precedence(isolated_selection):
+    llm_router.set_llm_model_order(
+        "chat",
+        [
+            "openrouter-nemotron-3.5-lightning-coreweave",
+            "openrouter-nemotron-3.5-lightning-deepinfra",
+            "openrouter-gpt-oss-20b",
+            "local",
+        ],
+        provider_mode="openrouter_with_local_fallback",
+    )
+    result = llm_router.select_llm_model(
+        "openrouter-gpt-oss-20b",
+        provider_mode="openrouter_with_local_fallback",
+        purpose="chat",
+    )
+    assert result["model_id"] == "openrouter-gpt-oss-20b"
+    assert result["model_order"] == [
+        "openrouter-gpt-oss-20b",
+        "openrouter-nemotron-3.5-lightning-coreweave",
+        "openrouter-nemotron-3.5-lightning-deepinfra",
+        "local",
+    ]
+
+
+def test_upsert_does_not_restore_excluded_models(isolated_selection):
+    subset = [
+        "openrouter-nemotron-3.5-lightning-coreweave",
+        "local",
+    ]
+    llm_catalog.set_model_order(
+        "chat",
+        subset,
+        llm_models=llm_router.LLM_MODELS,
+        prices=llm_router.ONLINE_ON_DEMAND_PRICES_USD,
+    )
+    llm_router.upsert_llm_catalog_entry(
+        {
+            "id": "openrouter-gpt-oss-20b",
+            "model": "openai/gpt-oss-20b",
+            "host_provider": "amazon-bedrock",
+            "enabled": True,
+            "purposes": ["chat", "content_creation"],
+        },
+        fetch_pricing=False,
+    )
+    assert llm_catalog.get_model_order("chat") == subset
+
+
+def test_refresh_pricing_does_not_hold_lock_during_http(isolated_selection, monkeypatch):
+    held_during_http = {"value": False}
+    real_lock = llm_catalog._CATALOG_LOCK
+
+    class TrackingLock:
+        def __enter__(self):
+            return real_lock.__enter__()
+
+        def __exit__(self, *args):
+            return real_lock.__exit__(*args)
+
+    def fake_fetch(model, host):
+        # If the catalog lock is held here, other writers would block.
+        held_during_http["value"] = real_lock.locked()
+        return {
+            "input": 0.01,
+            "output": 0.02,
+            "source": "openrouter",
+            "fetched_at": "2026-01-01T00:00:00Z",
+        }
+
+    monkeypatch.setattr(llm_catalog, "_CATALOG_LOCK", TrackingLock())
+    monkeypatch.setattr(llm_catalog, "fetch_endpoint_pricing", fake_fetch)
+
+    result = llm_router.refresh_llm_catalog_pricing(
+        entry_id="openrouter-gpt-oss-20b"
+    )
+    assert "openrouter-gpt-oss-20b" in result["updated"]
+    assert held_during_http["value"] is False
