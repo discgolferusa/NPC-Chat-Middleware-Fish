@@ -265,3 +265,87 @@ def test_refresh_pricing_does_not_hold_lock_during_http(isolated_selection, monk
     )
     assert "openrouter-gpt-oss-20b" in result["updated"]
     assert held_during_http["value"] is False
+
+
+def test_sync_promotes_local_mode_when_primary_is_online(isolated_selection):
+    full_order = [
+        "openrouter-gpt-oss-20b",
+        "local",
+    ]
+    llm_catalog.set_model_order(
+        "chat",
+        full_order,
+        llm_models=llm_router.LLM_MODELS,
+        prices=llm_router.ONLINE_ON_DEMAND_PRICES_USD,
+    )
+    llm_router.CURRENT_LLM_MODEL_ID = "local"
+    llm_router.LLM_PROVIDER_MODE = "local"
+    llm_router.CHAT_FALLBACK_MODEL_IDS = []
+    llm_router._sync_selection_from_catalog_order()
+    assert llm_router.CURRENT_LLM_MODEL_ID == "openrouter-gpt-oss-20b"
+    assert llm_router.LLM_PROVIDER_MODE == "openrouter_with_local_fallback"
+
+
+def test_reenable_restores_model_to_order(isolated_selection):
+    llm_catalog.set_model_order(
+        "chat",
+        ["openrouter-nemotron-3.5-lightning-coreweave", "local"],
+        llm_models=llm_router.LLM_MODELS,
+        prices=llm_router.ONLINE_ON_DEMAND_PRICES_USD,
+    )
+    llm_router.upsert_llm_catalog_entry(
+        {
+            "id": "openrouter-gpt-oss-20b",
+            "model": "openai/gpt-oss-20b",
+            "host_provider": "amazon-bedrock",
+            "enabled": False,
+            "purposes": ["chat", "content_creation"],
+        },
+        fetch_pricing=False,
+    )
+    assert "openrouter-gpt-oss-20b" not in llm_catalog.get_model_order("chat")
+    llm_router.upsert_llm_catalog_entry(
+        {
+            "id": "openrouter-gpt-oss-20b",
+            "model": "openai/gpt-oss-20b",
+            "host_provider": "amazon-bedrock",
+            "enabled": True,
+            "purposes": ["chat", "content_creation"],
+        },
+        fetch_pricing=False,
+    )
+    order = llm_catalog.get_model_order("chat")
+    assert "openrouter-gpt-oss-20b" in order
+    assert order[-1] == "openrouter-gpt-oss-20b"
+    assert llm_router.model_supports_purpose("openrouter-gpt-oss-20b", "chat")
+
+
+def test_adding_purpose_restores_model_to_that_order(isolated_selection):
+    llm_router.upsert_llm_catalog_entry(
+        {
+            "id": "openrouter-gpt-oss-20b",
+            "model": "openai/gpt-oss-20b",
+            "host_provider": "amazon-bedrock",
+            "enabled": True,
+            "purposes": ["chat"],
+        },
+        fetch_pricing=False,
+    )
+    llm_catalog.set_model_order(
+        "content_creation",
+        ["local"],
+        llm_models=llm_router.LLM_MODELS,
+        prices=llm_router.ONLINE_ON_DEMAND_PRICES_USD,
+    )
+    assert "openrouter-gpt-oss-20b" not in llm_catalog.get_model_order("content_creation")
+    llm_router.upsert_llm_catalog_entry(
+        {
+            "id": "openrouter-gpt-oss-20b",
+            "model": "openai/gpt-oss-20b",
+            "host_provider": "amazon-bedrock",
+            "enabled": True,
+            "purposes": ["chat", "content_creation"],
+        },
+        fetch_pricing=False,
+    )
+    assert "openrouter-gpt-oss-20b" in llm_catalog.get_model_order("content_creation")

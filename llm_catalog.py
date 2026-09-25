@@ -486,13 +486,14 @@ def set_model_order(
         return list(MODEL_ORDER[purpose])
 
 
-def _prune_orders(*, append_new_id: str | None = None) -> None:
+def _prune_orders(*, restore_ids: list[str] | None = None) -> None:
     """Drop invalid ids from MODEL_ORDER without re-adding admin-excluded models.
 
-    When ``append_new_id`` is set (a newly created catalog row), append it to the
-    end of each purpose list it supports so it becomes selectable without
-    reshuffling the admin's existing precedence.
+    ``restore_ids`` are appended (end of each eligible purpose list) when an entry
+    is newly created, re-enabled, or gains a purpose — so it becomes selectable
+    again without reshuffling the rest of the admin precedence.
     """
+    restore = [mid for mid in (restore_ids or []) if mid]
     for purpose in VALID_PURPOSES:
         order = _normalize_order(
             MODEL_ORDER.get(purpose),
@@ -500,17 +501,39 @@ def _prune_orders(*, append_new_id: str | None = None) -> None:
             purpose=purpose,
             append_missing=False,
         )
-        if append_new_id:
-            entry = CATALOG_ENTRIES.get(append_new_id)
+        for mid in restore:
+            entry = CATALOG_ENTRIES.get(mid)
             if (
                 entry
                 and entry.get("enabled") is not False
-                and append_new_id not in order
+                and mid not in order
             ):
                 purposes = entry.get("purposes") or []
                 if not purposes or purpose in purposes:
-                    order.append(append_new_id)
+                    order.append(mid)
         MODEL_ORDER[purpose] = order
+
+
+def _entry_should_restore_to_order(
+    previous: dict[str, Any] | None,
+    entry: dict[str, Any],
+    *,
+    is_new: bool,
+) -> bool:
+    """Whether upsert should append ``entry`` back onto purpose precedence lists."""
+    if is_new:
+        return True
+    if entry.get("enabled") is False:
+        return False
+    prev = previous or {}
+    if prev.get("enabled") is False and entry.get("enabled") is not False:
+        return True
+    prev_purposes = set(prev.get("purposes") or [])
+    new_purposes = set(entry.get("purposes") or [])
+    # Purpose list became empty (= universal) or gained a purpose.
+    if prev_purposes and (not new_purposes or bool(new_purposes - prev_purposes)):
+        return True
+    return False
 
 
 def upsert_entry(
@@ -535,6 +558,7 @@ def upsert_entry(
     if entry_id == "local" or host == "local":
         with _CATALOG_LOCK:
             current = CATALOG_ENTRIES.get("local", {})
+            previous = deepcopy(current) if current else None
             merged = {
                 **current,
                 "id": "local",
@@ -548,7 +572,12 @@ def upsert_entry(
             }
             entry = _normalize_entry(merged, entry_id="local")
             CATALOG_ENTRIES["local"] = entry
-            _prune_orders()
+            restore = (
+                ["local"]
+                if _entry_should_restore_to_order(previous, entry, is_new=False)
+                else None
+            )
+            _prune_orders(restore_ids=restore)
             apply_to_router(llm_models, prices)
             save_catalog()
             return deepcopy(entry)
@@ -567,6 +596,7 @@ def upsert_entry(
     is_new = entry_id not in CATALOG_ENTRIES
     with _CATALOG_LOCK:
         existing = CATALOG_ENTRIES.get(entry_id, {})
+        previous = deepcopy(existing) if existing else None
         merged = {
             **existing,
             **payload,
@@ -595,7 +625,12 @@ def upsert_entry(
 
     with _CATALOG_LOCK:
         CATALOG_ENTRIES[entry_id] = entry
-        _prune_orders(append_new_id=entry_id if is_new else None)
+        restore = (
+            [entry_id]
+            if _entry_should_restore_to_order(previous, entry, is_new=is_new)
+            else None
+        )
+        _prune_orders(restore_ids=restore)
         apply_to_router(llm_models, prices)
         save_catalog()
         return deepcopy(entry)

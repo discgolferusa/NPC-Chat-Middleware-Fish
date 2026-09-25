@@ -2238,6 +2238,10 @@ def select_llm_model(
                 CONTENT_CREATION_PROVIDER_MODE = provider_mode
             if model_id == "local":
                 CONTENT_CREATION_PROVIDER_MODE = "local"
+            elif provider_mode is None:
+                CONTENT_CREATION_PROVIDER_MODE = _provider_mode_for_primary(
+                    model_id, CONTENT_CREATION_PROVIDER_MODE
+                )
             if update_fallbacks:
                 CONTENT_CREATION_FALLBACK_MODEL_IDS = list(normalized_fallbacks or [])
             else:
@@ -2255,6 +2259,8 @@ def select_llm_model(
                 LLM_PROVIDER_MODE = provider_mode
             if model_id == "local":
                 LLM_PROVIDER_MODE = "local"
+            elif provider_mode is None:
+                LLM_PROVIDER_MODE = _provider_mode_for_primary(model_id, LLM_PROVIDER_MODE)
             if update_fallbacks:
                 CHAT_FALLBACK_MODEL_IDS = list(normalized_fallbacks or [])
             else:
@@ -2767,30 +2773,33 @@ def refresh_llm_catalog_pricing(entry_id: str | None = None) -> dict[str, Any]:
 
 def _reconcile_selection_after_catalog_change() -> None:
     """Drop disabled/missing ids from live primary+fallback chains and re-save."""
-    global CURRENT_LLM_MODEL_ID, CHAT_FALLBACK_MODEL_IDS
-    global CONTENT_CREATION_MODEL_ID, CONTENT_CREATION_FALLBACK_MODEL_IDS
+    _sync_selection_from_catalog_order()
 
-    with _STATE_LOCK:
-        for purpose in (PURPOSE_CHAT, PURPOSE_CONTENT_CREATION):
-            primary, fallbacks = llm_catalog.purpose_chain_from_order(purpose)
-            if purpose == PURPOSE_CONTENT_CREATION:
-                CONTENT_CREATION_MODEL_ID = primary
-                CONTENT_CREATION_FALLBACK_MODEL_IDS = list(fallbacks)
-            else:
-                CURRENT_LLM_MODEL_ID = primary
-                CHAT_FALLBACK_MODEL_IDS = list(fallbacks)
-        _save_runtime_config()
+
+def _provider_mode_for_primary(primary_model_id: str, current_mode: str) -> str:
+    """Align provider_mode with the catalog primary so online seeds are not stuck on local."""
+    entry = LLM_MODELS.get(primary_model_id) or {}
+    is_local = primary_model_id == "local" or entry.get("provider") == "local"
+    if is_local:
+        return "local"
+    normalized = _normalize_provider_mode(current_mode, default=ONLINE_WITH_FALLBACK_MODE)
+    if normalized == "local":
+        return ONLINE_WITH_FALLBACK_MODE
+    return normalized
 
 
 def _sync_selection_from_catalog_order() -> None:
-    """Apply persisted catalog precedence into runtime primary/fallback globals.
+    """Apply persisted catalog precedence into runtime primary/fallback/mode globals.
 
     Catalog ``MODEL_ORDER`` is authoritative after load/seed. A short
     ``llm_runtime_config.json`` (primary + one fallback) must not overwrite a
-    multi-model seeded precedence list on startup.
+    multi-model seeded precedence list on startup. When the primary is online,
+    a leftover ``local`` provider_mode is promoted so generation does not keep
+    calling llama.cpp while Admin shows an OpenRouter primary.
     """
-    global CURRENT_LLM_MODEL_ID, CHAT_FALLBACK_MODEL_IDS
-    global CONTENT_CREATION_MODEL_ID, CONTENT_CREATION_FALLBACK_MODEL_IDS
+    global CURRENT_LLM_MODEL_ID, LLM_PROVIDER_MODE, CHAT_FALLBACK_MODEL_IDS
+    global CONTENT_CREATION_MODEL_ID, CONTENT_CREATION_PROVIDER_MODE
+    global CONTENT_CREATION_FALLBACK_MODEL_IDS
 
     with _STATE_LOCK:
         for purpose in (PURPOSE_CHAT, PURPOSE_CONTENT_CREATION):
@@ -2798,9 +2807,13 @@ def _sync_selection_from_catalog_order() -> None:
             if purpose == PURPOSE_CONTENT_CREATION:
                 CONTENT_CREATION_MODEL_ID = primary
                 CONTENT_CREATION_FALLBACK_MODEL_IDS = list(fallbacks)
+                CONTENT_CREATION_PROVIDER_MODE = _provider_mode_for_primary(
+                    primary, CONTENT_CREATION_PROVIDER_MODE
+                )
             else:
                 CURRENT_LLM_MODEL_ID = primary
                 CHAT_FALLBACK_MODEL_IDS = list(fallbacks)
+                LLM_PROVIDER_MODE = _provider_mode_for_primary(primary, LLM_PROVIDER_MODE)
         _save_runtime_config()
 
 
