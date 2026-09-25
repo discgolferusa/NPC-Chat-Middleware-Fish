@@ -445,8 +445,12 @@ def _stamp_discovery_temporary_keys(
             loc["parent_temporary_key"] = resolved or None
 
     stamped_npcs: list[dict[str, Any]] = []
+    npc_alias_to_key: dict[str, str] = {}
     for index, npc in enumerate(npcs, start=1):
         temp_key = f"npc_{index:03d}"
+        for alias in _entity_ref_aliases(npc):
+            npc_alias_to_key[alias] = temp_key
+            npc_alias_to_key[snake_case(alias)] = temp_key
         primary = (
             npc.get("primary_location_key")
             or npc.get("first_location_id")
@@ -482,14 +486,36 @@ def _stamp_discovery_temporary_keys(
             }
         )
 
-    # Wire associated_npc_keys from NPC primary locations when empty.
+    def _resolve_npc_ref(ref: Any) -> str:
+        text = str(ref or "").strip()
+        if not text:
+            return ""
+        if text in npc_alias_to_key:
+            return npc_alias_to_key[text]
+        folded = text.casefold()
+        if folded in npc_alias_to_key:
+            return npc_alias_to_key[folded]
+        snaked = snake_case(text)
+        if snaked in npc_alias_to_key:
+            return npc_alias_to_key[snaked]
+        return ""
+
+    # Remap associated_npc_keys onto stamped npc_NNN handles (or rebuild from primaries).
     npcs_by_loc: dict[str, list[str]] = {}
     for npc in stamped_npcs:
         loc_key = str(npc.get("primary_location_key") or "")
         if loc_key:
             npcs_by_loc.setdefault(loc_key, []).append(npc["temporary_key"])
-    for loc in stamped_locations:
-        if not loc.get("associated_npc_keys"):
+    for index, loc in enumerate(stamped_locations):
+        raw_assoc = _as_str_list(locations[index].get("associated_npc_keys")) if index < len(locations) else []
+        remapped: list[str] = []
+        for ref in raw_assoc:
+            resolved = _resolve_npc_ref(ref)
+            if resolved and resolved not in remapped:
+                remapped.append(resolved)
+        if remapped:
+            loc["associated_npc_keys"] = remapped
+        else:
             loc["associated_npc_keys"] = list(npcs_by_loc.get(loc["temporary_key"]) or [])
 
     warnings.extend(_validate_temporary_keys(stamped_campaign, stamped_locations, stamped_npcs))
@@ -5013,6 +5039,13 @@ def _normalize_outline(
             return candidate if candidate in known_location_keys else ref
         return None
 
+    # Resolve parents after key_remap is complete (including merge-skipped existing ids).
+    for loc in locations:
+        parent = loc.get("parent_temporary_key")
+        if parent:
+            resolved = _resolve_location_ref(parent)
+            loc["parent_temporary_key"] = resolved
+
     existing_npc_name_keys: set[str] = {
         n.strip().casefold() for n in existing_npc_names if n and n.strip()
     }
@@ -6106,27 +6139,31 @@ def analyze_campaign_document(
     locations: list[dict[str, Any]] = []
     for batch in _batches(location_stubs, MAX_LOCATIONS_PER_BATCH):
         result = detail_location_batch(text, campaign, batch)
+        _merge_usage(usage, result.get("usage"))
         if any(_location_detail_is_sparse(loc) for loc in (result.get("locations") or [])):
             result = detail_location_batch(text, campaign, batch, is_retry=True)
+            _merge_usage(usage, result.get("usage"))
         if any(_location_detail_is_sparse(loc) for loc in (result.get("locations") or [])):
             result = detail_location_batch(
                 text, campaign, batch, is_retry=True, allow_seed_fallback=True
             )
+            _merge_usage(usage, result.get("usage"))
         warnings.extend(result.get("warnings") or [])
-        _merge_usage(usage, result.get("usage"))
         locations.extend(result.get("locations") or [])
 
     npcs: list[dict[str, Any]] = []
     for batch in _batches(npc_stubs, MAX_NPCS_PER_BATCH):
         result = detail_npc_batch(text, campaign, batch)
+        _merge_usage(usage, result.get("usage"))
         if any(_npc_detail_is_sparse(npc) for npc in (result.get("npcs") or [])):
             result = detail_npc_batch(text, campaign, batch, is_retry=True)
+            _merge_usage(usage, result.get("usage"))
         if any(_npc_detail_is_sparse(npc) for npc in (result.get("npcs") or [])):
             result = detail_npc_batch(
                 text, campaign, batch, is_retry=True, allow_seed_fallback=True
             )
+            _merge_usage(usage, result.get("usage"))
         warnings.extend(result.get("warnings") or [])
-        _merge_usage(usage, result.get("usage"))
         npcs.extend(result.get("npcs") or [])
 
     return {

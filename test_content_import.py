@@ -1823,6 +1823,128 @@ def test_create_new_normalize_ignores_llm_campaign_id_and_assigns_temp_keys():
     assert "usage" not in warnings
 
 
+def test_stamp_remaps_associated_npc_keys_onto_temp_handles():
+    campaign = {"title": "Hope", "name": "Hope"}
+    locations = [
+        {
+            "name": "Hadley's Hope",
+            "type": "colony",
+            "associated_npc_keys": ["theodora", "operations_guard"],
+        },
+        {"name": "Operations", "type": "building", "parent_temporary_key": "Hadley's Hope"},
+    ]
+    npcs = [
+        {
+            "name": "Theodora",
+            "temporary_key": "theodora",
+            "primary_location_key": "Hadley's Hope",
+            "significance": "conversational",
+        },
+        {
+            "name": "Guard",
+            "temporary_key": "operations_guard",
+            "primary_location_key": "Operations",
+            "significance": "conversational",
+        },
+    ]
+    warnings: list[str] = []
+    _, stamped_locs, stamped_npcs = content_import._stamp_discovery_temporary_keys(
+        campaign,
+        locations,
+        npcs,
+        mode="create_new",
+        existing_campaign_id=None,
+        warnings=warnings,
+    )
+    assert stamped_locs[0]["associated_npc_keys"] == ["npc_001", "npc_002"]
+    assert stamped_npcs[0]["temporary_key"] == "npc_001"
+    assert stamped_npcs[1]["temporary_key"] == "npc_002"
+
+
+def test_normalize_outline_resolves_parent_when_merge_skips_existing():
+    outline = {
+        "campaign": {"name": "Existing Camp", "title": "Existing Camp"},
+        "locations": [
+            {"temporary_key": "old_town", "name": "Old Town", "type": "city"},
+            {
+                "name": "New Tavern",
+                "type": "building",
+                "parent_temporary_key": "old_town",
+            },
+        ],
+        "npcs": [],
+    }
+    warnings: list[str] = []
+    _, locations, _ = content_import._normalize_outline(
+        outline,
+        mode="merge",
+        existing_campaign_id="existing_camp",
+        existing_location_ids=["old_town"],
+        existing_npc_names=[],
+        warnings=warnings,
+    )
+    assert len(locations) == 1
+    assert locations[0]["name"] == "New Tavern"
+    assert locations[0]["parent_temporary_key"] == "old_town"
+
+
+def test_analyze_merges_usage_across_sparse_retries(monkeypatch):
+    """Sparse detail retries must accumulate tokens from every hop."""
+    calls = {"loc": 0}
+
+    def fake_outline(*_args, **_kwargs):
+        return {
+            "campaign": {"temporary_key": "campaign_001", "title": "T", "name": "T"},
+            "locations": [
+                {"temporary_key": "location_001", "name": "Town", "type": "city"}
+            ],
+            "npcs": [],
+            "warnings": [],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "estimated_cost_usd": 0.01,
+                "model_id": "outline",
+            },
+        }
+
+    def fake_detail_location(_text, _campaign, _batch, is_retry=False, allow_seed_fallback=False):
+        calls["loc"] += 1
+        sparse = calls["loc"] < 3
+        return {
+            "locations": [
+                {
+                    "temporary_key": "location_001",
+                    "id": "location_001",
+                    "name": "Town",
+                    "type": "city",
+                    "summary": "" if sparse else "A quiet town.",
+                    "current_events": [],
+                    "rumors": [],
+                    "local_tone": [],
+                    "knowledge_rules": [],
+                    "important_locations": [],
+                }
+            ],
+            "warnings": [],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 50,
+                "estimated_cost_usd": 0.02,
+                "model_id": "detail",
+            },
+        }
+
+    monkeypatch.setattr(content_import, "outline_campaign_document", fake_outline)
+    monkeypatch.setattr(content_import, "detail_location_batch", fake_detail_location)
+
+    result = content_import.analyze_campaign_document("x" * 80, "create_new")
+    # outline 10/5 + three detail hops 100/50 each
+    assert result["usage"]["prompt_tokens"] == 10 + 300
+    assert result["usage"]["completion_tokens"] == 5 + 150
+    assert calls["loc"] == 3
+
+
 def test_validate_temporary_keys_detects_duplicates():
     warnings = content_import._validate_temporary_keys(
         {"temporary_key": "campaign_001"},
