@@ -258,3 +258,54 @@ def test_discovery_includes_debug_prompts(monkeypatch):
     assert "user_prompt" in result["debug"]
     assert "raw_response" in result["debug"]
     assert result["debug"]["final_location_count"] == 0
+
+
+def test_looks_like_truncated_json_detects_mid_string_cutoff():
+    raw = (
+        '{"campaign":{"title":"Coriolis Storm"},"locations":[],"npcs":[],'
+        '"events":[{"name":"Coriolis storm","source_refs":["pp. 5-8, 19-21'
+    )
+    assert content_import.looks_like_truncated_json(raw)
+    assert not content_import.looks_like_truncated_json(
+        '{"campaign":{"title":"X"},"locations":[],"npcs":[]}'
+    )
+
+
+def test_discovery_retries_with_larger_budget_on_truncation(monkeypatch):
+    calls = []
+
+    def fake_generate(messages, *, purpose="chat", max_tokens=None, temperature=None, response_format=None, **kwargs):
+        calls.append({"max_tokens": max_tokens, "response_format": response_format})
+        if len(calls) == 1:
+            truncated = (
+                '{"campaign":{"title":"Coriolis Storm","name":"Coriolis Storm"},'
+                '"locations":[{"temporary_key":"location_001","name":"Station"}],'
+                '"npcs":[{"temporary_key":"npc_001","name":"Ada"}],'
+                '"events":[{"name":"Storm","source_refs":["pp. 5-8, 19-21'
+            )
+            return truncated, {"prompt_tokens": 10, "completion_tokens": 2048, "model_id": "luna"}
+        return (
+            '{"campaign":{"title":"Coriolis Storm","name":"Coriolis Storm","genre":"sci_fi"},'
+            '"locations":[{"temporary_key":"location_001","name":"Station","type":"building"}],'
+            '"npcs":[{"temporary_key":"npc_001","name":"Ada","role":"pilot",'
+            '"primary_location_key":"location_001","significance":"conversational"}]}',
+            {"prompt_tokens": 10, "completion_tokens": 400, "model_id": "luna"},
+        )
+
+    import llm_router
+    monkeypatch.setattr(llm_router, "generate_llm_response_with_usage", fake_generate)
+    monkeypatch.setattr(llm_router, "IMPORT_MAX_SCHEMA_RETRIES", 2)
+
+    warnings = []
+    out = content_import._call_llm_json(
+        "sys",
+        "user",
+        warnings=warnings,
+        step="discovery",
+        response_schema=content_import.DISCOVERY_RESPONSE_SCHEMA,
+        schema_name="discovery_response",
+    )
+    assert out["locations"]
+    assert calls[0]["max_tokens"] == content_import.OUTLINE_MAX_TOKENS
+    assert calls[1]["max_tokens"] == content_import.DISCOVERY_RETRY_MAX_TOKENS
+    assert any("truncated" in w for w in warnings)
