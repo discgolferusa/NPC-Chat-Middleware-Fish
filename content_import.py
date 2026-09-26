@@ -4800,11 +4800,16 @@ def _rank_search_needles(needles: list[str]) -> list[str]:
     return primary or [n for n in ranked if len(n) >= 4]
 
 
-def _identity_cue_text(excerpt: str, name: str) -> str:
-    """Restrict identity inference to text at/after this NPC's best name mention.
+_PAGE_BREAK_IN_EXCERPT = re.compile(r"\n===\s*PAGE\s+\d+\s*===\s*\n", re.IGNORECASE)
 
-    Starts at the name (no lookbehind) so a prior callout's she/he cannot leak.
-    Uses the last hit of the longest needle (writeups usually follow TOC drops).
+
+def _identity_cue_text(excerpt: str, name: str) -> str:
+    """Restrict identity inference to text at/after this NPC's best writeup mention.
+
+    Prefers the highest ``_npc_writeup_score_at`` hit (not the last offset), because
+    page-neighborhood excerpts reorder hit pages first and a later scene drop can
+    outrank the real writeup by string position. The window stops at the next
+    ``=== PAGE ===`` marker so cues cannot spill into a neighboring page's NPC.
     """
     text = excerpt or ""
     name = str(name or "").strip()
@@ -4814,14 +4819,30 @@ def _identity_cue_text(excerpt: str, name: str) -> str:
     if not needles:
         return ""
     lower = text.casefold()
+    best: tuple[int, int, str] | None = None  # score, idx, needle
     for needle in needles:
-        hits = _mention_indexes(lower, needle)
-        if not hits:
-            continue
-        idx = hits[-1]
-        end = min(len(text), idx + len(needle) + _IDENTITY_CUE_AFTER)
-        return text[idx:end]
-    return ""
+        for idx in _mention_indexes(lower, needle):
+            score = _npc_writeup_score_at(text, idx, name)
+            # Prefer richer writeups; on ties prefer longer needle then earlier idx
+            # (earlier among equal scores keeps TOC from beating a same-score scene
+            # only when writeup scoring already failed — writeups score much higher).
+            cand = (score, len(needle), -idx, idx, needle)
+            if best is None:
+                best = (score, idx, needle)
+                continue
+            b_score, b_idx, b_needle = best
+            b_key = (b_score, len(b_needle), -b_idx)
+            if cand[:3] > b_key:
+                best = (score, idx, needle)
+    if best is None:
+        return ""
+    _score, idx, needle = best
+    end = min(len(text), idx + len(needle) + _IDENTITY_CUE_AFTER)
+    after = text[idx + len(needle) : end]
+    page_break = _PAGE_BREAK_IN_EXCERPT.search(after)
+    if page_break:
+        end = idx + len(needle) + page_break.start()
+    return text[idx:end]
 
 
 def _infer_npc_identity_from_excerpt(

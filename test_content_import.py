@@ -2076,6 +2076,32 @@ def test_infer_npc_identity_ignores_neighbor_writeup():
     assert "calm" in inferred.get("personality", [])
 
 
+def test_identity_cue_prefers_writeup_over_later_scene_in_reordered_excerpt():
+    """Hit-first page ordering puts writeup then a later scene; do not use last hit."""
+    # Production-like reorder: writeup page emitted before scene page, then a neighbor
+    # page with another NPC that would poison a naive 900-char forward slice.
+    excerpt = (
+        "=== PAGE 8 ===\n"
+        "Eadyan Falconmoon, a level-headed half-elf.\n"
+        "He's easy to spot and he is calm.\n\n"
+        "=== PAGE 2 ===\n"
+        "The party meets Eadyan Falconmoon near the doors.\n\n"
+        "=== PAGE 9 ===\n"
+        "Sister Mira, a stern dwarf. She guards the gate alone.\n"
+    )
+    cue = content_import._identity_cue_text(excerpt, "Eadyan Falconmoon")
+    assert "half-elf" in cue.casefold()
+    assert "Sister Mira" not in cue
+    inferred = content_import._infer_npc_identity_from_excerpt(
+        excerpt,
+        {"gender": "nonbinary", "race": "unknown", "personality": []},
+        name="Eadyan Falconmoon",
+    )
+    assert inferred["gender"] == "male"
+    assert inferred["race"] == "half-elf"
+    assert inferred.get("race") != "dwarf"
+
+
 def test_infer_npc_identity_overrides_hyphenated_nonbinary():
     excerpt = "Brother Marcus is a male monk. He greets the party with a calm manner."
     inferred = content_import._infer_npc_identity_from_excerpt(
