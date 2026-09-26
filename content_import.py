@@ -429,6 +429,7 @@ def _stamp_discovery_temporary_keys(
                 "name": str(loc.get("name") or temp_key).strip(),
                 "type": str(loc.get("type") or "other").strip() or "other",
                 "parent_temporary_key": parent_key,
+                "significance": _normalize_location_significance(loc.get("significance")),
                 "summary_hint": str(loc.get("summary_hint") or "").strip(),
                 "associated_npc_keys": _as_str_list(loc.get("associated_npc_keys")),
                 "source_refs": _as_list(loc.get("source_refs")),

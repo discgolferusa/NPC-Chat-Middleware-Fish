@@ -175,6 +175,31 @@ def test_normalize_outline_preserves_location_significance():
     assert locations[0]["significance"] == "minor"
 
 
+def test_stamp_discovery_preserves_location_significance():
+    warnings: list[str] = []
+    campaign, locations, npcs = content_import._stamp_discovery_temporary_keys(
+        {
+            "temporary_key": "campaign_001",
+            "title": "T",
+            "name": "T",
+            "genre": "sci_fi",
+        },
+        [
+            {
+                "temporary_key": "loc_raw",
+                "name": "Bridge",
+                "type": "ship",
+                "significance": "ignore",
+            }
+        ],
+        [],
+        mode="create_new",
+        existing_campaign_id=None,
+        warnings=warnings,
+    )
+    assert locations[0]["significance"] == "ignore"
+    assert locations[0]["temporary_key"] == "location_001"
+
 def test_json_schema_response_format_is_not_strict():
     fmt = content_import._json_schema_response_format(
         "discovery_response",
