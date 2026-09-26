@@ -640,10 +640,8 @@ def _stamp_discovery_temporary_keys(
             or ""
         )
         primary_key = _resolve_loc_ref(primary)
-        defaulted_primary = False
         if not primary_key and stamped_locations:
             primary_key = stamped_locations[0]["temporary_key"]
-            defaulted_primary = True
         other_keys: list[str] = []
         other_raw = npc.get("other_location_keys")
         if other_raw is None:
@@ -656,9 +654,10 @@ def _stamp_discovery_temporary_keys(
             npc.get("adventure_temporary_key") or npc.get("adventure_key") or ""
         ).strip()
         adv_key = _resolve_adventure_ref(npc_adv_raw)
-        # Prefer the primary location's adventure only when that location was
-        # explicitly resolved — not when we fell back to location_001.
-        if primary_key and not defaulted_primary:
+        # Inherit adventure from the primary location only when the NPC did not
+        # name one. Normalize may already have filled a blank primary with the
+        # first location; that must not reassign an explicit adventure_002+.
+        if primary_key and not npc_adv_raw:
             for loc in stamped_locations:
                 if loc["temporary_key"] == primary_key:
                     adv_key = str(loc.get("adventure_temporary_key") or adv_key)

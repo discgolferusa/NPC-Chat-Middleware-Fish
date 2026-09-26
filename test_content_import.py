@@ -2321,6 +2321,57 @@ def test_stamp_resolves_stamped_adventure_keys_on_entities():
     assert stamped_npcs[1]["primary_location_key"] == "location_001"
 
 
+def test_stamp_keeps_adventure_when_normalize_already_filled_primary():
+    """Normalize fills blank primary with location_001; stamp must not reassign adventure."""
+    outline = {
+        "adventures": [
+            {"title": "Sunless Citadel", "name": "Sunless Citadel"},
+            {"title": "Forge of Fury", "name": "Forge of Fury"},
+        ],
+        "locations": [
+            {
+                "name": "Kobold Den",
+                "type": "dungeon",
+                "adventure_temporary_key": "adventure_001",
+            },
+            {
+                "name": "Stone Tooth",
+                "type": "dungeon",
+                "adventure_temporary_key": "adventure_002",
+            },
+        ],
+        "npcs": [
+            {
+                "name": "Durgeddin",
+                "role": "dwarf",
+                # No primary — normalize will default to first location.
+                "adventure_temporary_key": "adventure_002",
+                "significance": "conversational",
+            },
+        ],
+    }
+    warnings: list[str] = []
+    adventures, locations, npcs = content_import._normalize_outline(
+        outline,
+        mode="create_new",
+        existing_campaign_id=None,
+        existing_location_ids=[],
+        existing_npc_names=[],
+        warnings=warnings,
+    )
+    assert npcs[0]["primary_location_key"]  # filled by normalize
+    adventures, locations, npcs = content_import._stamp_discovery_temporary_keys(
+        adventures,
+        locations,
+        npcs,
+        mode="create_new",
+        existing_campaign_id=None,
+        warnings=warnings,
+    )
+    assert npcs[0]["adventure_temporary_key"] == "adventure_002"
+    assert npcs[0]["primary_location_key"] == "location_001"
+
+
 def test_build_campaign_prompt_echoes_seed_temporary_key():
     prompt = content_import._build_campaign_prompt(
         "Some source text about Forge of Fury.",
