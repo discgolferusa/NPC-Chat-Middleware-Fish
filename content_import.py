@@ -1354,7 +1354,6 @@ _CONTENTS_DOTTED_TITLE = re.compile(
 _CHAPTER_BANNER_LINE = re.compile(
     r"(?im)^\s*CHAPTER\s+(\d+)\s*[I|:]\s*(.+?)\s*$",
 )
-_PAGE_MARKER = re.compile(r"(?m)^=== PAGE (\d+) ===\s*$")
 
 
 def _normalize_document_scope(value: str | None) -> str:
@@ -1443,9 +1442,13 @@ def _is_skipped_anthology_title(title: str) -> bool:
 
 
 def _split_pages(text: str) -> list[tuple[int, str]]:
-    """Return (page_number, page_body) for === PAGE N === extracts."""
+    """Return (page_number, page_body) for === PAGE N === extracts.
+
+    Uses the shared ``_PAGE_MARKER_RE`` so case / spacing variants match the rest
+    of import (e.g. ``=== page  9 ===``).
+    """
     pages: list[tuple[int, str]] = []
-    matches = list(_PAGE_MARKER.finditer(text or ""))
+    matches = list(_PAGE_MARKER_RE.finditer(text or ""))
     if not matches:
         return [(1, text or "")]
     for index, match in enumerate(matches):
@@ -1622,6 +1625,38 @@ def _collapse_discovery_to_single_adventure(
     return [primary], locations, npcs
 
 
+def _page_head_matches_adventure_title(title: str, page_head: str) -> bool:
+    """True when the page head clearly refers to this adventure title.
+
+    Do not match on a lone stopword like ``The`` / ``A`` — that pins every
+    untitled module to the first front-matter page.
+    """
+    needle = re.sub(r"\s+", " ", str(title or "")).strip().casefold()
+    head = page_head.casefold()
+    if not needle or not head:
+        return False
+    # Substantial prefix / full title (skip leading articles for the prefix).
+    stripped = re.sub(r"^(the|a|an)\s+", "", needle).strip()
+    for candidate in (needle, stripped):
+        if len(candidate) >= 8 and candidate[: min(28, len(candidate))] in head:
+            return True
+        if len(candidate) >= 4 and candidate in head:
+            return True
+    words = [
+        w
+        for w in re.findall(r"[a-z0-9']+", stripped or needle)
+        if w not in _EXCERPT_STOPWORDS and len(w) >= 4
+    ]
+    if not words:
+        return False
+    # One distinctive token (Sunless, Forge, Tamoachan) or two shorter tokens.
+    if len(words[0]) >= 6 and words[0] in head:
+        return True
+    if len(words) >= 2 and words[0] in head and words[1] in head:
+        return True
+    return False
+
+
 def _page_excerpt_for_adventure(
     pages: list[tuple[int, str]],
     adventure: dict[str, Any],
@@ -1645,23 +1680,23 @@ def _page_excerpt_for_adventure(
                 body = "\n".join(chunks)
                 break
     if not body and title:
-        needle = title.casefold()
         for page_no, page_body in pages:
             head = "\n".join(page_body.splitlines()[:8])
-            if needle[:18] in head.casefold() or title.split()[0].casefold() in head.casefold():
-                chunks = []
-                for later_no, later_body in pages:
-                    if later_no < page_no:
-                        continue
-                    if later_no > page_no + 4:
-                        break
-                    chunks.append(f"=== PAGE {later_no} ===\n{later_body.strip()}")
-                body = "\n".join(chunks)
-                adventure.setdefault("start_page", page_no)
-                break
+            if not _page_head_matches_adventure_title(title, head):
+                continue
+            chunks = []
+            for later_no, later_body in pages:
+                if later_no < page_no:
+                    continue
+                if later_no > page_no + 4:
+                    break
+                chunks.append(f"=== PAGE {later_no} ===\n{later_body.strip()}")
+            body = "\n".join(chunks)
+            adventure.setdefault("start_page", page_no)
+            break
     if not body:
         return ""
-    return body[:max_chars].strip()
+    return body[: max(0, max_chars)].strip()
 
 
 def _build_anthology_outline_document(
@@ -1686,25 +1721,39 @@ def _build_anthology_outline_document(
 
     pages = _split_pages(text)
     # Reserve budget for inventory + small shared front matter (credits/TOC).
-    front = ""
     contents_match = re.search(r"(?im)^\s*CONTENTS\s*$", text)
     if contents_match:
         front = text[contents_match.start() : contents_match.start() + 3500]
     else:
         front = text[:2500]
 
-    remaining = max_chars - len(inventory) - len(front) - 80
-    per_adventure = max(2500, remaining // max(len(adventures), 1))
+    overhead = len(inventory) + len(front) + 80
+    remaining = max(0, max_chars - overhead)
+    n_adv = max(len(adventures), 1)
+    # Fair share only — never floor above remaining/N (that starved later modules).
+    per_adventure = max(400, remaining // n_adv) if remaining else 0
     sections = [inventory, "", "--- TABLE OF CONTENTS / FRONT MATTER ---", front.strip(), ""]
+    used = len("\n".join(sections))
     for adv in adventures:
-        excerpt = _page_excerpt_for_adventure(pages, adv, max_chars=per_adventure)
         title = adv.get("title") or adv.get("name") or "Adventure"
-        sections.append(f"--- ADVENTURE MODULE: {title} ---")
+        header = f"--- ADVENTURE MODULE: {title} ---"
+        left = max_chars - used - len(header) - 2
+        if left < 120 or per_adventure <= 0:
+            sections.append(header)
+            sections.append(f"(Budget exhausted for excerpt; still emit this adventure.)")
+            sections.append("")
+            used = len("\n".join(sections))
+            continue
+        excerpt_budget = min(per_adventure, left)
+        excerpt = _page_excerpt_for_adventure(pages, adv, max_chars=excerpt_budget)
+        sections.append(header)
         sections.append(excerpt or f"(No page excerpt found for {title}; still emit this adventure.)")
         sections.append("")
+        used = len("\n".join(sections))
 
     combined = "\n".join(sections).strip()
     if len(combined) > max_chars:
+        # Prefer keeping inventory + as many full module sections as fit.
         combined = combined[:max_chars]
     warnings.append(
         f"Anthology TOC detected ({len(adventures)} adventures); outline text samples "

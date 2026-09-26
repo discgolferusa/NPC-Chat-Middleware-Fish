@@ -2532,3 +2532,60 @@ def test_outline_legacy_campaign_wrap_returns_adventures(monkeypatch):
     assert result["adventures"][0]["temporary_key"] == "adventure_001"
     assert result["campaign"]["temporary_key"] == "adventure_001"
     assert result["locations"][0]["adventure_temporary_key"] == "adventure_001"
+
+
+def test_page_head_match_ignores_leading_article_alone():
+    """'The' must not pin every adventure to the first page that says 'The …'."""
+    front = "The Forgotten Realms\nWelcome adventurers."
+    assert not content_import._page_head_matches_adventure_title("The Forge of Fury", front)
+    assert content_import._page_head_matches_adventure_title(
+        "The Forge of Fury",
+        "CHAPTER 2 I THE FORGE OF FURY\nIntro",
+    )
+
+
+def test_page_excerpt_does_not_use_the_as_title_hit():
+    pages = [
+        (1, "The Tales of Yawning Portal\nCredits and intro."),
+        (33, "CHAPTER 2 I THE FORGE OF FURY\nDwarven stronghold."),
+    ]
+    adv = {"title": "The Forge of Fury", "name": "The Forge of Fury"}
+    excerpt = content_import._page_excerpt_for_adventure(pages, adv, max_chars=2000)
+    assert "FORGE OF FURY" in excerpt
+    assert adv.get("start_page") == 33
+    assert "Credits and intro" not in excerpt
+
+
+def test_split_pages_accepts_case_and_spacing_variants():
+    text = "=== page  9 ===\nSunless\n=== PAGE 33 ===\nForge\n"
+    pages = content_import._split_pages(text)
+    assert [p for p, _ in pages] == [9, 33]
+    assert "Sunless" in pages[0][1]
+    assert "Forge" in pages[1][1]
+
+
+def test_anthology_outline_budget_keeps_later_modules():
+    """Tight max_chars must still mention every adventure, not only the first."""
+    text = (
+        "CONTENTS\n"
+        "Ch. 1: Alpha ................ 1\n"
+        "Ch. 2: Beta ................ 2\n"
+        "Ch. 3: Gamma ................ 3\n"
+        "=== PAGE 1 ===\nCHAPTER 1 I ALPHA\n" + ("alpha body " * 400) + "\n"
+        "=== PAGE 2 ===\nCHAPTER 2 I BETA\n" + ("beta body " * 400) + "\n"
+        "=== PAGE 3 ===\nCHAPTER 3 I GAMMA\n" + ("gamma body " * 400) + "\n"
+    )
+    adventures = [
+        {"title": "Alpha", "name": "Alpha", "start_page": 1},
+        {"title": "Beta", "name": "Beta", "start_page": 2},
+        {"title": "Gamma", "name": "Gamma", "start_page": 3},
+    ]
+    warnings: list[str] = []
+    out = content_import._build_anthology_outline_document(
+        text, adventures, max_chars=5000, warnings=warnings
+    )
+    assert "ADVENTURE MODULE: Alpha" in out
+    assert "ADVENTURE MODULE: Beta" in out
+    assert "ADVENTURE MODULE: Gamma" in out
+    # Fair share: later modules must not be truncated away entirely.
+    assert out.index("ADVENTURE MODULE: Alpha") < out.index("ADVENTURE MODULE: Gamma")
