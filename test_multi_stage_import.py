@@ -26,12 +26,15 @@ def test_import_stage_to_purpose_mapping():
 def test_generate_campaign_info_uses_campaign_purpose(monkeypatch):
     seen = {}
 
-    def fake_call(system, user, *, warnings, step, usage_acc=None, response_schema=None, schema_name=None, max_schema_retries=None):
+    def fake_call(system, user, *, warnings, step, usage_acc=None, response_schema=None, schema_name=None, max_schema_retries=None, debug_out=None):
         seen["step"] = step
         seen["schema_name"] = schema_name
         from llm_router import import_stage_to_purpose as map_purpose
 
         seen["purpose"] = map_purpose(step)
+        if debug_out is not None:
+            debug_out.clear()
+            debug_out.update({"step": step, "system_prompt": system, "user_prompt": user})
         if usage_acc is not None:
             usage_acc["prompt_tokens"] = 10
             usage_acc["completion_tokens"] = 5
@@ -224,3 +227,34 @@ def test_import_purpose_override_resolves_via_content_creation_eligibility(monke
     mid = llm_router._get_purpose_model_id(llm_router.PURPOSE_CONTENT_REPAIR)
     assert mid == "openrouter-gpt-oss-20b"
     assert mid != "local"
+def test_discovery_includes_debug_prompts(monkeypatch):
+    def fake_call(system, user, *, warnings, step, usage_acc=None, response_schema=None, schema_name=None, max_schema_retries=None, debug_out=None):
+        if debug_out is not None:
+            debug_out.clear()
+            debug_out.update(
+                {
+                    "step": step,
+                    "system_prompt": system,
+                    "user_prompt": user,
+                    "raw_response": '{"campaign":{"title":"X","name":"X"},"locations":[],"npcs":[]}',
+                    "llm_called": True,
+                }
+            )
+        if usage_acc is not None:
+            usage_acc["prompt_tokens"] = 3
+        return {"campaign": {"title": "X", "name": "X", "genre": "sci_fi"}, "locations": [], "npcs": []}
+
+    monkeypatch.setattr(content_import, "_call_llm_json", fake_call)
+    monkeypatch.setattr(content_import, "content_creation_max_input_chars", lambda: 200_000)
+    monkeypatch.setattr(content_import, "_document_has_recoverable_stat_blocks", lambda _t: False)
+    monkeypatch.setattr(content_import, "_document_has_recoverable_location_sites", lambda _t: False)
+
+    result = content_import.discover_campaign_document(
+        "=== PAGE 1 ===\nA long enough dune adventure document for discovery testing purposes here.\n",
+        "create_new",
+    )
+    assert "debug" in result
+    assert "system_prompt" in result["debug"]
+    assert "user_prompt" in result["debug"]
+    assert "raw_response" in result["debug"]
+    assert result["debug"]["final_location_count"] == 0

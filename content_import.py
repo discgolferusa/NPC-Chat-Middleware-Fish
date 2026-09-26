@@ -4888,6 +4888,7 @@ def _call_llm_json(
     response_schema: dict[str, Any] | None = None,
     schema_name: str | None = None,
     max_schema_retries: int | None = None,
+    debug_out: dict[str, Any] | None = None,
 ) -> Any:
     from llm_router import (
         IMPORT_MAX_SCHEMA_RETRIES,
@@ -4906,6 +4907,8 @@ def _call_llm_json(
 
     retries = IMPORT_MAX_SCHEMA_RETRIES if max_schema_retries is None else max(0, int(max_schema_retries))
     last_error: Exception | None = None
+    last_raw = ""
+    last_usage: dict[str, Any] = {}
     for attempt in range(retries + 1):
         raw, usage = generate_llm_response_with_usage(
             messages,
@@ -4914,8 +4917,32 @@ def _call_llm_json(
             temperature=IMPORT_TEMPERATURE,
             response_format=response_format if attempt == 0 else None,
         )
+        last_raw = raw if isinstance(raw, str) else str(raw or "")
+        last_usage = usage if isinstance(usage, dict) else {}
         if usage_acc is not None:
             _merge_usage(usage_acc, usage)
+        if debug_out is not None:
+            debug_out.clear()
+            debug_out.update(
+                {
+                    "step": step,
+                    "purpose": purpose,
+                    "attempt": attempt + 1,
+                    "attempts_allowed": retries + 1,
+                    "schema_name": schema_name,
+                    "used_response_format": bool(response_format) and attempt == 0,
+                    "system_prompt": system_prompt,
+                    "user_prompt": user_prompt,
+                    "raw_response": last_raw,
+                    "model_id": last_usage.get("model_id"),
+                    "usage": {
+                        "prompt_tokens": last_usage.get("prompt_tokens"),
+                        "completion_tokens": last_usage.get("completion_tokens"),
+                        "estimated_cost_usd": last_usage.get("estimated_cost_usd"),
+                        "model_id": last_usage.get("model_id"),
+                    },
+                }
+            )
         try:
             return extract_json(raw)
         except ContentImportError as ex:
@@ -5765,6 +5792,11 @@ def outline_campaign_document(
         and len(_extract_alien_location_site_stubs(bounded_text)) >= 2
     )
     document_for_deterministic_merge = bounded_text
+    discovery_debug: dict[str, Any] = {
+        "step": "discovery",
+        "llm_called": False,
+        "fast_path": None,
+    }
     if use_stat_block_fast_path or use_location_site_fast_path:
         full_document_text = bounded_text
     else:
@@ -5781,12 +5813,16 @@ def outline_campaign_document(
             "and seeding NPC stubs from FULL NAME blocks (detail sweep still runs)."
         )
         outline_raw = {"campaign": {}, "locations": [], "npcs": []}
+        discovery_debug["fast_path"] = "stat_blocks"
+        discovery_debug["note"] = "LLM discovery skipped; deterministic FULL NAME seeding."
     elif use_location_site_fast_path:
         warnings.append(
             "Alien moonside / locations chapter detected; skipping LLM outline "
             "and seeding major location site stubs (detail sweep still runs)."
         )
         outline_raw = {"campaign": {}, "locations": [], "npcs": []}
+        discovery_debug["fast_path"] = "location_sites"
+        discovery_debug["note"] = "LLM discovery skipped; deterministic location site seeding."
     else:
         outline_source = _prepare_outline_document_text(full_document_text, warnings)
         outline_prompt = _build_outline_prompt(
@@ -5801,14 +5837,20 @@ def outline_campaign_document(
                 usage_acc=usage,
                 response_schema=DISCOVERY_RESPONSE_SCHEMA,
                 schema_name="discovery_response",
+                debug_out=discovery_debug,
             )
+            discovery_debug["llm_called"] = True
         except Exception as ex:
+            discovery_debug["llm_called"] = True
+            discovery_debug["error"] = str(ex)
             if isinstance(ex, LLMProviderError):
                 raise ContentImportError(str(ex)) from ex
             raise ContentImportError(f"Outline pass failed: {ex}") from ex
 
         if not isinstance(outline_raw, dict):
             raise ContentImportError("Outline pass did not return a JSON object")
+        discovery_debug["parsed_location_count"] = len(outline_raw.get("locations") or []) if isinstance(outline_raw.get("locations"), list) else 0
+        discovery_debug["parsed_npc_count"] = len(outline_raw.get("npcs") or []) if isinstance(outline_raw.get("npcs"), list) else 0
 
     campaign, location_stubs, npc_stubs = _normalize_outline(
         outline_raw,
@@ -5898,6 +5940,14 @@ def outline_campaign_document(
     relationships = list(outline_raw.get("relationships") or []) if isinstance(outline_raw, dict) else []
     events = list(outline_raw.get("events") or []) if isinstance(outline_raw, dict) else []
 
+    discovery_debug["final_location_count"] = len(location_stubs)
+    discovery_debug["final_npc_count"] = len(npc_stubs)
+    if not location_stubs and not npc_stubs:
+        warnings.append(
+            "Discovery produced zero locations and zero NPCs after normalization/stamping. "
+            "Inspect response.debug (system_prompt / user_prompt / raw_response) to diagnose."
+        )
+
     return {
         "campaign": campaign,
         "locations": location_stubs,
@@ -5906,6 +5956,7 @@ def outline_campaign_document(
         "events": events if isinstance(events, list) else [],
         "warnings": warnings,
         "usage": usage,
+        "debug": discovery_debug,
     }
 
 
@@ -6322,6 +6373,7 @@ def generate_campaign_info(
         seed,
         source_index_summary=source_index_summary or "",
     )
+    campaign_debug: dict[str, Any] = {"step": "campaign", "llm_called": False}
     try:
         raw = _call_llm_json(
             _SYSTEM_PROMPT,
@@ -6331,8 +6383,12 @@ def generate_campaign_info(
             usage_acc=usage,
             response_schema=CAMPAIGN_INFO_RESPONSE_SCHEMA,
             schema_name="campaign_info_response",
+            debug_out=campaign_debug,
         )
+        campaign_debug["llm_called"] = True
     except Exception as ex:
+        campaign_debug["llm_called"] = True
+        campaign_debug["error"] = str(ex)
         if isinstance(ex, LLMProviderError):
             raise ContentImportError(str(ex)) from ex
         raise ContentImportError(f"Campaign info pass failed: {ex}") from ex
@@ -6347,7 +6403,7 @@ def generate_campaign_info(
             info[key] = raw[key]
     extra_warnings = _as_str_list(raw.get("warnings"))
     warnings.extend(extra_warnings)
-    return {"campaign": info, "warnings": warnings, "usage": usage}
+    return {"campaign": info, "warnings": warnings, "usage": usage, "debug": campaign_debug}
 
 
 def _build_repair_prompt(
