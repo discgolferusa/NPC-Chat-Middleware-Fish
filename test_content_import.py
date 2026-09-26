@@ -523,19 +523,19 @@ def test_chariot_pdfpig_analyze_imports_all_npcs(monkeypatch):
 
     def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step, usage_acc=None, **kwargs):
         calls.append(step)
-        if step == "outline":
+        if step in ("outline", "discovery"):
             raise AssertionError("stat-block fast path should not call the outline LLM")
-        if step == "location detail":
+        if step == "location_details":
             return {"locations": []}
-        if step == "npc detail":
+        if step == "npc_details":
             return {"npcs": []}
         return {}
 
     monkeypatch.setattr(content_import, "_call_llm_json", fake_call_llm_json)
     result = content_import.analyze_campaign_document(text, "create_new")
-    assert "outline" not in calls
-    assert "location detail" in calls
-    assert "npc detail" in calls
+    assert "outline" not in calls and "discovery" not in calls
+    assert "location_details" in calls
+    assert "npc_details" in calls
     names = {npc["name"] for npc in result["npcs"]}
     for expected in CHARIOT_EXPECTED_NPCS:
         assert expected in names
@@ -600,11 +600,11 @@ def test_chariot_pdf_extract_recovers_from_empty_llm_outline(monkeypatch):
 
     def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step, usage_acc=None, **kwargs):
         calls.append(step)
-        if step == "outline":
+        if step in ("outline", "discovery"):
             raise AssertionError("stat-block fast path should not call the outline LLM")
-        if step == "location detail":
+        if step == "location_details":
             return {"locations": []}
-        if step == "npc detail":
+        if step == "npc_details":
             # Sparse on purpose so PERSONALITY / AGENDA seed fallback still applies.
             return {"npcs": []}
         return {}
@@ -612,9 +612,9 @@ def test_chariot_pdf_extract_recovers_from_empty_llm_outline(monkeypatch):
     monkeypatch.setattr(content_import, "_call_llm_json", fake_call_llm_json)
 
     result = content_import.analyze_campaign_document(text, "create_new")
-    assert "outline" not in calls
-    assert "location detail" in calls
-    assert "npc detail" in calls
+    assert "outline" not in calls and "discovery" not in calls
+    assert "location_details" in calls
+    assert "npc_details" in calls
     assert "chariot" in str(result["campaign"].get("name") or "").casefold() or "gods" in str(
         result["campaign"].get("name") or ""
     ).casefold()
@@ -644,18 +644,18 @@ def test_outline_failure_recovers_from_stat_blocks(monkeypatch):
 
     def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step, usage_acc=None, **kwargs):
         calls.append(step)
-        if step == "outline":
+        if step in ("outline", "discovery"):
             raise RuntimeError("should not be called on stat-block fast path")
-        if step == "location detail":
+        if step == "location_details":
             return {"locations": []}
-        if step == "npc detail":
+        if step == "npc_details":
             return {"npcs": []}
         return {}
 
     monkeypatch.setattr(content_import, "_call_llm_json", fake_call_llm_json)
     result = content_import.analyze_campaign_document(text, "create_new")
-    assert "outline" not in calls
-    assert "npc detail" in calls
+    assert "outline" not in calls and "discovery" not in calls
+    assert "npc_details" in calls
     names = {npc["name"] for npc in result["npcs"]}
     assert "Albert Johns" in names
     assert "Ava 6" in names
@@ -666,9 +666,9 @@ def test_stat_block_fast_path_uses_llm_npc_detail_when_rich(monkeypatch):
     text = _load_chariot_pdf_extract_fixture()
 
     def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step, usage_acc=None, **kwargs):
-        if step == "outline":
+        if step in ("outline", "discovery"):
             raise AssertionError("outline must be skipped")
-        if step == "location detail":
+        if step == "location_details":
             return {
                 "locations": [
                     {
@@ -678,7 +678,7 @@ def test_stat_block_fast_path_uses_llm_npc_detail_when_rich(monkeypatch):
                     }
                 ]
             }
-        if step == "npc detail":
+        if step == "npc_details":
             return {
                 "npcs": [
                     {
@@ -802,11 +802,11 @@ def test_chariot_regression_replaces_movie_quote_outline_npcs(monkeypatch):
     }
 
     def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step, usage_acc=None, **kwargs):
-        if step == "outline":
+        if step in ("outline", "discovery"):
             return bad_outline
-        if step == "location detail":
+        if step == "location_details":
             return {"locations": []}
-        if step == "npc detail":
+        if step == "npc_details":
             return {"npcs": []}
         return {}
 
@@ -892,11 +892,11 @@ Owns the tavern.
     }
 
     def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step, usage_acc=None, **kwargs):
-        if step == "outline":
+        if step in ("outline", "discovery"):
             return outline
-        if step == "location detail":
+        if step == "location_details":
             return {"locations": []}
-        if step == "npc detail":
+        if step == "npc_details":
             return {"npcs": []}
         return {}
 
@@ -925,11 +925,11 @@ def test_merge_mode_skips_existing_npcs_from_stat_blocks(monkeypatch):
     }
 
     def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step, usage_acc=None, **kwargs):
-        if step == "outline":
+        if step in ("outline", "discovery"):
             return outline
-        if step == "location detail":
+        if step == "location_details":
             return {"locations": []}
-        if step == "npc detail":
+        if step == "npc_details":
             return {"npcs": []}
         return {}
 
@@ -962,11 +962,11 @@ def test_location_hints_resolve_existing_campaign_locations(monkeypatch):
     }
 
     def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step, usage_acc=None, **kwargs):
-        if step == "outline":
+        if step in ("outline", "discovery"):
             return outline
-        if step == "location detail":
+        if step == "location_details":
             return {"locations": []}
-        if step == "npc detail":
+        if step == "npc_details":
             return {"npcs": []}
         return {}
 
@@ -990,18 +990,18 @@ def test_chunked_outline_then_detail_batches(monkeypatch):
 
     def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step, usage_acc=None, **kwargs):
         steps.append(step)
-        if step == "outline":
+        if step in ("outline", "discovery"):
             raise AssertionError("stat-block outline must be skipped")
-        if step == "location detail":
+        if step == "location_details":
             return {"locations": []}
-        if step == "npc detail":
+        if step == "npc_details":
             return {"npcs": []}
         return {}
 
     monkeypatch.setattr(content_import, "_call_llm_json", fake_call_llm_json)
 
     outline = content_import.outline_campaign_document(text, "create_new")
-    assert "outline" not in steps
+    assert "outline" not in steps and "discovery" not in steps
     assert outline["npcs"]
     assert outline["locations"] or any(
         npc.get("first_location_id") for npc in outline["npcs"]
@@ -1020,14 +1020,14 @@ def test_chunked_outline_then_detail_batches(monkeypatch):
     ]
     loc_result = content_import.detail_location_batch(text, campaign, loc_batch)
     assert loc_result["locations"]
-    assert "location detail" in steps
+    assert "location_details" in steps
 
     johns = next(npc for npc in outline["npcs"] if npc["name"] == "Albert Johns")
     # First hop is LLM-only (editor may retry separately when sparse).
     sparse = content_import.detail_npc_batch(text, campaign, [johns])
     assert sparse["npcs"][0]["name"] == "Albert Johns"
     assert content_import._npc_detail_is_sparse(sparse["npcs"][0])
-    assert "npc detail" in steps
+    assert "npc_details" in steps
 
     # Last Funnel hop may request excerpt/stat seed fallback after retries.
     npc_result = content_import.detail_npc_batch(
@@ -1063,7 +1063,7 @@ def test_detail_location_batch_does_not_sparse_retry(monkeypatch):
         {"campaign_id": "c", "name": "C"},
         [{"id": "uscss_cronus", "name": "USCSS Cronus", "type": "building", "seeded_from_stat_blocks": True}],
     )
-    assert calls == ["location detail"]
+    assert calls == ["location_details"]
     assert content_import._location_detail_is_sparse(sparse["locations"][0])
 
     result = content_import.detail_location_batch(

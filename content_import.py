@@ -4767,6 +4767,100 @@ def _index_details_by_stub_id(
     return details_by_id
 
 
+_IMPORT_SHARED_RULES = (
+    "Shared rules for every import stage:\n"
+    "- Never invent permanent campaign_id, location id, or npc_id values.\n"
+    "- Use temporary_key handles only (campaign_001, location_NNN, npc_NNN).\n"
+    "- Prefer explicit source facts; mark uncertain material in warnings/ambiguities.\n"
+    "- Do not invent major plot events or revelations absent from the source.\n"
+    "- Respond with ONLY the JSON value — no markdown fences, no commentary.\n"
+)
+
+_SYSTEM_PROMPT = (
+    "You are a tabletop RPG campaign content structuring assistant for NPCNarrator. "
+    "You convert campaign documents into strict JSON matching the requested schema. "
+    "Prefer extracting and preserving concrete facts, wording, goals, secrets, and "
+    "voice notes from the source text over inventing new content.\n"
+    + _IMPORT_SHARED_RULES
+)
+
+
+def _json_schema_response_format(name: str, schema: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": name,
+            "strict": True,
+            "schema": schema,
+        },
+    }
+
+
+# Minimal JSON Schemas for OpenRouter structured output (optional; prompt remains authoritative).
+DISCOVERY_RESPONSE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": True,
+    "properties": {
+        "campaign": {"type": "object"},
+        "locations": {"type": "array"},
+        "npcs": {"type": "array"},
+        "relationships": {"type": "array"},
+        "factions": {"type": "array"},
+        "events": {"type": "array"},
+        "warnings": {"type": "array"},
+        "ambiguities": {"type": "array"},
+    },
+    "required": ["campaign", "locations", "npcs"],
+}
+
+CAMPAIGN_INFO_RESPONSE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": True,
+    "properties": {
+        "temporary_key": {"type": "string"},
+        "title": {"type": "string"},
+        "name": {"type": "string"},
+        "description": {"type": "string"},
+        "genre": {"type": "string"},
+        "rpg_system": {"type": "string"},
+        "premise": {"type": "string"},
+        "tone": {"type": "string"},
+        "themes": {"type": "array"},
+        "factions": {"type": "array"},
+        "starting_situation": {"type": "string"},
+        "warnings": {"type": "array"},
+    },
+    "required": ["title", "name"],
+}
+
+LOCATION_BATCH_RESPONSE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": True,
+    "properties": {"locations": {"type": "array"}},
+    "required": ["locations"],
+}
+
+NPC_BATCH_RESPONSE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": True,
+    "properties": {"npcs": {"type": "array"}},
+    "required": ["npcs"],
+}
+
+REPAIR_RESPONSE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": True,
+    "properties": {
+        "action": {"type": "string"},
+        "patches": {"type": "array"},
+        "rationale": {"type": "string"},
+        "source_refs": {"type": "array"},
+        "warnings": {"type": "array"},
+    },
+    "required": ["action"],
+}
+
+
 def _call_llm_json(
     system_prompt: str,
     user_prompt: str,
@@ -4774,33 +4868,51 @@ def _call_llm_json(
     warnings: list[str],
     step: str,
     usage_acc: dict[str, Any] | None = None,
+    response_schema: dict[str, Any] | None = None,
+    schema_name: str | None = None,
+    max_schema_retries: int | None = None,
 ) -> Any:
+    from llm_router import (
+        IMPORT_MAX_SCHEMA_RETRIES,
+        import_stage_to_purpose,
+        generate_llm_response_with_usage,
+    )
+
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
-    raw, usage = generate_llm_response_with_usage(
-        messages,
-        purpose="content_creation",
-        max_tokens=OUTLINE_MAX_TOKENS if step == "outline" else IMPORT_MAX_TOKENS,
-        temperature=IMPORT_TEMPERATURE,
-    )
-    if usage_acc is not None:
-        _merge_usage(usage_acc, usage)
-    try:
-        return extract_json(raw)
-    except ContentImportError as ex:
-        warnings.append(f"{step}: {ex}")
-        raise
+    purpose = import_stage_to_purpose(step)
+    response_format = None
+    if response_schema and schema_name:
+        response_format = _json_schema_response_format(schema_name, response_schema)
+
+    retries = IMPORT_MAX_SCHEMA_RETRIES if max_schema_retries is None else max(0, int(max_schema_retries))
+    last_error: Exception | None = None
+    for attempt in range(retries + 1):
+        raw, usage = generate_llm_response_with_usage(
+            messages,
+            purpose=purpose,
+            max_tokens=OUTLINE_MAX_TOKENS if step in ("outline", "discovery", "discover") else IMPORT_MAX_TOKENS,
+            temperature=IMPORT_TEMPERATURE,
+            response_format=response_format if attempt == 0 else None,
+        )
+        if usage_acc is not None:
+            _merge_usage(usage_acc, usage)
+        try:
+            return extract_json(raw)
+        except ContentImportError as ex:
+            last_error = ex
+            warnings.append(f"{step}: schema/parse retry {attempt + 1}: {ex}")
+            continue
+
+    assert last_error is not None
+    warnings.append(f"{step}: {last_error}")
+    raise last_error
 
 
-_SYSTEM_PROMPT = (
-    "You are a tabletop RPG campaign content structuring assistant for NPCNarrator. "
-    "You convert campaign documents into strict JSON matching the requested schema. "
-    "Prefer extracting and preserving concrete facts, wording, goals, secrets, and "
-    "voice notes from the source text over inventing new content. "
-    "Respond with ONLY the JSON value — no markdown code fences, no commentary."
-)
+# Keep legacy name used by older comments/tests.
+_SYSTEM_PROMPT_LEGACY_ANCHOR = True
 
 
 # --------------------------------------------------------------------------
@@ -4815,11 +4927,12 @@ def _build_outline_prompt(
     existing_location_ids: list[str],
     existing_npc_names: list[str],
 ) -> str:
+    """Slim discovery prompt: entity inventory only (campaign prose is a later hop)."""
     if mode == "merge" and existing_campaign_id:
         mode_guidance = (
-            f"This document is being merged into the EXISTING campaign \"{existing_campaign_id}\". "
+            f'This document is being merged into the EXISTING campaign "{existing_campaign_id}". '
             "Do NOT invent a new permanent campaign id. Discovery still uses temporary_key values "
-            f"for new entities; the application will stamp campaign_id=\"{existing_campaign_id}\" "
+            f'for new entities; the application will stamp campaign_id="{existing_campaign_id}" '
             "onto the campaign object.\n"
         )
         if existing_location_ids:
@@ -4838,28 +4951,30 @@ def _build_outline_prompt(
     else:
         mode_guidance = (
             "This is a brand new campaign. Do NOT invent a permanent campaign_id, location id, "
-            "or npc id. Use temporary_key values only (campaign_001, location_001, npc_001, …). "
-            "Provide campaign title/name/description/genre/rpg_system from the document.\n"
+            "or npc id. Use temporary_key values only (campaign_001, location_001, npc_001, …).\n"
         )
 
     return (
-        "Read the campaign document text below and produce a discovery outline as JSON with "
-        "exactly this shape:\n\n"
+        "Read the campaign document and produce a SLIM discovery inventory as JSON.\n"
+        "Do NOT write full campaign description, premise, tone, themes, or location/NPC prose — "
+        "only stubs for later stages.\n\n"
+        "Exact shape:\n\n"
         "{\n"
         '  "campaign": {\n'
         '    "temporary_key": "campaign_001",\n'
-        '    "title": "Display Title",\n'
-        '    "name": "Display Name",\n'
-        '    "description": "1-3 sentence summary",\n'
+        '    "title": "Module / display title",\n'
+        '    "name": "Short display name",\n'
         '    "genre": "fantasy|sci_fi|modern|horror|other",\n'
-        '    "rpg_system": "e.g. D&D 5e, Call of Cthulhu, Alien RPG"\n'
+        '    "rpg_system": "e.g. D&D 5e, Call of Cthulhu, Alien RPG",\n'
+        '    "publisher": ""\n'
         "  },\n"
         '  "locations": [{\n'
         '    "temporary_key": "location_001",\n'
         '    "name": "Display Name",\n'
         '    "type": "city|town|dungeon|forest|building|ship|region|other",\n'
         '    "parent_temporary_key": null,\n'
-        '    "summary_hint": "",\n'
+        '    "significance": "major|minor|ignore",\n'
+        '    "summary_hint": "one short phrase only",\n'
         '    "associated_npc_keys": [],\n'
         '    "source_refs": []\n'
         "  }],\n"
@@ -4871,53 +4986,49 @@ def _build_outline_prompt(
         '    "other_location_keys": [],\n'
         '    "significance": "conversational|secondary|ignore",\n'
         '    "source_refs": []\n'
-        "  }]\n"
+        "  }],\n"
+        '  "relationships": [],\n'
+        '  "factions": [],\n'
+        '  "events": [],\n'
+        '  "warnings": [],\n'
+        '  "ambiguities": []\n'
         "}\n\n"
         "Rules:\n"
-        "- temporary_key values are opaque handles (campaign_001 / location_001 / npc_001). "
-        "The application may renumber them; prefer unique keys within this response.\n"
+        "- temporary_key values are opaque handles. Prefer unique keys within this response.\n"
         "- Do NOT invent permanent NPCNarrator campaign_id / location id / npc id values.\n"
+        "- Keep campaign fields minimal (title/name/genre/rpg_system only). No long description.\n"
         "- Every primary_location_key / other_location_keys entry MUST reference a location "
         "temporary_key from the locations list.\n"
         "- parent_temporary_key: set for sublocations that nest under another location "
         "(major sites have null). Prefer major sites as top-level locations.\n"
-        "- significance: conversational (talkative named cast), secondary (named but minor), "
+        "- significance (locations): major (playable sites), minor, ignore (throwaway).\n"
+        "- significance (NPCs): conversational (talkative named cast), secondary (named but minor), "
         "ignore (generic enemies/monsters/mooks). Prefer ignore for unnamed enemy groups.\n"
         "- If the document has a NON-PLAYER CHARACTERS (or NPCs / Supporting Cast) section, "
         "that section is the authoritative NPC list. List every stat-block NPC there and do "
         "NOT list names only mentioned in intro text, movie quotes, sidebars, or player "
         "(PC) material.\n"
-        "- Character callout boxes are also authoritative NPCs even mid-scene: a short name "
-        "header followed by attributes (Awareness/Presence/...), Skills, TRAITS "
-        "(Trait: description), Tech Level / Story Points, and a prose biography that is more "
-        "than physical appearance. List each such callout NPC.\n"
-        "- Do NOT list credits / staff / acknowledgements (Writing, Editing, Cover, Art "
-        "Director, etc.), table-of-contents page references, publisher names, or trademark "
-        "boilerplate as NPCs.\n"
-        "- Do NOT list player characters, the PC party, or the PC ship crew as NPCs.\n"
+        "- Character callout boxes are also authoritative NPCs even mid-scene.\n"
+        "- Do NOT list credits / staff / acknowledgements, TOC page references, publisher "
+        "boilerplate, player characters, or the PC party as NPCs.\n"
         "- Prefer named supporting characters with dialogue, motives, or callout boxes over "
-        "generic monsters/enemies unless the text clearly presents them as individual "
-        "named characters with personality.\n"
-        "- Published RPG stat blocks (e.g. lines like 'JOHNS, OFFICER' with FULL NAME, "
-        "PERSONALITY, PERSONAL AGENDA) are always NPCs when inside the NPC section.\n"
-        "- Include every named location and every named NPC from the authoritative NPC section "
-        "or character callout boxes; minor NPCs in those places still count.\n"
+        "generic monsters/enemies unless clearly individual named characters.\n"
         "- If the document centers on a ship or vessel, list the ship as one location "
-        "(type ship) and put individual decks/rooms in later important_locations detail — "
-        "do not create a separate top-level location for every room.\n"
-        "- other_location_keys should only be non-empty for NPCs who travel or appear in more "
-        "than one place in the text.\n"
-        "- Set campaign.genre from the document's tone (fantasy, sci_fi, modern, horror, or "
-        "other). Set campaign.rpg_system to the named ruleset when stated (e.g. D&D 5e, "
-        "Call of Cthulhu, Alien RPG); otherwise leave rpg_system as an empty string.\n"
+        "(type ship); put decks/rooms in later detail.\n"
+        "- other_location_keys only for NPCs who appear in more than one place.\n"
+        "- Set campaign.genre from tone; rpg_system when stated else empty string.\n"
+        "- relationships/factions/events: light stubs only when clearly present; otherwise [].\n"
+        "- ambiguities: optional {code, entity_keys, evidence_refs, severity} when unsure.\n"
         f"{mode_guidance}"
-        "- Output ONLY the JSON object described above. No prose, no markdown fences.\n\n"
+        "- Output ONLY the JSON object. No prose, no markdown fences.\n\n"
         "Campaign document text:\n"
         '"""\n'
         f"{text}\n"
-        '"""'
+        '"""\n'
     )
 
+
+_build_discovery_prompt = _build_outline_prompt
 
 def _normalize_outline(
     outline: dict[str, Any],
@@ -5218,6 +5329,12 @@ def _build_location_detail_prompt(
         '  "local_tone": ["mood/atmosphere descriptors from the source"],\n'
         '  "knowledge_rules": ["rules about what NPCs here generally do or do not know"]\n'
         "}\n\n"
+        "KNOWLEDGE RULES:\n"
+        "- public_facts: only what outsiders can observe or commonly know.\n"
+        "- known_facts: only what THIS NPC knows from their role and location.\n"
+        "- secrets: only what THIS NPC conceals; do not dump module-wide GM plot.\n"
+        "- Do not give the NPC automatic GM omniscience or spoilers from distant pages.\n"
+        "- Mark uncertain enrichment in llm_rules as inferred, not as hard fact.\n\n"
         "CRITICAL EXTRACTION RULES:\n"
         "- Echo the exact temporary_key from the list. Do NOT invent permanent location ids.\n"
         "- Prefer copying concrete names, objects, factions, and plot facts from the source.\n"
@@ -5503,8 +5620,10 @@ def _fetch_location_details(
             _SYSTEM_PROMPT,
             prompt,
             warnings=warnings,
-            step="location detail",
+            step="location_details",
             usage_acc=usage_acc,
+            response_schema=LOCATION_BATCH_RESPONSE_SCHEMA,
+            schema_name="location_batch_response",
         )
         detail_items = _coerce_container(detail_raw, "locations")
         return _index_details_by_stub_id(detail_items, batch)
@@ -5539,8 +5658,10 @@ def _fetch_npc_details(
             _SYSTEM_PROMPT,
             prompt,
             warnings=warnings,
-            step="npc detail",
+            step="npc_details",
             usage_acc=usage_acc,
+            response_schema=NPC_BATCH_RESPONSE_SCHEMA,
+            schema_name="npc_batch_response",
         )
         detail_items = _coerce_container(detail_raw, "npcs")
         return _index_details_by_stub_id(detail_items, batch)
@@ -5653,8 +5774,10 @@ def outline_campaign_document(
                 _SYSTEM_PROMPT,
                 outline_prompt,
                 warnings=warnings,
-                step="outline",
+                step="discovery",
                 usage_acc=usage,
+                response_schema=DISCOVERY_RESPONSE_SCHEMA,
+                schema_name="discovery_response",
             )
         except Exception as ex:
             if isinstance(ex, LLMProviderError):
@@ -6103,6 +6226,204 @@ def detail_npc_batch(
         for stub in batch
     ]
     return {"npcs": npcs, "warnings": warnings, "usage": usage}
+
+
+
+def _build_campaign_prompt(
+    text: str,
+    discovery_campaign: dict[str, Any],
+    *,
+    source_index_summary: str = "",
+) -> str:
+    seed = {
+        "temporary_key": discovery_campaign.get("temporary_key") or "campaign_001",
+        "title": discovery_campaign.get("title") or discovery_campaign.get("name") or "",
+        "name": discovery_campaign.get("name") or discovery_campaign.get("title") or "",
+        "genre": discovery_campaign.get("genre") or "",
+        "rpg_system": discovery_campaign.get("rpg_system") or "",
+        "publisher": discovery_campaign.get("publisher") or "",
+    }
+    index_note = ""
+    if source_index_summary.strip():
+        index_note = f"Source index summary:\n{source_index_summary.strip()}\n\n"
+    return (
+        "Fill campaign information for NPCNarrator from the source excerpts and discovery seed.\n"
+        "Do NOT invent a permanent campaign_id. Echo temporary_key from the seed.\n\n"
+        f"Discovery seed (JSON):\n{json.dumps(seed, ensure_ascii=False)}\n\n"
+        f"{index_note}"
+        "Respond with exactly this shape:\n"
+        "{\n"
+        '  "temporary_key": "campaign_001",\n'
+        '  "title": "Display Title",\n'
+        '  "name": "Short Name",\n'
+        '  "description": "1-4 sentence campaign summary grounded in the source",\n'
+        '  "genre": "fantasy|sci_fi|modern|horror|other",\n'
+        '  "rpg_system": "named ruleset or empty string",\n'
+        '  "premise": "core hook",\n'
+        '  "tone": "short tone phrase",\n'
+        '  "themes": ["theme"],\n'
+        '  "factions": ["faction"],\n'
+        '  "starting_situation": "where play begins",\n'
+        '  "source_refs": [],\n'
+        '  "inferences": [],\n'
+        '  "warnings": []\n'
+        "}\n\n"
+        "Rules:\n"
+        "- Prefer concrete facts from the source over invention.\n"
+        "- Keep title/name aligned with the discovery seed unless the source clearly corrects them.\n"
+        "- Output ONLY the JSON object.\n\n"
+        "Campaign-relevant source text:\n"
+        '"""\n'
+        f"{text}\n"
+        '"""\n'
+    )
+
+
+def generate_campaign_info(
+    text: str,
+    campaign: dict[str, Any] | None = None,
+    *,
+    source_index_summary: str = "",
+    discovery: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Stage 2: campaign information hop (Luna / content_campaign)."""
+    warnings: list[str] = []
+    usage: dict[str, Any] = {}
+    seed = campaign if isinstance(campaign, dict) else {}
+    if not seed and isinstance(discovery, dict):
+        raw = discovery.get("campaign")
+        seed = raw if isinstance(raw, dict) else {}
+    bounded = _truncate_for_import_document(text or "", warnings, require_llm_budget=True)
+    prompt = _build_campaign_prompt(
+        bounded,
+        seed,
+        source_index_summary=source_index_summary or "",
+    )
+    try:
+        raw = _call_llm_json(
+            _SYSTEM_PROMPT,
+            prompt,
+            warnings=warnings,
+            step="campaign",
+            usage_acc=usage,
+            response_schema=CAMPAIGN_INFO_RESPONSE_SCHEMA,
+            schema_name="campaign_info_response",
+        )
+    except Exception as ex:
+        if isinstance(ex, LLMProviderError):
+            raise ContentImportError(str(ex)) from ex
+        raise ContentImportError(f"Campaign info pass failed: {ex}") from ex
+
+    if not isinstance(raw, dict):
+        raise ContentImportError("Campaign info pass did not return a JSON object")
+
+    info = _normalize_campaign_meta({**seed, **raw})
+    _apply_imported_campaign_setting(info, document_text=bounded)
+    for key in ("source_refs", "inferences", "warnings"):
+        if key in raw and isinstance(raw[key], list):
+            info[key] = raw[key]
+    extra_warnings = _as_str_list(raw.get("warnings"))
+    warnings.extend(extra_warnings)
+    return {"campaign": info, "warnings": warnings, "usage": usage}
+
+
+def _build_repair_prompt(
+    *,
+    problem: str,
+    entities: list[dict[str, Any]],
+    excerpts: str,
+    expected_schema: dict[str, Any] | None = None,
+) -> str:
+    schema_note = ""
+    if isinstance(expected_schema, dict) and expected_schema:
+        schema_note = (
+            "Expected field contract (informational):\n"
+            f"{json.dumps(expected_schema, ensure_ascii=False)[:4000]}\n\n"
+        )
+    return (
+        "You are repairing a single import problem. Use ONLY the provided entities and excerpts.\n"
+        "Do NOT request or invent the full module text. Prefer the smallest safe fix.\n\n"
+        f"Problem:\n{problem}\n\n"
+        f"Entities (JSON):\n{json.dumps(entities, ensure_ascii=False)[:12000]}\n\n"
+        f"{schema_note}"
+        "Respond with exactly:\n"
+        "{\n"
+        '  "action": "RESOLVED|NO_CHANGE|MERGE_ENTITIES|SPLIT_ENTITY|'
+        'UPDATE_RELATIONSHIP|UPDATE_FIELD|SOURCE_IS_AMBIGUOUS|INSUFFICIENT_EVIDENCE",\n'
+        '  "patches": [{"target_temporary_key": "", "field": "", "value": null}],\n'
+        '  "rationale": "short explanation",\n'
+        '  "source_refs": [],\n'
+        '  "warnings": []\n'
+        "}\n\n"
+        "Rules:\n"
+        "- action SOURCE_IS_AMBIGUOUS / INSUFFICIENT_EVIDENCE when evidence is weak; leave patches empty.\n"
+        "- Do not invent permanent ids.\n"
+        "- Output ONLY JSON.\n\n"
+        "Conflicting / cited excerpts:\n"
+        '"""\n'
+        f"{excerpts}\n"
+        '"""\n'
+    )
+
+
+def repair_import_entity(
+    *,
+    problem: str,
+    entities: list[dict[str, Any]] | None = None,
+    excerpts: str = "",
+    expected_schema: dict[str, Any] | None = None,
+    text: str | None = None,
+) -> dict[str, Any]:
+    """Stage 5: Sol repair hop. Never includes the full module by default."""
+    warnings: list[str] = []
+    usage: dict[str, Any] = {}
+    entity_list = entities if isinstance(entities, list) else []
+    excerpt_text = (excerpts or "").strip()
+    if not excerpt_text and text:
+        # Targeted only: cap to a small window; do not dump the full document.
+        excerpt_text = (text or "")[:8_000]
+        warnings.append("repair: no excerpts provided; using a capped head slice only.")
+    if len(excerpt_text) > 24_000:
+        excerpt_text = excerpt_text[:24_000]
+        warnings.append("repair: excerpts truncated to 24000 chars.")
+    prompt = _build_repair_prompt(
+        problem=str(problem or "").strip() or "unspecified_problem",
+        entities=entity_list,
+        excerpts=excerpt_text or "(no excerpts)",
+        expected_schema=expected_schema,
+    )
+    try:
+        raw = _call_llm_json(
+            _SYSTEM_PROMPT,
+            prompt,
+            warnings=warnings,
+            step="repair",
+            usage_acc=usage,
+            response_schema=REPAIR_RESPONSE_SCHEMA,
+            schema_name="repair_response",
+            max_schema_retries=1,
+        )
+    except Exception as ex:
+        if isinstance(ex, LLMProviderError):
+            raise ContentImportError(str(ex)) from ex
+        raise ContentImportError(f"Repair pass failed: {ex}") from ex
+
+    if not isinstance(raw, dict):
+        raise ContentImportError("Repair pass did not return a JSON object")
+
+    action = str(raw.get("action") or "NO_CHANGE").strip().upper() or "NO_CHANGE"
+    patches = raw.get("patches") if isinstance(raw.get("patches"), list) else []
+    extra = _as_str_list(raw.get("warnings"))
+    warnings.extend(extra)
+    return {
+        "action": action,
+        "patches": patches,
+        "rationale": str(raw.get("rationale") or "").strip(),
+        "source_refs": raw.get("source_refs") if isinstance(raw.get("source_refs"), list) else [],
+        "warnings": warnings,
+        "usage": usage,
+    }
+
 
 
 def analyze_campaign_document(

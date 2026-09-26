@@ -46,6 +46,8 @@ from content_import import (
     detail_location_batch,
     detail_npc_batch,
     discover_campaign_document,
+    generate_campaign_info,
+    repair_import_entity,
 )
 from required_dm_checks import (
     format_required_dm_checks_prompt_block,
@@ -4485,6 +4487,92 @@ def content_import_discover():
 def content_import_outline():
     """Short Funnel hop: thin wrapper over discover (temporary-key stubs)."""
     return content_import_discover()
+
+
+@app.post("/content/import/campaign-details")
+def content_import_campaign_details():
+    """Campaign information hop (after discovery, before review)."""
+    body = request.get_json(force=True, silent=True) or {}
+
+    text = body.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return jsonify({"error": "Missing text"}), 400
+
+    campaign = body.get("campaign")
+    if campaign is not None and not isinstance(campaign, dict):
+        return jsonify({"error": "campaign must be an object"}), 400
+
+    discovery = body.get("discovery")
+    if discovery is not None and not isinstance(discovery, dict):
+        return jsonify({"error": "discovery must be an object"}), 400
+
+    source_index_summary = body.get("source_index_summary") or body.get("source_index") or ""
+    if not isinstance(source_index_summary, str):
+        if isinstance(source_index_summary, dict):
+            source_index_summary = json.dumps(source_index_summary)[:4000]
+        else:
+            source_index_summary = str(source_index_summary or "")
+
+    try:
+        result = generate_campaign_info(
+            text,
+            campaign if isinstance(campaign, dict) else None,
+            source_index_summary=source_index_summary,
+            discovery=discovery if isinstance(discovery, dict) else None,
+        )
+        return jsonify(result)
+    except ContentImportError as ex:
+        print(f"[CONTENT-IMPORT] campaign-details rejected: {ex}", flush=True)
+        return jsonify({"error": str(ex)}), 400
+    except Exception as ex:
+        print(f"[CONTENT-IMPORT] campaign-details failed: {ex!r}", flush=True)
+        return _client_error(ex, 500)
+
+
+@app.post("/content/import/repair")
+def content_import_repair():
+    """Sol repair hop: targeted problem + entities + excerpts only."""
+    body = request.get_json(force=True, silent=True) or {}
+
+    problem = body.get("problem")
+    if not isinstance(problem, str) or not problem.strip():
+        return jsonify({"error": "Missing problem"}), 400
+
+    entities = body.get("entities") or []
+    if not isinstance(entities, list):
+        return jsonify({"error": "entities must be a list"}), 400
+
+    excerpts = body.get("excerpts")
+    if excerpts is None:
+        excerpts = ""
+    if not isinstance(excerpts, str):
+        return jsonify({"error": "excerpts must be a string"}), 400
+
+    expected_schema = body.get("expected_schema")
+    if expected_schema is not None and not isinstance(expected_schema, dict):
+        return jsonify({"error": "expected_schema must be an object"}), 400
+
+    # Intentionally ignore full-module "text" unless excerpts are empty — repair
+    # must not default to the whole document.
+    text = body.get("text") if not excerpts.strip() else None
+    if text is not None and not isinstance(text, str):
+        text = None
+
+    try:
+        result = repair_import_entity(
+            problem=problem,
+            entities=entities,
+            excerpts=excerpts,
+            expected_schema=expected_schema if isinstance(expected_schema, dict) else None,
+            text=text,
+        )
+        return jsonify(result)
+    except ContentImportError as ex:
+        print(f"[CONTENT-IMPORT] repair rejected: {ex}", flush=True)
+        return jsonify({"error": str(ex)}), 400
+    except Exception as ex:
+        print(f"[CONTENT-IMPORT] repair failed: {ex!r}", flush=True)
+        return _client_error(ex, 500)
 
 
 @app.post("/content/import/location-details")
