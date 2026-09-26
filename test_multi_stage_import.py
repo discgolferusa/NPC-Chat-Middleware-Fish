@@ -26,12 +26,15 @@ def test_import_stage_to_purpose_mapping():
 def test_generate_campaign_info_uses_campaign_purpose(monkeypatch):
     seen = {}
 
-    def fake_call(system, user, *, warnings, step, usage_acc=None, response_schema=None, schema_name=None, max_schema_retries=None):
+    def fake_call(system, user, *, warnings, step, usage_acc=None, response_schema=None, schema_name=None, max_schema_retries=None, debug_out=None):
         seen["step"] = step
         seen["schema_name"] = schema_name
         from llm_router import import_stage_to_purpose as map_purpose
 
         seen["purpose"] = map_purpose(step)
+        if debug_out is not None:
+            debug_out.clear()
+            debug_out.update({"step": step, "system_prompt": system, "user_prompt": user})
         if usage_acc is not None:
             usage_acc["prompt_tokens"] = 10
             usage_acc["completion_tokens"] = 5
@@ -224,3 +227,85 @@ def test_import_purpose_override_resolves_via_content_creation_eligibility(monke
     mid = llm_router._get_purpose_model_id(llm_router.PURPOSE_CONTENT_REPAIR)
     assert mid == "openrouter-gpt-oss-20b"
     assert mid != "local"
+def test_discovery_includes_debug_prompts(monkeypatch):
+    def fake_call(system, user, *, warnings, step, usage_acc=None, response_schema=None, schema_name=None, max_schema_retries=None, debug_out=None):
+        if debug_out is not None:
+            debug_out.clear()
+            debug_out.update(
+                {
+                    "step": step,
+                    "system_prompt": system,
+                    "user_prompt": user,
+                    "raw_response": '{"campaign":{"title":"X","name":"X"},"locations":[],"npcs":[]}',
+                    "llm_called": True,
+                }
+            )
+        if usage_acc is not None:
+            usage_acc["prompt_tokens"] = 3
+        return {"campaign": {"title": "X", "name": "X", "genre": "sci_fi"}, "locations": [], "npcs": []}
+
+    monkeypatch.setattr(content_import, "_call_llm_json", fake_call)
+    monkeypatch.setattr(content_import, "content_creation_max_input_chars", lambda: 200_000)
+    monkeypatch.setattr(content_import, "_document_has_recoverable_stat_blocks", lambda _t: False)
+    monkeypatch.setattr(content_import, "_document_has_recoverable_location_sites", lambda _t: False)
+
+    result = content_import.discover_campaign_document(
+        "=== PAGE 1 ===\nA long enough dune adventure document for discovery testing purposes here.\n",
+        "create_new",
+    )
+    assert "debug" in result
+    assert "system_prompt" in result["debug"]
+    assert "user_prompt" in result["debug"]
+    assert "raw_response" in result["debug"]
+    assert result["debug"]["final_location_count"] == 0
+
+
+def test_looks_like_truncated_json_detects_mid_string_cutoff():
+    raw = (
+        '{"campaign":{"title":"Coriolis Storm"},"locations":[],"npcs":[],'
+        '"events":[{"name":"Coriolis storm","source_refs":["pp. 5-8, 19-21'
+    )
+    assert content_import.looks_like_truncated_json(raw)
+    assert not content_import.looks_like_truncated_json(
+        '{"campaign":{"title":"X"},"locations":[],"npcs":[]}'
+    )
+
+
+def test_discovery_retries_with_larger_budget_on_truncation(monkeypatch):
+    calls = []
+
+    def fake_generate(messages, *, purpose="chat", max_tokens=None, temperature=None, response_format=None, **kwargs):
+        calls.append({"max_tokens": max_tokens, "response_format": response_format})
+        if len(calls) == 1:
+            truncated = (
+                '{"campaign":{"title":"Coriolis Storm","name":"Coriolis Storm"},'
+                '"locations":[{"temporary_key":"location_001","name":"Station"}],'
+                '"npcs":[{"temporary_key":"npc_001","name":"Ada"}],'
+                '"events":[{"name":"Storm","source_refs":["pp. 5-8, 19-21'
+            )
+            return truncated, {"prompt_tokens": 10, "completion_tokens": 2048, "model_id": "luna"}
+        return (
+            '{"campaign":{"title":"Coriolis Storm","name":"Coriolis Storm","genre":"sci_fi"},'
+            '"locations":[{"temporary_key":"location_001","name":"Station","type":"building"}],'
+            '"npcs":[{"temporary_key":"npc_001","name":"Ada","role":"pilot",'
+            '"primary_location_key":"location_001","significance":"conversational"}]}',
+            {"prompt_tokens": 10, "completion_tokens": 400, "model_id": "luna"},
+        )
+
+    import llm_router
+    monkeypatch.setattr(llm_router, "generate_llm_response_with_usage", fake_generate)
+    monkeypatch.setattr(llm_router, "IMPORT_MAX_SCHEMA_RETRIES", 2)
+
+    warnings = []
+    out = content_import._call_llm_json(
+        "sys",
+        "user",
+        warnings=warnings,
+        step="discovery",
+        response_schema=content_import.DISCOVERY_RESPONSE_SCHEMA,
+        schema_name="discovery_response",
+    )
+    assert out["locations"]
+    assert calls[0]["max_tokens"] == content_import.OUTLINE_MAX_TOKENS
+    assert calls[1]["max_tokens"] == content_import.DISCOVERY_RETRY_MAX_TOKENS
+    assert any("truncated" in w for w in warnings)

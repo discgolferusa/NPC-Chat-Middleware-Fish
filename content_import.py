@@ -50,7 +50,11 @@ MAX_LOCATIONS_PER_BATCH = IMPORT_LOCATION_BATCH_SIZE
 MAX_NPCS_PER_BATCH = IMPORT_NPC_BATCH_SIZE
 IMPORT_TEMPERATURE = 0.15
 IMPORT_MAX_TOKENS = 6144
-OUTLINE_MAX_TOKENS = 2048
+# Discovery inventories (many locs/NPCs/factions/events) regularly exceed 2k completion
+# tokens and get truncated mid-JSON — use the same budget as detail hops.
+OUTLINE_MAX_TOKENS = 6144
+# Second chance after a truncated discovery completion.
+DISCOVERY_RETRY_MAX_TOKENS = 8192
 # NPCNarrator writeups put the name in a header, then many blocks after it.
 # Bias the window forward so Knows/Hides/Memory/Finale are kept.
 EXCERPT_WINDOW_BEFORE = 400
@@ -222,9 +226,18 @@ def extract_json(text: str) -> Any:
 
     Handles markdown code fences, leading/trailing prose around the JSON, and
     falls back to scanning for the first balanced {...} or [...] block.
+
+    Truncated completions must not salvage a nested object (e.g. only
+    ``campaign``) — that caused empty discovery after a mid-response cutoff.
     """
     if not text or not text.strip():
         raise ContentImportError("Empty LLM response")
+
+    if looks_like_truncated_json(text):
+        raise ContentImportError(
+            "LLM response appears truncated (incomplete JSON). "
+            "Retry with a larger max_tokens budget."
+        )
 
     candidates = [_strip_code_fences(text), text.strip()]
     for candidate in candidates:
@@ -235,11 +248,76 @@ def extract_json(text: str) -> Any:
 
     for candidate in candidates:
         for open_ch, close_ch in (("{", "}"), ("[", "]")):
-            result = _find_balanced_json(candidate, open_ch, close_ch)
+            start = candidate.find(open_ch)
+            if start < 0:
+                continue
+            # Only the outermost block starting at the first opener — never a
+            # nested object further in (that hides truncation failures).
+            result = _find_balanced_json_once(candidate, open_ch, close_ch, start)
             if result is not None:
                 return result
 
     raise ContentImportError(f"Could not extract JSON from LLM response: {text[:200]!r}")
+
+
+def looks_like_truncated_json(text: str) -> bool:
+    """Heuristic: completion likely hit max_tokens mid-JSON."""
+    s = (text or "").strip()
+    if not s:
+        return False
+    if s.count("{") > s.count("}"):
+        return True
+    if s.count("[") > s.count("]"):
+        return True
+    # Mid-string cutoffs often end with an open quote or a trailing comma/colon.
+    tail = s.rstrip()[-80:] if len(s) > 80 else s.rstrip()
+    if tail.endswith((":", ",")) and not tail.endswith(("}", "]")):
+        return True
+    # Ends inside an open string: ..."pp. 5-8, 19-21
+    if re.search(r'"[^"\\]*(?:\\.[^"\\]*)*$', tail) and not tail.endswith(('}', ']', '"')):
+        return True
+    if re.search(r'"[^"]*$', tail) and not s.rstrip().endswith(('}', ']')):
+        return True
+    return False
+
+
+def _find_balanced_json_once(text: str, open_ch: str, close_ch: str, start: int) -> Any | None:
+    """Parse one balanced JSON value starting at ``start`` (no nested rescans)."""
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == open_ch:
+            depth += 1
+        elif ch == close_ch:
+            depth -= 1
+            if depth == 0:
+                snippet = text[start : i + 1]
+                try:
+                    return json.loads(snippet)
+                except json.JSONDecodeError:
+                    return None
+    return None
+
+
+def _max_tokens_for_import_step(step: str, *, attempt: int, truncated: bool) -> int:
+    discovery = step in ("outline", "discovery", "discover")
+    if discovery:
+        if truncated or attempt > 0:
+            return max(OUTLINE_MAX_TOKENS, DISCOVERY_RETRY_MAX_TOKENS)
+        return OUTLINE_MAX_TOKENS
+    return IMPORT_MAX_TOKENS
 
 
 def snake_case(value: Any) -> str:
@@ -4888,6 +4966,7 @@ def _call_llm_json(
     response_schema: dict[str, Any] | None = None,
     schema_name: str | None = None,
     max_schema_retries: int | None = None,
+    debug_out: dict[str, Any] | None = None,
 ) -> Any:
     from llm_router import (
         IMPORT_MAX_SCHEMA_RETRIES,
@@ -4906,24 +4985,67 @@ def _call_llm_json(
 
     retries = IMPORT_MAX_SCHEMA_RETRIES if max_schema_retries is None else max(0, int(max_schema_retries))
     last_error: Exception | None = None
+    last_raw = ""
+    last_usage: dict[str, Any] = {}
+    saw_truncation = False
     for attempt in range(retries + 1):
+        max_tokens = _max_tokens_for_import_step(step, attempt=attempt, truncated=saw_truncation)
         raw, usage = generate_llm_response_with_usage(
             messages,
             purpose=purpose,
-            max_tokens=OUTLINE_MAX_TOKENS if step in ("outline", "discovery", "discover") else IMPORT_MAX_TOKENS,
+            max_tokens=max_tokens,
             temperature=IMPORT_TEMPERATURE,
-            response_format=response_format if attempt == 0 else None,
+            response_format=response_format if attempt == 0 and not saw_truncation else None,
         )
+        last_raw = raw if isinstance(raw, str) else str(raw or "")
+        last_usage = usage if isinstance(usage, dict) else {}
         if usage_acc is not None:
             _merge_usage(usage_acc, usage)
+        if debug_out is not None:
+            debug_out.clear()
+            debug_out.update(
+                {
+                    "step": step,
+                    "purpose": purpose,
+                    "attempt": attempt + 1,
+                    "attempts_allowed": retries + 1,
+                    "max_tokens": max_tokens,
+                    "schema_name": schema_name,
+                    "used_response_format": bool(response_format) and attempt == 0 and not saw_truncation,
+                    "system_prompt": system_prompt,
+                    "user_prompt": user_prompt,
+                    "raw_response": last_raw,
+                    "model_id": last_usage.get("model_id"),
+                    "truncated_suspected": looks_like_truncated_json(last_raw),
+                    "usage": {
+                        "prompt_tokens": last_usage.get("prompt_tokens"),
+                        "completion_tokens": last_usage.get("completion_tokens"),
+                        "estimated_cost_usd": last_usage.get("estimated_cost_usd"),
+                        "model_id": last_usage.get("model_id"),
+                    },
+                }
+            )
         try:
             return extract_json(raw)
         except ContentImportError as ex:
             last_error = ex
-            warnings.append(f"{step}: schema/parse retry {attempt + 1}: {ex}")
+            truncated = looks_like_truncated_json(last_raw)
+            if truncated:
+                saw_truncation = True
+                warnings.append(
+                    f"{step}: response looks truncated (likely max_tokens={max_tokens}); "
+                    f"retrying with a larger completion budget."
+                )
+            else:
+                warnings.append(f"{step}: schema/parse retry {attempt + 1}: {ex}")
             continue
 
     assert last_error is not None
+    if saw_truncation:
+        warnings.append(
+            f"{step}: model output still truncated after retries — raise "
+            "OUTLINE_MAX_TOKENS / DISCOVERY_RETRY_MAX_TOKENS or slim the discovery schema."
+        )
     warnings.append(f"{step}: {last_error}")
     raise last_error
 
@@ -5035,6 +5157,8 @@ def _build_outline_prompt(
         "- other_location_keys only for NPCs who appear in more than one place.\n"
         "- Set campaign.genre from tone; rpg_system when stated else empty string.\n"
         "- relationships/factions/events: light stubs only when clearly present; otherwise [].\n"
+        "- Prefer a complete, valid JSON object over long event/faction prose. If space is "
+        "tight, omit events/factions before truncating locations or NPCs.\n"
         "- ambiguities: optional {code, entity_keys, evidence_refs, severity} when unsure.\n"
         f"{mode_guidance}"
         "- Output ONLY the JSON object. No prose, no markdown fences.\n\n"
@@ -5765,6 +5889,11 @@ def outline_campaign_document(
         and len(_extract_alien_location_site_stubs(bounded_text)) >= 2
     )
     document_for_deterministic_merge = bounded_text
+    discovery_debug: dict[str, Any] = {
+        "step": "discovery",
+        "llm_called": False,
+        "fast_path": None,
+    }
     if use_stat_block_fast_path or use_location_site_fast_path:
         full_document_text = bounded_text
     else:
@@ -5781,12 +5910,16 @@ def outline_campaign_document(
             "and seeding NPC stubs from FULL NAME blocks (detail sweep still runs)."
         )
         outline_raw = {"campaign": {}, "locations": [], "npcs": []}
+        discovery_debug["fast_path"] = "stat_blocks"
+        discovery_debug["note"] = "LLM discovery skipped; deterministic FULL NAME seeding."
     elif use_location_site_fast_path:
         warnings.append(
             "Alien moonside / locations chapter detected; skipping LLM outline "
             "and seeding major location site stubs (detail sweep still runs)."
         )
         outline_raw = {"campaign": {}, "locations": [], "npcs": []}
+        discovery_debug["fast_path"] = "location_sites"
+        discovery_debug["note"] = "LLM discovery skipped; deterministic location site seeding."
     else:
         outline_source = _prepare_outline_document_text(full_document_text, warnings)
         outline_prompt = _build_outline_prompt(
@@ -5801,14 +5934,20 @@ def outline_campaign_document(
                 usage_acc=usage,
                 response_schema=DISCOVERY_RESPONSE_SCHEMA,
                 schema_name="discovery_response",
+                debug_out=discovery_debug,
             )
+            discovery_debug["llm_called"] = True
         except Exception as ex:
+            discovery_debug["llm_called"] = True
+            discovery_debug["error"] = str(ex)
             if isinstance(ex, LLMProviderError):
                 raise ContentImportError(str(ex)) from ex
             raise ContentImportError(f"Outline pass failed: {ex}") from ex
 
         if not isinstance(outline_raw, dict):
             raise ContentImportError("Outline pass did not return a JSON object")
+        discovery_debug["parsed_location_count"] = len(outline_raw.get("locations") or []) if isinstance(outline_raw.get("locations"), list) else 0
+        discovery_debug["parsed_npc_count"] = len(outline_raw.get("npcs") or []) if isinstance(outline_raw.get("npcs"), list) else 0
 
     campaign, location_stubs, npc_stubs = _normalize_outline(
         outline_raw,
@@ -5898,6 +6037,14 @@ def outline_campaign_document(
     relationships = list(outline_raw.get("relationships") or []) if isinstance(outline_raw, dict) else []
     events = list(outline_raw.get("events") or []) if isinstance(outline_raw, dict) else []
 
+    discovery_debug["final_location_count"] = len(location_stubs)
+    discovery_debug["final_npc_count"] = len(npc_stubs)
+    if not location_stubs and not npc_stubs:
+        warnings.append(
+            "Discovery produced zero locations and zero NPCs after normalization/stamping. "
+            "Inspect response.debug (system_prompt / user_prompt / raw_response) to diagnose."
+        )
+
     return {
         "campaign": campaign,
         "locations": location_stubs,
@@ -5906,6 +6053,7 @@ def outline_campaign_document(
         "events": events if isinstance(events, list) else [],
         "warnings": warnings,
         "usage": usage,
+        "debug": discovery_debug,
     }
 
 
@@ -6322,6 +6470,7 @@ def generate_campaign_info(
         seed,
         source_index_summary=source_index_summary or "",
     )
+    campaign_debug: dict[str, Any] = {"step": "campaign", "llm_called": False}
     try:
         raw = _call_llm_json(
             _SYSTEM_PROMPT,
@@ -6331,8 +6480,12 @@ def generate_campaign_info(
             usage_acc=usage,
             response_schema=CAMPAIGN_INFO_RESPONSE_SCHEMA,
             schema_name="campaign_info_response",
+            debug_out=campaign_debug,
         )
+        campaign_debug["llm_called"] = True
     except Exception as ex:
+        campaign_debug["llm_called"] = True
+        campaign_debug["error"] = str(ex)
         if isinstance(ex, LLMProviderError):
             raise ContentImportError(str(ex)) from ex
         raise ContentImportError(f"Campaign info pass failed: {ex}") from ex
@@ -6347,7 +6500,7 @@ def generate_campaign_info(
             info[key] = raw[key]
     extra_warnings = _as_str_list(raw.get("warnings"))
     warnings.extend(extra_warnings)
-    return {"campaign": info, "warnings": warnings, "usage": usage}
+    return {"campaign": info, "warnings": warnings, "usage": usage, "debug": campaign_debug}
 
 
 def _build_repair_prompt(
