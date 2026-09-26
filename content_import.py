@@ -360,7 +360,9 @@ def _batches(items: list[Any], size: int) -> list[list[Any]]:
     return [items[i : i + size] for i in range(0, len(items), size)] if items else []
 
 
-_TEMP_KEY_PATTERN = re.compile(r"^(campaign|location|npc)_\d{3,}$", re.IGNORECASE)
+_TEMP_KEY_PATTERN = re.compile(
+    r"^(campaign|adventure|location|npc)_\d{3,}$", re.IGNORECASE
+)
 _VALID_SIGNIFICANCE = frozenset({"conversational", "secondary", "ignore"})
 _VALID_LOCATION_SIGNIFICANCE = frozenset({"major", "minor", "ignore"})
 
@@ -416,7 +418,7 @@ def _normalize_location_significance(value: Any) -> str:
 
 
 def _validate_temporary_keys(
-    campaign: dict[str, Any],
+    adventures: list[dict[str, Any]] | dict[str, Any],
     locations: list[dict[str, Any]],
     npcs: list[dict[str, Any]],
 ) -> list[str]:
@@ -435,12 +437,52 @@ def _validate_temporary_keys(
         else:
             seen[key] = kind
 
-    _check("campaign", str(campaign.get("temporary_key") or ""))
+    if isinstance(adventures, dict):
+        adventure_list = [adventures]
+    else:
+        adventure_list = list(adventures or [])
+    for adv in adventure_list:
+        _check("adventure", str(adv.get("temporary_key") or ""))
     for loc in locations:
         _check("location", str(loc.get("temporary_key") or loc.get("id") or ""))
     for npc in npcs:
         _check("npc", str(npc.get("temporary_key") or npc.get("id") or ""))
     return warnings
+
+
+def _coerce_adventure_stubs(outline: dict[str, Any]) -> list[dict[str, Any]]:
+    """Prefer adventures[]; wrap legacy singular campaign for backward compatibility."""
+    raw = outline.get("adventures")
+    if isinstance(raw, list):
+        adventures = [a for a in raw if isinstance(a, dict)]
+        if adventures:
+            return adventures
+    campaign_raw = outline.get("campaign") if isinstance(outline.get("campaign"), dict) else {}
+    if campaign_raw:
+        return [campaign_raw]
+    return [{"title": "Campaign", "name": "Campaign"}]
+
+
+def _adventure_stub_from_raw(raw: dict[str, Any]) -> dict[str, Any]:
+    title = str(raw.get("title") or raw.get("name") or "").strip()
+    name = str(raw.get("name") or title or "").strip()
+    return {
+        "temporary_key": str(raw.get("temporary_key") or "").strip(),
+        "title": title or name or "Campaign",
+        "name": name or title or "Campaign",
+        "description": str(raw.get("description") or "").strip(),
+        "genre": normalize_campaign_genre(raw.get("genre")),
+        "rpg_system": str(raw.get("rpg_system") or "").strip(),
+        "publisher": str(raw.get("publisher") or "").strip(),
+        "premise": str(raw.get("premise") or "").strip(),
+        "themes": _as_str_list(raw.get("themes")),
+        "tone": str(raw.get("tone") or "").strip(),
+        "factions": _as_str_list(raw.get("factions")),
+        "important_context": _as_str_list(raw.get("important_context")),
+        "starting_situation": str(raw.get("starting_situation") or "").strip(),
+        "summary_hint": str(raw.get("summary_hint") or "").strip(),
+        "source_refs": _as_list(raw.get("source_refs")),
+    }
 
 
 def _entity_ref_aliases(entity: dict[str, Any]) -> list[str]:
@@ -462,34 +504,76 @@ def _entity_ref_aliases(entity: dict[str, Any]) -> list[str]:
 
 
 def _stamp_discovery_temporary_keys(
-    campaign: dict[str, Any],
+    adventures_or_campaign: dict[str, Any] | list[dict[str, Any]],
     locations: list[dict[str, Any]],
     npcs: list[dict[str, Any]],
     *,
     mode: str,
     existing_campaign_id: str | None,
     warnings: list[str],
-) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
-    """Assign authoritative temporary keys and remap location refs."""
-    title = str(campaign.get("title") or campaign.get("name") or "").strip()
-    name = str(campaign.get("name") or title or "Campaign").strip()
-    stamped_campaign: dict[str, Any] = {
-        "temporary_key": "campaign_001",
-        "title": title or name,
-        "name": name,
-        "description": str(campaign.get("description") or "").strip(),
-        "genre": normalize_campaign_genre(campaign.get("genre")),
-        "rpg_system": str(campaign.get("rpg_system") or "").strip(),
-        "premise": str(campaign.get("premise") or "").strip(),
-        "themes": _as_str_list(campaign.get("themes")),
-        "tone": str(campaign.get("tone") or "").strip(),
-        "factions": _as_str_list(campaign.get("factions")),
-        "important_context": _as_str_list(campaign.get("important_context")),
-        "starting_situation": str(campaign.get("starting_situation") or "").strip(),
-    }
-    if mode == "merge" and existing_campaign_id:
-        # Detail hops / editor still need the existing permanent campaign id.
-        stamped_campaign["campaign_id"] = existing_campaign_id.strip()
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Assign authoritative temporary keys and remap location refs.
+
+    Accepts a legacy singular campaign dict or an adventures list. Returns stamped
+    adventures (adventure_001…), locations, and NPCs with adventure_temporary_key.
+    """
+    if isinstance(adventures_or_campaign, dict):
+        adventure_inputs = [adventures_or_campaign]
+    else:
+        adventure_inputs = [a for a in (adventures_or_campaign or []) if isinstance(a, dict)]
+    if not adventure_inputs:
+        adventure_inputs = [{"title": "Campaign", "name": "Campaign"}]
+
+    adventure_alias_to_key: dict[str, str] = {}
+    stamped_adventures: list[dict[str, Any]] = []
+    for index, adv in enumerate(adventure_inputs, start=1):
+        temp_key = f"adventure_{index:03d}"
+        title = str(adv.get("title") or adv.get("name") or "").strip()
+        name = str(adv.get("name") or title or "Campaign").strip()
+        stamped: dict[str, Any] = {
+            "temporary_key": temp_key,
+            "title": title or name,
+            "name": name,
+            "description": str(adv.get("description") or "").strip(),
+            "genre": normalize_campaign_genre(adv.get("genre")),
+            "rpg_system": str(adv.get("rpg_system") or "").strip(),
+            "publisher": str(adv.get("publisher") or "").strip(),
+            "premise": str(adv.get("premise") or "").strip(),
+            "themes": _as_str_list(adv.get("themes")),
+            "tone": str(adv.get("tone") or "").strip(),
+            "factions": _as_str_list(adv.get("factions")),
+            "important_context": _as_str_list(adv.get("important_context")),
+            "starting_situation": str(adv.get("starting_situation") or "").strip(),
+            "summary_hint": str(adv.get("summary_hint") or "").strip(),
+            "source_refs": _as_list(adv.get("source_refs")),
+        }
+        if mode == "merge" and existing_campaign_id and index == 1:
+            stamped["campaign_id"] = existing_campaign_id.strip()
+        # Register the stamped handle itself so LLM refs like adventure_002 resolve.
+        adventure_alias_to_key[temp_key] = temp_key
+        adventure_alias_to_key[temp_key.casefold()] = temp_key
+        for alias in _entity_ref_aliases(adv):
+            adventure_alias_to_key[alias] = temp_key
+            adventure_alias_to_key[snake_case(alias)] = temp_key
+        # Legacy discovery used campaign_001; map onto adventure_001.
+        adventure_alias_to_key[f"campaign_{index:03d}"] = temp_key
+        stamped_adventures.append(stamped)
+
+    default_adventure_key = stamped_adventures[0]["temporary_key"]
+
+    def _resolve_adventure_ref(ref: Any) -> str:
+        text = str(ref or "").strip()
+        if not text:
+            return default_adventure_key
+        if text in adventure_alias_to_key:
+            return adventure_alias_to_key[text]
+        folded = text.casefold()
+        if folded in adventure_alias_to_key:
+            return adventure_alias_to_key[folded]
+        snaked = snake_case(text)
+        if snaked in adventure_alias_to_key:
+            return adventure_alias_to_key[snaked]
+        return default_adventure_key
 
     loc_alias_to_key: dict[str, str] = {}
     stamped_locations: list[dict[str, Any]] = []
@@ -503,14 +587,17 @@ def _stamp_discovery_temporary_keys(
             parent_key = None
         else:
             parent_key = str(parent_raw).strip() or None
+        adv_key = _resolve_adventure_ref(
+            loc.get("adventure_temporary_key") or loc.get("adventure_key")
+        )
         stamped_locations.append(
             {
                 "temporary_key": temp_key,
-                # Legacy: keep id equal to temporary_key during transition.
                 "id": temp_key,
                 "name": str(loc.get("name") or temp_key).strip(),
                 "type": str(loc.get("type") or "other").strip() or "other",
                 "parent_temporary_key": parent_key,
+                "adventure_temporary_key": adv_key,
                 "significance": _normalize_location_significance(loc.get("significance")),
                 "summary_hint": str(loc.get("summary_hint") or "").strip(),
                 "associated_npc_keys": _as_str_list(loc.get("associated_npc_keys")),
@@ -532,7 +619,6 @@ def _stamp_discovery_temporary_keys(
         snaked = snake_case(text)
         if snaked in loc_alias_to_key:
             return loc_alias_to_key[snaked]
-        # Preserve unresolved refs (merge-mode existing campaign location ids).
         return text
 
     for loc in stamped_locations:
@@ -564,6 +650,18 @@ def _stamp_discovery_temporary_keys(
             resolved = _resolve_loc_ref(ref)
             if resolved and resolved != primary_key and resolved not in other_keys:
                 other_keys.append(resolved)
+        npc_adv_raw = str(
+            npc.get("adventure_temporary_key") or npc.get("adventure_key") or ""
+        ).strip()
+        adv_key = _resolve_adventure_ref(npc_adv_raw)
+        # Inherit adventure from the primary location only when the NPC did not
+        # name one. Normalize may already have filled a blank primary with the
+        # first location; that must not reassign an explicit adventure_002+.
+        if primary_key and not npc_adv_raw:
+            for loc in stamped_locations:
+                if loc["temporary_key"] == primary_key:
+                    adv_key = str(loc.get("adventure_temporary_key") or adv_key)
+                    break
         stamped_npcs.append(
             {
                 "temporary_key": temp_key,
@@ -572,9 +670,9 @@ def _stamp_discovery_temporary_keys(
                 "role": str(npc.get("role") or "").strip(),
                 "primary_location_key": primary_key,
                 "other_location_keys": other_keys,
-                # Legacy aliases used by detail hops / older editor code.
                 "first_location_id": primary_key,
                 "other_location_ids": list(other_keys),
+                "adventure_temporary_key": adv_key,
                 "significance": _normalize_significance(npc.get("significance")),
                 "source_refs": _as_list(npc.get("source_refs")),
                 "seeded_from_stat_blocks": bool(npc.get("seeded_from_stat_blocks")),
@@ -597,14 +695,17 @@ def _stamp_discovery_temporary_keys(
             return npc_alias_to_key[snaked]
         return ""
 
-    # Remap associated_npc_keys onto stamped npc_NNN handles (or rebuild from primaries).
     npcs_by_loc: dict[str, list[str]] = {}
     for npc in stamped_npcs:
         loc_key = str(npc.get("primary_location_key") or "")
         if loc_key:
             npcs_by_loc.setdefault(loc_key, []).append(npc["temporary_key"])
     for index, loc in enumerate(stamped_locations):
-        raw_assoc = _as_str_list(locations[index].get("associated_npc_keys")) if index < len(locations) else []
+        raw_assoc = (
+            _as_str_list(locations[index].get("associated_npc_keys"))
+            if index < len(locations)
+            else []
+        )
         remapped: list[str] = []
         for ref in raw_assoc:
             resolved = _resolve_npc_ref(ref)
@@ -615,8 +716,8 @@ def _stamp_discovery_temporary_keys(
         else:
             loc["associated_npc_keys"] = list(npcs_by_loc.get(loc["temporary_key"]) or [])
 
-    warnings.extend(_validate_temporary_keys(stamped_campaign, stamped_locations, stamped_npcs))
-    return stamped_campaign, stamped_locations, stamped_npcs
+    warnings.extend(_validate_temporary_keys(stamped_adventures, stamped_locations, stamped_npcs))
+    return stamped_adventures, stamped_locations, stamped_npcs
 
 
 def _collapse_spaced_caps(text: str) -> str:
@@ -5201,6 +5302,7 @@ DISCOVERY_RESPONSE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": True,
     "properties": {
+        "adventures": {"type": "array"},
         "campaign": {"type": "object"},
         "locations": {"type": "array"},
         "npcs": {"type": "array"},
@@ -5210,7 +5312,7 @@ DISCOVERY_RESPONSE_SCHEMA: dict[str, Any] = {
         "warnings": {"type": "array"},
         "ambiguities": {"type": "array"},
     },
-    "required": ["campaign", "locations", "npcs"],
+    "required": ["locations", "npcs"],
 }
 
 CAMPAIGN_INFO_RESPONSE_SCHEMA: dict[str, Any] = {
@@ -5377,7 +5479,7 @@ def _build_outline_prompt(
             f'This document is being merged into the EXISTING campaign "{existing_campaign_id}". '
             "Do NOT invent a new permanent campaign id. Discovery still uses temporary_key values "
             f'for new entities; the application will stamp campaign_id="{existing_campaign_id}" '
-            "onto the campaign object.\n"
+            "onto the adventure object.\n"
         )
         if existing_location_ids:
             mode_guidance += (
@@ -5394,8 +5496,8 @@ def _build_outline_prompt(
             )
     else:
         mode_guidance = (
-            "This is a brand new campaign. Do NOT invent a permanent campaign_id, location id, "
-            "or npc id. Use temporary_key values only (campaign_001, location_001, npc_001, …).\n"
+            "This is a brand new import. Do NOT invent a permanent campaign_id, location id, "
+            "or npc id. Use temporary_key values only (adventure_001, location_001, npc_001, …).\n"
         )
 
     return (
@@ -5404,19 +5506,21 @@ def _build_outline_prompt(
         "only stubs for later stages.\n\n"
         "Exact shape:\n\n"
         "{\n"
-        '  "campaign": {\n'
-        '    "temporary_key": "campaign_001",\n'
-        '    "title": "Module / display title",\n'
+        '  "adventures": [{\n'
+        '    "temporary_key": "adventure_001",\n'
+        '    "title": "Module / adventure display title",\n'
         '    "name": "Short display name",\n'
         '    "genre": "fantasy|sci_fi|modern|horror|other",\n'
         '    "rpg_system": "e.g. D&D 5e, Call of Cthulhu, Alien RPG",\n'
-        '    "publisher": ""\n'
-        "  },\n"
+        '    "publisher": "",\n'
+        '    "summary_hint": "one short phrase only"\n'
+        "  }],\n"
         '  "locations": [{\n'
         '    "temporary_key": "location_001",\n'
         '    "name": "Display Name",\n'
         '    "type": "city|town|dungeon|forest|building|ship|region|other",\n'
         '    "parent_temporary_key": null,\n'
+        '    "adventure_temporary_key": "adventure_001",\n'
         '    "significance": "major|minor|ignore",\n'
         '    "summary_hint": "one short phrase only",\n'
         '    "associated_npc_keys": [],\n'
@@ -5428,6 +5532,7 @@ def _build_outline_prompt(
         '    "role": "short role or title",\n'
         '    "primary_location_key": "location_001",\n'
         '    "other_location_keys": [],\n'
+        '    "adventure_temporary_key": "adventure_001",\n'
         '    "significance": "conversational|secondary|ignore",\n'
         '    "source_refs": []\n'
         "  }],\n"
@@ -5440,7 +5545,13 @@ def _build_outline_prompt(
         "Rules:\n"
         "- temporary_key values are opaque handles. Prefer unique keys within this response.\n"
         "- Do NOT invent permanent NPCNarrator campaign_id / location id / npc id values.\n"
-        "- Keep campaign fields minimal (title/name/genre/rpg_system only). No long description.\n"
+        "- Keep adventure fields minimal (title/name/genre/rpg_system only). No long description.\n"
+        "- Anthologies / mission packs: emit ONE adventure stub per independent playable "
+        "adventure, mission, or one-shot (TOC entries, 'Adventure N', named modules such as "
+        "Yawning Portal chapters or Delphi Missions). Do NOT invent adventures from mere "
+        "chapters of one continuous campaign.\n"
+        "- Continuously-linked hardcovers without separable adventures → exactly ONE adventure.\n"
+        "- Every location and NPC MUST set adventure_temporary_key to the adventure it belongs to.\n"
         "- Every primary_location_key / other_location_keys entry MUST reference a location "
         "temporary_key from the locations list.\n"
         "- parent_temporary_key: set for sublocations that nest under another location "
@@ -5460,7 +5571,7 @@ def _build_outline_prompt(
         "- If the document centers on a ship or vessel, list the ship as one location "
         "(type ship); put decks/rooms in later detail.\n"
         "- other_location_keys only for NPCs who appear in more than one place.\n"
-        "- Set campaign.genre from tone; rpg_system when stated else empty string.\n"
+        "- Set adventure.genre from tone; rpg_system when stated else empty string.\n"
         "- relationships/factions/events: light stubs only when clearly present; otherwise [].\n"
         "- Prefer a complete, valid JSON object over long event/faction prose. If space is "
         "tight, omit events/factions before truncating locations or NPCs.\n"
@@ -5484,28 +5595,12 @@ def _normalize_outline(
     existing_location_ids: list[str],
     existing_npc_names: list[str],
     warnings: list[str],
-) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
-    campaign_raw = outline.get("campaign") if isinstance(outline.get("campaign"), dict) else {}
-
-    title = str(campaign_raw.get("title") or campaign_raw.get("name") or "").strip()
-    name = str(campaign_raw.get("name") or title or "").strip()
-    campaign: dict[str, Any] = {
-        "temporary_key": str(campaign_raw.get("temporary_key") or "campaign_001").strip()
-        or "campaign_001",
-        "title": title or name or "Campaign",
-        "name": name or title or "Campaign",
-        "description": str(campaign_raw.get("description") or "").strip(),
-        "genre": normalize_campaign_genre(campaign_raw.get("genre")),
-        "rpg_system": str(campaign_raw.get("rpg_system") or "").strip(),
-        "premise": str(campaign_raw.get("premise") or "").strip(),
-        "themes": _as_str_list(campaign_raw.get("themes")),
-        "tone": str(campaign_raw.get("tone") or "").strip(),
-        "factions": _as_str_list(campaign_raw.get("factions")),
-        "important_context": _as_str_list(campaign_raw.get("important_context")),
-        "starting_situation": str(campaign_raw.get("starting_situation") or "").strip(),
-    }
-    if mode == "merge" and existing_campaign_id:
-        campaign["campaign_id"] = existing_campaign_id.strip()
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    adventures: list[dict[str, Any]] = [
+        _adventure_stub_from_raw(raw) for raw in _coerce_adventure_stubs(outline)
+    ]
+    if mode == "merge" and existing_campaign_id and adventures:
+        adventures[0]["campaign_id"] = existing_campaign_id.strip()
 
     existing_location_set: set[str] = {
         loc_id.strip() for loc_id in existing_location_ids if loc_id and loc_id.strip()
@@ -5573,6 +5668,11 @@ def _normalize_outline(
                 "name": name or final_key.replace("_", " ").title(),
                 "type": str(raw_loc.get("type") or "other").strip() or "other",
                 "parent_temporary_key": parent_key,
+                "adventure_temporary_key": str(
+                    raw_loc.get("adventure_temporary_key")
+                    or raw_loc.get("adventure_key")
+                    or ""
+                ).strip(),
                 "significance": _normalize_location_significance(raw_loc.get("significance")),
                 "summary_hint": str(raw_loc.get("summary_hint") or "").strip(),
                 "associated_npc_keys": _as_str_list(raw_loc.get("associated_npc_keys")),
@@ -5680,12 +5780,17 @@ def _normalize_outline(
                 "other_location_keys": other_location_keys,
                 "first_location_id": primary_final,
                 "other_location_ids": list(other_location_keys),
+                "adventure_temporary_key": str(
+                    raw_npc.get("adventure_temporary_key")
+                    or raw_npc.get("adventure_key")
+                    or ""
+                ).strip(),
                 "significance": _normalize_significance(raw_npc.get("significance")),
                 "source_refs": _as_list(raw_npc.get("source_refs")),
             }
         )
 
-    return campaign, locations, npcs
+    return adventures, locations, npcs
 
 
 # --------------------------------------------------------------------------
@@ -6251,7 +6356,7 @@ def outline_campaign_document(
             "Published NON-PLAYER CHARACTERS stat blocks detected; skipping LLM outline "
             "and seeding NPC stubs from FULL NAME blocks (detail sweep still runs)."
         )
-        outline_raw = {"campaign": {}, "locations": [], "npcs": []}
+        outline_raw = {"adventures": [{}], "locations": [], "npcs": []}
         discovery_debug["fast_path"] = "stat_blocks"
         discovery_debug["note"] = "LLM discovery skipped; deterministic FULL NAME seeding."
     elif use_location_site_fast_path:
@@ -6259,7 +6364,7 @@ def outline_campaign_document(
             "Alien moonside / locations chapter detected; skipping LLM outline "
             "and seeding major location site stubs (detail sweep still runs)."
         )
-        outline_raw = {"campaign": {}, "locations": [], "npcs": []}
+        outline_raw = {"adventures": [{}], "locations": [], "npcs": []}
         discovery_debug["fast_path"] = "location_sites"
         discovery_debug["note"] = "LLM discovery skipped; deterministic location site seeding."
     else:
@@ -6291,7 +6396,7 @@ def outline_campaign_document(
         discovery_debug["parsed_location_count"] = len(outline_raw.get("locations") or []) if isinstance(outline_raw.get("locations"), list) else 0
         discovery_debug["parsed_npc_count"] = len(outline_raw.get("npcs") or []) if isinstance(outline_raw.get("npcs"), list) else 0
 
-    campaign, location_stubs, npc_stubs = _normalize_outline(
+    adventures, location_stubs, npc_stubs = _normalize_outline(
         outline_raw,
         mode=mode,
         existing_campaign_id=existing_campaign_id,
@@ -6299,11 +6404,18 @@ def outline_campaign_document(
         existing_npc_names=existing_npc_names,
         warnings=warnings,
     )
+    campaign = adventures[0] if adventures else {"title": "Campaign", "name": "Campaign"}
     _apply_imported_campaign_setting(
         campaign,
         document_text=full_document_text,
         alien_fast_path=use_stat_block_fast_path or use_location_site_fast_path,
     )
+    for adv in adventures[1:]:
+        _apply_imported_campaign_setting(
+            adv,
+            document_text=full_document_text,
+            alien_fast_path=use_stat_block_fast_path or use_location_site_fast_path,
+        )
 
     name_blank = not campaign.get("name") or str(campaign.get("name")).strip().casefold() in {
         "campaign",
@@ -6367,20 +6479,22 @@ def outline_campaign_document(
             stub["first_location_id"] = first_key
             stub["primary_location_key"] = first_key
 
-    campaign, location_stubs, npc_stubs = _stamp_discovery_temporary_keys(
-        campaign,
+    adventures, location_stubs, npc_stubs = _stamp_discovery_temporary_keys(
+        adventures,
         location_stubs,
         npc_stubs,
         mode=mode,
         existing_campaign_id=existing_campaign_id,
         warnings=warnings,
     )
+    campaign = adventures[0] if adventures else {}
 
     relationships = list(outline_raw.get("relationships") or []) if isinstance(outline_raw, dict) else []
     events = list(outline_raw.get("events") or []) if isinstance(outline_raw, dict) else []
 
     discovery_debug["final_location_count"] = len(location_stubs)
     discovery_debug["final_npc_count"] = len(npc_stubs)
+    discovery_debug["final_adventure_count"] = len(adventures)
     if not location_stubs and not npc_stubs:
         warnings.append(
             "Discovery produced zero locations and zero NPCs after normalization/stamping. "
@@ -6388,6 +6502,7 @@ def outline_campaign_document(
         )
 
     return {
+        "adventures": adventures,
         "campaign": campaign,
         "locations": location_stubs,
         "npcs": npc_stubs,
@@ -6758,8 +6873,9 @@ def _build_campaign_prompt(
     *,
     source_index_summary: str = "",
 ) -> str:
+    seed_key = str(discovery_campaign.get("temporary_key") or "").strip() or "adventure_001"
     seed = {
-        "temporary_key": discovery_campaign.get("temporary_key") or "campaign_001",
+        "temporary_key": seed_key,
         "title": discovery_campaign.get("title") or discovery_campaign.get("name") or "",
         "name": discovery_campaign.get("name") or discovery_campaign.get("title") or "",
         "genre": discovery_campaign.get("genre") or "",
@@ -6771,12 +6887,13 @@ def _build_campaign_prompt(
         index_note = f"Source index summary:\n{source_index_summary.strip()}\n\n"
     return (
         "Fill campaign information for NPCNarrator from the source excerpts and discovery seed.\n"
-        "Do NOT invent a permanent campaign_id. Echo temporary_key from the seed.\n\n"
+        "Do NOT invent a permanent campaign_id. Echo temporary_key from the seed exactly "
+        f'(use "{seed_key}").\n\n'
         f"Discovery seed (JSON):\n{json.dumps(seed, ensure_ascii=False)}\n\n"
         f"{index_note}"
         "Respond with exactly this shape:\n"
         "{\n"
-        '  "temporary_key": "campaign_001",\n'
+        f'  "temporary_key": "{seed_key}",\n'
         '  "title": "Display Title",\n'
         '  "name": "Short Name",\n'
         '  "description": "1-4 sentence campaign summary grounded in the source",\n'
@@ -6794,6 +6911,7 @@ def _build_campaign_prompt(
         "Rules:\n"
         "- Prefer concrete facts from the source over invention.\n"
         "- Keep title/name aligned with the discovery seed unless the source clearly corrects them.\n"
+        f'- temporary_key MUST remain "{seed_key}".\n'
         "- Output ONLY the JSON object.\n\n"
         "Campaign-relevant source text:\n"
         '"""\n'
@@ -6845,7 +6963,10 @@ def generate_campaign_info(
     if not isinstance(raw, dict):
         raise ContentImportError("Campaign info pass did not return a JSON object")
 
+    seed_key = str(seed.get("temporary_key") or "").strip() or "adventure_001"
     info = _normalize_campaign_meta({**seed, **raw})
+    # Never let the model overwrite the adventure/campaign temporary_key seed.
+    info["temporary_key"] = seed_key
     _apply_imported_campaign_setting(info, document_text=bounded)
     for key in ("source_refs", "inferences", "warnings"):
         if key in raw and isinstance(raw[key], list):
