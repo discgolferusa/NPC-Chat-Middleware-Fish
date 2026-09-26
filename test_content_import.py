@@ -2032,3 +2032,83 @@ def test_detail_preserves_temporary_key(monkeypatch):
     assert "battered" in loc["summary"].casefold()
     assert result["usage"]["prompt_tokens"] == 3
 
+
+def test_infer_npc_identity_falconmoon_excerpt():
+    """Short HotDQ-style prose must yield male / half-elf / calm personality."""
+    excerpt = (
+        "Eadyan Falconmoon, a level-headed half-elf.\n"
+        "He's easy to spot, being the only calm person they can\n"
+        "find in the temple, and he is elated to see them. He looks\n"
+        "to the characters for a plan."
+    )
+    # Simulate LLM inventing nonbinary + they/them + unknown race.
+    inferred = content_import._infer_npc_identity_from_excerpt(
+        excerpt,
+        {
+            "gender": "nonbinary",
+            "race": "unknown",
+            "pronouns": {"subject": "they", "object": "them"},
+            "personality": [],
+        },
+    )
+    assert inferred["gender"] == "male"
+    assert inferred["race"] == "half-elf"
+    assert "calm" in inferred["personality"]
+    assert "level-headed" in inferred["personality"]
+    assert inferred.get("pronouns") is None  # cleared so merge applies he/him
+
+
+def test_merge_npc_detail_overrides_invented_nonbinary(monkeypatch):
+    excerpt = (
+        "Brother Marcus is a male monk. He greets the party with a calm manner "
+        "and offers them shelter in the temple."
+    )
+
+    def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step, usage_acc=None, **kwargs):
+        return {
+            "npcs": [
+                {
+                    "temporary_key": "marcus",
+                    "gender": "nonbinary",
+                    "race": "unknown",
+                    "pronouns": {
+                        "subject": "they",
+                        "object": "them",
+                        "possessive_adjective": "their",
+                        "possessive_pronoun": "theirs",
+                        "reflexive": "themself",
+                    },
+                    "personality": [],
+                    "public_facts": ["Priest in the temple."],
+                    "known_facts": [],
+                    "secrets": [],
+                    "llm_rules": [],
+                    "voice": [],
+                }
+            ]
+        }
+
+    monkeypatch.setattr(content_import, "_call_llm_json", fake_call_llm_json)
+    result = content_import.detail_npc_batch(
+        excerpt,
+        {"campaign_id": "test_camp", "name": "Test"},
+        [
+            {
+                "temporary_key": "marcus",
+                "name": "Brother Marcus",
+                "role": "monk",
+                "first_location_id": "temple",
+            }
+        ],
+    )
+    npc = result["npcs"][0]
+    assert npc["gender"] == "male"
+    assert npc["pronouns"]["subject"] == "he"
+    assert "calm" in npc["personality"]
+
+
+def test_normalize_pronouns_unspecified_stays_empty():
+    assert content_import._normalize_pronouns(None, "unspecified") == {}
+    assert content_import._normalize_pronouns("", "unknown") == {}
+    assert content_import._normalize_pronouns(None, "male")["subject"] == "he"
+
