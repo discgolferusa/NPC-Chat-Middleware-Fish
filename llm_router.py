@@ -396,7 +396,12 @@ def _get_purpose_model_id(purpose: str) -> str:
     if purpose in IMPORT_PURPOSES:
         override = str(IMPORT_PURPOSE_MODEL_IDS.get(purpose) or "").strip()
         if override:
-            return _resolve_model_id(override, default=CONTENT_CREATION_MODEL_ID, purpose=purpose)
+            # Resolve against content_creation eligibility (catalog rarely lists import purposes).
+            return _resolve_model_id(
+                override,
+                default=CONTENT_CREATION_MODEL_ID,
+                purpose=PURPOSE_CONTENT_CREATION,
+            )
     return CONTENT_CREATION_MODEL_ID
 
 
@@ -516,6 +521,9 @@ def model_supports_purpose(model_id: str, purpose: str) -> bool:
     Entries with no explicit ``purposes`` list count as universal, so a trimmed
     catalog can never leave a dropdown with nothing to choose. Disabled entries
     are excluded from purpose selection lists.
+
+    Import-stage purposes inherit ``content_creation`` eligibility so IMPORT_*_MODEL
+    overrides resolve to real OpenRouter catalog entries instead of falling back to local.
     """
     entry = LLM_MODELS.get(model_id)
     if not entry:
@@ -525,7 +533,12 @@ def model_supports_purpose(model_id: str, purpose: str) -> bool:
     allowed = entry.get("purposes")
     if not allowed:
         return True
-    return _normalize_purpose(purpose) in allowed
+    normalized = _normalize_purpose(purpose)
+    if normalized in allowed:
+        return True
+    if normalized in IMPORT_PURPOSES and PURPOSE_CONTENT_CREATION in allowed:
+        return True
+    return False
 
 
 def models_for_purpose(purpose: str) -> list[str]:

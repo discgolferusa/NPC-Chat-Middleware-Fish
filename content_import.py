@@ -36,16 +36,18 @@ from typing import Any
 from party_campaign import normalize_campaign_genre
 from llm_router import (
     LLMProviderError,
+    IMPORT_LOCATION_BATCH_SIZE,
+    IMPORT_MAX_REPAIR_ATTEMPTS,
+    IMPORT_NPC_BATCH_SIZE,
     content_creation_max_input_chars,
     content_creation_zero_budget_error_message,
     generate_llm_response_with_usage,
 )
 
 MAX_INPUT_CHARS = 120_000
-# One entity per Funnel hop. Location batching + sparse retries stacked past the
-# editor's per-hop HTTP timeout (CONTENT_CREATION_LOCAL_TIMEOUT_SECONDS each).
-MAX_LOCATIONS_PER_BATCH = 1
-MAX_NPCS_PER_BATCH = 1
+# Funnel-safe defaults come from IMPORT_* env (see llm_router / llm_secrets.env.example).
+MAX_LOCATIONS_PER_BATCH = IMPORT_LOCATION_BATCH_SIZE
+MAX_NPCS_PER_BATCH = IMPORT_NPC_BATCH_SIZE
 IMPORT_TEMPERATURE = 0.15
 IMPORT_MAX_TOKENS = 6144
 OUTLINE_MAX_TOKENS = 2048
@@ -278,6 +280,7 @@ def _batches(items: list[Any], size: int) -> list[list[Any]]:
 
 _TEMP_KEY_PATTERN = re.compile(r"^(campaign|location|npc)_\d{3,}$", re.IGNORECASE)
 _VALID_SIGNIFICANCE = frozenset({"conversational", "secondary", "ignore"})
+_VALID_LOCATION_SIGNIFICANCE = frozenset({"major", "minor", "ignore"})
 
 
 def _empty_usage(*, model_id: str | None = None) -> dict[str, Any]:
@@ -317,6 +320,17 @@ def _normalize_significance(value: Any) -> str:
     if raw in _VALID_SIGNIFICANCE:
         return raw
     return "conversational"
+
+
+def _normalize_location_significance(value: Any) -> str:
+    raw = str(value or "").strip().casefold()
+    if raw in _VALID_LOCATION_SIGNIFICANCE:
+        return raw
+    if raw == "conversational":
+        return "major"
+    if raw == "secondary":
+        return "minor"
+    return "major"
 
 
 def _validate_temporary_keys(
@@ -4786,11 +4800,13 @@ _SYSTEM_PROMPT = (
 
 
 def _json_schema_response_format(name: str, schema: dict[str, Any]) -> dict[str, Any]:
+    # strict:false — our import schemas use additionalProperties and partial required
+    # lists; OpenAI/OpenRouter reject strict:true with additionalProperties:true.
     return {
         "type": "json_schema",
         "json_schema": {
             "name": name,
-            "strict": True,
+            "strict": False,
             "schema": schema,
         },
     }
@@ -5127,6 +5143,7 @@ def _normalize_outline(
                 "name": name or final_key.replace("_", " ").title(),
                 "type": str(raw_loc.get("type") or "other").strip() or "other",
                 "parent_temporary_key": parent_key,
+                "significance": _normalize_location_significance(raw_loc.get("significance")),
                 "summary_hint": str(raw_loc.get("summary_hint") or "").strip(),
                 "associated_npc_keys": _as_str_list(raw_loc.get("associated_npc_keys")),
                 "source_refs": _as_list(raw_loc.get("source_refs")),
@@ -5330,11 +5347,10 @@ def _build_location_detail_prompt(
         '  "knowledge_rules": ["rules about what NPCs here generally do or do not know"]\n'
         "}\n\n"
         "KNOWLEDGE RULES:\n"
-        "- public_facts: only what outsiders can observe or commonly know.\n"
-        "- known_facts: only what THIS NPC knows from their role and location.\n"
-        "- secrets: only what THIS NPC conceals; do not dump module-wide GM plot.\n"
-        "- Do not give the NPC automatic GM omniscience or spoilers from distant pages.\n"
-        "- Mark uncertain enrichment in llm_rules as inferred, not as hard fact.\n\n"
+        "- knowledge_rules: what locals, visitors, or NPCs here generally know or must not know.\n"
+        "- public_knowledge on sub-locations: only commonly believed or observable facts.\n"
+        "- Do not dump module-wide GM secrets into knowledge_rules or public_knowledge.\n"
+        "- Mark uncertain enrichment as inferred in knowledge_rules, not as hard fact.\n\n"
         "CRITICAL EXTRACTION RULES:\n"
         "- Echo the exact temporary_key from the list. Do NOT invent permanent location ids.\n"
         "- Prefer copying concrete names, objects, factions, and plot facts from the source.\n"
@@ -5488,6 +5504,12 @@ def _build_npc_detail_prompt(
         '  "secrets": ["what THIS NPC will not willingly reveal"],\n'
         '  "llm_rules": ["actionable play guidance from the source"]\n'
         "}\n\n"
+        "KNOWLEDGE RULES:\n"
+        "- public_facts: only what outsiders can observe or commonly know.\n"
+        "- known_facts: only what THIS NPC knows from their role and location.\n"
+        "- secrets: only what THIS NPC conceals; do not dump module-wide GM plot.\n"
+        "- Do not give the NPC automatic GM omniscience or spoilers from distant pages.\n"
+        "- Mark uncertain enrichment in llm_rules as inferred, not as hard fact.\n\n"
         "CRITICAL EXTRACTION RULES:\n"
         "- Echo the exact temporary_key from the list. Do NOT invent permanent npc ids.\n"
         "- EXTRACT over invent. Copy concrete facts from the source; do not replace them with generics.\n"
@@ -6401,7 +6423,7 @@ def repair_import_entity(
             usage_acc=usage,
             response_schema=REPAIR_RESPONSE_SCHEMA,
             schema_name="repair_response",
-            max_schema_retries=1,
+            max_schema_retries=IMPORT_MAX_REPAIR_ATTEMPTS,
         )
     except Exception as ex:
         if isinstance(ex, LLMProviderError):

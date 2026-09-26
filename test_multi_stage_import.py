@@ -138,3 +138,64 @@ def test_slim_discovery_prompt_omits_long_campaign_prose_fields():
     assert "SLIM discovery" in prompt
     assert "Do NOT write full campaign description" in prompt
     assert '"premise"' not in prompt
+
+
+def test_location_prompt_uses_location_knowledge_rules_not_npc_fields():
+    prompt = content_import._build_location_detail_prompt(
+        [{"temporary_key": "location_001", "id": "location_001", "name": "Bridge", "type": "ship"}],
+        "Bridge prose.",
+        {"name": "Test", "temporary_key": "campaign_001"},
+    )
+    assert "knowledge_rules" in prompt
+    assert "public_knowledge" in prompt
+    assert "THIS NPC" not in prompt
+    assert "public_facts" not in prompt or "public_facts:" not in prompt.split("KNOWLEDGE RULES:")[-1]
+
+
+def test_normalize_outline_preserves_location_significance():
+    campaign, locations, npcs = content_import._normalize_outline(
+        {
+            "campaign": {"temporary_key": "campaign_001", "title": "T", "name": "T", "genre": "sci_fi"},
+            "locations": [
+                {
+                    "temporary_key": "location_001",
+                    "name": "Bridge",
+                    "type": "ship",
+                    "significance": "minor",
+                }
+            ],
+            "npcs": [],
+        },
+        mode="create_new",
+        existing_campaign_id=None,
+        existing_location_ids=[],
+        existing_npc_names=[],
+        warnings=[],
+    )
+    assert locations[0]["significance"] == "minor"
+
+
+def test_json_schema_response_format_is_not_strict():
+    fmt = content_import._json_schema_response_format(
+        "discovery_response",
+        content_import.DISCOVERY_RESPONSE_SCHEMA,
+    )
+    assert fmt["json_schema"]["strict"] is False
+
+
+def test_import_purpose_override_resolves_via_content_creation_eligibility(monkeypatch):
+    import llm_router
+
+    monkeypatch.setitem(
+        llm_router.IMPORT_PURPOSE_MODEL_IDS,
+        llm_router.PURPOSE_CONTENT_REPAIR,
+        "openrouter-gpt-oss-20b",
+    )
+    # Catalog entry typically lists content_creation, not content_repair.
+    entry = llm_router.LLM_MODELS.get("openrouter-gpt-oss-20b")
+    if entry is not None:
+        entry["purposes"] = [llm_router.PURPOSE_CONTENT_CREATION]
+        entry["enabled"] = True
+    mid = llm_router._get_purpose_model_id(llm_router.PURPOSE_CONTENT_REPAIR)
+    assert mid == "openrouter-gpt-oss-20b"
+    assert mid != "local"
