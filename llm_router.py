@@ -113,8 +113,37 @@ REASONING_MODEL_MARKERS = ("gpt-oss", "qwen3", "nemotron", "deepseek-v4")
 
 PURPOSE_CHAT = "chat"
 PURPOSE_CONTENT_CREATION = "content_creation"
-VALID_PURPOSES = frozenset({PURPOSE_CHAT, PURPOSE_CONTENT_CREATION})
+# Import stage purposes (multi-stage module import). Default model routing falls
+# back to content_creation unless IMPORT_* / CONTENT_*_LLM_MODEL_ID is set.
+PURPOSE_CONTENT_DISCOVERY = "content_discovery"
+PURPOSE_CONTENT_CAMPAIGN = "content_campaign"
+PURPOSE_CONTENT_LOCATION = "content_location"
+PURPOSE_CONTENT_NPC = "content_npc"
+PURPOSE_CONTENT_REPAIR = "content_repair"
+IMPORT_PURPOSES = frozenset(
+    {
+        PURPOSE_CONTENT_DISCOVERY,
+        PURPOSE_CONTENT_CAMPAIGN,
+        PURPOSE_CONTENT_LOCATION,
+        PURPOSE_CONTENT_NPC,
+        PURPOSE_CONTENT_REPAIR,
+    }
+)
+VALID_PURPOSES = frozenset({PURPOSE_CHAT, PURPOSE_CONTENT_CREATION}) | IMPORT_PURPOSES
 DEFAULT_PURPOSE = PURPOSE_CHAT
+
+# All content-family purposes (legacy + staged import).
+CONTENT_FAMILY_PURPOSES = frozenset({PURPOSE_CONTENT_CREATION}) | IMPORT_PURPOSES
+
+_ALL_CONTENT_PURPOSES_LIST = [
+    PURPOSE_CHAT,
+    PURPOSE_CONTENT_CREATION,
+    PURPOSE_CONTENT_DISCOVERY,
+    PURPOSE_CONTENT_CAMPAIGN,
+    PURPOSE_CONTENT_LOCATION,
+    PURPOSE_CONTENT_NPC,
+    PURPOSE_CONTENT_REPAIR,
+]
 
 # OpenRouter catalog. Credit budget (not RPM/TPM) gates online vs local fallback.
 # `purposes` / `enabled` gate Admin dropdowns. `provider_order` / `host_provider`
@@ -132,7 +161,7 @@ _SEED_LLM_MODELS: dict[str, dict[str, Any]] = {
         "online": False,
         "enabled": True,
         "limits": None,
-        "purposes": [PURPOSE_CHAT, PURPOSE_CONTENT_CREATION],
+        "purposes": list(_ALL_CONTENT_PURPOSES_LIST),
     },
     "openrouter-gpt-oss-20b": {
         "id": "openrouter-gpt-oss-20b",
@@ -145,7 +174,7 @@ _SEED_LLM_MODELS: dict[str, dict[str, Any]] = {
         "online": True,
         "enabled": True,
         "limits": None,
-        "purposes": [PURPOSE_CHAT, PURPOSE_CONTENT_CREATION],
+        "purposes": list(_ALL_CONTENT_PURPOSES_LIST),
     },
     "openrouter-nemotron-3.5-lightning-coreweave": {
         "id": "openrouter-nemotron-3.5-lightning-coreweave",
@@ -158,7 +187,7 @@ _SEED_LLM_MODELS: dict[str, dict[str, Any]] = {
         "online": True,
         "enabled": True,
         "limits": None,
-        "purposes": [PURPOSE_CHAT, PURPOSE_CONTENT_CREATION],
+        "purposes": list(_ALL_CONTENT_PURPOSES_LIST),
     },
     "openrouter-nemotron-3.5-lightning-deepinfra": {
         "id": "openrouter-nemotron-3.5-lightning-deepinfra",
@@ -171,7 +200,7 @@ _SEED_LLM_MODELS: dict[str, dict[str, Any]] = {
         "online": True,
         "enabled": True,
         "limits": None,
-        "purposes": [PURPOSE_CHAT, PURPOSE_CONTENT_CREATION],
+        "purposes": list(_ALL_CONTENT_PURPOSES_LIST),
     },
     "openrouter-deepseek-v4-flash-0731-coreweave": {
         "id": "openrouter-deepseek-v4-flash-0731-coreweave",
@@ -184,7 +213,7 @@ _SEED_LLM_MODELS: dict[str, dict[str, Any]] = {
         "online": True,
         "enabled": True,
         "limits": None,
-        "purposes": [PURPOSE_CHAT, PURPOSE_CONTENT_CREATION],
+        "purposes": list(_ALL_CONTENT_PURPOSES_LIST),
     },
 }
 LLM_MODELS: dict[str, dict[str, Any]] = deepcopy(_SEED_LLM_MODELS)
@@ -212,12 +241,47 @@ CONTENT_CREATION_MODEL_ID = os.getenv("CONTENT_CREATION_LLM_MODEL_ID", CURRENT_L
 CONTENT_CREATION_PROVIDER_MODE = os.getenv("CONTENT_CREATION_LLM_PROVIDER_MODE", LLM_PROVIDER_MODE)
 CONTENT_CREATION_FALLBACK_MODEL_IDS: list[str] = ["local"]
 
+# Per-stage import model overrides (optional). Empty → inherit content_creation.
+# Env names match the multi-stage import plan.
+_IMPORT_PURPOSE_ENV: dict[str, tuple[str, str]] = {
+    PURPOSE_CONTENT_DISCOVERY: ("IMPORT_DISCOVERY_MODEL", "CONTENT_DISCOVERY_LLM_MODEL_ID"),
+    PURPOSE_CONTENT_CAMPAIGN: ("IMPORT_CAMPAIGN_MODEL", "CONTENT_CAMPAIGN_LLM_MODEL_ID"),
+    PURPOSE_CONTENT_LOCATION: ("IMPORT_LOCATION_MODEL", "CONTENT_LOCATION_LLM_MODEL_ID"),
+    PURPOSE_CONTENT_NPC: ("IMPORT_NPC_MODEL", "CONTENT_NPC_LLM_MODEL_ID"),
+    PURPOSE_CONTENT_REPAIR: ("IMPORT_REPAIR_MODEL", "CONTENT_REPAIR_LLM_MODEL_ID"),
+}
+
+
+def _env_import_model_id(purpose: str) -> str:
+    for key in _IMPORT_PURPOSE_ENV.get(purpose, ()):
+        raw = str(os.getenv(key, "") or "").strip()
+        if raw:
+            return raw
+    return ""
+
+
+IMPORT_PURPOSE_MODEL_IDS: dict[str, str] = {
+    purpose: _env_import_model_id(purpose) for purpose in IMPORT_PURPOSES
+}
+
+IMPORT_MAX_SCHEMA_RETRIES = max(0, int(os.getenv("IMPORT_MAX_SCHEMA_RETRIES", "2")))
+IMPORT_MAX_REPAIR_ATTEMPTS = max(0, int(os.getenv("IMPORT_MAX_REPAIR_ATTEMPTS", "2")))
+IMPORT_LOCATION_BATCH_SIZE = max(1, int(os.getenv("IMPORT_LOCATION_BATCH_SIZE", "1")))
+IMPORT_NPC_BATCH_SIZE = max(1, int(os.getenv("IMPORT_NPC_BATCH_SIZE", "1")))
+
 # Per-purpose runtime status. Mutated in place (never rebound) so callers never
 # need `global` to update them.
-LAST_ACTIVE_PROVIDER: dict[str, str] = {PURPOSE_CHAT: "local", PURPOSE_CONTENT_CREATION: "local"}
-LAST_ACTIVE_MODEL_ID: dict[str, str] = {PURPOSE_CHAT: "local", PURPOSE_CONTENT_CREATION: "local"}
-LAST_FALLBACK_REASON: dict[str, str | None] = {PURPOSE_CHAT: None, PURPOSE_CONTENT_CREATION: None}
-LAST_LLM_ERROR: dict[str, str | None] = {PURPOSE_CHAT: None, PURPOSE_CONTENT_CREATION: None}
+def _empty_purpose_status(default: str | None = "local") -> dict[str, str | None]:
+    out: dict[str, str | None] = {PURPOSE_CHAT: default, PURPOSE_CONTENT_CREATION: default}
+    for purpose in IMPORT_PURPOSES:
+        out[purpose] = default
+    return out
+
+
+LAST_ACTIVE_PROVIDER: dict[str, str] = {k: str(v or "local") for k, v in _empty_purpose_status().items()}
+LAST_ACTIVE_MODEL_ID: dict[str, str] = {k: str(v or "local") for k, v in _empty_purpose_status().items()}
+LAST_FALLBACK_REASON: dict[str, str | None] = _empty_purpose_status(None)
+LAST_LLM_ERROR: dict[str, str | None] = _empty_purpose_status(None)
 
 ONLINE_DISABLED_UNTIL: datetime | None = None
 
@@ -322,19 +386,55 @@ def _normalize_purpose(purpose: str | None) -> str:
     return DEFAULT_PURPOSE
 
 
+def _is_content_family_purpose(purpose: str) -> bool:
+    return purpose in CONTENT_FAMILY_PURPOSES
+
+
 def _get_purpose_model_id(purpose: str) -> str:
-    return CONTENT_CREATION_MODEL_ID if purpose == PURPOSE_CONTENT_CREATION else CURRENT_LLM_MODEL_ID
+    if purpose == PURPOSE_CHAT:
+        return CURRENT_LLM_MODEL_ID
+    if purpose in IMPORT_PURPOSES:
+        override = str(IMPORT_PURPOSE_MODEL_IDS.get(purpose) or "").strip()
+        if override:
+            # Resolve against content_creation eligibility (catalog rarely lists import purposes).
+            return _resolve_model_id(
+                override,
+                default=CONTENT_CREATION_MODEL_ID,
+                purpose=PURPOSE_CONTENT_CREATION,
+            )
+    return CONTENT_CREATION_MODEL_ID
 
 
 def _get_purpose_provider_mode(purpose: str) -> str:
-    raw = CONTENT_CREATION_PROVIDER_MODE if purpose == PURPOSE_CONTENT_CREATION else LLM_PROVIDER_MODE
+    if purpose == PURPOSE_CHAT:
+        raw = LLM_PROVIDER_MODE
+    else:
+        raw = CONTENT_CREATION_PROVIDER_MODE
     return _normalize_provider_mode(raw, default="local")
 
 
 def _get_purpose_fallback_model_ids(purpose: str) -> list[str]:
-    if purpose == PURPOSE_CONTENT_CREATION:
+    if _is_content_family_purpose(purpose):
         return list(CONTENT_CREATION_FALLBACK_MODEL_IDS)
     return list(CHAT_FALLBACK_MODEL_IDS)
+
+
+def import_stage_to_purpose(stage: str | None) -> str:
+    """Map content_import step names onto LLM purposes."""
+    key = str(stage or "").strip().lower()
+    mapping = {
+        "outline": PURPOSE_CONTENT_DISCOVERY,
+        "discovery": PURPOSE_CONTENT_DISCOVERY,
+        "discover": PURPOSE_CONTENT_DISCOVERY,
+        "campaign": PURPOSE_CONTENT_CAMPAIGN,
+        "campaign_details": PURPOSE_CONTENT_CAMPAIGN,
+        "location": PURPOSE_CONTENT_LOCATION,
+        "location_details": PURPOSE_CONTENT_LOCATION,
+        "npc": PURPOSE_CONTENT_NPC,
+        "npc_details": PURPOSE_CONTENT_NPC,
+        "repair": PURPOSE_CONTENT_REPAIR,
+    }
+    return mapping.get(key, PURPOSE_CONTENT_CREATION)
 
 
 def _normalize_fallback_model_ids(
@@ -421,6 +521,9 @@ def model_supports_purpose(model_id: str, purpose: str) -> bool:
     Entries with no explicit ``purposes`` list count as universal, so a trimmed
     catalog can never leave a dropdown with nothing to choose. Disabled entries
     are excluded from purpose selection lists.
+
+    Import-stage purposes inherit ``content_creation`` eligibility so IMPORT_*_MODEL
+    overrides resolve to real OpenRouter catalog entries instead of falling back to local.
     """
     entry = LLM_MODELS.get(model_id)
     if not entry:
@@ -430,7 +533,12 @@ def model_supports_purpose(model_id: str, purpose: str) -> bool:
     allowed = entry.get("purposes")
     if not allowed:
         return True
-    return _normalize_purpose(purpose) in allowed
+    normalized = _normalize_purpose(purpose)
+    if normalized in allowed:
+        return True
+    if normalized in IMPORT_PURPOSES and PURPOSE_CONTENT_CREATION in allowed:
+        return True
+    return False
 
 
 def models_for_purpose(purpose: str) -> list[str]:
@@ -915,7 +1023,7 @@ def _effective_max_tokens(
 ) -> int:
     if max_tokens is not None:
         return max(1, int(max_tokens))
-    if purpose == PURPOSE_CONTENT_CREATION:
+    if _is_content_family_purpose(purpose):
         return CONTENT_CREATION_DEFAULT_MAX_TOKENS
     if _is_reasoning_model(model_id, model_name):
         return _chat_reply_cap("chat_reply_reasoning_max_tokens", REASONING_MAX_TOKENS)
@@ -1218,7 +1326,7 @@ def _would_exceed_online_limits(
     purpose = _normalize_purpose(purpose)
     model_slot = (
         "content creation model"
-        if purpose == PURPOSE_CONTENT_CREATION
+        if _is_content_family_purpose(purpose)
         else "chat model"
     )
 
@@ -1544,7 +1652,7 @@ def _openrouter_timeout_seconds(
 ) -> int:
     if timeout is not None:
         return max(1, int(timeout))
-    if purpose == PURPOSE_CONTENT_CREATION:
+    if _is_content_family_purpose(purpose):
         return max(CONTENT_CREATION_OPENROUTER_TIMEOUT_SECONDS, OPENROUTER_TIMEOUT_SECONDS)
     if _is_reasoning_model(model_id, model_name):
         return max(OPENROUTER_TIMEOUT_SECONDS, 30)
@@ -1563,6 +1671,7 @@ def call_openrouter_chat_completions(
     max_tokens: int | None = None,
     timeout: int | None = None,
     purpose: str = DEFAULT_PURPOSE,
+    response_format: dict[str, Any] | None = None,
 ) -> tuple[str, dict[str, int], requests.Response]:
     headers = _openrouter_auth_headers()
     effective_max = _effective_max_tokens(model_id, max_tokens, model_name=model_name, purpose=purpose)
@@ -1572,6 +1681,8 @@ def call_openrouter_chat_completions(
         "temperature": 0.80 if temperature is None else temperature,
         "max_tokens": effective_max,
     }
+    if isinstance(response_format, dict) and response_format:
+        payload["response_format"] = response_format
     _apply_reasoning_options(payload, model_id=model_id or "", model_name=model_name)
     _apply_openrouter_provider_preferences(payload, model_id=model_id)
     _clear_routed_provider()
@@ -1587,6 +1698,24 @@ def call_openrouter_chat_completions(
             timeout=timeout,
         ),
     )
+
+    # Provider rejected structured output — caller may retry without schema.
+    if (
+        response.status_code >= 400
+        and response_format
+        and response.status_code in (400, 422)
+    ):
+        err_body = ""
+        try:
+            err_body = (response.text or "")[:500]
+        except Exception:
+            err_body = ""
+        if "response_format" in err_body.lower() or "json_schema" in err_body.lower():
+            print(
+                f"[LLM] openrouter rejected response_format model={model_name}; "
+                "caller should fall back to prompt-only JSON",
+                flush=True,
+            )
 
     if response.status_code >= 400:
         return "", {}, response
@@ -1656,7 +1785,7 @@ def _set_active(provider: str, model_id: str, purpose: str = DEFAULT_PURPOSE) ->
 
 
 def _local_timeout_for_purpose(purpose: str) -> int:
-    if purpose == PURPOSE_CONTENT_CREATION:
+    if _is_content_family_purpose(purpose):
         return CONTENT_CREATION_LOCAL_TIMEOUT_SECONDS
     return LOCAL_LLM_TIMEOUT_SECONDS
 
@@ -1867,6 +1996,7 @@ def generate_llm_response_with_usage(
     temperature: float | None = None,
     max_tokens: int | None = None,
     purpose: str = DEFAULT_PURPOSE,
+    response_format: dict[str, Any] | None = None,
     **kwargs: Any,
 ) -> tuple[str, dict[str, Any]]:
     purpose = _normalize_purpose(purpose)
@@ -1990,7 +2120,24 @@ def generate_llm_response_with_usage(
             max_tokens=effective_max_tokens,
             timeout=online_timeout,
             purpose=purpose,
+            response_format=response_format,
         )
+        # Structured-output rejection: retry once without response_format.
+        if (
+            response.status_code in (400, 422)
+            and response_format
+            and not content
+        ):
+            content, usage, response = call_openrouter_chat_completions(
+                messages,
+                model_name,
+                model_id=selected_model_id,
+                temperature=temperature,
+                max_tokens=effective_max_tokens,
+                timeout=online_timeout,
+                purpose=purpose,
+                response_format=None,
+            )
     except requests.Timeout as ex:
         # Per-model timeout: try configured OpenRouter fallbacks. Do not circuit-break
         # the whole account — that would skip DeepInfra/etc. on later turns.
@@ -2640,6 +2787,17 @@ def _usage_by_purpose_summary(purpose: str) -> dict[str, Any]:
 def get_llm_status() -> dict[str, Any]:
     chat_status = _purpose_status(PURPOSE_CHAT)
     creation_status = _purpose_status(PURPOSE_CONTENT_CREATION)
+    purposes: dict[str, Any] = {
+        PURPOSE_CHAT: chat_status,
+        PURPOSE_CONTENT_CREATION: creation_status,
+    }
+    usage_by_purpose: dict[str, Any] = {
+        PURPOSE_CHAT: _usage_by_purpose_summary(PURPOSE_CHAT),
+        PURPOSE_CONTENT_CREATION: _usage_by_purpose_summary(PURPOSE_CONTENT_CREATION),
+    }
+    for purpose in IMPORT_PURPOSES:
+        purposes[purpose] = _purpose_status(purpose)
+        usage_by_purpose[purpose] = _usage_by_purpose_summary(purpose)
 
     return {
         # --- existing top-level fields kept for backward compatibility (== chat purpose) ---
@@ -2663,14 +2821,8 @@ def get_llm_status() -> dict[str, Any]:
             "provider_allow_fallbacks": _openrouter_allow_fallbacks(),
         },
         # --- purpose-scoped detail ---
-        "purposes": {
-            PURPOSE_CHAT: chat_status,
-            PURPOSE_CONTENT_CREATION: creation_status,
-        },
-        "usage_by_purpose": {
-            PURPOSE_CHAT: _usage_by_purpose_summary(PURPOSE_CHAT),
-            PURPOSE_CONTENT_CREATION: _usage_by_purpose_summary(PURPOSE_CONTENT_CREATION),
-        },
+        "purposes": purposes,
+        "usage_by_purpose": usage_by_purpose,
     }
 
 
