@@ -29,6 +29,7 @@ from typing import Any
 
 import requests
 
+import llm_catalog
 from prompt_caps import get_prompt_caps
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -96,6 +97,7 @@ CONTENT_CREATION_DEFAULT_MAX_TOKENS = int(os.getenv("LLM_CONTENT_CREATION_MAX_TO
 
 LLM_USAGE_FILE = BASE_DIR / "llm_usage.json"
 LLM_RUNTIME_CONFIG_FILE = BASE_DIR / "llm_runtime_config.json"
+LLM_CATALOG_FILE = BASE_DIR / "llm_catalog.json"
 LLM_SECRETS_FILE = BASE_DIR / "llm_secrets.env"
 
 VALID_PROVIDER_MODES = frozenset({"local", "openrouter", "openrouter_with_local_fallback"})
@@ -115,19 +117,20 @@ VALID_PURPOSES = frozenset({PURPOSE_CHAT, PURPOSE_CONTENT_CREATION})
 DEFAULT_PURPOSE = PURPOSE_CHAT
 
 # OpenRouter catalog. Credit budget (not RPM/TPM) gates online vs local fallback.
-# `purposes` gates which Admin -> LLM dropdown offers the model.
-# Optional `provider_order` pins OpenRouter routing for that catalog entry
-# (overrides OPENROUTER_PROVIDER_ORDER for that model only).
-# `provider_label` is shown in Admin dropdowns so each option names its host.
-LLM_MODELS: dict[str, dict[str, Any]] = {
+# `purposes` / `enabled` gate Admin dropdowns. `provider_order` / `host_provider`
+# pin OpenRouter routing for that catalog entry. Live rows are loaded from
+# llm_catalog.json (seeded from these defaults on first boot).
+_SEED_LLM_MODELS: dict[str, dict[str, Any]] = {
     "local": {
         "id": "local",
         "label": "Local llama.cpp — local",
         "provider": "local",
         "provider_label": "local",
+        "host_provider": "local",
         "model": LOCAL_LLM_MODEL,
         "url": LOCAL_LLM_URL,
         "online": False,
+        "enabled": True,
         "limits": None,
         "purposes": [PURPOSE_CHAT, PURPOSE_CONTENT_CREATION],
     },
@@ -136,8 +139,11 @@ LLM_MODELS: dict[str, dict[str, Any]] = {
         "label": "GPT-OSS 20B — Amazon Bedrock / Novita",
         "provider": "openrouter",
         "provider_label": "Amazon Bedrock / Novita",
+        "host_provider": "amazon-bedrock",
         "model": "openai/gpt-oss-20b",
+        "provider_order": ["amazon-bedrock", "novita"],
         "online": True,
+        "enabled": True,
         "limits": None,
         "purposes": [PURPOSE_CHAT, PURPOSE_CONTENT_CREATION],
     },
@@ -146,9 +152,11 @@ LLM_MODELS: dict[str, dict[str, Any]] = {
         "label": "Nemotron 3.5 Lightning — CoreWeave",
         "provider": "openrouter",
         "provider_label": "CoreWeave",
+        "host_provider": "coreweave",
         "model": "nvidia/nemotron-3.5-lightning",
         "provider_order": ["coreweave"],
         "online": True,
+        "enabled": True,
         "limits": None,
         "purposes": [PURPOSE_CHAT, PURPOSE_CONTENT_CREATION],
     },
@@ -157,9 +165,11 @@ LLM_MODELS: dict[str, dict[str, Any]] = {
         "label": "Nemotron 3.5 Lightning — DeepInfra",
         "provider": "openrouter",
         "provider_label": "DeepInfra",
+        "host_provider": "deepinfra",
         "model": "nvidia/nemotron-3.5-lightning",
         "provider_order": ["deepinfra"],
         "online": True,
+        "enabled": True,
         "limits": None,
         "purposes": [PURPOSE_CHAT, PURPOSE_CONTENT_CREATION],
     },
@@ -168,13 +178,16 @@ LLM_MODELS: dict[str, dict[str, Any]] = {
         "label": "DeepSeek V4 Flash 0731 — CoreWeave",
         "provider": "openrouter",
         "provider_label": "CoreWeave",
+        "host_provider": "coreweave",
         "model": "deepseek/deepseek-v4-flash-0731",
         "provider_order": ["coreweave"],
         "online": True,
+        "enabled": True,
         "limits": None,
         "purposes": [PURPOSE_CHAT, PURPOSE_CONTENT_CREATION],
     },
 }
+LLM_MODELS: dict[str, dict[str, Any]] = deepcopy(_SEED_LLM_MODELS)
 
 # Retired Groq catalog ids (and chained aliases) remap onto OpenRouter gpt-oss-20b.
 DEPRECATED_MODEL_ALIASES: dict[str, str] = {
@@ -406,10 +419,13 @@ def model_supports_purpose(model_id: str, purpose: str) -> bool:
     """Whether the catalog offers ``model_id`` for ``purpose``.
 
     Entries with no explicit ``purposes`` list count as universal, so a trimmed
-    catalog can never leave a dropdown with nothing to choose.
+    catalog can never leave a dropdown with nothing to choose. Disabled entries
+    are excluded from purpose selection lists.
     """
     entry = LLM_MODELS.get(model_id)
     if not entry:
+        return False
+    if entry.get("enabled") is False:
         return False
     allowed = entry.get("purposes")
     if not allowed:
@@ -419,6 +435,9 @@ def model_supports_purpose(model_id: str, purpose: str) -> bool:
 
 def models_for_purpose(purpose: str) -> list[str]:
     normalized = _normalize_purpose(purpose)
+    ordered = llm_catalog.get_model_order(normalized)
+    if ordered:
+        return [mid for mid in ordered if model_supports_purpose(mid, normalized)]
     return [mid for mid in LLM_MODELS if model_supports_purpose(mid, normalized)]
 
 
@@ -1004,10 +1023,16 @@ def _request_owner_user_id() -> str:
 
 
 def _pricing_for_model(model_id: str) -> dict[str, float]:
-    entry = GROQ_ON_DEMAND_PRICES_USD.get(model_id)
-    if entry:
-        return {"input": float(entry["input"]), "output": float(entry["output"])}
-    # Unknown online ids: treat as zero so we still show tokens without inventing rates.
+    entry = LLM_MODELS.get(model_id) or {}
+    pricing = entry.get("pricing") if isinstance(entry.get("pricing"), dict) else None
+    if pricing is not None:
+        return {
+            "input": float(pricing.get("input") or 0.0),
+            "output": float(pricing.get("output") or 0.0),
+        }
+    table = ONLINE_ON_DEMAND_PRICES_USD.get(model_id)
+    if table:
+        return {"input": float(table["input"]), "output": float(table["output"])}
     if model_id == "local" or not model_id:
         return {"input": 0.0, "output": 0.0}
     return {"input": 0.0, "output": 0.0}
@@ -2159,12 +2184,26 @@ def select_llm_model(
     provider_mode: str | None = None,
     purpose: str = DEFAULT_PURPOSE,
     fallback_model_ids: Any = None,
+    model_order: Any = None,
 ) -> dict[str, Any]:
     global CURRENT_LLM_MODEL_ID, LLM_PROVIDER_MODE, CHAT_FALLBACK_MODEL_IDS
     global CONTENT_CREATION_MODEL_ID, CONTENT_CREATION_PROVIDER_MODE
     global CONTENT_CREATION_FALLBACK_MODEL_IDS
 
     purpose = _normalize_purpose(purpose)
+
+    # Full ordered precedence list: first id is primary, rest are fallbacks.
+    if model_order is not None:
+        ordered = llm_catalog.set_model_order(
+            purpose,
+            model_order,
+            llm_models=LLM_MODELS,
+            prices=ONLINE_ON_DEMAND_PRICES_USD,
+        )
+        if not ordered:
+            raise ValueError("model_order must include at least one enabled model")
+        model_id = ordered[0]
+        fallback_model_ids = ordered[1:]
 
     if model_id not in LLM_MODELS:
         remapped = _alias_model_id(model_id)
@@ -2199,6 +2238,10 @@ def select_llm_model(
                 CONTENT_CREATION_PROVIDER_MODE = provider_mode
             if model_id == "local":
                 CONTENT_CREATION_PROVIDER_MODE = "local"
+            elif provider_mode is None:
+                CONTENT_CREATION_PROVIDER_MODE = _provider_mode_for_primary(
+                    model_id, CONTENT_CREATION_PROVIDER_MODE
+                )
             if update_fallbacks:
                 CONTENT_CREATION_FALLBACK_MODEL_IDS = list(normalized_fallbacks or [])
             else:
@@ -2216,6 +2259,8 @@ def select_llm_model(
                 LLM_PROVIDER_MODE = provider_mode
             if model_id == "local":
                 LLM_PROVIDER_MODE = "local"
+            elif provider_mode is None:
+                LLM_PROVIDER_MODE = _provider_mode_for_primary(model_id, LLM_PROVIDER_MODE)
             if update_fallbacks:
                 CHAT_FALLBACK_MODEL_IDS = list(normalized_fallbacks or [])
             else:
@@ -2231,6 +2276,40 @@ def select_llm_model(
         LAST_FALLBACK_REASON[purpose] = None
         LAST_LLM_ERROR[purpose] = None
 
+        # Keep catalog precedence aligned without truncating a longer admin order.
+        if model_order is not None:
+            pass  # already applied via set_model_order above
+        elif update_fallbacks:
+            # Explicit fallback_model_ids means the caller intends this full chain.
+            llm_catalog.set_model_order(
+                purpose,
+                [result_model_id, *result_fallbacks],
+                llm_models=LLM_MODELS,
+                prices=ONLINE_ON_DEMAND_PRICES_USD,
+            )
+        else:
+            # Primary/mode-only change: move primary to front, keep remaining order.
+            existing = llm_catalog.get_model_order(purpose)
+            merged = [result_model_id, *[m for m in existing if m != result_model_id]]
+            llm_catalog.set_model_order(
+                purpose,
+                merged,
+                llm_models=LLM_MODELS,
+                prices=ONLINE_ON_DEMAND_PRICES_USD,
+            )
+
+        # Fallbacks mirror the persisted precedence list (everything after primary).
+        full_order = llm_catalog.get_model_order(purpose)
+        if full_order:
+            result_model_id = full_order[0]
+            result_fallbacks = full_order[1:]
+            if purpose == PURPOSE_CONTENT_CREATION:
+                CONTENT_CREATION_MODEL_ID = result_model_id
+                CONTENT_CREATION_FALLBACK_MODEL_IDS = list(result_fallbacks)
+            else:
+                CURRENT_LLM_MODEL_ID = result_model_id
+                CHAT_FALLBACK_MODEL_IDS = list(result_fallbacks)
+
         _save_runtime_config()
 
         return {
@@ -2238,6 +2317,7 @@ def select_llm_model(
             "model_id": result_model_id,
             "provider_mode": result_provider_mode,
             "fallback_model_ids": result_fallbacks,
+            "model_order": llm_catalog.get_model_order(purpose),
             "selected_model": _public_model_entry(result_model_id),
         }
 
@@ -2528,6 +2608,7 @@ def _purpose_status(purpose: str) -> dict[str, Any]:
         "model_id": selected_model_id,
         "provider_mode": provider_mode,
         "fallback_model_ids": _get_purpose_fallback_model_ids(purpose),
+        "model_order": llm_catalog.get_model_order(purpose),
         "selected_model": selected_model,
         "active_provider": LAST_ACTIVE_PROVIDER.get(purpose, "local"),
         "active_model_id": LAST_ACTIVE_MODEL_ID.get(purpose, "local"),
@@ -2594,6 +2675,8 @@ def get_llm_status() -> dict[str, Any]:
 
 
 def get_llm_models_payload() -> dict[str, Any]:
+    chat_order = llm_catalog.get_model_order(PURPOSE_CHAT)
+    creation_order = llm_catalog.get_model_order(PURPOSE_CONTENT_CREATION)
     return {
         "current_model_id": CURRENT_LLM_MODEL_ID,
         "provider_mode": LLM_PROVIDER_MODE,
@@ -2609,38 +2692,160 @@ def get_llm_models_payload() -> dict[str, Any]:
             {
                 "id": "openrouter_with_local_fallback",
                 "label": (
-                    "openrouter_with_local_fallback — try primary + fallback models "
-                    "(local last by default; also at 80% credit usage)"
+                    "openrouter_with_local_fallback — try models in precedence order "
+                    "(also switches to local at 80% credit usage)"
                 ),
             },
         ],
         # Full catalog for back-compat; each entry carries `purposes`, and every
         # purpose also gets its own pre-filtered list so clients need not re-derive it.
         "models": _public_model_list(),
+        "catalog": llm_catalog.public_catalog_entries(include_disabled=True),
+        "model_order": {
+            PURPOSE_CHAT: chat_order,
+            PURPOSE_CONTENT_CREATION: creation_order,
+        },
         "purposes": {
             PURPOSE_CHAT: {
                 "current_model_id": CURRENT_LLM_MODEL_ID,
                 "provider_mode": LLM_PROVIDER_MODE,
                 "fallback_model_ids": list(CHAT_FALLBACK_MODEL_IDS),
+                "model_order": chat_order,
                 "models": _public_model_list(PURPOSE_CHAT),
             },
             PURPOSE_CONTENT_CREATION: {
                 "current_model_id": CONTENT_CREATION_MODEL_ID,
                 "provider_mode": CONTENT_CREATION_PROVIDER_MODE,
                 "fallback_model_ids": list(CONTENT_CREATION_FALLBACK_MODEL_IDS),
+                "model_order": creation_order,
                 "models": _public_model_list(PURPOSE_CONTENT_CREATION),
             },
         },
     }
 
 
+def upsert_llm_catalog_entry(payload: dict[str, Any], *, fetch_pricing: bool = True) -> dict[str, Any]:
+    entry = llm_catalog.upsert_entry(
+        payload,
+        llm_models=LLM_MODELS,
+        prices=ONLINE_ON_DEMAND_PRICES_USD,
+        fetch_pricing=fetch_pricing,
+    )
+    _reconcile_selection_after_catalog_change()
+    return entry
+
+
+def delete_llm_catalog_entry(entry_id: str) -> None:
+    llm_catalog.delete_entry(
+        entry_id,
+        llm_models=LLM_MODELS,
+        prices=ONLINE_ON_DEMAND_PRICES_USD,
+    )
+    _reconcile_selection_after_catalog_change()
+
+
+def set_llm_model_order(purpose: str, model_ids: Any, provider_mode: str | None = None) -> dict[str, Any]:
+    """Persist precedence list and sync primary/fallback selection for a purpose."""
+    purpose = _normalize_purpose(purpose)
+    ordered = llm_catalog.set_model_order(
+        purpose,
+        model_ids,
+        llm_models=LLM_MODELS,
+        prices=ONLINE_ON_DEMAND_PRICES_USD,
+    )
+    if not ordered:
+        raise ValueError("model_order must include at least one enabled model for this purpose")
+    return select_llm_model(
+        ordered[0],
+        provider_mode=provider_mode,
+        purpose=purpose,
+        model_order=ordered,
+    )
+
+
+def refresh_llm_catalog_pricing(entry_id: str | None = None) -> dict[str, Any]:
+    return llm_catalog.refresh_pricing(
+        entry_id=entry_id,
+        llm_models=LLM_MODELS,
+        prices=ONLINE_ON_DEMAND_PRICES_USD,
+    )
+
+
+def _reconcile_selection_after_catalog_change() -> None:
+    """Drop disabled/missing ids from live primary+fallback chains and re-save."""
+    _sync_selection_from_catalog_order()
+
+
+def _provider_mode_for_primary(primary_model_id: str, current_mode: str) -> str:
+    """Align provider_mode with the catalog primary so online seeds are not stuck on local."""
+    entry = LLM_MODELS.get(primary_model_id) or {}
+    is_local = primary_model_id == "local" or entry.get("provider") == "local"
+    if is_local:
+        return "local"
+    normalized = _normalize_provider_mode(current_mode, default=ONLINE_WITH_FALLBACK_MODE)
+    if normalized == "local":
+        return ONLINE_WITH_FALLBACK_MODE
+    return normalized
+
+
+def _sync_selection_from_catalog_order() -> None:
+    """Apply persisted catalog precedence into runtime primary/fallback/mode globals.
+
+    Catalog ``MODEL_ORDER`` is authoritative after load/seed. A short
+    ``llm_runtime_config.json`` (primary + one fallback) must not overwrite a
+    multi-model seeded precedence list on startup. When the primary is online,
+    a leftover ``local`` provider_mode is promoted so generation does not keep
+    calling llama.cpp while Admin shows an OpenRouter primary.
+    """
+    global CURRENT_LLM_MODEL_ID, LLM_PROVIDER_MODE, CHAT_FALLBACK_MODEL_IDS
+    global CONTENT_CREATION_MODEL_ID, CONTENT_CREATION_PROVIDER_MODE
+    global CONTENT_CREATION_FALLBACK_MODEL_IDS
+
+    with _STATE_LOCK:
+        for purpose in (PURPOSE_CHAT, PURPOSE_CONTENT_CREATION):
+            primary, fallbacks = llm_catalog.purpose_chain_from_order(purpose)
+            if purpose == PURPOSE_CONTENT_CREATION:
+                CONTENT_CREATION_MODEL_ID = primary
+                CONTENT_CREATION_FALLBACK_MODEL_IDS = list(fallbacks)
+                CONTENT_CREATION_PROVIDER_MODE = _provider_mode_for_primary(
+                    primary, CONTENT_CREATION_PROVIDER_MODE
+                )
+            else:
+                CURRENT_LLM_MODEL_ID = primary
+                CHAT_FALLBACK_MODEL_IDS = list(fallbacks)
+                LLM_PROVIDER_MODE = _provider_mode_for_primary(primary, LLM_PROVIDER_MODE)
+        _save_runtime_config()
+
+
 def init_llm_router() -> None:
     _load_secrets_file()
+
+    def _openrouter_headers() -> dict[str, str]:
+        return _openrouter_auth_headers() if openrouter_is_configured() else {}
+
+    llm_catalog.configure(
+        catalog_file=LLM_CATALOG_FILE,
+        get_openrouter_api_root=_openrouter_api_root,
+        get_openrouter_headers=_openrouter_headers,
+        get_local_model=lambda: LOCAL_LLM_MODEL,
+        get_local_url=lambda: LOCAL_LLM_URL,
+    )
+    llm_catalog.load_or_seed(
+        llm_models=LLM_MODELS,
+        prices=ONLINE_ON_DEMAND_PRICES_USD,
+        default_prices=dict(ONLINE_ON_DEMAND_PRICES_USD),
+        local_model=LOCAL_LLM_MODEL,
+        local_url=LOCAL_LLM_URL,
+    )
+
+    # Runtime config still loads provider modes / remaps; precedence comes from catalog.
     _load_runtime_config()
+    _sync_selection_from_catalog_order()
 
     # Refresh local model metadata after env/secrets load.
-    LLM_MODELS["local"]["model"] = LOCAL_LLM_MODEL
-    LLM_MODELS["local"]["url"] = LOCAL_LLM_URL
+    if "local" in LLM_MODELS:
+        LLM_MODELS["local"]["model"] = LOCAL_LLM_MODEL
+        LLM_MODELS["local"]["url"] = LOCAL_LLM_URL
 
     provider_order = _openrouter_provider_order()
     print(
@@ -2648,7 +2853,8 @@ def init_llm_router() -> None:
         f"content_creation_model={CONTENT_CREATION_MODEL_ID} content_creation_mode={CONTENT_CREATION_PROVIDER_MODE} "
         f"openrouter_configured={openrouter_is_configured()} "
         f"provider_order={provider_order or '(none)'} "
-        f"provider_allow_fallbacks={_openrouter_allow_fallbacks()}",
+        f"provider_allow_fallbacks={_openrouter_allow_fallbacks()} "
+        f"catalog_entries={len(LLM_MODELS)}",
         flush=True,
     )
 

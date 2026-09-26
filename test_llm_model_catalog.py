@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import pytest
 
+import llm_catalog
 import llm_router
 
 
@@ -71,7 +72,7 @@ def test_every_catalog_id_has_a_pricing_row():
 
 def test_pricing_table_has_no_orphan_rows():
     for model_id in llm_router.ONLINE_ON_DEMAND_PRICES_USD:
-        assert model_id in llm_router.LLM_MODELS
+        assert model_id in llm_router.LLM_MODELS, model_id
 
 
 @pytest.mark.parametrize(
@@ -103,7 +104,7 @@ def test_groq_provider_modes_alias_to_openrouter():
     )
 
 
-def test_models_for_purpose_include_openrouter_and_local():
+def test_models_for_purpose_include_openrouter_and_local(isolated_selection):
     chat_models = llm_router.models_for_purpose("chat")
     creation_models = llm_router.models_for_purpose("content_creation")
     for shared in (
@@ -324,8 +325,18 @@ def test_would_exceed_online_limits_uses_credit_threshold(monkeypatch):
 
 @pytest.fixture()
 def isolated_selection(monkeypatch, tmp_path):
+    catalog_path = tmp_path / "llm_catalog.json"
     monkeypatch.setattr(
         llm_router, "LLM_RUNTIME_CONFIG_FILE", tmp_path / "llm_runtime_config.json"
+    )
+    monkeypatch.setattr(llm_router, "LLM_CATALOG_FILE", catalog_path)
+    monkeypatch.setattr(llm_catalog, "LLM_CATALOG_FILE", catalog_path)
+    llm_catalog.load_or_seed(
+        llm_models=llm_router.LLM_MODELS,
+        prices=llm_router.ONLINE_ON_DEMAND_PRICES_USD,
+        default_prices=dict(llm_router.ONLINE_ON_DEMAND_PRICES_USD),
+        local_model=llm_router.LOCAL_LLM_MODEL,
+        local_url=llm_router.LOCAL_LLM_URL,
     )
     monkeypatch.setattr(llm_router, "CURRENT_LLM_MODEL_ID", "local")
     monkeypatch.setattr(llm_router, "LLM_PROVIDER_MODE", "local")
@@ -915,7 +926,7 @@ def test_openrouter_success_does_not_clear_402_cooldown(monkeypatch):
         purpose="chat",
         respect_online_disabled=False,
     )
-    assert content == "ok"
+    assert content[0] == "ok"
     assert llm_router.ONLINE_DISABLED_UNTIL == disabled_until
 
 def test_llm_status_exposes_openrouter_provider_order(api, monkeypatch):
