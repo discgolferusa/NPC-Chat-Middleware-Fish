@@ -2050,6 +2050,7 @@ def test_infer_npc_identity_falconmoon_excerpt():
             "pronouns": {"subject": "they", "object": "them"},
             "personality": [],
         },
+        name="Eadyan Falconmoon",
     )
     assert inferred["gender"] == "male"
     assert inferred["race"] == "half-elf"
@@ -2057,6 +2058,38 @@ def test_infer_npc_identity_falconmoon_excerpt():
     assert "level-headed" in inferred["personality"]
     assert inferred.get("pronouns") is None  # cleared so merge applies he/him
 
+
+def test_infer_npc_identity_ignores_neighbor_writeup():
+    excerpt = (
+        "=== PAGE 8 ===\n"
+        "Sister Mira, a stern dwarf. She guards the gate.\n\n"
+        "=== PAGE 9 ===\n"
+        "Eadyan Falconmoon greets the party. He is calm.\n"
+    )
+    inferred = content_import._infer_npc_identity_from_excerpt(
+        excerpt,
+        {"gender": "unspecified", "race": "unknown", "personality": []},
+        name="Eadyan Falconmoon",
+    )
+    assert inferred["gender"] == "male"
+    assert inferred.get("race", "unknown") in {"unknown", ""}  # dwarf must not leak
+    assert "calm" in inferred.get("personality", [])
+
+
+def test_infer_npc_identity_overrides_hyphenated_nonbinary():
+    excerpt = "Brother Marcus is a male monk. He greets the party with a calm manner."
+    inferred = content_import._infer_npc_identity_from_excerpt(
+        excerpt,
+        {
+            "gender": "non-binary",
+            "pronouns": {"subject": "they", "object": "them"},
+            "personality": [],
+        },
+        name="Brother Marcus",
+    )
+    assert inferred["gender"] == "male"
+    assert inferred.get("pronouns") is None
+    assert content_import._canonicalize_import_gender("enby") == "nonbinary"
 
 def test_merge_npc_detail_overrides_invented_nonbinary(monkeypatch):
     excerpt = (

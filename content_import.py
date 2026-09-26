@@ -2548,9 +2548,12 @@ def _page_neighborhood_for_needles(
     spans = _parse_page_spans(text)
     if not spans:
         return ""
+    search_needles = _rank_search_needles(needles)
+    if not search_needles:
+        return ""
     lower = text.casefold()
     hit_pages: set[int] = set()
-    for needle in needles:
+    for needle in search_needles:
         for idx in _mention_indexes(lower, needle):
             page = _page_num_at_offset(spans, idx)
             if page is not None:
@@ -4773,16 +4776,71 @@ _RACE_INFER_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+_INVENTED_NONBINARY_GENDERS = frozenset({"nonbinary", "non-binary", "enby", "nb"})
+_IDENTITY_CUE_AFTER = 900
 
-def _infer_npc_identity_from_excerpt(excerpt: str, detail: dict[str, Any]) -> dict[str, Any]:
+
+def _canonicalize_import_gender(raw: str) -> str:
+    gender = (raw or "").strip().lower()
+    if gender in _INVENTED_NONBINARY_GENDERS:
+        return "nonbinary"
+    if gender in {"male", "female", "unspecified"}:
+        return gender
+    return "unspecified" if not gender else gender
+
+
+def _rank_search_needles(needles: list[str]) -> list[str]:
+    """Prefer long/specific needles so short shared tokens cannot flood page hits."""
+    ranked = sorted(
+        {str(n).strip() for n in needles if str(n).strip()},
+        key=lambda n: len(n),
+        reverse=True,
+    )
+    primary = [n for n in ranked if len(n) >= 6 or any(ch in n for ch in (" ", "-", "_"))]
+    return primary or [n for n in ranked if len(n) >= 4]
+
+
+def _identity_cue_text(excerpt: str, name: str) -> str:
+    """Restrict identity inference to text at/after this NPC's best name mention.
+
+    Starts at the name (no lookbehind) so a prior callout's she/he cannot leak.
+    Uses the last hit of the longest needle (writeups usually follow TOC drops).
+    """
+    text = excerpt or ""
+    name = str(name or "").strip()
+    if not text.strip() or not name:
+        return ""
+    needles = _rank_search_needles(_distinctive_name_needles(name, snake_case(name)))
+    if not needles:
+        return ""
+    lower = text.casefold()
+    for needle in needles:
+        hits = _mention_indexes(lower, needle)
+        if not hits:
+            continue
+        idx = hits[-1]
+        end = min(len(text), idx + len(needle) + _IDENTITY_CUE_AFTER)
+        return text[idx:end]
+    return ""
+
+
+def _infer_npc_identity_from_excerpt(
+    excerpt: str,
+    detail: dict[str, Any],
+    *,
+    name: str = "",
+) -> dict[str, Any]:
     """Fill blank gender/race/personality from clear excerpt cues (import only).
 
     Also corrects LLM ``nonbinary``/they when the excerpt clearly uses he/she —
     models often default to they/them when unsure, which then became nonbinary
     in the Yaml Editor.
+
+    Cues are taken only from windows around ``name`` so neighboring writeups in a
+    ±2 page neighborhood do not leak race/gender/personality onto this NPC.
     """
     out = dict(detail) if isinstance(detail, dict) else {}
-    text = excerpt or ""
+    text = _identity_cue_text(excerpt, name) if name else (excerpt or "")
     if not text.strip():
         return out
 
@@ -4790,7 +4848,6 @@ def _infer_npc_identity_from_excerpt(excerpt: str, detail: dict[str, Any]) -> di
     # Prefer strong male cues; "his" alone is weak (place possessives) but ok with he/him.
     has_he_strong = bool(re.search(r"\b(he|him|himself)\b", text, re.IGNORECASE))
     has_his = bool(re.search(r"\bhis\b", text, re.IGNORECASE))
-    has_he = has_he_strong or has_his
     has_male = bool(re.search(r"\bmale\b", text, re.IGNORECASE))
     has_female = bool(re.search(r"\bfemale\b", text, re.IGNORECASE))
     clear_male = (has_he_strong or has_male) and not (has_she or has_female)
@@ -4799,13 +4856,15 @@ def _infer_npc_identity_from_excerpt(excerpt: str, detail: dict[str, Any]) -> di
     if not clear_male and not clear_female and has_his and not (has_she or has_female):
         clear_male = True
 
-    gender = str(out.get("gender") or "").strip().lower()
+    gender = _canonicalize_import_gender(str(out.get("gender") or ""))
     # Override blank, unspecified, or inventively-nonbinary when excerpt is clear.
-    if gender in {"", "unspecified", "nonbinary"}:
+    if gender in {"", "unspecified"} or gender in _INVENTED_NONBINARY_GENDERS or gender == "nonbinary":
         if clear_male:
             out["gender"] = "male"
         elif clear_female:
             out["gender"] = "female"
+        else:
+            out["gender"] = gender if gender == "nonbinary" else "unspecified"
 
     inferred_gender = str(out.get("gender") or "").strip().lower()
     if inferred_gender in {"male", "female"}:
@@ -4937,22 +4996,17 @@ def _relevant_excerpts(
     if not text or not needles:
         return text
 
-    # Prefer full page neighborhoods when the extractor left PAGE markers —
-    # better for PDF callouts that sit outside linear scene flow.
-    page_slice = _page_neighborhood_for_needles(text, list(needles))
+    # Rank/drop short needles BEFORE page search so shared tokens (e.g. "Hope")
+    # cannot mark dozens of pages and crowd out the real writeup.
+    search_needles = _rank_search_needles(needles)
+    if not search_needles:
+        return text[: min(len(text), EXCERPT_MAX_CHARS)]
+
+    page_slice = _page_neighborhood_for_needles(text, search_needles)
     if page_slice.strip():
         return page_slice
 
     lower = text.casefold()
-    # Prefer long/specific needles so short tokens cannot flood the budget.
-    ranked = sorted(
-        {str(n).strip() for n in needles if str(n).strip()},
-        key=lambda n: len(n),
-        reverse=True,
-    )
-    primary = [n for n in ranked if len(n) >= 6 or any(ch in n for ch in (" ", "-", "_"))]
-    search_needles = primary or [n for n in ranked if len(n) >= 4]
-
     spans: list[tuple[int, int, int]] = []  # start, end, needle_len
     for needle in search_needles:
         for idx in _mention_indexes(lower, needle):
@@ -5907,10 +5961,14 @@ def _merge_npc_detail(
     *,
     excerpt: str = "",
 ) -> dict[str, Any]:
-    detail = _infer_npc_identity_from_excerpt(excerpt, detail if isinstance(detail, dict) else {})
+    detail = _infer_npc_identity_from_excerpt(
+        excerpt,
+        detail if isinstance(detail, dict) else {},
+        name=str(stub.get("name") or ""),
+    )
     secrets = _as_str_list(detail.get("secrets"))
     llm_rules = _as_str_list(detail.get("llm_rules"))
-    gender = str(detail.get("gender") or "unspecified").strip().lower() or "unspecified"
+    gender = _canonicalize_import_gender(str(detail.get("gender") or "unspecified"))
     if gender not in {"male", "female", "nonbinary", "unspecified"}:
         gender = "unspecified"
 
@@ -6657,6 +6715,8 @@ def detail_npc_batch(
 
     npcs = []
     for stub in batch:
+        # Prefer the name-focused writeup excerpt only — never fall back to the
+        # full document for identity cues (neighboring NPCs would leak).
         excerpt = _npc_writeup_excerpt(text, str(stub.get("name") or ""))
         npcs.append(
             _merge_npc_detail(
@@ -6664,7 +6724,7 @@ def detail_npc_batch(
                 _lookup_stub_detail(details_by_id, stub),
                 campaign_stamp,
                 warnings,
-                excerpt=excerpt or text,
+                excerpt=excerpt,
             )
         )
     return {"npcs": npcs, "warnings": warnings, "usage": usage}
