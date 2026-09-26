@@ -1320,6 +1320,484 @@ def _prepare_outline_document_text(text: str, warnings: list[str]) -> str:
     return npc_section
 
 
+_SKIP_ANTHOLOGY_TITLES = frozenset(
+    {
+        "contents",
+        "introduction",
+        "credits",
+        "appendix",
+        "appendices",
+        "maps",
+        "index",
+        "using this book",
+        "the yawning portal",
+        "tales from the yawning portal",
+        "magic items",
+        "monsters",
+        "creatures",
+        "character hooks",
+        "adventure synopsis",
+        "running the adventure",
+        "aftermath",
+        "preface",
+        "foreword",
+        "table of contents",
+    }
+)
+
+_CONTENTS_CHAPTER_LINE = re.compile(
+    r"(?im)^\s*Ch(?:apter)?\.?\s*(\d+)\s*[:.\-I|]\s*(.+?)\s*(?:\.{2,}|\s{2,})\s*\d*",
+)
+_CONTENTS_DOTTED_TITLE = re.compile(
+    r"(?im)^\s*([A-Z][A-Za-z0-9' \-]{3,70}?)\s*\.{3,}\s*\d+\s*",
+)
+_CHAPTER_BANNER_LINE = re.compile(
+    r"(?im)^\s*CHAPTER\s+(\d+)\s*[I|:]\s*(.+?)\s*$",
+)
+_PAGE_MARKER = re.compile(r"(?m)^=== PAGE (\d+) ===\s*$")
+
+
+def _normalize_document_scope(value: str | None) -> str:
+    """Return ``single`` (default) or ``anthology``.
+
+    Anthology TOC merge / multi-adventure expansion only runs when the caller
+    explicitly opts in — multi-chapter single adventures must stay one campaign.
+    """
+    folded = re.sub(r"[\s\-]+", "_", str(value or "").strip().casefold())
+    if folded in {"anthology", "multiple", "multi", "multi_adventure", "anthology_mode"}:
+        return "anthology"
+    return "single"
+
+
+def _clean_adventure_title_raw(name: str) -> str:
+    cleaned = re.sub(r"\s+", " ", str(name or "")).strip(" :-|")
+    cleaned = re.sub(r"\s+\d{1,4}\s*$", "", cleaned)  # trailing page numbers
+    cleaned = cleaned.replace("OfT", "Of T")
+    cleaned = cleaned.replace("ofH", "of H")
+    return cleaned.strip(" :-|")
+
+
+def _title_case_adventure(name: str) -> str:
+    cleaned = _clean_adventure_title_raw(name)
+    if not cleaned:
+        return ""
+    # Preserve small words when title-casing ALL CAPS banners.
+    small = {"of", "the", "and", "a", "an", "in", "to", "for"}
+    words = cleaned.split(" ")
+    out: list[str] = []
+    for i, word in enumerate(words):
+        low = word.casefold()
+        if i > 0 and low in small:
+            out.append(low)
+        elif word.isupper() or word.islower() or not word.isalpha():
+            out.append(word[:1].upper() + word[1:].lower() if word else word)
+        else:
+            # Mixed OCR casing — force title case without inserting spaces.
+            out.append(word[:1].upper() + word[1:].lower() if word else word)
+    return " ".join(out)
+
+
+def _adventure_title_quality(raw_title: str) -> tuple[int, int, int, int]:
+    """Higher is better. Score the raw CHAPTER banner text before display casing."""
+    text = _clean_adventure_title_raw(raw_title)
+    letters = sum(1 for ch in text if ch.isalpha())
+    junk = sum(1 for ch in text if not (ch.isalnum() or ch in " '-"))
+    digits = sum(1 for ch in text if ch.isdigit())
+    # Prefer clean ALL-CAPS banners over OCR-mangled mixed case.
+    caps = text.replace(" ", "")
+    all_caps_bonus = 20 if caps.isupper() and letters >= 8 else 0
+    weird_case = 0
+    for word in text.split():
+        if len(word) > 1 and any(ch.isupper() for ch in word[1:] if ch.isalpha()) and not word.isupper():
+            weird_case += 1
+    return (all_caps_bonus + letters - junk * 3 - digits - weird_case * 8, letters, -junk, -weird_case)
+
+
+def _is_skipped_anthology_title(title: str) -> bool:
+    folded = re.sub(r"\s+", " ", str(title or "")).strip().casefold()
+    if not folded or len(folded) < 4:
+        return True
+    if folded in _SKIP_ANTHOLOGY_TITLES:
+        return True
+    if folded.startswith(("app.", "appendix", "map ", "maps ", "table ", "act ", "scene ")):
+        return True
+    if "warrior" in folded and "thay" in folded:
+        return True
+    # Section headings that appear as page banners in single-adventure books.
+    sectionish = (
+        "overview",
+        "general features",
+        "locations on",
+        "dungeon characteristics",
+        "resolving the",
+        "character hooks",
+        "adventure synopsis",
+        "running the adventure",
+        "aftermath",
+        "grove level",
+        "fortress level",
+    )
+    if any(folded.startswith(s) or folded == s for s in sectionish):
+        return True
+    return False
+
+
+def _split_pages(text: str) -> list[tuple[int, str]]:
+    """Return (page_number, page_body) for === PAGE N === extracts."""
+    pages: list[tuple[int, str]] = []
+    matches = list(_PAGE_MARKER.finditer(text or ""))
+    if not matches:
+        return [(1, text or "")]
+    for index, match in enumerate(matches):
+        start = match.end()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        try:
+            page_no = int(match.group(1))
+        except ValueError:
+            page_no = index + 1
+        pages.append((page_no, text[start:end]))
+    return pages
+
+
+def _extract_anthology_adventure_stubs(text: str) -> list[dict[str, Any]]:
+    """Deterministic adventure inventory from CONTENTS / chapter banners.
+
+    Only used when ``document_scope=anthology``. Prefers numbered CHAPTER banners
+    (one stub per chapter) so OCR/page-section titles do not invent extras.
+    """
+    text = text or ""
+    if not text.strip():
+        return []
+
+    # chapter_no -> best stub (or None-keyed list for unnumbered titles)
+    by_chapter: dict[int, dict[str, Any]] = {}
+    unnumbered: list[dict[str, Any]] = []
+    unnumbered_keys: set[str] = set()
+
+    def _fold_key(display: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", display.casefold())
+
+    def _add(title: str, *, page: int | None = None, chapter: int | None = None) -> None:
+        raw = _clean_adventure_title_raw(title)
+        display = _title_case_adventure(raw)
+        if _is_skipped_anthology_title(display):
+            return
+        key = _fold_key(display)
+        if len(key) < 6:
+            return
+        stub: dict[str, Any] = {
+            "title": display,
+            "name": display,
+            "summary_hint": "Independent adventure module from anthology TOC",
+            "_raw_title": raw,
+        }
+        if page is not None:
+            stub["start_page"] = page
+            stub["source_refs"] = [{"page": page}]
+        if chapter is not None:
+            stub["chapter"] = chapter
+            prior = by_chapter.get(chapter)
+            if prior is None or _adventure_title_quality(raw) > _adventure_title_quality(
+                str(prior.get("_raw_title") or prior.get("name") or "")
+            ):
+                # Keep earlier page if we already had one and the new title wins.
+                if prior and "start_page" in prior and "start_page" not in stub:
+                    stub["start_page"] = prior["start_page"]
+                    stub["source_refs"] = list(prior.get("source_refs") or [])
+                by_chapter[chapter] = stub
+            elif prior is not None and page is not None and "start_page" not in prior:
+                prior["start_page"] = page
+                prior["source_refs"] = [{"page": page}]
+            return
+        if key in unnumbered_keys:
+            return
+        for prior_key in list(unnumbered_keys):
+            if key in prior_key or prior_key in key:
+                if len(key) <= len(prior_key):
+                    return
+                unnumbered_keys.discard(prior_key)
+                unnumbered[:] = [
+                    item
+                    for item in unnumbered
+                    if _fold_key(str(item.get("name") or "")) != prior_key
+                ]
+                break
+        unnumbered_keys.add(key)
+        unnumbered.append(stub)
+
+    # 1) CONTENTS block — Ch. N: Title ........ page
+    contents_match = re.search(r"(?im)^\s*CONTENTS\s*$", text)
+    if contents_match:
+        contents_slice = text[contents_match.start() : contents_match.start() + 12_000]
+        for match in _CONTENTS_CHAPTER_LINE.finditer(contents_slice):
+            try:
+                chapter = int(match.group(1))
+            except ValueError:
+                chapter = None
+            title = match.group(2).strip()
+            title = re.split(r"\s{2,}|\s+App\.|\s+Map\s|\s+Amulet\b", title)[0].strip()
+            _add(title, chapter=chapter)
+
+    # 2) In-body CHAPTER N I TITLE banners (one slot per chapter number).
+    for match in _CHAPTER_BANNER_LINE.finditer(text):
+        try:
+            chapter = int(match.group(1))
+        except ValueError:
+            continue
+        _add(match.group(2), chapter=chapter)
+
+    # 3) Page-leading CHAPTER banners + (only if still thin) ALL-CAPS titles.
+    chapter_count = len(by_chapter)
+    for page_no, body in _split_pages(text):
+        lines = [ln.strip() for ln in body.splitlines() if ln.strip()][:6]
+        for line in lines:
+            banner = _CHAPTER_BANNER_LINE.match(line)
+            if banner:
+                try:
+                    chapter = int(banner.group(1))
+                except ValueError:
+                    chapter = None
+                _add(banner.group(2), page=page_no, chapter=chapter)
+                break
+            if chapter_count >= 2:
+                break
+            collapsed_line = _collapsed_line_from_raw_line(line)
+            if not re.fullmatch(r"[A-Z0-9][A-Z0-9 ,'\-]{6,70}", collapsed_line):
+                continue
+            if _is_skipped_anthology_title(collapsed_line):
+                continue
+            if len(collapsed_line.split()) < 2:
+                continue
+            _add(collapsed_line, page=page_no)
+            break
+
+    found = [by_chapter[k] for k in sorted(by_chapter.keys())]
+    if len(found) < 2 and unnumbered:
+        # Only fall back to unnumbered titles when chapter banners were insufficient.
+        found.extend(unnumbered)
+        # Dedupe by fold key preferring chapter-tagged entries.
+        deduped: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in found:
+            key = _fold_key(str(item.get("name") or ""))
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            deduped.append(item)
+        found = deduped
+
+    for item in found:
+        item.pop("_raw_title", None)
+
+    found.sort(
+        key=lambda item: (
+            int(item["chapter"]) if isinstance(item.get("chapter"), int) else 10_000,
+            int(item["start_page"]) if isinstance(item.get("start_page"), int) else 10_000,
+            str(item.get("name") or ""),
+        )
+    )
+    return found
+
+
+def _collapse_discovery_to_single_adventure(
+    adventures: list[dict[str, Any]],
+    locations: list[dict[str, Any]],
+    npcs: list[dict[str, Any]],
+    warnings: list[str],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Keep one adventure when document_scope=single (multi-chapter books stay one campaign)."""
+    if len(adventures) <= 1:
+        return adventures, locations, npcs
+    primary = adventures[0]
+    primary_key = str(primary.get("temporary_key") or "adventure_001")
+    warnings.append(
+        f"document_scope=single: collapsed {len(adventures)} discovered adventures into one "
+        f"campaign ({primary.get('title') or primary.get('name') or primary_key}). "
+        "Choose Anthology on upload to import multiple modules from one file."
+    )
+    for loc in locations:
+        loc["adventure_temporary_key"] = primary_key
+    for npc in npcs:
+        npc["adventure_temporary_key"] = primary_key
+    return [primary], locations, npcs
+
+
+def _page_excerpt_for_adventure(
+    pages: list[tuple[int, str]],
+    adventure: dict[str, Any],
+    *,
+    max_chars: int,
+) -> str:
+    start_page = adventure.get("start_page")
+    title = str(adventure.get("title") or adventure.get("name") or "").strip()
+    body = ""
+    if isinstance(start_page, int):
+        for page_no, page_body in pages:
+            if page_no >= start_page:
+                # Take this page and a couple following for context.
+                chunks: list[str] = []
+                for later_no, later_body in pages:
+                    if later_no < start_page:
+                        continue
+                    if later_no > start_page + 4:
+                        break
+                    chunks.append(f"=== PAGE {later_no} ===\n{later_body.strip()}")
+                body = "\n".join(chunks)
+                break
+    if not body and title:
+        needle = title.casefold()
+        for page_no, page_body in pages:
+            head = "\n".join(page_body.splitlines()[:8])
+            if needle[:18] in head.casefold() or title.split()[0].casefold() in head.casefold():
+                chunks = []
+                for later_no, later_body in pages:
+                    if later_no < page_no:
+                        continue
+                    if later_no > page_no + 4:
+                        break
+                    chunks.append(f"=== PAGE {later_no} ===\n{later_body.strip()}")
+                body = "\n".join(chunks)
+                adventure.setdefault("start_page", page_no)
+                break
+    if not body:
+        return ""
+    return body[:max_chars].strip()
+
+
+def _build_anthology_outline_document(
+    text: str,
+    adventures: list[dict[str, Any]],
+    *,
+    max_chars: int,
+    warnings: list[str],
+) -> str:
+    """Build an outline prompt corpus that keeps every TOC adventure visible."""
+    if max_chars < 4000:
+        max_chars = 4000
+    inventory_lines = [
+        "ADVENTURE INVENTORY (required): emit ONE adventures[] entry for EACH of these "
+        "independent modules. Do not collapse them into a single adventure.",
+    ]
+    for index, adv in enumerate(adventures, start=1):
+        page = adv.get("start_page")
+        page_note = f" (starts ~page {page})" if isinstance(page, int) else ""
+        inventory_lines.append(f"{index}. {adv.get('title') or adv.get('name')}{page_note}")
+    inventory = "\n".join(inventory_lines)
+
+    pages = _split_pages(text)
+    # Reserve budget for inventory + small shared front matter (credits/TOC).
+    front = ""
+    contents_match = re.search(r"(?im)^\s*CONTENTS\s*$", text)
+    if contents_match:
+        front = text[contents_match.start() : contents_match.start() + 3500]
+    else:
+        front = text[:2500]
+
+    remaining = max_chars - len(inventory) - len(front) - 80
+    per_adventure = max(2500, remaining // max(len(adventures), 1))
+    sections = [inventory, "", "--- TABLE OF CONTENTS / FRONT MATTER ---", front.strip(), ""]
+    for adv in adventures:
+        excerpt = _page_excerpt_for_adventure(pages, adv, max_chars=per_adventure)
+        title = adv.get("title") or adv.get("name") or "Adventure"
+        sections.append(f"--- ADVENTURE MODULE: {title} ---")
+        sections.append(excerpt or f"(No page excerpt found for {title}; still emit this adventure.)")
+        sections.append("")
+
+    combined = "\n".join(sections).strip()
+    if len(combined) > max_chars:
+        combined = combined[:max_chars]
+    warnings.append(
+        f"Anthology TOC detected ({len(adventures)} adventures); outline text samples "
+        "each module instead of only the first NPC section."
+    )
+    return combined
+
+
+def _merge_anthology_adventures(
+    adventures: list[dict[str, Any]],
+    locations: list[dict[str, Any]],
+    npcs: list[dict[str, Any]],
+    toc_adventures: list[dict[str, Any]],
+    warnings: list[str],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Ensure TOC adventures survive when the LLM only returned the first module."""
+    if len(toc_adventures) < 2:
+        return adventures, locations, npcs
+
+    def _fold(name: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", str(name or "").casefold())
+
+    llm_by_fold = {_fold(a.get("name") or a.get("title") or ""): a for a in adventures}
+    merged: list[dict[str, Any]] = []
+    for toc in toc_adventures:
+        fold = _fold(toc.get("name") or toc.get("title") or "")
+        existing = llm_by_fold.get(fold)
+        if existing:
+            # Keep LLM stub but ensure title/name from TOC when clearer.
+            if not str(existing.get("title") or "").strip():
+                existing["title"] = toc.get("title") or toc.get("name")
+            if not str(existing.get("name") or "").strip():
+                existing["name"] = toc.get("name") or toc.get("title")
+            merged.append(existing)
+        else:
+            merged.append(
+                {
+                    "title": toc.get("title") or toc.get("name"),
+                    "name": toc.get("name") or toc.get("title"),
+                    "summary_hint": toc.get("summary_hint") or "",
+                    "source_refs": list(toc.get("source_refs") or []),
+                    "genre": toc.get("genre") or "",
+                    "rpg_system": toc.get("rpg_system") or "",
+                }
+            )
+
+    if len(merged) > len(adventures):
+        warnings.append(
+            f"LLM discovery returned {len(adventures)} adventure(s); expanded to "
+            f"{len(merged)} from the document table of contents / chapter titles."
+        )
+
+    # Seed a major location for TOC-only adventures so generate has something to attach.
+    existing_loc_folds = {
+        (_fold(loc.get("name") or ""), str(loc.get("adventure_temporary_key") or ""))
+        for loc in locations
+    }
+    for index, adv in enumerate(merged, start=1):
+        adv_key_hint = str(adv.get("temporary_key") or f"adventure_{index:03d}")
+        name = str(adv.get("name") or adv.get("title") or "").strip()
+        fold = _fold(name)
+        has_loc = any(
+            fold and fold == loc_fold
+            for loc_fold, _adv in existing_loc_folds
+        ) or any(
+            str(loc.get("adventure_temporary_key") or "") in {adv_key_hint, fold}
+            or _fold(loc.get("name") or "") == fold
+            for loc in locations
+        )
+        # Also treat any location already pointing at this adventure name via LLM key.
+        if not has_loc:
+            # Check if any location's adventure key will map after stamp — soft check by name.
+            linked = [
+                loc
+                for loc in locations
+                if _fold(str(loc.get("adventure_temporary_key") or "")) == fold
+            ]
+            if linked:
+                continue
+            locations.append(
+                {
+                    "name": name or f"Adventure {index}",
+                    "type": "dungeon",
+                    "adventure_temporary_key": adv.get("temporary_key") or name,
+                    "significance": "major",
+                    "summary_hint": "Primary site for this adventure module",
+                    "source_refs": list(adv.get("source_refs") or []),
+                }
+            )
+
+    return merged, locations, npcs
+
+
 def _truncate_preserving_npc_section(text: str, max_chars: int) -> str:
     """Shrink long documents but keep the NON-PLAYER CHARACTERS section when present.
 
@@ -6307,11 +6785,16 @@ def outline_campaign_document(
     existing_campaign_id: str | None = None,
     existing_location_ids: list[str] | None = None,
     existing_npc_names: list[str] | None = None,
+    document_scope: str | None = None,
 ) -> dict[str, Any]:
     """Pass 1: campaign + location/NPC stubs with temporary keys (no detail sweeps).
 
     Used by the editor as a short Funnel hop before per-batch detail calls.
     Alias: ``discover_campaign_document``.
+
+    ``document_scope`` defaults to ``single`` (one campaign even for multi-chapter
+    books). Pass ``anthology`` only when the user opts in so TOC merge can expand
+    multiple independent modules from one file.
     """
     warnings: list[str] = []
     usage = _empty_usage()
@@ -6320,9 +6803,15 @@ def outline_campaign_document(
     )
     existing_location_ids = [str(x).strip() for x in (existing_location_ids or []) if str(x).strip()]
     existing_npc_names = [str(x).strip() for x in (existing_npc_names or []) if str(x).strip()]
+    scope = _normalize_document_scope(document_scope)
 
     if not text or not text.strip():
         raise ContentImportError("No document text provided")
+
+    # Anthology inventory only when the user opted in — never invent modules from CHAPTER banners alone.
+    toc_adventures = (
+        _extract_anthology_adventure_stubs(text) if scope == "anthology" else []
+    )
 
     if len(text) > MAX_INPUT_CHARS:
         bounded_text = _cap_document_text(text, MAX_INPUT_CHARS, warnings)
@@ -6340,6 +6829,8 @@ def outline_campaign_document(
         "step": "discovery",
         "llm_called": False,
         "fast_path": None,
+        "document_scope": scope,
+        "toc_adventure_count": len(toc_adventures),
     }
     if use_stat_block_fast_path or use_location_site_fast_path:
         full_document_text = bounded_text
@@ -6368,10 +6859,29 @@ def outline_campaign_document(
         discovery_debug["fast_path"] = "location_sites"
         discovery_debug["note"] = "LLM discovery skipped; deterministic location site seeding."
     else:
-        outline_source = _prepare_outline_document_text(full_document_text, warnings)
+        if len(toc_adventures) >= 2:
+            # Sample each adventure from the full extract so later modules survive truncation.
+            outline_budget = min(max(len(full_document_text), 12_000), MAX_INPUT_CHARS)
+            outline_source = _build_anthology_outline_document(
+                text,
+                toc_adventures,
+                max_chars=outline_budget,
+                warnings=warnings,
+            )
+        else:
+            outline_source = _prepare_outline_document_text(full_document_text, warnings)
         outline_prompt = _build_outline_prompt(
             outline_source, mode, existing_campaign_id, existing_location_ids, existing_npc_names
         )
+        if len(toc_adventures) >= 2:
+            inventory = ", ".join(
+                str(a.get("title") or a.get("name") or "") for a in toc_adventures
+            )
+            outline_prompt = (
+                f"This document is an anthology with these required adventures: {inventory}.\n"
+                "Your adventures[] array MUST include every one of them (one stub each).\n\n"
+                + outline_prompt
+            )
         try:
             outline_raw = _call_llm_json(
                 _SYSTEM_PROMPT,
@@ -6404,6 +6914,21 @@ def outline_campaign_document(
         existing_npc_names=existing_npc_names,
         warnings=warnings,
     )
+    if scope == "anthology" and len(toc_adventures) >= 2:
+        adventures, location_stubs, npc_stubs = _merge_anthology_adventures(
+            adventures,
+            location_stubs,
+            npc_stubs,
+            toc_adventures,
+            warnings,
+        )
+    elif scope == "single" and len(adventures) > 1:
+        adventures, location_stubs, npc_stubs = _collapse_discovery_to_single_adventure(
+            adventures,
+            location_stubs,
+            npc_stubs,
+            warnings,
+        )
     campaign = adventures[0] if adventures else {"title": "Campaign", "name": "Campaign"}
     _apply_imported_campaign_setting(
         campaign,
@@ -6520,6 +7045,7 @@ def discover_campaign_document(
     existing_campaign_id: str | None = None,
     existing_location_ids: list[str] | None = None,
     existing_npc_names: list[str] | None = None,
+    document_scope: str | None = None,
 ) -> dict[str, Any]:
     """Alias for ``outline_campaign_document`` (temporary-key discovery)."""
     return outline_campaign_document(
@@ -6528,6 +7054,7 @@ def discover_campaign_document(
         existing_campaign_id=existing_campaign_id,
         existing_location_ids=existing_location_ids,
         existing_npc_names=existing_npc_names,
+        document_scope=document_scope,
     )
 
 

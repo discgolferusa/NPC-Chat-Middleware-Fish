@@ -2372,6 +2372,114 @@ def test_stamp_keeps_adventure_when_normalize_already_filled_primary():
     assert npcs[0]["primary_location_key"] == "location_001"
 
 
+def test_normalize_document_scope_defaults_to_single():
+    assert content_import._normalize_document_scope(None) == "single"
+    assert content_import._normalize_document_scope("") == "single"
+    assert content_import._normalize_document_scope("SINGLE") == "single"
+    assert content_import._normalize_document_scope("anthology") == "anthology"
+    assert content_import._normalize_document_scope("multi-adventure") == "anthology"
+
+
+def test_extract_anthology_stubs_from_chapter_banners():
+    text = """
+CONTENTS
+Ch. 1: The Sunless Citadel ................ 9
+Ch. 2: The Forge of Fury ................ 33
+
+=== PAGE 9 ===
+CHAPTER 1 I THE SUNLESS CITADEL
+Intro text.
+
+=== PAGE 33 ===
+CHAPTER 2 I THE FORGE OF FURY
+More text.
+
+=== PAGE 61 ===
+CHAPTER 3 I THE HIDDEN SHRINE OF TAMOACHAN
+
+=== PAGE 90 ===
+CHAPTER 4 I WHITE PLUME MOUNTAIN
+
+=== PAGE 127 ===
+CHAPTER 5 I DEAD IN THAY
+
+=== PAGE 166 ===
+CHAPTER 6 I AGAINST THE GIANTS
+
+=== PAGE 200 ===
+CHAPTER 7 I TOMB OF HORRORS
+"""
+    stubs = content_import._extract_anthology_adventure_stubs(text)
+    titles = [s["title"] for s in stubs]
+    assert len(stubs) == 7
+    assert titles[0] == "The Sunless Citadel"
+    assert titles[1] == "The Forge of Fury"
+    assert titles[6] == "Tomb of Horrors"
+    assert [s.get("chapter") for s in stubs] == [1, 2, 3, 4, 5, 6, 7]
+
+
+def test_extract_anthology_stubs_dedupe_ocr_chapter_variants():
+    text = """
+CHAPTER 6 I ACrAINST THE GIANTS
+CHAPTER 6 I AGAINST THE GIANTS
+CHAPTER 6 I AGAINST THE Cl ANTS
+"""
+    stubs = content_import._extract_anthology_adventure_stubs(text)
+    assert len(stubs) == 1
+    assert stubs[0]["chapter"] == 6
+    assert "Giant" in stubs[0]["title"]
+
+
+def test_collapse_discovery_to_single_adventure():
+    adventures = [
+        {"temporary_key": "adventure_001", "title": "Act One", "name": "Act One"},
+        {"temporary_key": "adventure_002", "title": "Act Two", "name": "Act Two"},
+    ]
+    locations = [{"name": "Museum", "adventure_temporary_key": "adventure_002"}]
+    npcs = [{"name": "Curator", "adventure_temporary_key": "adventure_002"}]
+    warnings: list[str] = []
+    out_adv, out_loc, out_npc = content_import._collapse_discovery_to_single_adventure(
+        adventures, locations, npcs, warnings
+    )
+    assert len(out_adv) == 1
+    assert out_adv[0]["temporary_key"] == "adventure_001"
+    assert out_loc[0]["adventure_temporary_key"] == "adventure_001"
+    assert out_npc[0]["adventure_temporary_key"] == "adventure_001"
+    assert any("document_scope=single" in w for w in warnings)
+
+
+def test_outline_skips_toc_merge_when_document_scope_single(monkeypatch):
+    """Multi-chapter banners must not expand adventures unless scope=anthology."""
+    text = (
+        "CHAPTER 1 I THE SUNLESS CITADEL\n" + ("room " * 200) + "\n"
+        "CHAPTER 2 I THE FORGE OF FURY\n" + ("room " * 200)
+    )
+
+    def fake_llm(*_args, **_kwargs):
+        return {
+            "adventures": [
+                {"title": "The Sunless Citadel", "name": "The Sunless Citadel"},
+                {"title": "The Forge of Fury", "name": "The Forge of Fury"},
+            ],
+            "locations": [{"name": "Citadel", "type": "dungeon"}],
+            "npcs": [{"name": "Meepo", "role": "kobold", "significance": "conversational"}],
+        }
+
+    monkeypatch.setattr(content_import, "_call_llm_json", fake_llm)
+    monkeypatch.setattr(content_import, "_document_has_recoverable_stat_blocks", lambda *_a, **_k: False)
+    monkeypatch.setattr(content_import, "_document_has_recoverable_location_sites", lambda *_a, **_k: False)
+
+    single = content_import.outline_campaign_document(text, "create_new", document_scope="single")
+    assert len(single["adventures"]) == 1
+    assert single["debug"]["document_scope"] == "single"
+    assert single["debug"]["toc_adventure_count"] == 0
+
+    anthology = content_import.outline_campaign_document(text, "create_new", document_scope="anthology")
+    assert len(anthology["adventures"]) >= 2
+    assert anthology["debug"]["document_scope"] == "anthology"
+    assert anthology["debug"]["toc_adventure_count"] >= 2
+
+
 def test_build_campaign_prompt_echoes_seed_temporary_key():
     prompt = content_import._build_campaign_prompt(
         "Some source text about Forge of Fury.",

@@ -4457,6 +4457,7 @@ def content_import_discover():
         return jsonify({"error": "Missing text"}), 400
 
     mode = str(body.get("mode") or "create_new").strip().lower()
+    document_scope = str(body.get("document_scope") or body.get("anthology_mode") or "single")
     existing_campaign_id = body.get("existing_campaign_id")
     existing_location_ids = body.get("existing_location_ids") or []
     existing_npc_names = body.get("existing_npc_names") or []
@@ -4473,6 +4474,7 @@ def content_import_discover():
             existing_campaign_id=existing_campaign_id,
             existing_location_ids=existing_location_ids,
             existing_npc_names=existing_npc_names,
+            document_scope=document_scope,
         )
         return jsonify(result)
     except ContentImportError as ex:
