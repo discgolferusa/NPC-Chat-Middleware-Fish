@@ -2112,3 +2112,40 @@ def test_normalize_pronouns_unspecified_stays_empty():
     assert content_import._normalize_pronouns("", "unknown") == {}
     assert content_import._normalize_pronouns(None, "male")["subject"] == "he"
 
+
+def test_npc_writeup_excerpt_uses_page_neighborhood_for_popout():
+    """Callout on a distant PAGE still lands in the excerpt (±2 around every hit)."""
+    text = (
+        "=== PAGE 1 ===\nIntro\n"
+        "=== PAGE 2 ===\nThe party meets Eadyan Falconmoon at the doors.\n"
+        "=== PAGE 3 ===\nCombat\n"
+        "=== PAGE 4 ===\nTravel\n"
+        "=== PAGE 5 ===\nTravel more\n"
+        "=== PAGE 6 ===\nSidebar\n"
+        "=== PAGE 7 ===\nSidebar\n"
+        "=== PAGE 8 ===\nEadyan Falconmoon, a level-headed half-elf. He is calm.\n"
+        "=== PAGE 9 ===\nNext\n"
+        "=== PAGE 10 ===\nNear\n"
+        "=== PAGE 11 ===\nFar away epilogue\n"
+    )
+    excerpt = content_import._npc_writeup_excerpt(text, "Eadyan Falconmoon")
+    assert "half-elf" in excerpt.casefold()
+    assert "=== PAGE 2 ===" in excerpt
+    assert "=== PAGE 8 ===" in excerpt
+    assert "=== PAGE 10 ===" in excerpt
+    assert "Far away epilogue" not in excerpt
+
+
+def test_format_page_neighborhood_prioritizes_hit_pages():
+    filler = "Front matter filler line.\n" * 400
+    text = (
+        f"=== PAGE 1 ===\n{filler}"
+        "=== PAGE 2 ===\nTitle\n"
+        "=== PAGE 3 ===\nEadyan Falconmoon is calm.\n"
+    )
+    out = content_import._format_page_neighborhood(
+        text, {3}, pages_around=2, max_chars=3_000
+    )
+    assert "Eadyan Falconmoon" in out
+    assert out.index("Eadyan") < out.index("Front matter") or "Front matter" not in out
+

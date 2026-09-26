@@ -60,6 +60,10 @@ DISCOVERY_RETRY_MAX_TOKENS = 8192
 EXCERPT_WINDOW_BEFORE = 400
 EXCERPT_WINDOW_AFTER = 7_000
 EXCERPT_MAX_CHARS = 28_000
+# When PDF text has === PAGE N === markers, expand NPC excerpts by this many
+# neighboring pages around every name hit (catches callout/pop-out text).
+NPC_EXCERPT_PAGES_AROUND = 2
+_PAGE_MARKER_RE = re.compile(r"^===\s*PAGE\s+(\d+)\s*===\s*$", re.IGNORECASE | re.MULTILINE)
 _EXCERPT_STOPWORDS = frozenset(
     {
         "a", "an", "and", "at", "by", "de", "for", "from", "in", "into", "la", "le",
@@ -2466,20 +2470,123 @@ def _npc_writeup_score_at(text: str, mention_idx: int, name: str) -> int:
     return score
 
 
+def _parse_page_spans(text: str) -> list[tuple[int, int, int]]:
+    """Return (page_num, body_start, body_end) for each === PAGE N === marker."""
+    text = text or ""
+    matches = list(_PAGE_MARKER_RE.finditer(text))
+    if not matches:
+        return []
+    spans: list[tuple[int, int, int]] = []
+    for i, match in enumerate(matches):
+        page_num = int(match.group(1))
+        start = match.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        if end > start:
+            spans.append((page_num, start, end))
+    return spans
+
+
+def _page_num_at_offset(spans: list[tuple[int, int, int]], offset: int) -> int | None:
+    for page_num, start, end in spans:
+        # Include the marker line itself as belonging to this page.
+        if start - 64 <= offset < end:
+            return page_num
+    return None
+
+
+def _format_page_neighborhood(
+    text: str,
+    hit_pages: set[int] | list[int],
+    *,
+    pages_around: int = NPC_EXCERPT_PAGES_AROUND,
+    max_chars: int = EXCERPT_MAX_CHARS,
+) -> str:
+    """Join ±pages_around neighbors; emit hit pages first so budget keeps writeups."""
+    spans = _parse_page_spans(text)
+    if not spans or not hit_pages:
+        return ""
+    by_num = {page: (start, end) for page, start, end in spans}
+    hits = sorted({int(p) for p in hit_pages if int(p) > 0 and int(p) in by_num})
+    if not hits:
+        return ""
+    around = max(0, int(pages_around))
+    neighbors: list[int] = []
+    seen: set[int] = set(hits)
+    for page in hits:
+        for n in range(max(1, page - around), page + around + 1):
+            if n in by_num and n not in seen:
+                seen.add(n)
+                neighbors.append(n)
+    ordered = list(hits) + sorted(neighbors)
+
+    chunks: list[str] = []
+    total = 0
+    for page in ordered:
+        start, end = by_num[page]
+        body = text[start:end].strip()
+        if not body:
+            continue
+        piece = f"=== PAGE {page} ===\n{body}"
+        if total + len(piece) > max_chars:
+            remain = max_chars - total
+            if remain > 400:
+                chunks.append(piece[:remain])
+            break
+        chunks.append(piece)
+        total += len(piece) + 2
+    return "\n\n".join(chunks)
+
+
+def _page_neighborhood_for_needles(
+    text: str,
+    needles: list[str],
+    *,
+    pages_around: int = NPC_EXCERPT_PAGES_AROUND,
+    max_chars: int = EXCERPT_MAX_CHARS,
+) -> str:
+    """If PAGE markers exist, return ±pages_around around every name-hit page."""
+    spans = _parse_page_spans(text)
+    if not spans:
+        return ""
+    lower = text.casefold()
+    hit_pages: set[int] = set()
+    for needle in needles:
+        for idx in _mention_indexes(lower, needle):
+            page = _page_num_at_offset(spans, idx)
+            if page is not None:
+                hit_pages.add(page)
+    return _format_page_neighborhood(
+        text, hit_pages, pages_around=pages_around, max_chars=max_chars
+    )
+
+
 def _npc_writeup_excerpt(
     document_text: str,
     name: str,
     *,
     window_before: int = 450,
     window_after: int = 2_400,
+    pages_around: int = NPC_EXCERPT_PAGES_AROUND,
 ) -> str:
-    """Prefer the name mention nearest Awareness/TRAITS/bio over casual name-drops."""
+    """Prefer page neighborhoods (±N) around every name hit; else char windows.
+
+    PDF pop-outs / callouts often extract onto a different page than the main
+    scene flow. Searching all pages for the name and expanding neighbors lets
+    the LLM see the writeup instead of a thin scene name-drop.
+    """
     text = document_text or ""
     if not text.strip():
         return ""
     needles = _writeup_search_needles(name)
     if not needles:
         needles = _distinctive_name_needles(name, snake_case(name))
+
+    page_slice = _page_neighborhood_for_needles(
+        text, needles, pages_around=pages_around, max_chars=EXCERPT_MAX_CHARS
+    )
+    if page_slice.strip():
+        return page_slice
+
     lower = text.casefold()
     scored: list[tuple[int, int, str]] = []
     for needle in needles:
@@ -4829,6 +4936,12 @@ def _relevant_excerpts(
     """Pull document windows around name/id mentions so detail passes stay focused."""
     if not text or not needles:
         return text
+
+    # Prefer full page neighborhoods when the extractor left PAGE markers —
+    # better for PDF callouts that sit outside linear scene flow.
+    page_slice = _page_neighborhood_for_needles(text, list(needles))
+    if page_slice.strip():
+        return page_slice
 
     lower = text.casefold()
     # Prefer long/specific needles so short tokens cannot flood the budget.
