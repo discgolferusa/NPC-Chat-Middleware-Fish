@@ -2281,6 +2281,73 @@ def test_normalize_and_stamp_anthology_adventures():
     assert npcs[1]["adventure_temporary_key"] == "adventure_002"
 
 
+def test_stamp_resolves_stamped_adventure_keys_on_entities():
+    """LLM adventure_002 refs must resolve after stamping, not collapse to adventure_001."""
+    adventures = [
+        {"title": "Sunless Citadel", "name": "Sunless Citadel"},
+        {"title": "Forge of Fury", "name": "Forge of Fury"},
+    ]
+    locations = [
+        {"name": "Kobold Den", "type": "dungeon", "adventure_temporary_key": "adventure_001"},
+        {"name": "Stone Tooth", "type": "dungeon", "adventure_temporary_key": "adventure_002"},
+    ]
+    npcs = [
+        {
+            "name": "Meepo",
+            "primary_location_key": "Kobold Den",
+            "adventure_temporary_key": "adventure_001",
+            "significance": "conversational",
+        },
+        {
+            "name": "Durgeddin",
+            "primary_location_key": "",
+            "adventure_temporary_key": "adventure_002",
+            "significance": "conversational",
+        },
+    ]
+    warnings: list[str] = []
+    stamped_adv, stamped_locs, stamped_npcs = content_import._stamp_discovery_temporary_keys(
+        adventures,
+        locations,
+        npcs,
+        mode="create_new",
+        existing_campaign_id=None,
+        warnings=warnings,
+    )
+    assert [a["temporary_key"] for a in stamped_adv] == ["adventure_001", "adventure_002"]
+    assert stamped_locs[1]["adventure_temporary_key"] == "adventure_002"
+    # Blank primary defaults to location_001 but must keep adventure_002.
+    assert stamped_npcs[1]["adventure_temporary_key"] == "adventure_002"
+    assert stamped_npcs[1]["primary_location_key"] == "location_001"
+
+
+def test_build_campaign_prompt_echoes_seed_temporary_key():
+    prompt = content_import._build_campaign_prompt(
+        "Some source text about Forge of Fury.",
+        {"temporary_key": "adventure_002", "title": "Forge of Fury", "name": "Forge of Fury"},
+    )
+    assert '"temporary_key": "adventure_002"' in prompt
+    assert "adventure_001" not in prompt
+
+
+def test_generate_campaign_info_preserves_seed_temporary_key(monkeypatch):
+    def fake_llm(*_args, **_kwargs):
+        return {
+            "temporary_key": "adventure_001",
+            "title": "Forge of Fury",
+            "name": "Forge of Fury",
+            "description": "A dwarven stronghold.",
+            "premise": "Reclaim the forge.",
+        }
+
+    monkeypatch.setattr(content_import, "_call_llm_json", fake_llm)
+    result = content_import.generate_campaign_info(
+        "Forge of Fury " * 20,
+        campaign={"temporary_key": "adventure_002", "title": "Forge of Fury", "name": "Forge of Fury"},
+    )
+    assert result["campaign"]["temporary_key"] == "adventure_002"
+
+
 def test_outline_legacy_campaign_wrap_returns_adventures(monkeypatch):
     """Discover hop wraps singular campaign into adventures[] for editor consumers."""
 

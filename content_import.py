@@ -549,6 +549,9 @@ def _stamp_discovery_temporary_keys(
         }
         if mode == "merge" and existing_campaign_id and index == 1:
             stamped["campaign_id"] = existing_campaign_id.strip()
+        # Register the stamped handle itself so LLM refs like adventure_002 resolve.
+        adventure_alias_to_key[temp_key] = temp_key
+        adventure_alias_to_key[temp_key.casefold()] = temp_key
         for alias in _entity_ref_aliases(adv):
             adventure_alias_to_key[alias] = temp_key
             adventure_alias_to_key[snake_case(alias)] = temp_key
@@ -637,8 +640,10 @@ def _stamp_discovery_temporary_keys(
             or ""
         )
         primary_key = _resolve_loc_ref(primary)
+        defaulted_primary = False
         if not primary_key and stamped_locations:
             primary_key = stamped_locations[0]["temporary_key"]
+            defaulted_primary = True
         other_keys: list[str] = []
         other_raw = npc.get("other_location_keys")
         if other_raw is None:
@@ -647,11 +652,13 @@ def _stamp_discovery_temporary_keys(
             resolved = _resolve_loc_ref(ref)
             if resolved and resolved != primary_key and resolved not in other_keys:
                 other_keys.append(resolved)
-        adv_key = _resolve_adventure_ref(
-            npc.get("adventure_temporary_key") or npc.get("adventure_key")
-        )
-        # If the NPC's primary location belongs to another adventure, prefer that.
-        if primary_key:
+        npc_adv_raw = str(
+            npc.get("adventure_temporary_key") or npc.get("adventure_key") or ""
+        ).strip()
+        adv_key = _resolve_adventure_ref(npc_adv_raw)
+        # Prefer the primary location's adventure only when that location was
+        # explicitly resolved — not when we fell back to location_001.
+        if primary_key and not defaulted_primary:
             for loc in stamped_locations:
                 if loc["temporary_key"] == primary_key:
                     adv_key = str(loc.get("adventure_temporary_key") or adv_key)
@@ -6867,8 +6874,9 @@ def _build_campaign_prompt(
     *,
     source_index_summary: str = "",
 ) -> str:
+    seed_key = str(discovery_campaign.get("temporary_key") or "").strip() or "adventure_001"
     seed = {
-        "temporary_key": discovery_campaign.get("temporary_key") or "campaign_001",
+        "temporary_key": seed_key,
         "title": discovery_campaign.get("title") or discovery_campaign.get("name") or "",
         "name": discovery_campaign.get("name") or discovery_campaign.get("title") or "",
         "genre": discovery_campaign.get("genre") or "",
@@ -6880,13 +6888,13 @@ def _build_campaign_prompt(
         index_note = f"Source index summary:\n{source_index_summary.strip()}\n\n"
     return (
         "Fill campaign information for NPCNarrator from the source excerpts and discovery seed.\n"
-        "Do NOT invent a permanent campaign_id. Echo temporary_key from the seed "
-        "(adventure_NNN or campaign_NNN).\n\n"
+        "Do NOT invent a permanent campaign_id. Echo temporary_key from the seed exactly "
+        f'(use "{seed_key}").\n\n'
         f"Discovery seed (JSON):\n{json.dumps(seed, ensure_ascii=False)}\n\n"
         f"{index_note}"
         "Respond with exactly this shape:\n"
         "{\n"
-        '  "temporary_key": "adventure_001",\n'
+        f'  "temporary_key": "{seed_key}",\n'
         '  "title": "Display Title",\n'
         '  "name": "Short Name",\n'
         '  "description": "1-4 sentence campaign summary grounded in the source",\n'
@@ -6904,6 +6912,7 @@ def _build_campaign_prompt(
         "Rules:\n"
         "- Prefer concrete facts from the source over invention.\n"
         "- Keep title/name aligned with the discovery seed unless the source clearly corrects them.\n"
+        f'- temporary_key MUST remain "{seed_key}".\n'
         "- Output ONLY the JSON object.\n\n"
         "Campaign-relevant source text:\n"
         '"""\n'
@@ -6955,7 +6964,10 @@ def generate_campaign_info(
     if not isinstance(raw, dict):
         raise ContentImportError("Campaign info pass did not return a JSON object")
 
+    seed_key = str(seed.get("temporary_key") or "").strip() or "adventure_001"
     info = _normalize_campaign_meta({**seed, **raw})
+    # Never let the model overwrite the adventure/campaign temporary_key seed.
+    info["temporary_key"] = seed_key
     _apply_imported_campaign_setting(info, document_text=bounded)
     for key in ("source_refs", "inferences", "warnings"):
         if key in raw and isinstance(raw[key], list):
