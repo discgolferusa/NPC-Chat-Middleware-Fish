@@ -1793,7 +1793,7 @@ def test_create_new_normalize_ignores_llm_campaign_id_and_assigns_temp_keys():
         ],
     }
     warnings: list[str] = []
-    campaign, locations, npcs = content_import._normalize_outline(
+    adventures, locations, npcs = content_import._normalize_outline(
         outline,
         mode="create_new",
         existing_campaign_id=None,
@@ -1801,21 +1801,24 @@ def test_create_new_normalize_ignores_llm_campaign_id_and_assigns_temp_keys():
         existing_npc_names=[],
         warnings=warnings,
     )
+    campaign = adventures[0]
     assert "campaign_id" not in campaign
     assert campaign["name"] == "Hope's Last Day"
-    campaign, locations, npcs = content_import._stamp_discovery_temporary_keys(
-        campaign,
+    adventures, locations, npcs = content_import._stamp_discovery_temporary_keys(
+        adventures,
         locations,
         npcs,
         mode="create_new",
         existing_campaign_id=None,
         warnings=warnings,
     )
-    assert campaign["temporary_key"] == "campaign_001"
+    campaign = adventures[0]
+    assert campaign["temporary_key"] == "adventure_001"
     assert "campaign_id" not in campaign
     assert [loc["temporary_key"] for loc in locations] == ["location_001", "location_002"]
     assert all(loc["id"] == loc["temporary_key"] for loc in locations)
     assert locations[1]["parent_temporary_key"] == "location_001"
+    assert all(loc.get("adventure_temporary_key") == "adventure_001" for loc in locations)
     assert [npc["temporary_key"] for npc in npcs] == ["npc_001", "npc_002"]
     assert npcs[0]["primary_location_key"] == "location_001"
     assert npcs[0]["first_location_id"] == "location_001"
@@ -1859,6 +1862,7 @@ def test_stamp_remaps_associated_npc_keys_onto_temp_handles():
     assert stamped_locs[0]["associated_npc_keys"] == ["npc_001", "npc_002"]
     assert stamped_npcs[0]["temporary_key"] == "npc_001"
     assert stamped_npcs[1]["temporary_key"] == "npc_002"
+    assert stamped_locs[0]["adventure_temporary_key"] == "adventure_001"
 
 
 def test_normalize_outline_resolves_parent_when_merge_skips_existing():
@@ -1990,9 +1994,10 @@ def test_outline_create_new_assigns_temp_keys_without_llm_campaign_id(monkeypatc
         "Hope's Last Day\nA short module about Hope Station.",
         "create_new",
     )
-    assert result["campaign"]["temporary_key"] == "campaign_001"
+    assert result["campaign"]["temporary_key"] == "adventure_001"
     assert "campaign_id" not in result["campaign"]
     assert result["campaign"]["name"] == "Hope's Last Day"
+    assert result["adventures"][0]["temporary_key"] == "adventure_001"
     assert result["locations"][0]["temporary_key"] == "location_001"
     assert result["npcs"][0]["temporary_key"] == "npc_001"
     assert result["npcs"][0]["primary_location_key"] == "location_001"
@@ -2208,3 +2213,96 @@ def test_format_page_neighborhood_prioritizes_hit_pages():
     assert "Eadyan Falconmoon" in out
     assert out.index("Eadyan") < out.index("Front matter") or "Front matter" not in out
 
+
+def test_coerce_adventure_stubs_wraps_legacy_campaign():
+    outline = {"campaign": {"title": "Sunless Citadel", "name": "Sunless Citadel", "genre": "fantasy"}}
+    stubs = content_import._coerce_adventure_stubs(outline)
+    assert len(stubs) == 1
+    assert stubs[0]["title"] == "Sunless Citadel"
+
+
+def test_normalize_and_stamp_anthology_adventures():
+    outline = {
+        "adventures": [
+            {"temporary_key": "adv_a", "title": "Sunless Citadel", "name": "Sunless Citadel"},
+            {"temporary_key": "adv_b", "title": "Forge of Fury", "name": "Forge of Fury"},
+        ],
+        "locations": [
+            {
+                "name": "Kobold Den",
+                "type": "dungeon",
+                "adventure_temporary_key": "adv_a",
+            },
+            {
+                "name": "Stone Tooth",
+                "type": "dungeon",
+                "adventure_temporary_key": "adv_b",
+            },
+        ],
+        "npcs": [
+            {
+                "name": "Meepo",
+                "role": "kobold",
+                "primary_location_key": "Kobold Den",
+                "adventure_temporary_key": "adv_a",
+                "significance": "conversational",
+            },
+            {
+                "name": "Durgeddin",
+                "role": "dwarf",
+                "primary_location_key": "Stone Tooth",
+                "adventure_temporary_key": "adv_b",
+                "significance": "conversational",
+            },
+        ],
+    }
+    warnings: list[str] = []
+    adventures, locations, npcs = content_import._normalize_outline(
+        outline,
+        mode="create_new",
+        existing_campaign_id=None,
+        existing_location_ids=[],
+        existing_npc_names=[],
+        warnings=warnings,
+    )
+    assert len(adventures) == 2
+    adventures, locations, npcs = content_import._stamp_discovery_temporary_keys(
+        adventures,
+        locations,
+        npcs,
+        mode="create_new",
+        existing_campaign_id=None,
+        warnings=warnings,
+    )
+    assert [a["temporary_key"] for a in adventures] == ["adventure_001", "adventure_002"]
+    assert locations[0]["adventure_temporary_key"] == "adventure_001"
+    assert locations[1]["adventure_temporary_key"] == "adventure_002"
+    assert npcs[0]["adventure_temporary_key"] == "adventure_001"
+    assert npcs[1]["adventure_temporary_key"] == "adventure_002"
+
+
+def test_outline_legacy_campaign_wrap_returns_adventures(monkeypatch):
+    """Discover hop wraps singular campaign into adventures[] for editor consumers."""
+
+    def fake_llm(*_args, **_kwargs):
+        return {
+            "campaign": {"title": "One Shot", "name": "One Shot", "genre": "fantasy"},
+            "locations": [{"name": "Town", "type": "town"}],
+            "npcs": [
+                {
+                    "name": "Mayor",
+                    "role": "leader",
+                    "primary_location_key": "Town",
+                    "significance": "conversational",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(content_import, "_call_llm_json", fake_llm)
+    monkeypatch.setattr(content_import, "_document_has_recoverable_stat_blocks", lambda *_a, **_k: False)
+    text = "=== PAGE 1 ===\nOne Shot Adventure\n" + ("The mayor greets the party in town. " * 20)
+    result = content_import.outline_campaign_document(text, "create_new")
+    assert len(result["adventures"]) == 1
+    assert result["adventures"][0]["temporary_key"] == "adventure_001"
+    assert result["campaign"]["temporary_key"] == "adventure_001"
+    assert result["locations"][0]["adventure_temporary_key"] == "adventure_001"
