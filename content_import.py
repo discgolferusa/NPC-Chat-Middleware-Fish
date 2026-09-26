@@ -60,6 +60,10 @@ DISCOVERY_RETRY_MAX_TOKENS = 8192
 EXCERPT_WINDOW_BEFORE = 400
 EXCERPT_WINDOW_AFTER = 7_000
 EXCERPT_MAX_CHARS = 28_000
+# When PDF text has === PAGE N === markers, expand NPC excerpts by this many
+# neighboring pages around every name hit (catches callout/pop-out text).
+NPC_EXCERPT_PAGES_AROUND = 2
+_PAGE_MARKER_RE = re.compile(r"^===\s*PAGE\s+(\d+)\s*===\s*$", re.IGNORECASE | re.MULTILINE)
 _EXCERPT_STOPWORDS = frozenset(
     {
         "a", "an", "and", "at", "by", "de", "for", "from", "in", "into", "la", "le",
@@ -2466,20 +2470,126 @@ def _npc_writeup_score_at(text: str, mention_idx: int, name: str) -> int:
     return score
 
 
+def _parse_page_spans(text: str) -> list[tuple[int, int, int]]:
+    """Return (page_num, body_start, body_end) for each === PAGE N === marker."""
+    text = text or ""
+    matches = list(_PAGE_MARKER_RE.finditer(text))
+    if not matches:
+        return []
+    spans: list[tuple[int, int, int]] = []
+    for i, match in enumerate(matches):
+        page_num = int(match.group(1))
+        start = match.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        if end > start:
+            spans.append((page_num, start, end))
+    return spans
+
+
+def _page_num_at_offset(spans: list[tuple[int, int, int]], offset: int) -> int | None:
+    for page_num, start, end in spans:
+        # Include the marker line itself as belonging to this page.
+        if start - 64 <= offset < end:
+            return page_num
+    return None
+
+
+def _format_page_neighborhood(
+    text: str,
+    hit_pages: set[int] | list[int],
+    *,
+    pages_around: int = NPC_EXCERPT_PAGES_AROUND,
+    max_chars: int = EXCERPT_MAX_CHARS,
+) -> str:
+    """Join ±pages_around neighbors; emit hit pages first so budget keeps writeups."""
+    spans = _parse_page_spans(text)
+    if not spans or not hit_pages:
+        return ""
+    by_num = {page: (start, end) for page, start, end in spans}
+    hits = sorted({int(p) for p in hit_pages if int(p) > 0 and int(p) in by_num})
+    if not hits:
+        return ""
+    around = max(0, int(pages_around))
+    neighbors: list[int] = []
+    seen: set[int] = set(hits)
+    for page in hits:
+        for n in range(max(1, page - around), page + around + 1):
+            if n in by_num and n not in seen:
+                seen.add(n)
+                neighbors.append(n)
+    ordered = list(hits) + sorted(neighbors)
+
+    chunks: list[str] = []
+    total = 0
+    for page in ordered:
+        start, end = by_num[page]
+        body = text[start:end].strip()
+        if not body:
+            continue
+        piece = f"=== PAGE {page} ===\n{body}"
+        if total + len(piece) > max_chars:
+            remain = max_chars - total
+            if remain > 400:
+                chunks.append(piece[:remain])
+            break
+        chunks.append(piece)
+        total += len(piece) + 2
+    return "\n\n".join(chunks)
+
+
+def _page_neighborhood_for_needles(
+    text: str,
+    needles: list[str],
+    *,
+    pages_around: int = NPC_EXCERPT_PAGES_AROUND,
+    max_chars: int = EXCERPT_MAX_CHARS,
+) -> str:
+    """If PAGE markers exist, return ±pages_around around every name-hit page."""
+    spans = _parse_page_spans(text)
+    if not spans:
+        return ""
+    search_needles = _rank_search_needles(needles)
+    if not search_needles:
+        return ""
+    lower = text.casefold()
+    hit_pages: set[int] = set()
+    for needle in search_needles:
+        for idx in _mention_indexes(lower, needle):
+            page = _page_num_at_offset(spans, idx)
+            if page is not None:
+                hit_pages.add(page)
+    return _format_page_neighborhood(
+        text, hit_pages, pages_around=pages_around, max_chars=max_chars
+    )
+
+
 def _npc_writeup_excerpt(
     document_text: str,
     name: str,
     *,
     window_before: int = 450,
     window_after: int = 2_400,
+    pages_around: int = NPC_EXCERPT_PAGES_AROUND,
 ) -> str:
-    """Prefer the name mention nearest Awareness/TRAITS/bio over casual name-drops."""
+    """Prefer page neighborhoods (±N) around every name hit; else char windows.
+
+    PDF pop-outs / callouts often extract onto a different page than the main
+    scene flow. Searching all pages for the name and expanding neighbors lets
+    the LLM see the writeup instead of a thin scene name-drop.
+    """
     text = document_text or ""
     if not text.strip():
         return ""
     needles = _writeup_search_needles(name)
     if not needles:
         needles = _distinctive_name_needles(name, snake_case(name))
+
+    page_slice = _page_neighborhood_for_needles(
+        text, needles, pages_around=pages_around, max_chars=EXCERPT_MAX_CHARS
+    )
+    if page_slice.strip():
+        return page_slice
+
     lower = text.casefold()
     scored: list[tuple[int, int, str]] = []
     for needle in needles:
@@ -4610,6 +4720,9 @@ def _normalize_pronouns(value: Any, gender: str) -> dict[str, str]:
 
     Avoid substring checks like ``\"he\" in text`` — that matches inside ``the``.
     Prefer slash-forms and whole-word pronoun tokens only.
+
+    When gender is unspecified/unknown and no pronoun tokens are present, return an
+    empty dict — do NOT invent they/them (that used to become nonbinary in the editor).
     """
     if isinstance(value, dict):
         subject = str(value.get("subject") or "").strip().lower()
@@ -4634,19 +4747,210 @@ def _normalize_pronouns(value: Any, gender: str) -> dict[str, str]:
             return dict(obj)
 
     tokens = set(re.findall(r"[a-z]+", text))
+    # Prefer binary pronouns before they/them so "he … their plan" does not win as they.
     if tokens & {"she", "her", "hers", "herself"}:
         return dict(_PRONOUN_OBJECTS["she/her"])
-    if tokens & {"they", "them", "their", "theirs", "themselves"}:
-        return dict(_PRONOUN_OBJECTS["they/them"])
     if tokens & {"he", "him", "his", "himself"}:
         return dict(_PRONOUN_OBJECTS["he/him"])
+    if tokens & {"they", "them", "their", "theirs", "themselves"}:
+        return dict(_PRONOUN_OBJECTS["they/them"])
 
     gender_l = (gender or "").strip().lower()
     if gender_l in {"female", "woman", "f"}:
         return dict(_PRONOUN_OBJECTS["she/her"])
     if gender_l in {"male", "man", "m"}:
         return dict(_PRONOUN_OBJECTS["he/him"])
-    return dict(_PRONOUN_OBJECTS["they/them"])
+    if gender_l in {"nonbinary", "non-binary", "enby"}:
+        return dict(_PRONOUN_OBJECTS["they/them"])
+    # unspecified / unknown / blank → leave empty for the editor (gender stays unspecified).
+    return {}
+
+
+_RACE_INFER_PATTERN = re.compile(
+    r"\b("
+    r"half[\s-]?elf|half[\s-]?orc|tiefling|dragonborn|halfling|gnome|"
+    r"dwarf|elf|orc|human|aasimar|genasi|goliath|tabaxi|firbolg|kobold|"
+    r"goblin|hobgoblin|yuan[\s-]?ti|lizardfolk|triton|kenku|bugbear|"
+    r"half[\s-]?drow|drow|duergar|svirfneblin"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_INVENTED_NONBINARY_GENDERS = frozenset({"nonbinary", "non-binary", "enby", "nb"})
+_IDENTITY_CUE_AFTER = 900
+
+
+def _canonicalize_import_gender(raw: str) -> str:
+    gender = (raw or "").strip().lower()
+    if gender in _INVENTED_NONBINARY_GENDERS:
+        return "nonbinary"
+    if gender in {"male", "female", "unspecified"}:
+        return gender
+    return "unspecified" if not gender else gender
+
+
+def _rank_search_needles(needles: list[str]) -> list[str]:
+    """Prefer long/specific needles so short shared tokens cannot flood page hits."""
+    ranked = sorted(
+        {str(n).strip() for n in needles if str(n).strip()},
+        key=lambda n: len(n),
+        reverse=True,
+    )
+    primary = [n for n in ranked if len(n) >= 6 or any(ch in n for ch in (" ", "-", "_"))]
+    return primary or [n for n in ranked if len(n) >= 4]
+
+
+_PAGE_BREAK_IN_EXCERPT = re.compile(r"\n===\s*PAGE\s+\d+\s*===\s*\n", re.IGNORECASE)
+
+
+def _identity_cue_text(excerpt: str, name: str) -> str:
+    """Restrict identity inference to text at/after this NPC's best writeup mention.
+
+    Prefers the highest ``_npc_writeup_score_at`` hit (not the last offset), because
+    page-neighborhood excerpts reorder hit pages first and a later scene drop can
+    outrank the real writeup by string position. The window stops at the next
+    ``=== PAGE ===`` marker so cues cannot spill into a neighboring page's NPC.
+    """
+    text = excerpt or ""
+    name = str(name or "").strip()
+    if not text.strip() or not name:
+        return ""
+    needles = _rank_search_needles(_distinctive_name_needles(name, snake_case(name)))
+    if not needles:
+        return ""
+    lower = text.casefold()
+    best: tuple[int, int, str] | None = None  # score, idx, needle
+    for needle in needles:
+        for idx in _mention_indexes(lower, needle):
+            score = _npc_writeup_score_at(text, idx, name)
+            # Prefer richer writeups; on ties prefer longer needle then earlier idx
+            # (earlier among equal scores keeps TOC from beating a same-score scene
+            # only when writeup scoring already failed — writeups score much higher).
+            cand = (score, len(needle), -idx, idx, needle)
+            if best is None:
+                best = (score, idx, needle)
+                continue
+            b_score, b_idx, b_needle = best
+            b_key = (b_score, len(b_needle), -b_idx)
+            if cand[:3] > b_key:
+                best = (score, idx, needle)
+    if best is None:
+        return ""
+    _score, idx, needle = best
+    end = min(len(text), idx + len(needle) + _IDENTITY_CUE_AFTER)
+    after = text[idx + len(needle) : end]
+    page_break = _PAGE_BREAK_IN_EXCERPT.search(after)
+    if page_break:
+        end = idx + len(needle) + page_break.start()
+    return text[idx:end]
+
+
+def _infer_npc_identity_from_excerpt(
+    excerpt: str,
+    detail: dict[str, Any],
+    *,
+    name: str = "",
+) -> dict[str, Any]:
+    """Fill blank gender/race/personality from clear excerpt cues (import only).
+
+    Also corrects LLM ``nonbinary``/they when the excerpt clearly uses he/she —
+    models often default to they/them when unsure, which then became nonbinary
+    in the Yaml Editor.
+
+    Cues are taken only from windows around ``name`` so neighboring writeups in a
+    ±2 page neighborhood do not leak race/gender/personality onto this NPC.
+    """
+    out = dict(detail) if isinstance(detail, dict) else {}
+    text = _identity_cue_text(excerpt, name) if name else (excerpt or "")
+    if not text.strip():
+        return out
+
+    has_she = bool(re.search(r"\b(she|her|hers|herself)\b", text, re.IGNORECASE))
+    # Prefer strong male cues; "his" alone is weak (place possessives) but ok with he/him.
+    has_he_strong = bool(re.search(r"\b(he|him|himself)\b", text, re.IGNORECASE))
+    has_his = bool(re.search(r"\bhis\b", text, re.IGNORECASE))
+    has_male = bool(re.search(r"\bmale\b", text, re.IGNORECASE))
+    has_female = bool(re.search(r"\bfemale\b", text, re.IGNORECASE))
+    clear_male = (has_he_strong or has_male) and not (has_she or has_female)
+    clear_female = (has_she or has_female) and not (has_he_strong or has_male)
+    # "his" without he/him only counts when no feminine cues.
+    if not clear_male and not clear_female and has_his and not (has_she or has_female):
+        clear_male = True
+
+    gender = _canonicalize_import_gender(str(out.get("gender") or ""))
+    # Override blank, unspecified, or inventively-nonbinary when excerpt is clear.
+    if gender in {"", "unspecified"} or gender in _INVENTED_NONBINARY_GENDERS or gender == "nonbinary":
+        if clear_male:
+            out["gender"] = "male"
+        elif clear_female:
+            out["gender"] = "female"
+        else:
+            out["gender"] = gender if gender == "nonbinary" else "unspecified"
+
+    inferred_gender = str(out.get("gender") or "").strip().lower()
+    if inferred_gender in {"male", "female"}:
+        pronouns = out.get("pronouns")
+        subject = ""
+        if isinstance(pronouns, dict):
+            subject = str(pronouns.get("subject") or "").strip().lower()
+        elif pronouns:
+            subject = str(pronouns).strip().lower()
+        # Drop LLM they/them (or empty) so merge can apply he/him or she/her.
+        if subject in {"", "they", "them"} or "they" in subject:
+            out["pronouns"] = None
+
+    race = str(out.get("race") or "").strip().lower()
+    if race in {"", "unknown"}:
+        match = _RACE_INFER_PATTERN.search(text)
+        if match:
+            raw = re.sub(r"\s+", "-", match.group(1).strip().lower())
+            raw = raw.replace("halfelf", "half-elf").replace("halforc", "half-orc")
+            out["race"] = raw
+
+    personality = _as_str_list(out.get("personality"))
+    if not personality:
+        for label, pattern in (
+            ("level-headed", r"\blevel[\s-]?headed\b"),
+            ("calm", r"\bcalm\b"),
+            ("elated to see allies", r"\belated\b"),
+        ):
+            if re.search(pattern, text, re.IGNORECASE):
+                personality.append(label)
+        if personality:
+            out["personality"] = personality
+
+    return out
+
+
+def _merge_seed_preserving_llm_identity(
+    llm_detail: dict[str, Any] | None,
+    seed: dict[str, Any],
+) -> dict[str, Any]:
+    """Prefer LLM identity fields; fill empty lists from seed without wiping gender/race."""
+    base = dict(seed) if isinstance(seed, dict) else {}
+    llm = llm_detail if isinstance(llm_detail, dict) else {}
+    merged = dict(base)
+    for key, value in llm.items():
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        if isinstance(value, list) and not value:
+            continue
+        if key == "race" and str(value).strip().lower() in {"", "unknown"}:
+            continue
+        if key == "gender" and str(value).strip().lower() in {"", "unspecified"}:
+            continue
+        merged[key] = value
+
+    # Never let seed overwrite a concrete LLM gender/race with unspecified/unknown.
+    llm_gender = str(llm.get("gender") or "").strip().lower()
+    if llm_gender in {"male", "female", "nonbinary"}:
+        merged["gender"] = llm_gender
+    llm_race = str(llm.get("race") or "").strip()
+    if llm_race and llm_race.lower() != "unknown":
+        merged["race"] = llm_race
+    return merged
 
 
 def _distinctive_name_needles(name: str, entity_id: str = "") -> list[str]:
@@ -4713,16 +5017,17 @@ def _relevant_excerpts(
     if not text or not needles:
         return text
 
-    lower = text.casefold()
-    # Prefer long/specific needles so short tokens cannot flood the budget.
-    ranked = sorted(
-        {str(n).strip() for n in needles if str(n).strip()},
-        key=lambda n: len(n),
-        reverse=True,
-    )
-    primary = [n for n in ranked if len(n) >= 6 or any(ch in n for ch in (" ", "-", "_"))]
-    search_needles = primary or [n for n in ranked if len(n) >= 4]
+    # Rank/drop short needles BEFORE page search so shared tokens (e.g. "Hope")
+    # cannot mark dozens of pages and crowd out the real writeup.
+    search_needles = _rank_search_needles(needles)
+    if not search_needles:
+        return text[: min(len(text), EXCERPT_MAX_CHARS)]
 
+    page_slice = _page_neighborhood_for_needles(text, search_needles)
+    if page_slice.strip():
+        return page_slice
+
+    lower = text.casefold()
     spans: list[tuple[int, int, int]] = []  # start, end, needle_len
     for needle in search_needles:
         for idx in _mention_indexes(lower, needle):
@@ -5608,6 +5913,10 @@ def _build_npc_detail_prompt(
         "- Free prose paragraphs that open with the character's name.\n\n"
         "Field mapping (layout-agnostic):\n"
         "- Keep/refine role from the stub; do not blank it.\n"
+        "- Species/ancestry words (half-elf, dwarf, human, …) → race.\n"
+        "- he/him/his or she/her → gender male/female and matching pronouns. "
+        "Do NOT invent nonbinary or they/them when the source uses binary pronouns "
+        "or words like male/female.\n"
         "- Motives, temperament, labeled traits, agendas → personality and llm_rules.\n"
         "- Appearance, public reputation, social role → public_facts.\n"
         "- What this NPC knows, plans, or can share → known_facts.\n"
@@ -5618,9 +5927,9 @@ def _build_npc_detail_prompt(
         'Respond with exactly {"npcs": [ ... ]} where each array item has this shape:\n\n'
         "{\n"
         '  "temporary_key": "<exact temporary_key from the list below>",\n'
-        '  "pronouns": {"subject":"she","object":"her","possessive_adjective":"her",'
-        '"possessive_pronoun":"hers","reflexive":"herself"},\n'
-        '  "race": "species/ancestry if stated, else \\"unknown\\"",\n'
+        '  "pronouns": {"subject":"he","object":"him","possessive_adjective":"his",'
+        '"possessive_pronoun":"his","reflexive":"himself"},\n'
+        '  "race": "species/ancestry if stated (e.g. half-elf), else \\"unknown\\"",\n'
         '  "gender": "male|female|nonbinary|unspecified",\n'
         '  "voice": ["short spoken-delivery traits"],\n'
         '  "personality": ["distinct traits and motives from the source"],\n'
@@ -5639,7 +5948,12 @@ def _build_npc_detail_prompt(
         "- Echo the exact temporary_key from the list. Do NOT invent permanent npc ids.\n"
         "- EXTRACT over invent. Copy concrete facts from the source; do not replace them with generics.\n"
         "- Empty lists only when the source truly has nothing for that field.\n"
-        "- If the source says she/her (or uses she/her language), pronouns and gender must match.\n"
+        "- If the source uses he/him (or she/her), set gender and pronouns to match. "
+        "Use gender=unspecified only when the source gives no cue — never invent nonbinary.\n"
+        "- Race must copy ancestry terms from the source (half-elf, dwarf, …); use unknown "
+        "only when none is stated.\n"
+        "- Short scene sentences still count: calm, level-headed, elated, looks to the "
+        "characters for a plan → personality and/or public_facts.\n"
         "- public_facts = what OTHER characters already know or can see.\n"
         "- known_facts = what THIS NPC knows and may share.\n"
         "- secrets = what THIS NPC will not willingly reveal.\n"
@@ -5660,12 +5974,37 @@ def _build_npc_detail_prompt(
     )
 
 
-def _merge_npc_detail(stub: dict[str, Any], detail: dict[str, Any], campaign_id: str, warnings: list[str]) -> dict[str, Any]:
+def _merge_npc_detail(
+    stub: dict[str, Any],
+    detail: dict[str, Any],
+    campaign_id: str,
+    warnings: list[str],
+    *,
+    excerpt: str = "",
+) -> dict[str, Any]:
+    detail = _infer_npc_identity_from_excerpt(
+        excerpt,
+        detail if isinstance(detail, dict) else {},
+        name=str(stub.get("name") or ""),
+    )
     secrets = _as_str_list(detail.get("secrets"))
     llm_rules = _as_str_list(detail.get("llm_rules"))
-    gender = str(detail.get("gender") or "unspecified").strip().lower() or "unspecified"
+    gender = _canonicalize_import_gender(str(detail.get("gender") or "unspecified"))
     if gender not in {"male", "female", "nonbinary", "unspecified"}:
         gender = "unspecified"
+
+    pronouns = _normalize_pronouns(detail.get("pronouns"), gender)
+    # If pronouns clearly assert binary gender, align gender when still unspecified.
+    # Do NOT treat they/them as nonbinary — leave unspecified (models invent they too often).
+    subject = str(pronouns.get("subject") or "").strip().lower()
+    if gender == "unspecified":
+        if subject == "he":
+            gender = "male"
+        elif subject == "she":
+            gender = "female"
+    # Binary gender wins over LLM they/them leftovers.
+    if gender in {"male", "female"} and subject in {"", "they"}:
+        pronouns = _normalize_pronouns(None, gender)
 
     if secrets and not any("[DM CHECK:" in rule for rule in llm_rules):
         llm_rules.append(
@@ -5680,7 +6019,7 @@ def _merge_npc_detail(stub: dict[str, Any], detail: dict[str, Any], campaign_id:
     primary = stub.get("primary_location_key") or stub.get("first_location_id") or ""
     other = stub.get("other_location_keys") or stub.get("other_location_ids") or []
 
-    return {
+    result = {
         "temporary_key": temp_key,
         "id": temp_key,
         "campaign_id": campaign_id,
@@ -5692,7 +6031,7 @@ def _merge_npc_detail(stub: dict[str, Any], detail: dict[str, Any], campaign_id:
         "other_location_keys": list(other),
         "gender": gender,
         "race": str(detail.get("race") or "unknown").strip() or "unknown",
-        "pronouns": _normalize_pronouns(detail.get("pronouns"), gender),
+        "pronouns": pronouns,
         "voice": _as_str_list(detail.get("voice")),
         "personality": _as_str_list(detail.get("personality")),
         "public_facts": _as_str_list(detail.get("public_facts")),
@@ -5700,6 +6039,9 @@ def _merge_npc_detail(stub: dict[str, Any], detail: dict[str, Any], campaign_id:
         "secrets": secrets,
         "llm_rules": llm_rules,
     }
+    if not result["pronouns"] and gender in {"male", "female", "nonbinary"}:
+        result["pronouns"] = _normalize_pronouns(None, gender)
+    return result
 
 
 # --------------------------------------------------------------------------
@@ -6361,7 +6703,9 @@ def detail_npc_batch(
             continue
         if allow_seed_fallback:
             if _npc_stub_has_stat_seed(stub):
-                details_by_id[key] = _npc_detail_from_stat_seed(stub)
+                details_by_id[key] = _merge_seed_preserving_llm_identity(
+                    detail, _npc_detail_from_stat_seed(stub)
+                )
                 warnings.append(
                     f"NPC '{key}': detail sparse after LLM; fell back to "
                     "PERSONALITY / PERSONAL AGENDA from the stat block."
@@ -6373,7 +6717,7 @@ def detail_npc_batch(
                 text,
             )
             if seeded is not None:
-                details_by_id[key] = seeded
+                details_by_id[key] = _merge_seed_preserving_llm_identity(detail, seeded)
                 warnings.append(
                     f"NPC '{key}': detail sparse after LLM; seeded from "
                     "document excerpts as a last resort."
@@ -6390,12 +6734,20 @@ def detail_npc_batch(
                 f"NPC '{key}': LLM detail sparse (editor may retry this hop)."
             )
 
-    npcs = [
-        _merge_npc_detail(
-            stub, _lookup_stub_detail(details_by_id, stub), campaign_stamp, warnings
+    npcs = []
+    for stub in batch:
+        # Prefer the name-focused writeup excerpt only — never fall back to the
+        # full document for identity cues (neighboring NPCs would leak).
+        excerpt = _npc_writeup_excerpt(text, str(stub.get("name") or ""))
+        npcs.append(
+            _merge_npc_detail(
+                stub,
+                _lookup_stub_detail(details_by_id, stub),
+                campaign_stamp,
+                warnings,
+                excerpt=excerpt,
+            )
         )
-        for stub in batch
-    ]
     return {"npcs": npcs, "warnings": warnings, "usage": usage}
 
 

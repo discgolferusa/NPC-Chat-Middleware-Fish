@@ -2032,3 +2032,179 @@ def test_detail_preserves_temporary_key(monkeypatch):
     assert "battered" in loc["summary"].casefold()
     assert result["usage"]["prompt_tokens"] == 3
 
+
+def test_infer_npc_identity_falconmoon_excerpt():
+    """Short HotDQ-style prose must yield male / half-elf / calm personality."""
+    excerpt = (
+        "Eadyan Falconmoon, a level-headed half-elf.\n"
+        "He's easy to spot, being the only calm person they can\n"
+        "find in the temple, and he is elated to see them. He looks\n"
+        "to the characters for a plan."
+    )
+    # Simulate LLM inventing nonbinary + they/them + unknown race.
+    inferred = content_import._infer_npc_identity_from_excerpt(
+        excerpt,
+        {
+            "gender": "nonbinary",
+            "race": "unknown",
+            "pronouns": {"subject": "they", "object": "them"},
+            "personality": [],
+        },
+        name="Eadyan Falconmoon",
+    )
+    assert inferred["gender"] == "male"
+    assert inferred["race"] == "half-elf"
+    assert "calm" in inferred["personality"]
+    assert "level-headed" in inferred["personality"]
+    assert inferred.get("pronouns") is None  # cleared so merge applies he/him
+
+
+def test_infer_npc_identity_ignores_neighbor_writeup():
+    excerpt = (
+        "=== PAGE 8 ===\n"
+        "Sister Mira, a stern dwarf. She guards the gate.\n\n"
+        "=== PAGE 9 ===\n"
+        "Eadyan Falconmoon greets the party. He is calm.\n"
+    )
+    inferred = content_import._infer_npc_identity_from_excerpt(
+        excerpt,
+        {"gender": "unspecified", "race": "unknown", "personality": []},
+        name="Eadyan Falconmoon",
+    )
+    assert inferred["gender"] == "male"
+    assert inferred.get("race", "unknown") in {"unknown", ""}  # dwarf must not leak
+    assert "calm" in inferred.get("personality", [])
+
+
+def test_identity_cue_prefers_writeup_over_later_scene_in_reordered_excerpt():
+    """Hit-first page ordering puts writeup then a later scene; do not use last hit."""
+    # Production-like reorder: writeup page emitted before scene page, then a neighbor
+    # page with another NPC that would poison a naive 900-char forward slice.
+    excerpt = (
+        "=== PAGE 8 ===\n"
+        "Eadyan Falconmoon, a level-headed half-elf.\n"
+        "He's easy to spot and he is calm.\n\n"
+        "=== PAGE 2 ===\n"
+        "The party meets Eadyan Falconmoon near the doors.\n\n"
+        "=== PAGE 9 ===\n"
+        "Sister Mira, a stern dwarf. She guards the gate alone.\n"
+    )
+    cue = content_import._identity_cue_text(excerpt, "Eadyan Falconmoon")
+    assert "half-elf" in cue.casefold()
+    assert "Sister Mira" not in cue
+    inferred = content_import._infer_npc_identity_from_excerpt(
+        excerpt,
+        {"gender": "nonbinary", "race": "unknown", "personality": []},
+        name="Eadyan Falconmoon",
+    )
+    assert inferred["gender"] == "male"
+    assert inferred["race"] == "half-elf"
+    assert inferred.get("race") != "dwarf"
+
+
+def test_infer_npc_identity_overrides_hyphenated_nonbinary():
+    excerpt = "Brother Marcus is a male monk. He greets the party with a calm manner."
+    inferred = content_import._infer_npc_identity_from_excerpt(
+        excerpt,
+        {
+            "gender": "non-binary",
+            "pronouns": {"subject": "they", "object": "them"},
+            "personality": [],
+        },
+        name="Brother Marcus",
+    )
+    assert inferred["gender"] == "male"
+    assert inferred.get("pronouns") is None
+    assert content_import._canonicalize_import_gender("enby") == "nonbinary"
+
+def test_merge_npc_detail_overrides_invented_nonbinary(monkeypatch):
+    excerpt = (
+        "Brother Marcus is a male monk. He greets the party with a calm manner "
+        "and offers them shelter in the temple."
+    )
+
+    def fake_call_llm_json(system_prompt, user_prompt, *, warnings, step, usage_acc=None, **kwargs):
+        return {
+            "npcs": [
+                {
+                    "temporary_key": "marcus",
+                    "gender": "nonbinary",
+                    "race": "unknown",
+                    "pronouns": {
+                        "subject": "they",
+                        "object": "them",
+                        "possessive_adjective": "their",
+                        "possessive_pronoun": "theirs",
+                        "reflexive": "themself",
+                    },
+                    "personality": [],
+                    "public_facts": ["Priest in the temple."],
+                    "known_facts": [],
+                    "secrets": [],
+                    "llm_rules": [],
+                    "voice": [],
+                }
+            ]
+        }
+
+    monkeypatch.setattr(content_import, "_call_llm_json", fake_call_llm_json)
+    result = content_import.detail_npc_batch(
+        excerpt,
+        {"campaign_id": "test_camp", "name": "Test"},
+        [
+            {
+                "temporary_key": "marcus",
+                "name": "Brother Marcus",
+                "role": "monk",
+                "first_location_id": "temple",
+            }
+        ],
+    )
+    npc = result["npcs"][0]
+    assert npc["gender"] == "male"
+    assert npc["pronouns"]["subject"] == "he"
+    assert "calm" in npc["personality"]
+
+
+def test_normalize_pronouns_unspecified_stays_empty():
+    assert content_import._normalize_pronouns(None, "unspecified") == {}
+    assert content_import._normalize_pronouns("", "unknown") == {}
+    assert content_import._normalize_pronouns(None, "male")["subject"] == "he"
+
+
+def test_npc_writeup_excerpt_uses_page_neighborhood_for_popout():
+    """Callout on a distant PAGE still lands in the excerpt (±2 around every hit)."""
+    text = (
+        "=== PAGE 1 ===\nIntro\n"
+        "=== PAGE 2 ===\nThe party meets Eadyan Falconmoon at the doors.\n"
+        "=== PAGE 3 ===\nCombat\n"
+        "=== PAGE 4 ===\nTravel\n"
+        "=== PAGE 5 ===\nTravel more\n"
+        "=== PAGE 6 ===\nSidebar\n"
+        "=== PAGE 7 ===\nSidebar\n"
+        "=== PAGE 8 ===\nEadyan Falconmoon, a level-headed half-elf. He is calm.\n"
+        "=== PAGE 9 ===\nNext\n"
+        "=== PAGE 10 ===\nNear\n"
+        "=== PAGE 11 ===\nFar away epilogue\n"
+    )
+    excerpt = content_import._npc_writeup_excerpt(text, "Eadyan Falconmoon")
+    assert "half-elf" in excerpt.casefold()
+    assert "=== PAGE 2 ===" in excerpt
+    assert "=== PAGE 8 ===" in excerpt
+    assert "=== PAGE 10 ===" in excerpt
+    assert "Far away epilogue" not in excerpt
+
+
+def test_format_page_neighborhood_prioritizes_hit_pages():
+    filler = "Front matter filler line.\n" * 400
+    text = (
+        f"=== PAGE 1 ===\n{filler}"
+        "=== PAGE 2 ===\nTitle\n"
+        "=== PAGE 3 ===\nEadyan Falconmoon is calm.\n"
+    )
+    out = content_import._format_page_neighborhood(
+        text, {3}, pages_around=2, max_chars=3_000
+    )
+    assert "Eadyan Falconmoon" in out
+    assert out.index("Eadyan") < out.index("Front matter") or "Front matter" not in out
+
