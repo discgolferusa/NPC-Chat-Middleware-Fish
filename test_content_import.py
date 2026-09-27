@@ -358,6 +358,93 @@ def test_full_name_accepts_middle_initial_with_period():
     ) == ["A. Mallory Eckford"]
 
 
+def test_full_name_accepts_nickname_quotes_tommy_man():
+    """Heart of Darkness: Tommy «Mr.» Man must not be dropped by token grammar."""
+    assert content_import._iter_full_names_on_line(
+        'FULL NAME:Tommy "Mr." Man Tommy "Mr." Man'
+    ) == ['Tommy "Mr." Man']
+    assert content_import._iter_full_names_on_line(
+        "FULL NAME:Tommy «Mr.» Man Tommy «Mr.» Man"
+    ) == ['Tommy "Mr." Man']
+    assert content_import._iter_full_names_on_line(
+        "FULL NAME:Brut «Cecil» Amor Brut «Cecil» Amor"
+    ) == ['Brut "Cecil" Amor']
+    assert content_import._iter_full_names_on_line(
+        'FULL NAME:Flo "Candlestick Maker" Flo "Candlestick Maker"'
+    ) == ['Flo "Candlestick Maker"']
+
+
+def test_full_name_accepts_numeric_model_ids_eve_9():
+    """Android / model names with digit tokens (EVE 9, Grey 88-80) must parse."""
+    assert content_import._iter_full_names_on_line(
+        "FULL NAME:EVE 9 EVE 9"
+    ) == ["EVE 9"]
+    assert content_import._iter_full_names_on_line(
+        "FULL NAME: Ava 6"
+    ) == ["Ava 6"]
+    assert content_import._iter_full_names_on_line(
+        "FULL NAME:First Mate Grey 88-80 First Mate Grey 88-80"
+    ) == ["First Mate Grey 88-80"]
+
+
+def test_full_name_accepts_accented_and_curly_apostrophe_names():
+    """Accented surnames and PdfPig U+2019-inside-name glitches must still parse."""
+    assert "\u2019" in content_import._PERSON_NAME_TOKEN
+    assert "\\u2019" not in content_import._PERSON_NAME_TOKEN
+    assert content_import._iter_full_names_on_line(
+        "FULL NAME:Sub-Lieutenant Cûng Pflüger Sub-Lieutenant Cûng Pflüger"
+    ) == ["Sub-Lieutenant Cûng Pflüger"]
+    curly = "FULL NAME:Sub-Lieutenant C\u2019ng Pfl\u2019üger Sub-Lieutenant C\u2019ng Pfl\u2019üger"
+    assert content_import._iter_full_names_on_line(curly) == [
+        "Sub-Lieutenant C'ng Pfl'üger"
+    ]
+
+
+def test_person_name_helpers_shared_across_import_paths():
+    """Callout plausibility and stub normalize use the same person-name grammar."""
+    assert content_import._is_plausible_callout_name("EVE 9")
+    assert content_import._is_plausible_callout_name('Tommy "Mr." Man')
+    assert content_import._is_plausible_callout_name("Ava 6")
+    assert content_import._normalize_pdf_person_name("EVE 9") == "EVE 9"
+    stubs = content_import._normalize_npc_stubs(
+        [{"temporary_key": "tommy", "name": "Tommy «Mr.» Man", "significance": "conversational"}]
+    )
+    assert stubs[0]["name"] == 'Tommy "Mr." Man'
+
+
+def test_heart_of_darkness_style_stat_blocks_include_tommy_and_eve():
+    section = (
+        "NON-PLAYER CHARACTERS\n"
+        "MAN\n"
+        "CONVICTED ORGANIZED CRIME, EREBOS\n"
+        'FULL NAME:Tommy "Mr." Man Tommy "Mr." Man\n'
+        "AGE:28 28\n"
+        "PERSONALITY:Cocky Cocky\n"
+        "PERSONAL AGENDA: Stay useful to the highest bidder.\n"
+        "STRENGTH: 3\n"
+        "EVE\n"
+        "SYNTHETIC, STATION\n"
+        "FULL NAME:EVE 9 EVE 9\n"
+        "AGE:3 3\n"
+        "PERSONALITY:Curious Curious\n"
+        "PERSONAL AGENDA: Observe the crew without interference.\n"
+        "STRENGTH: 4\n"
+        "WEBB\n"
+        "STATION, 3WE\n"
+        "FULL NAME:Doctor Asher Webb, Md. Doctor Asher Webb, Md.\n"
+        "AGE:45 45\n"
+        "PERSONALITY:Clinical Clinical\n"
+        "PERSONAL AGENDA: Keep the station running.\n"
+        "STRENGTH: 2\n"
+    )
+    parsed = content_import._extract_alien_rpg_stat_block_npcs(section)
+    by_name = {row["name"]: row for row in parsed}
+    assert 'Tommy "Mr." Man' in by_name
+    assert "EVE 9" in by_name
+    assert "Doctor Asher Webb" in by_name
+    assert by_name['Tommy "Mr." Man'].get("personality", "").casefold() == "cocky"
+
+
 def test_act_iii_prose_is_not_a_stat_block_heading():
     assert content_import._iter_stat_block_headings(
         "found in Act III, Meyers has it concealed,"

@@ -11,7 +11,9 @@ Pipeline:
   1. Outline pass — one LLM call, or deterministic stub seeding when recoverable
      published callouts are present (ALIEN FULL NAME blocks, or Cubicle 7-style
      name + Awareness/Presence + TRAITS character boxes). Exposed as
-     ``outline_campaign_document``.
+     ``outline_campaign_document``. Person-name tokenization is shared across
+     those seeders and LLM stub normalization so nicknames and alphanumeric
+     model IDs (e.g. Tommy "Mr." Man, EVE 9) survive every import path.
   2. Location detail — format-agnostic LLM extraction from name-focused excerpts,
      plus TOC/Exploring windows and a generic sub-area harvest into
      ``important_locations`` when the model returns a summary without rooms.
@@ -138,14 +140,45 @@ _STAT_BLOCK_FALSE_HEADING_NAMES = frozenset(
     }
 )
 _FULL_NAME_LINE = re.compile(r"^FULL NAME:\s*(.+)$", re.IGNORECASE)
+# Shared person-name tokens for every import path (Alien FULL NAME, Cubicle 7
+# callouts, LLM stub validation). Must accept:
+# - middle initials (Edward R. Meyers)
+# - nicknames in quotes/guillemets (Tommy "Mr." Man, Brut «Cecil» Amor)
+# - alphanumeric model / android IDs (EVE 9, Ava 6, AA83, Grey 88-80)
+# - accented letters (Cûng Pflüger)
+# Word tokens MUST start with an uppercase letter so lowercase prose after a
+# name does not get swallowed (regression: "Micky Horton take the ship...").
+_PERSON_NAME_UPPER = r"[A-ZÀ-ÖØ-Þ]"
+# Apostrophe class must use real U+2018/U+2019 chars (not rf"\u2019" — that stays
+# literal backslash-u in the Python string; re may still parse it, but callers and
+# tests should see the actual characters).
+_PERSON_NAME_APOS_CLASS = "['\u2019\u2018\\-]"
+_PERSON_NAME_TOKEN = (
+    r"(?:"
+    # Quoted nickname segment (ASCII or curly/guillemet quotes from PDF extract).
+    r"[\"“”«»][^\"“”«»\n]{1,40}[\"“”«»]"
+    r"|"
+    # Initial / short honorific with period (A., Mr. when unquoted).
+    rf"{_PERSON_NAME_UPPER}\."
+    r"|"
+    # Numeric id fragment (9, 88-80).
+    r"[0-9]+(?:-[0-9]+)?"
+    r"|"
+    # Capitalized word or model id (Tommy, EVE, AA83, Pflüger).
+    # Allow curly apostrophes — PdfPig often emits U+2019 inside accented names.
+    f"{_PERSON_NAME_UPPER}(?:[^\\W_]|{_PERSON_NAME_APOS_CLASS})*"
+    r")"
+)
 # PdfPig two-column lines often contain multiple FULL NAME markers on one line.
-# Allow middle initials (``Edward R. Meyers``, ``A. Mallory Eckford``).
 # Restrict to name tokens; stop before the next FULL NAME or lowercase prose.
-_FULL_NAME_TOKEN = r"(?:[A-Z]\.|[A-Z][a-zA-Z0-9'\-]*)"
 _FULL_NAME_ANY = re.compile(
     r"(?:FULL|Full|full)\s+(?:NAME|Name|name):\s*"
-    rf"({_FULL_NAME_TOKEN}(?:\s+{_FULL_NAME_TOKEN}){{0,5}})"
+    rf"({_PERSON_NAME_TOKEN}(?:\s+{_PERSON_NAME_TOKEN}){{0,7}})"
     r"(?=\s*(?:FULL|Full|full)\s+(?:NAME|Name|name)\s*:|\s+[a-z]|\s*$|[,;\n])",
+)
+# Same token grammar without the FULL NAME label — used for callout / stub checks.
+_PERSON_NAME_SEQUENCE = re.compile(
+    rf"^{_PERSON_NAME_TOKEN}(?:\s+{_PERSON_NAME_TOKEN}){{0,7}}$"
 )
 # Two-column extracts often glue ``MEYERS, COLONELMEYERS, COLONEL``.
 _DOUBLED_STAT_HEADING = re.compile(
@@ -940,6 +973,47 @@ def _dedupe_repeated_full_name(name: str) -> str:
     return " ".join(parts)
 
 
+def _normalize_person_display_name(name: str) -> str:
+    """Shared display-name cleanup for Alien, Cubicle 7, and LLM import stubs.
+
+    Keeps nicknames and numeric model IDs; normalizes curly/guillemet quotes to ASCII
+    and collapses two-column FULL NAME duplicates.
+    """
+    s = str(name or "").strip()
+    if not s:
+        return ""
+    for src, dst in (
+        ("«", '"'),
+        ("»", '"'),
+        ("“", '"'),
+        ("”", '"'),
+        ("‘", "'"),
+        ("’", "'"),
+    ):
+        s = s.replace(src, dst)
+    s = re.sub(r"\s+", " ", s).strip()
+    return _dedupe_repeated_full_name(s)
+
+
+def _title_person_token(token: str) -> str:
+    """Title-case a person-name token without mangling nicknames or model IDs."""
+    t = str(token or "")
+    if not t:
+        return t
+    if len(t) >= 2 and t[0] == '"' and t[-1] == '"':
+        return t
+    if re.fullmatch(r"[0-9]+(?:-[0-9]+)?", t):
+        return t
+    # Preserve short ALL-CAPS model / serial tokens (EVE, AA83, AVA6).
+    if re.fullmatch(r"[A-Z]{2,8}\d*", t):
+        return t
+    if re.fullmatch(rf"{_PERSON_NAME_UPPER}\.", t):
+        return t[0].upper() + "."
+    if len(t) == 1:
+        return t.upper()
+    return t[0].upper() + t[1:].lower()
+
+
 def _role_looks_like_prose(role: str) -> bool:
     """Published roles are ALL-CAPS labels; reject sentence fragments from GEAR wraps."""
     role = (role or "").strip()
@@ -1135,7 +1209,7 @@ def _iter_full_names_on_line(line: str) -> list[str]:
     """Return every FULL NAME value on a line (PdfPig often glues two columns)."""
     names: list[str] = []
     for match in _FULL_NAME_ANY.finditer(line.strip()):
-        name = _dedupe_repeated_full_name(match.group(1).strip())
+        name = _normalize_person_display_name(match.group(1))
         if name:
             names.append(name)
     return names
@@ -2695,7 +2769,10 @@ _CREDIT_ROLE_LINE = re.compile(
 _CALLOUT_BIO_NAME = re.compile(
     r"\b([A-Z][a-z]{1,14}(?:\s+[A-Z][a-z]{1,14}){1,2})\b"
 )
-_CALLOUT_SINGLE_NAME = re.compile(r"[\"“”']([A-Za-z][A-Za-z'-]{1,20})[\"“”']")
+# Quoted single-name headers ("Chad") and short model IDs ("EVE", "AVA6").
+_CALLOUT_SINGLE_NAME = re.compile(
+    r"[\"“”']([A-Za-z][A-Za-z0-9'-]{0,20})[\"“”']"
+)
 _CALLOUT_NAME_STOPWORDS = frozenset(
     {
         "awareness",
@@ -3502,8 +3579,14 @@ def _normalize_pdf_person_name(raw: str) -> str:
 
     Only joins trailing tokens when at least one looks like a split fragment.
     Legitimate multi-word names (Mary Ann Lee, Jean Luc Picard) are left alone.
+    Preserves nicknames, numeric model IDs (EVE 9), and short ALL-CAPS serials.
     """
-    s = str(raw or "").strip().strip("\"“”'‘’")
+    s = _normalize_person_display_name(raw)
+    if not s:
+        return ""
+    # Single-token quoted callout header ("Chad") → bare name.
+    if len(s) >= 2 and s[0] == '"' and s[-1] == '"' and " " not in s[1:-1]:
+        s = s[1:-1].strip()
     if not s:
         return ""
     tokens = re.sub(r"\s+", " ", s).split()
@@ -3512,7 +3595,7 @@ def _normalize_pdf_person_name(raw: str) -> str:
         if right.casefold() not in {"vs", "the", "of", "and", "or", "jr", "sr", "ii", "iii", "iv"}:
             if _token_looks_pdf_split_fragment(left) or _token_looks_pdf_split_fragment(right):
                 tokens = tokens[:-2] + [left + right]
-    return " ".join((t[0].upper() + t[1:].lower()) if t else t for t in tokens)
+    return " ".join(_title_person_token(t) for t in tokens)
 
 
 def _collapse_alpha_shards(segment: str) -> str:
@@ -3533,15 +3616,27 @@ def _collapse_alpha_shards(segment: str) -> str:
 
 
 def _is_plausible_callout_name(name: str) -> bool:
-    key = str(name or "").strip().casefold()
+    """True when ``name`` looks like a published character display name.
+
+    Uses the same person-name token grammar as Alien FULL NAME parsing so
+    nicknames and numeric model IDs (EVE 9) survive Cubicle 7 callout seeding.
+    """
+    display = _normalize_person_display_name(name)
+    key = display.casefold()
     if not key or key in _CALLOUT_NAME_STOPWORDS:
         return False
     if any(key == stop or key.startswith(stop + " ") for stop in _CALLOUT_NAME_STOPWORDS):
         return False
-    words = str(name).split()
-    if not (1 <= len(words) <= 3):
+    # Strip ASCII nickname quotes for stopword / empty checks only; match grammar with them.
+    bare = display.replace('"', "").strip()
+    if not bare:
         return False
-    return all(re.fullmatch(r"[A-Za-z][A-Za-z'-]{0,20}", w) for w in words)
+    if not _PERSON_NAME_SEQUENCE.match(display) and not _PERSON_NAME_SEQUENCE.match(bare):
+        return False
+    words = bare.split()
+    if not (1 <= len(words) <= 5):
+        return False
+    return True
 
 
 def _split_dual_column_headers(header_line: str, count: int) -> list[str]:
@@ -6133,6 +6228,9 @@ def _build_outline_prompt(
         "- significance (locations): major (playable sites), minor, ignore (throwaway).\n"
         "- significance (NPCs): conversational (talkative named cast), secondary (named but minor), "
         "ignore (generic enemies/monsters/mooks). Prefer ignore for unnamed enemy groups.\n"
+        "- Preserve published display names exactly: keep nicknames in quotes "
+        '(Tommy "Mr." Man), alphanumeric model/android names (EVE 9, Ava 6), '
+        "and accented letters. Do not drop or rewrite them into plain ASCII approximations.\n"
         "- If the document has a NON-PLAYER CHARACTERS (or NPCs / Supporting Cast) section, "
         "that section is the authoritative NPC list. List every stat-block NPC there and do "
         "NOT list names only mentioned in intro text, movie quotes, sidebars, or player "
@@ -6290,7 +6388,7 @@ def _normalize_outline(
     for raw_npc in _as_list(outline.get("npcs")):
         if not isinstance(raw_npc, dict):
             continue
-        name = str(raw_npc.get("name") or "").strip()
+        name = _normalize_person_display_name(str(raw_npc.get("name") or "").strip())
         if not name:
             continue
         raw_key = str(raw_npc.get("temporary_key") or raw_npc.get("id") or name).strip()
@@ -7301,6 +7399,7 @@ def _normalize_npc_stubs(raw_npcs: Any) -> list[dict[str, Any]]:
         if not isinstance(raw, dict):
             continue
         name = str(raw.get("name") or "").strip()
+        name = _normalize_person_display_name(name)
         temp_key = str(raw.get("temporary_key") or raw.get("id") or "").strip()
         if not temp_key and name:
             temp_key = snake_case(name)
