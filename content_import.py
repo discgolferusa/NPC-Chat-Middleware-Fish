@@ -76,19 +76,20 @@ _EXCERPT_STOPWORDS = frozenset(
 
 # Published module headers (PDFs often space letters: N O N - P L A Y E R).
 # Format-agnostic: Alien NON-PLAYER CHARACTERS, Supporting Cast, Dramatis Personae, …
+# Word boundaries avoid prose like "unimportant NPCs" / mid-sentence mentions.
 _NPC_SECTION_PATTERN = re.compile(
     r"(?:"
-    r"non\s*[- ]?\s*player[\s\n]+characters?"
-    r"|supporting[\s\n]+cast"
-    r"|dramatis[\s\n]+personae"
-    r"|cast[\s\n]+of[\s\n]+characters"
-    r"|important[\s\n]+npcs?"
-    r"|major[\s\n]+npcs?"
+    r"(?<![A-Za-z])non\s*[- ]?\s*player[\s\n]+characters?\b"
+    r"|(?<![A-Za-z])supporting[\s\n]+cast\b"
+    r"|(?<![A-Za-z])dramatis[\s\n]+personae\b"
+    r"|(?<![A-Za-z])cast[\s\n]+of[\s\n]+characters\b"
+    r"|(?<![A-Za-z])important[\s\n]+npcs?\b"
+    r"|(?<![A-Za-z])major[\s\n]+npcs?\b"
     r")",
     re.IGNORECASE,
 )
 _TOC_NPC_HEADER_LINE = re.compile(
-    r"\.{2,}|\s+\d{1,4}\s*$",
+    r"\.{2,}",
     re.IGNORECASE,
 )
 _NPC_SECTION_END_PATTERN = re.compile(
@@ -784,9 +785,18 @@ def _collapsed_line_from_raw_line(line: str) -> str:
 def _is_toc_npc_header_line(collapsed_line: str) -> bool:
     if not collapsed_line:
         return False
-    if _TOC_NPC_HEADER_LINE.search(collapsed_line):
+    stripped = collapsed_line.strip()
+    if _TOC_NPC_HEADER_LINE.search(stripped):
         return True
-    if len(collapsed_line) <= 48 and re.search(r"\bpage\s+\d+\b", collapsed_line, re.IGNORECASE):
+    # TOC index rows like "Non-Player Characters 24" — not every heading with a trailing digit.
+    if re.fullmatch(
+        r"(?i)(?:non\s*[- ]?\s*player\s+characters?|supporting\s+cast|"
+        r"dramatis\s+personae|cast\s+of\s+characters|important\s+npcs?|"
+        r"major\s+npcs?)\s+\d{1,4}",
+        stripped,
+    ):
+        return True
+    if len(stripped) <= 48 and re.search(r"\bpage\s+\d+\b", stripped, re.IGNORECASE):
         return True
     return False
 
@@ -855,7 +865,7 @@ def _find_best_npc_section_header_offset(text: str) -> int | None:
         full_name_count = len(_FULL_NAME_ANY.findall(lookahead[start:end]))
         if is_toc and full_name_count == 0 and span_len < 120:
             continue
-        rank = (0 if is_toc else 1, full_name_count, span_len)
+        rank = (0 if is_toc else 1, full_name_count, line_start)
         if best_rank is None or rank > best_rank:
             best_rank = rank
             best_offset = line_start
@@ -940,6 +950,20 @@ def _npc_section_span_from_match(
     return start, end
 
 
+def _npc_section_match_looks_like_header(collapsed_text: str, match: re.Match[str]) -> bool:
+    """True when the match sits on a short section header line, not running prose."""
+    line_start = collapsed_text.rfind("\n", 0, match.start()) + 1
+    line_end = collapsed_text.find("\n", match.start())
+    if line_end < 0:
+        line_end = len(collapsed_text)
+    if collapsed_text[line_start : match.start()].strip():
+        return False
+    line = collapsed_text[line_start:line_end].strip()
+    if not line or len(line) > 72:
+        return False
+    return True
+
+
 def _find_npc_section_span(collapsed_text: str) -> tuple[int, int] | None:
     """Return [start, end) slice of the authoritative NPC section when present.
 
@@ -952,6 +976,8 @@ def _find_npc_section_span(collapsed_text: str) -> tuple[int, int] | None:
     best_rank: tuple[int, int, int] | None = None
 
     for match in _NPC_SECTION_PATTERN.finditer(collapsed_text):
+        if not _npc_section_match_looks_like_header(collapsed_text, match):
+            continue
         is_toc = _looks_like_toc_npc_section_hit(collapsed_text, match)
         start, end = _npc_section_span_from_match(collapsed_text, match)
         span_len = end - start
@@ -959,8 +985,9 @@ def _find_npc_section_span(collapsed_text: str) -> tuple[int, int] | None:
         # Drop bare TOC index lines with no body.
         if is_toc and full_name_count == 0 and span_len < 120:
             continue
-        # Prefer non-TOC headers, then more FULL NAME markers, then longer body.
-        rank = (0 if is_toc else 1, full_name_count, span_len)
+        # Prefer non-TOC headers, then more FULL NAME markers, then later headers
+        # (avoid early prose/TOC crumbs that would open a huge span through the book).
+        rank = (0 if is_toc else 1, full_name_count, start)
         if best_rank is None or rank > best_rank:
             best_rank = rank
             best_span = (start, end)
@@ -2758,6 +2785,10 @@ _ENSEMBLE_SECTION_FALSE_HEADINGS = frozenset(
         "supporting cast",
         "dramatis personae",
         "cast of characters",
+        "important npcs",
+        "important npc",
+        "major npcs",
+        "major npc",
         "stationside locations",
         "important locations",
         "heart of darkness",
@@ -2776,6 +2807,39 @@ _ENSEMBLE_STAT_SIGNAL = re.compile(
 )
 _ENSEMBLE_PRODUCT_NOISE = re.compile(
     r"(?i)\b(?:MODEL|TYPE\s+[A-Z]|WEYLAND|HYPERDYNE|PAGE\s+\d+)\b"
+)
+# Last-token collectives only — do not treat every plural-looking surname as a group.
+_ENSEMBLE_COLLECTIVE_LAST = frozenset(
+    {
+        "androids",
+        "convicts",
+        "marines",
+        "guards",
+        "crew",
+        "drones",
+        "soldiers",
+        "bandits",
+        "cultists",
+        "thugs",
+        "raiders",
+        "pirates",
+        "mercenaries",
+        "officers",
+        "workers",
+        "prisoners",
+        "survivors",
+        "rebels",
+        "synthetics",
+        "zombies",
+        "aliens",
+        "xenomorphs",
+        "gang",
+        "mob",
+        "pack",
+        "squad",
+        "team",
+        "unit",
+    }
 )
 
 
@@ -2805,31 +2869,24 @@ def _looks_like_ensemble_heading(line: str) -> bool:
     upper_ratio = sum(1 for c in letters if c.isupper()) / len(letters)
     if upper_ratio < 0.85:
         return False
-    # Prefer collective / plural group labels over single surnames or model names.
-    last = words[-1]
-    if last.endswith("S") or last.endswith("s"):
-        return True
-    return any(
-        w.casefold()
-        in {
-            "androids",
-            "convicts",
-            "marines",
-            "guards",
-            "crew",
-            "drones",
-            "soldiers",
-            "bandits",
-            "cultists",
-            "gang",
-            "mob",
-            "pack",
-            "squad",
-            "team",
-            "unit",
-        }
-        for w in words
-    )
+    # Require a known collective last token (Conscripted Convicts, Corrections Androids).
+    # A bare plural-looking surname must not become a secondary ensemble.
+    return words[-1].casefold() in _ENSEMBLE_COLLECTIVE_LAST
+
+
+def _ensemble_owned_by_nearby_full_name(heading: str, early_lines: list[str]) -> bool:
+    """True when a nearby FULL NAME belongs to this heading (person banner), not a column neighbor."""
+    short = (heading.split() or [""])[0]
+    display = _title_case_ensemble_name(heading)
+    for line in early_lines:
+        if "FULL NAME:" not in line.upper():
+            continue
+        for fname in _iter_full_names_on_line(line):
+            if display.casefold() == fname.casefold():
+                return True
+            if short and _heading_matches_display_name(short, fname):
+                return True
+    return False
 
 
 def _extract_npc_section_ensemble_npcs(
@@ -2860,14 +2917,12 @@ def _extract_npc_section_ensemble_npcs(
         key = display.casefold()
         if key in seen or key in skip:
             continue
-        # Skip when this heading is just the short-name banner for a FULL NAME person.
+        # Skip person banners (SHORT NAME then that person's FULL NAME). Do not skip
+        # when a two-column neighbor's FULL NAME shares the early window.
+        early_lines = lines[index : index + 8]
+        if _ensemble_owned_by_nearby_full_name(line, early_lines):
+            continue
         window = "\n".join(lines[index : index + 28])
-        if re.search(r"(?i)FULL\s+NAME\s*:", window):
-            # Allow if FULL NAME belongs to a later neighbor column — only skip when
-            # the first FULL NAME is within a few lines and looks like this heading.
-            early = "\n".join(lines[index : index + 8])
-            if re.search(r"(?i)FULL\s+NAME\s*:", early):
-                continue
         if not _ENSEMBLE_STAT_SIGNAL.search(window):
             continue
         # Avoid location chapter bleed (STATIONSIDE LOCATIONS rooms).

@@ -479,6 +479,52 @@ def test_npc_section_ensembles_seed_conscripted_convicts_as_secondary():
     assert by_name["Corrections Androids"]["significance"] == "secondary"
 
 
+def test_ensemble_heading_ignores_neighbor_full_name_and_person_plurals():
+    """Two-column FULL NAME next to a group must not drop the ensemble."""
+    section = (
+        "NON-PLAYER CHARACTERS\n"
+        "CONSCRIPTED CONVICTS\n"
+        'FULL NAME:Tommy "Mr." Man\n'
+        "AGE:28\n"
+        "The prison workforce finally went nuclear.\n"
+        "STRENGTH 4\n"
+        "HEALTH: 4\n"
+        "SKILLS: Close Combat 3\n"
+        "JAMES JONES\n"
+        "STRENGTH 3\n"
+        "HEALTH: 3\n"
+    )
+    rows = content_import._extract_npc_section_ensemble_npcs(section)
+    names = {r["name"] for r in rows}
+    assert "Conscripted Convicts" in names
+    assert "James Jones" not in names
+
+
+def test_prose_important_npcs_does_not_steal_section_span():
+    text = (
+        "Intro mentions the unimportant NPCs in passing and the supporting cast of the film.\n"
+        "See major NPCs later.\n\n"
+        "NON-PLAYER CHARACTERS\n"
+        "FULL NAME: EVE 9\n"
+        "PERSONALITY: Curious\n"
+        "STRENGTH: 4\n"
+        "FULL NAME: Tommy Man\n"
+        "PERSONALITY: Cocky\n"
+        "STRENGTH: 3\n"
+        "FULL NAME: Grey 88-80\n"
+        "PERSONALITY: Stoic\n"
+        "STRENGTH: 3\n"
+        "APPENDIX\n"
+        "Notes\n"
+    )
+    collapsed = content_import._collapse_spaced_caps(text)
+    span = content_import._find_npc_section_span(collapsed)
+    assert span is not None
+    section = collapsed[span[0] : span[1]]
+    assert section.strip().upper().startswith("NON-PLAYER")
+    assert "unimportant" not in section.casefold()
+
+
 def test_supporting_cast_section_header_is_recognized():
     text = (
         "Introduction\nWelcome.\n\n"
