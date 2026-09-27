@@ -445,6 +445,58 @@ def test_heart_of_darkness_style_stat_blocks_include_tommy_and_eve():
     assert by_name['Tommy "Mr." Man'].get("personality", "").casefold() == "cocky"
 
 
+def test_npc_section_ensembles_seed_conscripted_convicts_as_secondary():
+    """Named group writeups in the cast section are secondary across systems."""
+    section = (
+        "NON-PLAYER CHARACTERS\n"
+        "GREY\n"
+        "FIRST MATE, USCSS CETORHINA\n"
+        "FULL NAME:First Mate Grey 88-80 First Mate Grey 88-80\n"
+        "AGE:40 40\n"
+        "PERSONALITY:Stoic Stoic\n"
+        "PERSONAL AGENDA: Keep the ship alive.\n"
+        "STRENGTH: 3\n"
+        "CORRECTIONS ANDROIDS\n"
+        "CONSCRIPTED CONVICTS\n"
+        "The prison workforce finally went nuclear.\n"
+        "STRENGTH 4, AGILITY 3, WITS 2, EMPATHY 3\n"
+        "HEALTH: 4\n"
+        "SKILLS: Close Combat 3, Stamina 2\n"
+        "GEAR: Two shivs\n"
+        "STATIONSIDE LOCATIONS\n"
+        "OPERATIONS\n"
+    )
+    warnings: list[str] = []
+    stubs = content_import._npc_stubs_from_stat_blocks(
+        section, location_ids=set(), warnings=warnings
+    )
+    by_name = {s["name"]: s for s in stubs}
+    assert "First Mate Grey 88-80" in by_name
+    assert by_name["First Mate Grey 88-80"]["significance"] == "conversational"
+    assert "Conscripted Convicts" in by_name
+    assert by_name["Conscripted Convicts"]["significance"] == "secondary"
+    assert "Corrections Androids" in by_name
+    assert by_name["Corrections Androids"]["significance"] == "secondary"
+
+
+def test_supporting_cast_section_header_is_recognized():
+    text = (
+        "Introduction\nWelcome.\n\n"
+        "SUPPORTING CAST\n"
+        "FULL NAME: EVE 9\n"
+        "PERSONALITY: Curious\n"
+        "STRENGTH: 4\n"
+        "APPENDIX\n"
+        "Extra notes.\n"
+    )
+    collapsed = content_import._collapse_spaced_caps(text)
+    span = content_import._find_npc_section_span(collapsed)
+    assert span is not None
+    section = collapsed[span[0] : span[1]]
+    assert "EVE 9" in section
+    assert "FULL NAME" in section
+
+
 def test_act_iii_prose_is_not_a_stat_block_heading():
     assert content_import._iter_stat_block_headings(
         "found in Act III, Meyers has it concealed,"
