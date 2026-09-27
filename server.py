@@ -4458,6 +4458,7 @@ def content_import_discover():
 
     mode = str(body.get("mode") or "create_new").strip().lower()
     document_scope = str(body.get("document_scope") or body.get("anthology_mode") or "single")
+    source_kind = str(body.get("source_kind") or "document")
     existing_campaign_id = body.get("existing_campaign_id")
     existing_location_ids = body.get("existing_location_ids") or []
     existing_npc_names = body.get("existing_npc_names") or []
@@ -4475,6 +4476,7 @@ def content_import_discover():
             existing_location_ids=existing_location_ids,
             existing_npc_names=existing_npc_names,
             document_scope=document_scope,
+            source_kind=source_kind,
         )
         return jsonify(result)
     except ContentImportError as ex:
@@ -4515,12 +4517,15 @@ def content_import_campaign_details():
         else:
             source_index_summary = str(source_index_summary or "")
 
+    source_kind = str(body.get("source_kind") or "document")
+
     try:
         result = generate_campaign_info(
             text,
             campaign if isinstance(campaign, dict) else None,
             source_index_summary=source_index_summary,
             discovery=discovery if isinstance(discovery, dict) else None,
+            source_kind=source_kind,
         )
         return jsonify(result)
     except ContentImportError as ex:
