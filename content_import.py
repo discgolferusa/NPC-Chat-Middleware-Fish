@@ -149,6 +149,10 @@ _FULL_NAME_LINE = re.compile(r"^FULL NAME:\s*(.+)$", re.IGNORECASE)
 # Word tokens MUST start with an uppercase letter so lowercase prose after a
 # name does not get swallowed (regression: "Micky Horton take the ship...").
 _PERSON_NAME_UPPER = r"[A-ZÀ-ÖØ-Þ]"
+# Apostrophe class must use real U+2018/U+2019 chars (not rf"\u2019" — that stays
+# literal backslash-u in the Python string; re may still parse it, but callers and
+# tests should see the actual characters).
+_PERSON_NAME_APOS_CLASS = "['\u2019\u2018\\-]"
 _PERSON_NAME_TOKEN = (
     r"(?:"
     # Quoted nickname segment (ASCII or curly/guillemet quotes from PDF extract).
@@ -162,7 +166,7 @@ _PERSON_NAME_TOKEN = (
     r"|"
     # Capitalized word or model id (Tommy, EVE, AA83, Pflüger).
     # Allow curly apostrophes — PdfPig often emits U+2019 inside accented names.
-    rf"{_PERSON_NAME_UPPER}(?:[^\W_]|['\u2019\u2018\-])*"
+    f"{_PERSON_NAME_UPPER}(?:[^\\W_]|{_PERSON_NAME_APOS_CLASS})*"
     r")"
 )
 # PdfPig two-column lines often contain multiple FULL NAME markers on one line.

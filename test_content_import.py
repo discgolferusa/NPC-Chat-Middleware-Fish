@@ -389,6 +389,8 @@ def test_full_name_accepts_numeric_model_ids_eve_9():
 
 def test_full_name_accepts_accented_and_curly_apostrophe_names():
     """Accented surnames and PdfPig U+2019-inside-name glitches must still parse."""
+    assert "\u2019" in content_import._PERSON_NAME_TOKEN
+    assert "\\u2019" not in content_import._PERSON_NAME_TOKEN
     assert content_import._iter_full_names_on_line(
         "FULL NAME:Sub-Lieutenant Cûng Pflüger Sub-Lieutenant Cûng Pflüger"
     ) == ["Sub-Lieutenant Cûng Pflüger"]
