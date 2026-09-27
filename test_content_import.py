@@ -2418,6 +2418,42 @@ CHAPTER 7 I TOMB OF HORRORS
     assert [s.get("chapter") for s in stubs] == [1, 2, 3, 4, 5, 6, 7]
 
 
+def test_extract_anthology_stubs_ignores_all_caps_page_heads():
+    """Scene/location splash titles must not become adventure inventory."""
+    text = """
+=== PAGE 5 ===
+LOCATION:
+HARAR, ETHIOPIA
+4
+HYENAS OF HARAR
+Some mission prose.
+
+=== PAGE 6 ===
+THE CITY OF HARAR
+Inside walls prose.
+
+=== PAGE 7 ===
+INSIDE THE WALLS
+More scene text.
+"""
+    stubs = content_import._extract_anthology_adventure_stubs(text)
+    assert stubs == []
+
+
+def test_sample_document_for_anthology_outline_covers_later_pages():
+    pages = []
+    for i in range(1, 21):
+        pages.append(f"=== PAGE {i} ===\nModule marker {i} " + ("body " * 80))
+    text = "\n".join(pages)
+    warnings: list[str] = []
+    out = content_import._sample_document_for_anthology_outline(
+        text, max_chars=6000, warnings=warnings
+    )
+    assert "Module marker 1" in out
+    assert "Module marker 20" in out or "Module marker 19" in out
+    assert any("sampled" in w for w in warnings)
+
+
 def test_extract_anthology_stubs_dedupe_ocr_chapter_variants():
     text = """
 CHAPTER 6 I ACrAINST THE GIANTS
@@ -2475,9 +2511,58 @@ def test_outline_skips_toc_merge_when_document_scope_single(monkeypatch):
     assert single["debug"]["toc_adventure_count"] == 0
 
     anthology = content_import.outline_campaign_document(text, "create_new", document_scope="anthology")
-    assert len(anthology["adventures"]) >= 2
+    # LLM inventory wins — no forced TOC expansion beyond what the model returned.
+    assert len(anthology["adventures"]) == 2
     assert anthology["debug"]["document_scope"] == "anthology"
-    assert anthology["debug"]["toc_adventure_count"] >= 2
+    assert anthology["debug"]["adventure_inventory_source"] == "llm"
+    assert anthology["debug"]["chapter_hint_count"] >= 2
+
+
+def test_outline_anthology_does_not_force_chapter_hint_inventory(monkeypatch):
+    """CHAPTER banners are hints only; LLM list is authoritative."""
+    text = (
+        "CHAPTER 1 I THE SUNLESS CITADEL\n" + ("room " * 200) + "\n"
+        "CHAPTER 2 I THE FORGE OF FURY\n" + ("room " * 200) + "\n"
+        "CHAPTER 3 I WHITE PLUME MOUNTAIN\n" + ("room " * 200)
+    )
+
+    captured: dict[str, str] = {}
+
+    def fake_llm(system, prompt, **_kwargs):
+        captured["prompt"] = prompt
+        return {
+            "adventures": [
+                {"title": "The Sunless Citadel", "name": "The Sunless Citadel"},
+                {"title": "The Forge of Fury", "name": "The Forge of Fury"},
+            ],
+            "locations": [],
+            "npcs": [],
+        }
+
+    monkeypatch.setattr(content_import, "_call_llm_json", fake_llm)
+    monkeypatch.setattr(content_import, "_document_has_recoverable_stat_blocks", lambda *_a, **_k: False)
+    monkeypatch.setattr(content_import, "_document_has_recoverable_location_sites", lambda *_a, **_k: False)
+
+    out = content_import.outline_campaign_document(text, "create_new", document_scope="anthology")
+    assert len(out["adventures"]) == 2
+    assert "DOCUMENT SCOPE = anthology" in captured["prompt"]
+    assert "Optional chapter-banner hints" in captured["prompt"]
+    assert "MUST include every one" not in captured["prompt"]
+    titles = {a["title"] for a in out["adventures"]}
+    assert "White Plume Mountain" not in titles
+
+
+def test_build_outline_prompt_single_scope_asks_for_one_adventure():
+    prompt = content_import._build_outline_prompt(
+        "Some text",
+        "create_new",
+        None,
+        [],
+        [],
+        document_scope="single",
+    )
+    assert "DOCUMENT SCOPE = single" in prompt
+    assert "exactly ONE adventures[] stub" in prompt
 
 
 def test_build_campaign_prompt_echoes_seed_temporary_key():
