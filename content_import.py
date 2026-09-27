@@ -1368,6 +1368,14 @@ def _normalize_document_scope(value: str | None) -> str:
     return "single"
 
 
+def _normalize_source_kind(value: str | None) -> str:
+    """Return ``document`` (default) or ``vtt_world``."""
+    folded = re.sub(r"[\s\-]+", "_", str(value or "").strip().casefold())
+    if folded in {"vtt_world", "vtt", "foundry", "world"}:
+        return "vtt_world"
+    return "document"
+
+
 def _clean_adventure_title_raw(name: str) -> str:
     cleaned = re.sub(r"\s+", " ", str(name or "")).strip(" :-|")
     cleaned = re.sub(r"\s+\d{1,4}\s*$", "", cleaned)  # trailing page numbers
@@ -6003,6 +6011,7 @@ def _build_outline_prompt(
     *,
     document_scope: str = "single",
     chapter_hint_titles: list[str] | None = None,
+    source_kind: str = "document",
 ) -> str:
     """Slim discovery prompt: entity inventory only (campaign prose is a later hop)."""
     if mode == "merge" and existing_campaign_id:
@@ -6029,6 +6038,16 @@ def _build_outline_prompt(
         mode_guidance = (
             "This is a brand new import. Do NOT invent a permanent campaign_id, location id, "
             "or npc id. Use temporary_key values only (adventure_001, location_001, npc_001, …).\n"
+        )
+
+    kind = _normalize_source_kind(source_kind)
+    if kind == "vtt_world":
+        mode_guidance += (
+            "SOURCE KIND = VTT world export (journals, actors, scenes), not a published PDF.\n"
+            "- Prefer JOURNAL sections for adventure/location lore.\n"
+            "- ACTOR sections (especially on-scene) are strong NPC candidates.\n"
+            "- SCENE sections name playable sites; link them to locations when possible.\n"
+            "- Ignore system rules, SRD, and generic monster reference tone when present.\n"
         )
 
     scope = _normalize_document_scope(document_scope)
@@ -6863,6 +6882,7 @@ def outline_campaign_document(
     existing_location_ids: list[str] | None = None,
     existing_npc_names: list[str] | None = None,
     document_scope: str | None = None,
+    source_kind: str | None = None,
 ) -> dict[str, Any]:
     """Pass 1: campaign + location/NPC stubs with temporary keys (no detail sweeps).
 
@@ -6881,6 +6901,7 @@ def outline_campaign_document(
     existing_location_ids = [str(x).strip() for x in (existing_location_ids or []) if str(x).strip()]
     existing_npc_names = [str(x).strip() for x in (existing_npc_names or []) if str(x).strip()]
     scope = _normalize_document_scope(document_scope)
+    kind = _normalize_source_kind(source_kind)
 
     if not text or not text.strip():
         raise ContentImportError("No document text provided")
@@ -6907,6 +6928,7 @@ def outline_campaign_document(
         "llm_called": False,
         "fast_path": None,
         "document_scope": scope,
+        "source_kind": kind,
         "toc_adventure_count": len(chapter_hints),
         "chapter_hint_count": len(chapter_hints),
         "adventure_inventory_source": "llm" if scope == "anthology" else "llm_single",
@@ -6960,6 +6982,7 @@ def outline_campaign_document(
             existing_npc_names,
             document_scope=scope,
             chapter_hint_titles=hint_titles if scope == "anthology" else None,
+            source_kind=kind,
         )
         try:
             outline_raw = _call_llm_json(
@@ -7118,6 +7141,7 @@ def discover_campaign_document(
     existing_location_ids: list[str] | None = None,
     existing_npc_names: list[str] | None = None,
     document_scope: str | None = None,
+    source_kind: str | None = None,
 ) -> dict[str, Any]:
     """Alias for ``outline_campaign_document`` (temporary-key discovery)."""
     return outline_campaign_document(
@@ -7127,6 +7151,7 @@ def discover_campaign_document(
         existing_location_ids=existing_location_ids,
         existing_npc_names=existing_npc_names,
         document_scope=document_scope,
+        source_kind=source_kind,
     )
 
 
@@ -7471,6 +7496,7 @@ def _build_campaign_prompt(
     discovery_campaign: dict[str, Any],
     *,
     source_index_summary: str = "",
+    source_kind: str = "document",
 ) -> str:
     seed_key = str(discovery_campaign.get("temporary_key") or "").strip() or "adventure_001"
     seed = {
@@ -7484,10 +7510,17 @@ def _build_campaign_prompt(
     index_note = ""
     if source_index_summary.strip():
         index_note = f"Source index summary:\n{source_index_summary.strip()}\n\n"
+    kind_note = ""
+    if _normalize_source_kind(source_kind) == "vtt_world":
+        kind_note = (
+            "SOURCE KIND = VTT world export. Ground the summary in journal/actor/scene "
+            "sections; do not invent a published adventure module layout.\n\n"
+        )
     return (
         "Fill campaign information for NPCNarrator from the source excerpts and discovery seed.\n"
         "Do NOT invent a permanent campaign_id. Echo temporary_key from the seed exactly "
         f'(use "{seed_key}").\n\n'
+        f"{kind_note}"
         f"Discovery seed (JSON):\n{json.dumps(seed, ensure_ascii=False)}\n\n"
         f"{index_note}"
         "Respond with exactly this shape:\n"
@@ -7525,6 +7558,7 @@ def generate_campaign_info(
     *,
     source_index_summary: str = "",
     discovery: dict[str, Any] | None = None,
+    source_kind: str | None = None,
 ) -> dict[str, Any]:
     """Stage 2: campaign information hop (Luna / content_campaign)."""
     warnings: list[str] = []
@@ -7538,6 +7572,7 @@ def generate_campaign_info(
         bounded,
         seed,
         source_index_summary=source_index_summary or "",
+        source_kind=_normalize_source_kind(source_kind),
     )
     campaign_debug: dict[str, Any] = {"step": "campaign", "llm_called": False}
     try:
