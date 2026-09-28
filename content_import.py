@@ -77,9 +77,11 @@ _EXCERPT_STOPWORDS = frozenset(
 # Published module headers (PDFs often space letters: N O N - P L A Y E R).
 # Format-agnostic: Alien NON-PLAYER CHARACTERS, Supporting Cast, Dramatis Personae, …
 # Word boundaries avoid prose like "unimportant NPCs" / mid-sentence mentions.
+# ``player`` may sit against ``characters`` with no space when columns glue
+# (NON-PLAYERCHARACTERS); allow optional whitespace including newlines.
 _NPC_SECTION_PATTERN = re.compile(
     r"(?:"
-    r"(?<![A-Za-z])non\s*[- ]?\s*player[\s\n]+characters?\b"
+    r"(?<![A-Za-z])non\s*[- ]?\s*player[\s\n]*characters?\b"
     r"|(?<![A-Za-z])supporting[\s\n]+cast\b"
     r"|(?<![A-Za-z])dramatis[\s\n]+personae\b"
     r"|(?<![A-Za-z])cast[\s\n]+of[\s\n]+characters\b"
@@ -87,6 +89,10 @@ _NPC_SECTION_PATTERN = re.compile(
     r"|(?<![A-Za-z])major[\s\n]+npcs?\b"
     r")",
     re.IGNORECASE,
+)
+# PdfPig two-column extracts often duplicate tokens: CHARACTERSCHARACTERS, GREYGREY.
+_DOUBLED_PDF_TOKEN = re.compile(
+    r"([A-Za-z][A-Za-z0-9'-]{1,48})\1\b"
 )
 _TOC_NPC_HEADER_LINE = re.compile(
     r"\.{2,}",
@@ -769,17 +775,32 @@ def _collapse_spaced_caps(text: str) -> str:
     for line in text.splitlines():
         stripped = line.strip()
         if stripped and re.fullmatch(r"[A-Z0-9](?:\s+[A-Z0-9-])+", stripped):
-            lines.append(re.sub(r"\s+", "", stripped))
+            lines.append(_collapse_doubled_pdf_tokens(re.sub(r"\s+", "", stripped)))
             continue
-        lines.append(line)
+        lines.append(_collapse_doubled_pdf_tokens(line))
     return "\n".join(lines)
+
+
+def _collapse_doubled_pdf_tokens(text: str) -> str:
+    """Collapse PdfPig two-column duplicates: CHARACTERSCHARACTERS → CHARACTERS.
+
+    Heart of Darkness (and similar) extract the NPC header as
+    ``NON-PLAYER …\\nCHARACTERSCHARACTERS``. Without this collapse,
+    ``characters?\\b`` fails mid-token and the authoritative cast section is never found.
+    """
+    out = str(text or "")
+    prev = None
+    while prev != out:
+        prev = out
+        out = _DOUBLED_PDF_TOKEN.sub(r"\1", out)
+    return out
 
 
 def _collapsed_line_from_raw_line(line: str) -> str:
     stripped = line.strip()
     if stripped and re.fullmatch(r"[A-Z0-9](?:\s+[A-Z0-9-])+", stripped):
-        return re.sub(r"\s+", "", stripped)
-    return stripped
+        return _collapse_doubled_pdf_tokens(re.sub(r"\s+", "", stripped))
+    return _collapse_doubled_pdf_tokens(stripped)
 
 
 def _is_toc_npc_header_line(collapsed_line: str) -> bool:
@@ -810,10 +831,12 @@ def _npc_header_collapsed_from_lines(lines: list[str]) -> str | None:
         return None
 
     collapsed = " ".join(_collapsed_line_from_raw_line(line) for line in stripped_lines)
+    collapsed = _collapse_doubled_pdf_tokens(collapsed)
     match = _NPC_SECTION_PATTERN.search(collapsed)
     if not match:
         return None
-    if collapsed[: match.start()].strip():
+    before = collapsed[: match.start()].strip()
+    if before and not re.fullmatch(r"(?i)(?:non\s*[- ]?\s*player\s*)+", before):
         return None
 
     remainder = collapsed[match.end() :].strip()
@@ -958,8 +981,12 @@ def _npc_section_match_looks_like_header(collapsed_text: str, match: re.Match[st
     line_end = collapsed_text.find("\n", match.start())
     if line_end < 0:
         line_end = len(collapsed_text)
-    if collapsed_text[line_start : match.start()].strip():
-        return False
+    before = collapsed_text[line_start : match.start()].strip()
+    if before:
+        # PdfPig two-column duplicate: "NON-PLAYER NON-PLAYER CHARACTERS" — the
+        # regex match often starts at the second NON-PLAYER.
+        if not re.fullmatch(r"(?i)(?:non\s*[- ]?\s*player\s*)+", before):
+            return False
     # PDF extracts may glue the rest of the page onto one line — only inspect a
     # short remainder for TOC crumbs / punctuation / immediate FULL NAME.
     peek_end = min(line_end, match.end() + 24)
@@ -2821,8 +2848,8 @@ def _npc_stubs_from_stat_blocks(
 
     if stubs:
         warnings.append(
-            f"Parsed {len(stubs)} NPC(s) from the authoritative NPC/cast section "
-            "(labeled names + named ensembles)."
+            f"Parsed {len(stubs)} NPC(s) from the authoritative NON-PLAYER CHARACTERS / "
+            "cast section (labeled names + named ensembles / stat blocks)."
         )
     return stubs
 
@@ -5658,11 +5685,22 @@ def _merge_outline_npcs_with_stat_blocks(
 
     if dropped:
         warnings.append(
-            "Ignored outline NPC(s) outside the stat-block section: "
+            "Ignored outline NPC(s) outside the authoritative NPC/cast section: "
             + ", ".join(dropped)
         )
 
-    return kept_llm + stat_stubs
+    # When the published cast section is confident, it is authoritative — do not
+    # keep LLM inventions from events/sidebars (e.g. "Cuddles" the starfish).
+    if kept_llm:
+        warnings.append(
+            "Ignored outline NPC(s) not listed in the authoritative NPC/cast section: "
+            + ", ".join(
+                str(n.get("name") or "").strip()
+                for n in kept_llm
+                if str(n.get("name") or "").strip()
+            )
+        )
+    return list(stat_stubs)
 
 
 def _merge_outline_npcs_with_callouts(
@@ -7353,8 +7391,9 @@ def outline_campaign_document(
 
     if use_stat_block_fast_path:
         warnings.append(
-            "Published NPC/cast section detected; skipping LLM outline and seeding NPC stubs "
-            "from labeled names and named ensembles (detail sweep still runs)."
+            "Published NON-PLAYER CHARACTERS / cast section detected; skipping LLM outline "
+            "and seeding NPC stubs from labeled names and named ensembles "
+            "(stat block / cast writeups; detail sweep still runs)."
         )
         outline_raw = {"adventures": [{}], "locations": [], "npcs": []}
         discovery_debug["fast_path"] = "stat_blocks"
