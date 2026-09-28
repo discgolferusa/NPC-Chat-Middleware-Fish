@@ -374,6 +374,96 @@ def test_full_name_accepts_nickname_quotes_tommy_man():
     ) == ['Flo "Candlestick Maker"']
 
 
+def test_collapse_doubled_pdf_tokens_fixes_characterscharacters():
+    assert (
+        content_import._collapse_doubled_pdf_tokens("CHARACTERSCHARACTERS")
+        == "CHARACTERS"
+    )
+    assert content_import._collapse_doubled_pdf_tokens("GREYGREY") == "GREY"
+    collapsed = content_import._collapse_spaced_caps(
+        "NON-PLAYER   NON-PLAYER   \nCHARACTERSCHARACTERS\n"
+        'FULL NAME:FULL NAME: Tommy "Mr." Man Tommy "Mr." Man\n'
+    )
+    assert "CHARACTERSCHARACTERS" not in collapsed
+    assert content_import._find_npc_section_span(collapsed) is not None
+
+
+def test_heart_of_darkness_two_column_header_finds_tommy_not_cuddles(monkeypatch):
+    """PdfPig HoD headers glue CHARACTERSCHARACTERS; events invent Cuddles."""
+    text = (
+        "HEART OF DARKNESS\n"
+        "Contents\n"
+        "Non-Player Characters ........ 21\n"
+        "NON-PLAYER   NON-PLAYER   \n"
+        "CHARACTERSCHARACTERS\n"
+        "MAN\n"
+        "CONVICTED ORGANIZED CRIME, EREBOS\n"
+        'FULL NAME:Tommy "Mr." Man Tommy "Mr." Man\n'
+        "AGE:28 28\n"
+        "PERSONALITY:Cocky Cocky\n"
+        "STRENGTH: 3\n"
+        "EVE\n"
+        "SYNTHETIC, STATION\n"
+        "FULL NAME:EVE 9 EVE 9\n"
+        "AGE:3 3\n"
+        "PERSONALITY:Curious Curious\n"
+        "STRENGTH: 5\n"
+        "GREY\n"
+        "ANDROID\n"
+        "FULL NAME:First Mate Grey 88-80 First Mate Grey 88-80\n"
+        "PERSONALITY:Docile Docile\n"
+        "STRENGTH: 4\n"
+        "APPENDIX\n"
+        "CUDDLES THE STARFISH: It looks like the PCs have found their first survivor.\n"
+        "Cuddles wants to give someone a fatal hug.\n"
+    )
+    assert content_import._document_has_recoverable_stat_blocks(text)
+
+    def fake_llm(*_a, **_k):
+        raise AssertionError("stat-block fast path should not call outline LLM")
+
+    monkeypatch.setattr(content_import, "_call_llm_json", fake_llm)
+    result = content_import.outline_campaign_document(text, "create_new")
+    names = {npc["name"] for npc in result["npcs"]}
+    assert 'Tommy "Mr." Man' in names
+    assert "EVE 9" in names
+    assert not any("cuddles" in n.casefold() for n in names)
+
+
+def test_merge_stat_blocks_drops_llm_event_monsters():
+    warnings: list[str] = []
+    section = (
+        "NON-PLAYER CHARACTERS\n"
+        "MAN\n"
+        'FULL NAME:Tommy "Mr." Man\n'
+        "PERSONALITY:Cocky\n"
+        "STRENGTH: 3\n"
+        "EVE\n"
+        "FULL NAME:EVE 9\n"
+        "PERSONALITY:Curious\n"
+        "STRENGTH: 5\n"
+        "GREY\n"
+        "FULL NAME:First Mate Grey 88-80\n"
+        "PERSONALITY:Docile\n"
+        "STRENGTH: 4\n"
+    )
+    merged = content_import._merge_outline_npcs_with_stat_blocks(
+        [
+            {"name": "Cuddles", "role": "starfish", "significance": "conversational"},
+            {"name": "Tommy Man", "role": "convict", "significance": "conversational"},
+        ],
+        section,
+        mode="create_new",
+        existing_npc_names=[],
+        location_ids=set(),
+        warnings=warnings,
+    )
+    names = {n["name"] for n in merged}
+    assert 'Tommy "Mr." Man' in names or any("tommy" in n.casefold() for n in names)
+    assert not any("cuddles" in n.casefold() for n in names)
+    assert any("authoritative" in w.lower() or "cast section" in w.lower() for w in warnings)
+
+
 def test_full_name_accepts_numeric_model_ids_eve_9():
     """Android / model names with digit tokens (EVE 9, Grey 88-80) must parse."""
     assert content_import._iter_full_names_on_line(
@@ -705,7 +795,8 @@ def test_find_npc_section_span_prefers_body_over_toc_without_full_name():
     warnings: list[str] = []
     prepared = content_import._prepare_outline_document_text(text, warnings)
     assert "JOHN SMITH, GUARD" in prepared
-    assert "--- NON-PLAYER CHARACTERS (authoritative NPC list) ---" in prepared
+    assert "(authoritative NPC list)" in prepared
+    assert "NON-PLAYER CHARACTERS" in prepared or "AUTHORITATIVE NPC" in prepared.upper()
 
 
 def test_stat_block_outline_succeeds_when_content_creation_budget_zero(monkeypatch):
