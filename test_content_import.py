@@ -445,6 +445,188 @@ def test_heart_of_darkness_style_stat_blocks_include_tommy_and_eve():
     assert by_name['Tommy "Mr." Man'].get("personality", "").casefold() == "cocky"
 
 
+def test_npc_section_ensembles_seed_conscripted_convicts_as_secondary():
+    """Named group writeups in the cast section are secondary across systems."""
+    section = (
+        "NON-PLAYER CHARACTERS\n"
+        "GREY\n"
+        "FIRST MATE, USCSS CETORHINA\n"
+        "FULL NAME:First Mate Grey 88-80 First Mate Grey 88-80\n"
+        "AGE:40 40\n"
+        "PERSONALITY:Stoic Stoic\n"
+        "PERSONAL AGENDA: Keep the ship alive.\n"
+        "STRENGTH: 3\n"
+        "CORRECTIONS ANDROIDS\n"
+        "CONSCRIPTED CONVICTS\n"
+        "The prison workforce finally went nuclear.\n"
+        "STRENGTH 4, AGILITY 3, WITS 2, EMPATHY 3\n"
+        "HEALTH: 4\n"
+        "SKILLS: Close Combat 3, Stamina 2\n"
+        "GEAR: Two shivs\n"
+        "STATIONSIDE LOCATIONS\n"
+        "OPERATIONS\n"
+    )
+    warnings: list[str] = []
+    stubs = content_import._npc_stubs_from_stat_blocks(
+        section, location_ids=set(), warnings=warnings
+    )
+    by_name = {s["name"]: s for s in stubs}
+    assert "First Mate Grey 88-80" in by_name
+    assert by_name["First Mate Grey 88-80"]["significance"] == "conversational"
+    assert "Conscripted Convicts" in by_name
+    assert by_name["Conscripted Convicts"]["significance"] == "secondary"
+    assert "Corrections Androids" in by_name
+    assert by_name["Corrections Androids"]["significance"] == "secondary"
+
+
+def test_ensemble_heading_ignores_neighbor_full_name_and_person_plurals():
+    """Two-column FULL NAME next to a group must not drop the ensemble."""
+    section = (
+        "NON-PLAYER CHARACTERS\n"
+        "CONSCRIPTED CONVICTS\n"
+        'FULL NAME:Tommy "Mr." Man\n'
+        "AGE:28\n"
+        "The prison workforce finally went nuclear.\n"
+        "STRENGTH 4\n"
+        "HEALTH: 4\n"
+        "SKILLS: Close Combat 3\n"
+        "JAMES JONES\n"
+        "STRENGTH 3\n"
+        "HEALTH: 3\n"
+    )
+    rows = content_import._extract_npc_section_ensemble_npcs(section)
+    names = {r["name"] for r in rows}
+    assert "Conscripted Convicts" in names
+    assert "James Jones" not in names
+
+
+def test_prose_important_npcs_does_not_steal_section_span():
+    text = (
+        "Intro mentions the unimportant NPCs in passing and the supporting cast of the film.\n"
+        "See major NPCs later.\n\n"
+        "NON-PLAYER CHARACTERS\n"
+        "FULL NAME: EVE 9\n"
+        "PERSONALITY: Curious\n"
+        "STRENGTH: 4\n"
+        "FULL NAME: Tommy Man\n"
+        "PERSONALITY: Cocky\n"
+        "STRENGTH: 3\n"
+        "FULL NAME: Grey 88-80\n"
+        "PERSONALITY: Stoic\n"
+        "STRENGTH: 3\n"
+        "APPENDIX\n"
+        "Notes\n"
+    )
+    collapsed = content_import._collapse_spaced_caps(text)
+    span = content_import._find_npc_section_span(collapsed)
+    assert span is not None
+    section = collapsed[span[0] : span[1]]
+    assert section.strip().upper().startswith("NON-PLAYER")
+    assert "unimportant" not in section.casefold()
+
+
+def test_earlier_rich_cast_section_beats_later_empty_recap_header():
+    """Cubicle 7-style: 0 FULL NAME rows — primary Supporting Cast must beat a late recap."""
+    text = (
+        "SUPPORTING CAST\n"
+        "Chad\n"
+        "Awareness 3 Presence 4\n"
+        "TRAITS\n"
+        "Charming: Always smiling.\n"
+        "Mary Ann\n"
+        "Awareness 2 Presence 3\n"
+        "TRAITS\n"
+        "Sharp: Notices everything.\n"
+        + ("filler\n" * 40)
+        + "IMPORTANT NPCS\n"
+        "See earlier.\n"
+        "APPENDIX\n"
+    )
+    collapsed = content_import._collapse_spaced_caps(text)
+    span = content_import._find_npc_section_span(collapsed)
+    assert span is not None
+    section = collapsed[span[0] : span[1]]
+    assert section.strip().upper().startswith("SUPPORTING CAST")
+    assert "IMPORTANT NPCS" not in section[:40].upper() or section.upper().startswith(
+        "SUPPORTING"
+    )
+
+
+def test_early_teaser_header_does_not_steal_real_cast_section():
+    """Early heading that spans to APPENDIX must not outrank the real writeup chapter."""
+    text = (
+        "NON-PLAYER CHARACTERS\n"
+        "These characters appear in the next chapter.\n"
+        + ("adventure prose continues here.\n" * 120)
+        + "NON-PLAYER CHARACTERS\n"
+        "FULL NAME: EVE 9\n"
+        "PERSONALITY: Curious\n"
+        "STRENGTH: 4\n"
+        "FULL NAME: Tommy Man\n"
+        "PERSONALITY: Cocky\n"
+        "STRENGTH: 3\n"
+        "FULL NAME: Grey 88-80\n"
+        "PERSONALITY: Stoic\n"
+        "STRENGTH: 3\n"
+        "APPENDIX\n"
+        "Notes\n"
+    )
+    collapsed = content_import._collapse_spaced_caps(text)
+    span = content_import._find_npc_section_span(collapsed)
+    assert span is not None
+    section = collapsed[span[0] : span[1]]
+    # Must start at the writeup chapter, not the early teaser.
+    assert "EVE 9" in section[:800]
+    assert "These characters appear" not in section[:200]
+
+
+def test_rank_window_ignores_prose_cast_phrase_inside_chapter():
+    """Mid-sentence 'supporting cast' must not truncate proximal FULL NAME scoring."""
+    text = (
+        "NON-PLAYER CHARACTERS\n"
+        "The crew meets the supporting cast of the film in this scene.\n"
+        "FULL NAME: EVE 9\n"
+        "PERSONALITY: Curious\n"
+        "STRENGTH: 4\n"
+        "FULL NAME: Tommy Man\n"
+        "PERSONALITY: Cocky\n"
+        "STRENGTH: 3\n"
+        "FULL NAME: Grey 88-80\n"
+        "PERSONALITY: Stoic\n"
+        "STRENGTH: 3\n"
+        "APPENDIX\n"
+    )
+    collapsed = content_import._collapse_spaced_caps(text)
+    span = content_import._find_npc_section_span(collapsed)
+    assert span is not None
+    section = collapsed[span[0] : span[1]]
+    assert "EVE 9" in section
+    assert "Tommy Man" in section
+    names, signals = content_import._npc_section_rank_metrics(
+        collapsed, span[0], span[1]
+    )
+    assert names >= 3
+    assert signals >= 3
+
+
+def test_supporting_cast_section_header_is_recognized():
+    text = (
+        "Introduction\nWelcome.\n\n"
+        "SUPPORTING CAST\n"
+        "FULL NAME: EVE 9\n"
+        "PERSONALITY: Curious\n"
+        "STRENGTH: 4\n"
+        "APPENDIX\n"
+        "Extra notes.\n"
+    )
+    collapsed = content_import._collapse_spaced_caps(text)
+    span = content_import._find_npc_section_span(collapsed)
+    assert span is not None
+    section = collapsed[span[0] : span[1]]
+    assert "EVE 9" in section
+    assert "FULL NAME" in section
+
+
 def test_act_iii_prose_is_not_a_stat_block_heading():
     assert content_import._iter_stat_block_headings(
         "found in Act III, Meyers has it concealed,"

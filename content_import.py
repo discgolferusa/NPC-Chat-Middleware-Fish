@@ -9,11 +9,12 @@ elsewhere in this repo) for the caller to review and persist.
 
 Pipeline:
   1. Outline pass — one LLM call, or deterministic stub seeding when recoverable
-     published callouts are present (ALIEN FULL NAME blocks, or Cubicle 7-style
-     name + Awareness/Presence + TRAITS character boxes). Exposed as
-     ``outline_campaign_document``. Person-name tokenization is shared across
-     those seeders and LLM stub normalization so nicknames and alphanumeric
-     model IDs (e.g. Tommy "Mr." Man, EVE 9) survive every import path.
+     published callouts are present (labeled FULL NAME / person rows, Cubicle 7-style
+     name + Awareness/Presence + TRAITS character boxes, or named ensemble writeups
+     in an authoritative NPC/cast section). Exposed as ``outline_campaign_document``.
+     Person-name tokenization and ensemble seeding are shared across seeders and LLM
+     stub normalization so nicknames, alphanumeric model IDs (e.g. Tommy "Mr." Man,
+     EVE 9), and named groups (Conscripted Convicts) survive every import path.
   2. Location detail — format-agnostic LLM extraction from name-focused excerpts,
      plus TOC/Exploring windows and a generic sub-area harvest into
      ``important_locations`` when the model returns a summary without rooms.
@@ -74,12 +75,21 @@ _EXCERPT_STOPWORDS = frozenset(
 )
 
 # Published module headers (PDFs often space letters: N O N - P L A Y E R).
+# Format-agnostic: Alien NON-PLAYER CHARACTERS, Supporting Cast, Dramatis Personae, …
+# Word boundaries avoid prose like "unimportant NPCs" / mid-sentence mentions.
 _NPC_SECTION_PATTERN = re.compile(
-    r"non\s*[- ]?\s*player[\s\n]+characters?",
+    r"(?:"
+    r"(?<![A-Za-z])non\s*[- ]?\s*player[\s\n]+characters?\b"
+    r"|(?<![A-Za-z])supporting[\s\n]+cast\b"
+    r"|(?<![A-Za-z])dramatis[\s\n]+personae\b"
+    r"|(?<![A-Za-z])cast[\s\n]+of[\s\n]+characters\b"
+    r"|(?<![A-Za-z])important[\s\n]+npcs?\b"
+    r"|(?<![A-Za-z])major[\s\n]+npcs?\b"
+    r")",
     re.IGNORECASE,
 )
 _TOC_NPC_HEADER_LINE = re.compile(
-    r"\.{2,}|\s+\d{1,4}\s*$",
+    r"\.{2,}",
     re.IGNORECASE,
 )
 _NPC_SECTION_END_PATTERN = re.compile(
@@ -775,9 +785,18 @@ def _collapsed_line_from_raw_line(line: str) -> str:
 def _is_toc_npc_header_line(collapsed_line: str) -> bool:
     if not collapsed_line:
         return False
-    if _TOC_NPC_HEADER_LINE.search(collapsed_line):
+    stripped = collapsed_line.strip()
+    if _TOC_NPC_HEADER_LINE.search(stripped):
         return True
-    if len(collapsed_line) <= 48 and re.search(r"\bpage\s+\d+\b", collapsed_line, re.IGNORECASE):
+    # TOC index rows like "Non-Player Characters 24" — not every heading with a trailing digit.
+    if re.fullmatch(
+        r"(?i)(?:non\s*[- ]?\s*player\s+characters?|supporting\s+cast|"
+        r"dramatis\s+personae|cast\s+of\s+characters|important\s+npcs?|"
+        r"major\s+npcs?)\s+\d{1,4}",
+        stripped,
+    ):
+        return True
+    if len(stripped) <= 48 and re.search(r"\bpage\s+\d+\b", stripped, re.IGNORECASE):
         return True
     return False
 
@@ -834,7 +853,7 @@ def _find_best_npc_section_header_offset(text: str) -> int | None:
         return None
 
     best_offset: int | None = None
-    best_rank: tuple[int, int, int] | None = None
+    best_rank: tuple[int, int, int, int] | None = None
     for line_start, collapsed_line in _iter_npc_section_header_starts(text):
         is_toc = _is_toc_npc_header_line(collapsed_line)
         lookahead = _collapse_spaced_caps(text[line_start : line_start + 25_000])
@@ -843,10 +862,12 @@ def _find_best_npc_section_header_offset(text: str) -> int | None:
             continue
         start, end = _npc_section_span_from_match(lookahead, match)
         span_len = end - start
-        full_name_count = len(_FULL_NAME_ANY.findall(lookahead[start:end]))
-        if is_toc and full_name_count == 0 and span_len < 120:
+        # ``start``/``end`` are relative to ``lookahead``; metrics need absolute-style
+        # slicing within that same string.
+        full_name_count, body_signals = _npc_section_rank_metrics(lookahead, start, end)
+        if is_toc and full_name_count == 0 and body_signals == 0 and span_len < 120:
             continue
-        rank = (0 if is_toc else 1, full_name_count, span_len)
+        rank = (0 if is_toc else 1, full_name_count, body_signals, -line_start)
         if best_rank is None or rank > best_rank:
             best_rank = rank
             best_offset = line_start
@@ -931,6 +952,65 @@ def _npc_section_span_from_match(
     return start, end
 
 
+def _npc_section_match_looks_like_header(collapsed_text: str, match: re.Match[str]) -> bool:
+    """True when the match sits on a section header, not running prose."""
+    line_start = collapsed_text.rfind("\n", 0, match.start()) + 1
+    line_end = collapsed_text.find("\n", match.start())
+    if line_end < 0:
+        line_end = len(collapsed_text)
+    if collapsed_text[line_start : match.start()].strip():
+        return False
+    # PDF extracts may glue the rest of the page onto one line — only inspect a
+    # short remainder for TOC crumbs / punctuation / immediate FULL NAME.
+    peek_end = min(line_end, match.end() + 24)
+    after = collapsed_text[match.end() : peek_end].strip()
+    if not after:
+        return True
+    if after.upper().startswith("FULL NAME"):
+        return True
+    return bool(re.fullmatch(r"[:.\-–—]?\s*\d{0,4}", after))
+
+
+_NPC_SECTION_BODY_SIGNAL = re.compile(
+    r"(?i)\b(?:FULL\s+NAME|PERSONALITY|PERSONAL\s+AGENDA|STRENGTH|HEALTH|SKILLS|"
+    r"GEAR|AWARENESS|PRESENCE|TRAITS?|COORDINATION|RESOLVE|INGENUITY)\b"
+)
+# Rank cast richness only near the header. Spans often stretch to APPENDIX, so an
+# early teaser/contents hit must not inherit FULL NAME counts from a later chapter.
+_NPC_SECTION_RANK_WINDOW = 12_000
+
+
+def _npc_section_body_signal_count(section_text: str) -> int:
+    """Count cast-writeup signals (works when FULL NAME count is 0, e.g. Cubicle 7)."""
+    return len(_NPC_SECTION_BODY_SIGNAL.findall(section_text or ""))
+
+
+def _npc_section_rank_metrics(
+    collapsed_text: str,
+    start: int,
+    end: int,
+) -> tuple[int, int]:
+    """Return (full_name_count, body_signals) from the proximal cast window only.
+
+    Stops before the next *real* cast-section header so an early teaser that spans
+    to APPENDIX cannot inherit writeup signals from a later real chapter. Mid-sentence
+    phrases like "supporting cast of the film" must not cut the window.
+    """
+    window_end = min(end, start + _NPC_SECTION_RANK_WINDOW)
+    search_from = min(end, start + 1)
+    for next_header in _NPC_SECTION_PATTERN.finditer(
+        collapsed_text, search_from, window_end
+    ):
+        if next_header.start() <= start:
+            continue
+        if not _npc_section_match_looks_like_header(collapsed_text, next_header):
+            continue
+        window_end = next_header.start()
+        break
+    proximal = collapsed_text[start:window_end]
+    return len(_FULL_NAME_ANY.findall(proximal)), _npc_section_body_signal_count(proximal)
+
+
 def _find_npc_section_span(collapsed_text: str) -> tuple[int, int] | None:
     """Return [start, end) slice of the authoritative NPC section when present.
 
@@ -940,18 +1020,23 @@ def _find_npc_section_span(collapsed_text: str) -> tuple[int, int] | None:
         return None
 
     best_span: tuple[int, int] | None = None
-    best_rank: tuple[int, int, int] | None = None
+    # (body?, full_names, body_signals, -start) — earlier wins content ties.
+    best_rank: tuple[int, int, int, int] | None = None
 
     for match in _NPC_SECTION_PATTERN.finditer(collapsed_text):
+        if not _npc_section_match_looks_like_header(collapsed_text, match):
+            continue
         is_toc = _looks_like_toc_npc_section_hit(collapsed_text, match)
         start, end = _npc_section_span_from_match(collapsed_text, match)
         span_len = end - start
-        full_name_count = len(_FULL_NAME_ANY.findall(collapsed_text[start:end]))
+        full_name_count, body_signals = _npc_section_rank_metrics(
+            collapsed_text, start, end
+        )
         # Drop bare TOC index lines with no body.
-        if is_toc and full_name_count == 0 and span_len < 120:
+        if is_toc and full_name_count == 0 and body_signals == 0 and span_len < 120:
             continue
-        # Prefer non-TOC headers, then more FULL NAME markers, then longer body.
-        rank = (0 if is_toc else 1, full_name_count, span_len)
+        # Prefer non-TOC, richer *proximal* cast content, then earlier headers.
+        rank = (0 if is_toc else 1, full_name_count, body_signals, -start)
         if best_rank is None or rank > best_rank:
             best_rank = rank
             best_span = (start, end)
@@ -1386,11 +1471,14 @@ def _prepare_outline_document_text(text: str, warnings: list[str]) -> str:
     intro = collapsed[: min(start, 2500)].strip()
     npc_section = collapsed[start:end].strip()
     warnings.append(
-        "Detected a NON-PLAYER CHARACTERS section; outline will prioritize that "
+        "Detected an authoritative NPC/cast section; outline will prioritize that "
         "section over names from intro text, quotes, or player-facing material."
     )
     if intro:
-        return f"{intro}\n\n--- NON-PLAYER CHARACTERS (authoritative NPC list) ---\n\n{npc_section}"
+        return (
+            f"{intro}\n\n--- AUTHORITATIVE NPC / CAST SECTION (authoritative NPC list) "
+            f"---\n\n{npc_section}"
+        )
     return npc_section
 
 
@@ -1951,7 +2039,7 @@ def _truncate_preserving_npc_section(text: str, max_chars: int) -> str:
 
     start, end = span
     section = collapsed[start:end].strip()
-    separator = "\n\n--- NON-PLAYER CHARACTERS (priority excerpt) ---\n\n"
+    separator = "\n\n--- AUTHORITATIVE NPC / CAST SECTION (priority excerpt) ---\n\n"
     # Always reserve some head room for titles/locations, even when the NPC
     # span has no hard end and would otherwise consume the whole budget.
     head_reserve = min(2500, max(0, max_chars // 4))
@@ -2649,9 +2737,14 @@ def _npc_stubs_from_stat_blocks(
     location_ids: set[str],
     warnings: list[str],
 ) -> list[dict[str, Any]]:
-    """Build outline NPC stubs from ALIEN RPG stat blocks."""
+    """Build outline NPC stubs from an authoritative published NPC section.
+
+    Seeds:
+    - Labeled person rows (``FULL NAME:`` / shared person-name grammar)
+    - Named ensemble / group writeups (e.g. Conscripted Convicts) as secondary
+    """
     parsed = _extract_alien_rpg_stat_block_npcs(section_text)
-    if not parsed:
+    if not parsed and not section_text.strip():
         return []
 
     def _resolve_hint(hint: str) -> str:
@@ -2669,15 +2762,23 @@ def _npc_stubs_from_stat_blocks(
         return hint
 
     stubs: list[dict[str, Any]] = []
+    seen: set[str] = set()
     for row in parsed:
+        name = _normalize_person_display_name(row.get("name") or "")
+        if not name:
+            continue
+        key = name.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
         loc = _resolve_hint(row.get("location_hint") or "")
         personality = str(row.get("personality") or "").strip()
         agenda = str(row.get("personal_agenda") or "").strip()
         stubs.append(
             {
-                "temporary_key": snake_case(row["name"]),
-                "id": snake_case(row["name"]),
-                "name": row["name"],
+                "temporary_key": snake_case(name),
+                "id": snake_case(name),
+                "name": name,
                 "role": row.get("role") or "",
                 "primary_location_key": loc,
                 "other_location_keys": [],
@@ -2691,10 +2792,217 @@ def _npc_stubs_from_stat_blocks(
             }
         )
 
-    warnings.append(
-        f"Parsed {len(stubs)} NPC(s) from published stat blocks in NON-PLAYER CHARACTERS."
-    )
+    for row in _extract_npc_section_ensemble_npcs(section_text, skip_names=seen):
+        name = _normalize_person_display_name(row.get("name") or "")
+        if not name:
+            continue
+        key = name.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        loc = _resolve_hint(row.get("location_hint") or "")
+        stubs.append(
+            {
+                "temporary_key": snake_case(name),
+                "id": snake_case(name),
+                "name": name,
+                "role": row.get("role") or "named group",
+                "primary_location_key": loc,
+                "other_location_keys": [],
+                "first_location_id": loc,
+                "other_location_ids": [],
+                "significance": "secondary",
+                "source_refs": [],
+                "seeded_from_stat_blocks": True,
+                "seed_personality": "",
+                "seed_personal_agenda": str(row.get("summary") or "").strip(),
+            }
+        )
+
+    if stubs:
+        warnings.append(
+            f"Parsed {len(stubs)} NPC(s) from the authoritative NPC/cast section "
+            "(labeled names + named ensembles)."
+        )
     return stubs
+
+
+_ENSEMBLE_SECTION_FALSE_HEADINGS = frozenset(
+    {
+        "non-player characters",
+        "non player characters",
+        "supporting cast",
+        "dramatis personae",
+        "cast of characters",
+        "important npcs",
+        "important npc",
+        "major npcs",
+        "major npc",
+        "stationside locations",
+        "important locations",
+        "heart of darkness",
+        "appendix",
+        "index",
+        "maps",
+        "contents",
+        "introduction",
+        "the situation",
+        "player characters",
+    }
+)
+_ENSEMBLE_STAT_SIGNAL = re.compile(
+    r"(?i)\b(?:STRENGTH|HEALTH|SKILLS|GEAR|TALENT|ARMOR|AWARENESS|PRESENCE|"
+    r"TRAITS?|COORDINATION|RESOLVE|INGENUITY)\b"
+)
+_ENSEMBLE_PRODUCT_NOISE = re.compile(
+    r"(?i)\b(?:MODEL|TYPE\s+[A-Z]|WEYLAND|HYPERDYNE|PAGE\s+\d+)\b"
+)
+# Last-token collectives only — do not treat every plural-looking surname as a group.
+_ENSEMBLE_COLLECTIVE_LAST = frozenset(
+    {
+        "androids",
+        "convicts",
+        "marines",
+        "guards",
+        "crew",
+        "drones",
+        "soldiers",
+        "bandits",
+        "cultists",
+        "thugs",
+        "raiders",
+        "pirates",
+        "mercenaries",
+        "officers",
+        "workers",
+        "prisoners",
+        "survivors",
+        "rebels",
+        "synthetics",
+        "zombies",
+        "aliens",
+        "xenomorphs",
+        "gang",
+        "mob",
+        "pack",
+        "squad",
+        "team",
+        "unit",
+    }
+)
+
+
+def _title_case_ensemble_name(raw: str) -> str:
+    words = [w for w in re.split(r"\s+", str(raw or "").strip()) if w]
+    return " ".join(w[:1].upper() + w[1:].lower() if w else w for w in words)
+
+
+def _looks_like_ensemble_heading(line: str) -> bool:
+    """True for named group / ensemble headers in an NPC section (any RPG line)."""
+    s = re.sub(r"\s+", " ", str(line or "").strip())
+    if not s or len(s) > 70:
+        return False
+    key = s.casefold()
+    if key in _ENSEMBLE_SECTION_FALSE_HEADINGS:
+        return False
+    if key.startswith("full name") or key.startswith("personal "):
+        return False
+    if _ENSEMBLE_PRODUCT_NOISE.search(s):
+        return False
+    words = s.split()
+    if not (2 <= len(words) <= 5):
+        return False
+    letters = [c for c in s if c.isalpha()]
+    if len(letters) < 6:
+        return False
+    upper_ratio = sum(1 for c in letters if c.isupper()) / len(letters)
+    if upper_ratio < 0.85:
+        return False
+    # Require a known collective last token (Conscripted Convicts, Corrections Androids).
+    # A bare plural-looking surname must not become a secondary ensemble.
+    return words[-1].casefold() in _ENSEMBLE_COLLECTIVE_LAST
+
+
+def _ensemble_owned_by_nearby_full_name(heading: str, early_lines: list[str]) -> bool:
+    """True when a nearby FULL NAME belongs to this heading (person banner), not a column neighbor."""
+    short = (heading.split() or [""])[0]
+    display = _title_case_ensemble_name(heading)
+    for line in early_lines:
+        if "FULL NAME:" not in line.upper():
+            continue
+        for fname in _iter_full_names_on_line(line):
+            if display.casefold() == fname.casefold():
+                return True
+            if short and _heading_matches_display_name(short, fname):
+                return True
+    return False
+
+
+def _extract_npc_section_ensemble_npcs(
+    section_text: str,
+    *,
+    skip_names: set[str] | None = None,
+) -> list[dict[str, str]]:
+    """Seed named ensemble/group writeups from an authoritative NPC section.
+
+    Format-agnostic: ALL-CAPS (or near-all-caps) multi-word headings followed by
+    combat/trait stats become ``secondary`` stubs. Covers Alien groups like
+    Conscripted Convicts and similar Supporting Cast ensembles in other lines.
+    """
+    skip = {s.casefold() for s in (skip_names or set()) if s}
+    text = _normalize_alien_pdf_stat_text(section_text or "")
+    if not text.strip():
+        return []
+
+    lines = text.splitlines()
+    results: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    for index, raw in enumerate(lines):
+        line = raw.strip()
+        if not _looks_like_ensemble_heading(line):
+            continue
+        display = _title_case_ensemble_name(line)
+        key = display.casefold()
+        if key in seen or key in skip:
+            continue
+        # Skip person banners (SHORT NAME then that person's FULL NAME). Do not skip
+        # when a two-column neighbor's FULL NAME shares the early window.
+        early_lines = lines[index : index + 8]
+        if _ensemble_owned_by_nearby_full_name(line, early_lines):
+            continue
+        window = "\n".join(lines[index : index + 28])
+        if not _ENSEMBLE_STAT_SIGNAL.search(window):
+            continue
+        # Avoid location chapter bleed (STATIONSIDE LOCATIONS rooms).
+        if re.search(r"(?i)^\s*(?:STATIONSIDE\s+)?LOCATIONS\b", window, re.M):
+            # Still allow if stats appear before the locations header.
+            loc_at = re.search(r"(?i)^\s*(?:STATIONSIDE\s+)?LOCATIONS\b", window, re.M)
+            stats_at = _ENSEMBLE_STAT_SIGNAL.search(window)
+            if loc_at and stats_at and loc_at.start() < stats_at.start():
+                continue
+
+        seen.add(key)
+        summary = ""
+        for look in lines[index + 1 : index + 6]:
+            cand = look.strip()
+            if not cand or _looks_like_ensemble_heading(cand):
+                continue
+            if _STAT_BLOCK_FIELD_STOP.match(cand) or _ENSEMBLE_STAT_SIGNAL.match(cand):
+                break
+            if cand[0].islower() or len(cand.split()) > 4:
+                summary = cand[:180]
+                break
+        results.append(
+            {
+                "name": display,
+                "role": "named group",
+                "location_hint": "",
+                "summary": summary,
+            }
+        )
+
+    return results
 
 
 def _npc_stub_has_stat_seed(stub: dict[str, Any]) -> bool:
@@ -6226,15 +6534,17 @@ def _build_outline_prompt(
         "- parent_temporary_key: set for sublocations that nest under another location "
         "(major sites have null). Prefer major sites as top-level locations.\n"
         "- significance (locations): major (playable sites), minor, ignore (throwaway).\n"
-        "- significance (NPCs): conversational (talkative named cast), secondary (named but minor), "
-        "ignore (generic enemies/monsters/mooks). Prefer ignore for unnamed enemy groups.\n"
+        "- significance (NPCs): conversational (talkative named cast), secondary (named but minor "
+        "or named groups/ensembles), ignore (unnamed generic enemies/monsters/mooks only).\n"
+        "- Named groups with their own writeup (Conscripted Convicts, Town Guard, Security Drones) "
+        "are secondary — do NOT mark them ignore and do NOT drop them.\n"
         "- Preserve published display names exactly: keep nicknames in quotes "
         '(Tommy "Mr." Man), alphanumeric model/android names (EVE 9, Ava 6), '
         "and accented letters. Do not drop or rewrite them into plain ASCII approximations.\n"
-        "- If the document has a NON-PLAYER CHARACTERS (or NPCs / Supporting Cast) section, "
-        "that section is the authoritative NPC list. List every stat-block NPC there and do "
-        "NOT list names only mentioned in intro text, movie quotes, sidebars, or player "
-        "(PC) material.\n"
+        "- If the document has a NON-PLAYER CHARACTERS / NPCs / Supporting Cast / Dramatis Personae "
+        "section, that section is the authoritative NPC list. List every labeled person AND every "
+        "named ensemble there; do NOT list names only mentioned in intro text, movie quotes, "
+        "sidebars, or player (PC) material.\n"
         "- Character callout boxes are also authoritative NPCs even mid-scene.\n"
         "- Do NOT list credits / staff / acknowledgements, TOC page references, publisher "
         "boilerplate, player characters, or the PC party as NPCs.\n"
@@ -6833,7 +7143,7 @@ def _cap_document_text(text: str, max_chars: int, warnings: list[str]) -> str:
     warnings.append(
         f"Input document was {len(text)} characters; truncated to fit the current "
         f"content_creation context budget ({max_chars} characters). "
-        "When a NON-PLAYER CHARACTERS section exists it is kept in priority. "
+        "When an authoritative NPC/cast section exists it is kept in priority. "
         "For long PDFs use Groq for content_creation or raise LOCAL_LLM_CONTEXT_TOKENS "
         "to match llama.cpp n_ctx."
     )
@@ -7043,12 +7353,15 @@ def outline_campaign_document(
 
     if use_stat_block_fast_path:
         warnings.append(
-            "Published NON-PLAYER CHARACTERS stat blocks detected; skipping LLM outline "
-            "and seeding NPC stubs from FULL NAME blocks (detail sweep still runs)."
+            "Published NPC/cast section detected; skipping LLM outline and seeding NPC stubs "
+            "from labeled names and named ensembles (detail sweep still runs)."
         )
         outline_raw = {"adventures": [{}], "locations": [], "npcs": []}
         discovery_debug["fast_path"] = "stat_blocks"
-        discovery_debug["note"] = "LLM discovery skipped; deterministic FULL NAME seeding."
+        discovery_debug["note"] = (
+            "LLM discovery skipped; deterministic NPC-section seeding "
+            "(labeled names + ensembles)."
+        )
     elif use_location_site_fast_path:
         warnings.append(
             "Alien moonside / locations chapter detected; skipping LLM outline "
