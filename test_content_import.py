@@ -525,6 +525,33 @@ def test_prose_important_npcs_does_not_steal_section_span():
     assert "unimportant" not in section.casefold()
 
 
+def test_earlier_rich_cast_section_beats_later_empty_recap_header():
+    """Cubicle 7-style: 0 FULL NAME rows — primary Supporting Cast must beat a late recap."""
+    text = (
+        "SUPPORTING CAST\n"
+        "Chad\n"
+        "Awareness 3 Presence 4\n"
+        "TRAITS\n"
+        "Charming: Always smiling.\n"
+        "Mary Ann\n"
+        "Awareness 2 Presence 3\n"
+        "TRAITS\n"
+        "Sharp: Notices everything.\n"
+        + ("filler\n" * 40)
+        + "IMPORTANT NPCS\n"
+        "See earlier.\n"
+        "APPENDIX\n"
+    )
+    collapsed = content_import._collapse_spaced_caps(text)
+    span = content_import._find_npc_section_span(collapsed)
+    assert span is not None
+    section = collapsed[span[0] : span[1]]
+    assert section.strip().upper().startswith("SUPPORTING CAST")
+    assert "IMPORTANT NPCS" not in section[:40].upper() or section.upper().startswith(
+        "SUPPORTING"
+    )
+
+
 def test_supporting_cast_section_header_is_recognized():
     text = (
         "Introduction\nWelcome.\n\n"

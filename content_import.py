@@ -853,7 +853,7 @@ def _find_best_npc_section_header_offset(text: str) -> int | None:
         return None
 
     best_offset: int | None = None
-    best_rank: tuple[int, int, int] | None = None
+    best_rank: tuple[int, int, int, int] | None = None
     for line_start, collapsed_line in _iter_npc_section_header_starts(text):
         is_toc = _is_toc_npc_header_line(collapsed_line)
         lookahead = _collapse_spaced_caps(text[line_start : line_start + 25_000])
@@ -863,9 +863,10 @@ def _find_best_npc_section_header_offset(text: str) -> int | None:
         start, end = _npc_section_span_from_match(lookahead, match)
         span_len = end - start
         full_name_count = len(_FULL_NAME_ANY.findall(lookahead[start:end]))
-        if is_toc and full_name_count == 0 and span_len < 120:
+        body_signals = _npc_section_body_signal_count(lookahead[start:end][:25_000])
+        if is_toc and full_name_count == 0 and body_signals == 0 and span_len < 120:
             continue
-        rank = (0 if is_toc else 1, full_name_count, line_start)
+        rank = (0 if is_toc else 1, full_name_count, body_signals, -line_start)
         if best_rank is None or rank > best_rank:
             best_rank = rank
             best_offset = line_start
@@ -951,17 +952,33 @@ def _npc_section_span_from_match(
 
 
 def _npc_section_match_looks_like_header(collapsed_text: str, match: re.Match[str]) -> bool:
-    """True when the match sits on a short section header line, not running prose."""
+    """True when the match sits on a section header, not running prose."""
     line_start = collapsed_text.rfind("\n", 0, match.start()) + 1
     line_end = collapsed_text.find("\n", match.start())
     if line_end < 0:
         line_end = len(collapsed_text)
     if collapsed_text[line_start : match.start()].strip():
         return False
-    line = collapsed_text[line_start:line_end].strip()
-    if not line or len(line) > 72:
-        return False
-    return True
+    # PDF extracts may glue the rest of the page onto one line — only inspect a
+    # short remainder for TOC crumbs / punctuation / immediate FULL NAME.
+    peek_end = min(line_end, match.end() + 24)
+    after = collapsed_text[match.end() : peek_end].strip()
+    if not after:
+        return True
+    if after.upper().startswith("FULL NAME"):
+        return True
+    return bool(re.fullmatch(r"[:.\-–—]?\s*\d{0,4}", after))
+
+
+_NPC_SECTION_BODY_SIGNAL = re.compile(
+    r"(?i)\b(?:FULL\s+NAME|PERSONALITY|PERSONAL\s+AGENDA|STRENGTH|HEALTH|SKILLS|"
+    r"GEAR|AWARENESS|PRESENCE|TRAITS?|COORDINATION|RESOLVE|INGENUITY)\b"
+)
+
+
+def _npc_section_body_signal_count(section_text: str) -> int:
+    """Count cast-writeup signals (works when FULL NAME count is 0, e.g. Cubicle 7)."""
+    return len(_NPC_SECTION_BODY_SIGNAL.findall(section_text or ""))
 
 
 def _find_npc_section_span(collapsed_text: str) -> tuple[int, int] | None:
@@ -973,7 +990,8 @@ def _find_npc_section_span(collapsed_text: str) -> tuple[int, int] | None:
         return None
 
     best_span: tuple[int, int] | None = None
-    best_rank: tuple[int, int, int] | None = None
+    # (body?, full_names, body_signals, -start) — earlier wins content ties.
+    best_rank: tuple[int, int, int, int] | None = None
 
     for match in _NPC_SECTION_PATTERN.finditer(collapsed_text):
         if not _npc_section_match_looks_like_header(collapsed_text, match):
@@ -981,13 +999,15 @@ def _find_npc_section_span(collapsed_text: str) -> tuple[int, int] | None:
         is_toc = _looks_like_toc_npc_section_hit(collapsed_text, match)
         start, end = _npc_section_span_from_match(collapsed_text, match)
         span_len = end - start
-        full_name_count = len(_FULL_NAME_ANY.findall(collapsed_text[start:end]))
+        section = collapsed_text[start:end]
+        full_name_count = len(_FULL_NAME_ANY.findall(section))
+        body_signals = _npc_section_body_signal_count(section[:25_000])
         # Drop bare TOC index lines with no body.
-        if is_toc and full_name_count == 0 and span_len < 120:
+        if is_toc and full_name_count == 0 and body_signals == 0 and span_len < 120:
             continue
-        # Prefer non-TOC headers, then more FULL NAME markers, then later headers
-        # (avoid early prose/TOC crumbs that would open a huge span through the book).
-        rank = (0 if is_toc else 1, full_name_count, start)
+        # Prefer non-TOC, richer cast content, then earlier headers (primary chapter
+        # before late recap headings with the same label density).
+        rank = (0 if is_toc else 1, full_name_count, body_signals, -start)
         if best_rank is None or rank > best_rank:
             best_rank = rank
             best_span = (start, end)
