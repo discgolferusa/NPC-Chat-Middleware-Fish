@@ -862,8 +862,9 @@ def _find_best_npc_section_header_offset(text: str) -> int | None:
             continue
         start, end = _npc_section_span_from_match(lookahead, match)
         span_len = end - start
-        full_name_count = len(_FULL_NAME_ANY.findall(lookahead[start:end]))
-        body_signals = _npc_section_body_signal_count(lookahead[start:end][:25_000])
+        # ``start``/``end`` are relative to ``lookahead``; metrics need absolute-style
+        # slicing within that same string.
+        full_name_count, body_signals = _npc_section_rank_metrics(lookahead, start, end)
         if is_toc and full_name_count == 0 and body_signals == 0 and span_len < 120:
             continue
         rank = (0 if is_toc else 1, full_name_count, body_signals, -line_start)
@@ -974,11 +975,34 @@ _NPC_SECTION_BODY_SIGNAL = re.compile(
     r"(?i)\b(?:FULL\s+NAME|PERSONALITY|PERSONAL\s+AGENDA|STRENGTH|HEALTH|SKILLS|"
     r"GEAR|AWARENESS|PRESENCE|TRAITS?|COORDINATION|RESOLVE|INGENUITY)\b"
 )
+# Rank cast richness only near the header. Spans often stretch to APPENDIX, so an
+# early teaser/contents hit must not inherit FULL NAME counts from a later chapter.
+_NPC_SECTION_RANK_WINDOW = 12_000
 
 
 def _npc_section_body_signal_count(section_text: str) -> int:
     """Count cast-writeup signals (works when FULL NAME count is 0, e.g. Cubicle 7)."""
     return len(_NPC_SECTION_BODY_SIGNAL.findall(section_text or ""))
+
+
+def _npc_section_rank_metrics(
+    collapsed_text: str,
+    start: int,
+    end: int,
+) -> tuple[int, int]:
+    """Return (full_name_count, body_signals) from the proximal cast window only.
+
+    Stops before the next cast-section header so an early teaser that spans to
+    APPENDIX cannot inherit writeup signals from a later real chapter.
+    """
+    window_end = min(end, start + _NPC_SECTION_RANK_WINDOW)
+    # Search after the current header match body for another section title.
+    search_from = min(end, start + 1)
+    next_header = _NPC_SECTION_PATTERN.search(collapsed_text, search_from, window_end)
+    if next_header is not None and next_header.start() > start:
+        window_end = next_header.start()
+    proximal = collapsed_text[start:window_end]
+    return len(_FULL_NAME_ANY.findall(proximal)), _npc_section_body_signal_count(proximal)
 
 
 def _find_npc_section_span(collapsed_text: str) -> tuple[int, int] | None:
@@ -999,14 +1023,13 @@ def _find_npc_section_span(collapsed_text: str) -> tuple[int, int] | None:
         is_toc = _looks_like_toc_npc_section_hit(collapsed_text, match)
         start, end = _npc_section_span_from_match(collapsed_text, match)
         span_len = end - start
-        section = collapsed_text[start:end]
-        full_name_count = len(_FULL_NAME_ANY.findall(section))
-        body_signals = _npc_section_body_signal_count(section[:25_000])
+        full_name_count, body_signals = _npc_section_rank_metrics(
+            collapsed_text, start, end
+        )
         # Drop bare TOC index lines with no body.
         if is_toc and full_name_count == 0 and body_signals == 0 and span_len < 120:
             continue
-        # Prefer non-TOC, richer cast content, then earlier headers (primary chapter
-        # before late recap headings with the same label density).
+        # Prefer non-TOC, richer *proximal* cast content, then earlier headers.
         rank = (0 if is_toc else 1, full_name_count, body_signals, -start)
         if best_rank is None or rank > best_rank:
             best_rank = rank

@@ -552,6 +552,34 @@ def test_earlier_rich_cast_section_beats_later_empty_recap_header():
     )
 
 
+def test_early_teaser_header_does_not_steal_real_cast_section():
+    """Early heading that spans to APPENDIX must not outrank the real writeup chapter."""
+    text = (
+        "NON-PLAYER CHARACTERS\n"
+        "These characters appear in the next chapter.\n"
+        + ("adventure prose continues here.\n" * 120)
+        + "NON-PLAYER CHARACTERS\n"
+        "FULL NAME: EVE 9\n"
+        "PERSONALITY: Curious\n"
+        "STRENGTH: 4\n"
+        "FULL NAME: Tommy Man\n"
+        "PERSONALITY: Cocky\n"
+        "STRENGTH: 3\n"
+        "FULL NAME: Grey 88-80\n"
+        "PERSONALITY: Stoic\n"
+        "STRENGTH: 3\n"
+        "APPENDIX\n"
+        "Notes\n"
+    )
+    collapsed = content_import._collapse_spaced_caps(text)
+    span = content_import._find_npc_section_span(collapsed)
+    assert span is not None
+    section = collapsed[span[0] : span[1]]
+    # Must start at the writeup chapter, not the early teaser.
+    assert "EVE 9" in section[:800]
+    assert "These characters appear" not in section[:200]
+
+
 def test_supporting_cast_section_header_is_recognized():
     text = (
         "Introduction\nWelcome.\n\n"
