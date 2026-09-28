@@ -992,15 +992,21 @@ def _npc_section_rank_metrics(
 ) -> tuple[int, int]:
     """Return (full_name_count, body_signals) from the proximal cast window only.
 
-    Stops before the next cast-section header so an early teaser that spans to
-    APPENDIX cannot inherit writeup signals from a later real chapter.
+    Stops before the next *real* cast-section header so an early teaser that spans
+    to APPENDIX cannot inherit writeup signals from a later real chapter. Mid-sentence
+    phrases like "supporting cast of the film" must not cut the window.
     """
     window_end = min(end, start + _NPC_SECTION_RANK_WINDOW)
-    # Search after the current header match body for another section title.
     search_from = min(end, start + 1)
-    next_header = _NPC_SECTION_PATTERN.search(collapsed_text, search_from, window_end)
-    if next_header is not None and next_header.start() > start:
+    for next_header in _NPC_SECTION_PATTERN.finditer(
+        collapsed_text, search_from, window_end
+    ):
+        if next_header.start() <= start:
+            continue
+        if not _npc_section_match_looks_like_header(collapsed_text, next_header):
+            continue
         window_end = next_header.start()
+        break
     proximal = collapsed_text[start:window_end]
     return len(_FULL_NAME_ANY.findall(proximal)), _npc_section_body_signal_count(proximal)
 
