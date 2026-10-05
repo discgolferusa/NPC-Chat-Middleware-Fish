@@ -77,6 +77,18 @@ class _FakeSttModel:
         return [segment], info
 
 
+def _force_local_stt(tmp_path, monkeypatch, model: _FakeSttModel):
+    import stt_catalog
+    import stt_service
+
+    catalog = tmp_path / "stt_catalog.json"
+    runtime = tmp_path / "stt_runtime_config.json"
+    stt_catalog.configure(catalog_file=catalog, runtime_file=runtime)
+    stt_catalog.load_or_seed()
+    stt_catalog.set_model_order(["local-whisper-lite"], provider_mode="local")
+    monkeypatch.setattr(stt_service, "ensure_local_whisper", lambda **kw: model)
+
+
 def test_transcribe_audio_keeps_short_ok(tmp_path, monkeypatch):
     """Functional: allowlisted ok survives the full transcribe_audio filter path."""
     import server
@@ -84,7 +96,7 @@ def test_transcribe_audio_keeps_short_ok(tmp_path, monkeypatch):
     wav = tmp_path / "ok.wav"
     _write_short_weak_wav(wav)
     model = _FakeSttModel(" Okay.")
-    monkeypatch.setattr(server, "STT_MODEL", model)
+    _force_local_stt(tmp_path, monkeypatch, model)
     monkeypatch.setattr(server, "_pad_wav_for_short_speech", lambda path: path)
 
     assert transcribe_audio(wav) == "Okay."
@@ -98,7 +110,7 @@ def test_transcribe_audio_rejects_short_you(tmp_path, monkeypatch):
     wav = tmp_path / "you.wav"
     _write_short_weak_wav(wav)
     model = _FakeSttModel(" You")
-    monkeypatch.setattr(server, "STT_MODEL", model)
+    _force_local_stt(tmp_path, monkeypatch, model)
     monkeypatch.setattr(server, "_pad_wav_for_short_speech", lambda path: path)
 
     assert transcribe_audio(wav) == ""
@@ -114,7 +126,7 @@ def test_npc_voice_turn_accepts_allowlisted_ok(api, tmp_path, monkeypatch):
     wav = tmp_path / "ok-upload.wav"
     _write_short_weak_wav(wav)
     model = _FakeSttModel("Ok")
-    monkeypatch.setattr(server, "STT_MODEL", model)
+    _force_local_stt(tmp_path, monkeypatch, model)
     # Use the real transcribe_audio path (fixture stubs it by default).
     monkeypatch.setattr(server, "transcribe_audio", transcribe_audio)
     monkeypatch.setattr(server, "_pad_wav_for_short_speech", lambda path: path)
