@@ -355,12 +355,41 @@ def attach_timing_headers(
             if provider:
                 phases["provider"] = provider
             phases.update(stt_attrs)
-            phases_json = json.dumps(phases, separators=(",", ":"))
-            if len(phases_json) <= 1800:
+            phases_json = _compact_phases_json(phases)
+            if phases_json:
                 response.headers[HeaderPhases] = phases_json
             if request_id:
-                print(f"[TIMING] {request_id} phases: {phases_json}", flush=True)
+                print(
+                    f"[TIMING] {request_id} phases: {phases_json or json.dumps(phases, separators=(',', ':'))}",
+                    flush=True,
+                )
 
     if request_id:
         response.headers.setdefault("X-Turn-Request-Id", str(request_id))
     return response
+
+
+def _compact_phases_json(phases: dict[str, Any], *, max_len: int = 1800) -> str | None:
+    """Serialize voice phases for the header, dropping bulky fields before giving up.
+
+    STT/LLM attribution and core ``*_ms`` fields are kept so client_turn_latency
+    still gets model timing when the full cumulative map would overflow.
+    """
+    phases_json = json.dumps(phases, separators=(",", ":"))
+    if len(phases_json) <= max_len:
+        return phases_json
+
+    slim = dict(phases)
+    slim.pop("cumulative_ms", None)
+    phases_json = json.dumps(slim, separators=(",", ":"))
+    if len(phases_json) <= max_len:
+        return phases_json
+
+    for key in ("unaccounted_ms", "other_ms", "tracked_ms", "post_llm_ms"):
+        slim.pop(key, None)
+        phases_json = json.dumps(slim, separators=(",", ":"))
+        if len(phases_json) <= max_len:
+            return phases_json
+
+    # Headers still carry X-Stt-* / X-Llm-*; omit phases rather than send truncated JSON.
+    return None

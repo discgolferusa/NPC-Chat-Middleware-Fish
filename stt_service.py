@@ -107,6 +107,17 @@ def _set_online_disabled(seconds: float, reason: str) -> None:
     )
 
 
+def _online_cooldown_seconds(error_type: str) -> float:
+    """Account-wide OpenRouter skip after auth/credits failures (shared API key).
+
+    Auth misconfig is usually fixed quickly, so it uses a shorter default than
+    credits exhaustion. Local Whisper in the chain still runs during cooldown.
+    """
+    if error_type == "authentication":
+        return _env_float("STT_AUTH_COOLDOWN_SECONDS", 60.0)
+    return _env_float("STT_ONLINE_COOLDOWN_SECONDS", 300.0)
+
+
 def _online_disabled_remaining() -> tuple[float, str]:
     with _ONLINE_DISABLED_LOCK:
         remaining = _ONLINE_DISABLED_UNTIL - time.monotonic()
@@ -286,8 +297,7 @@ def _attempt_openrouter(
         except STTProviderError as ex:
             last_error = ex
             if ex.error_type in _CHAIN_STOP_ERROR_TYPES:
-                cooldown = _env_float("STT_ONLINE_COOLDOWN_SECONDS", 300.0)
-                _set_online_disabled(cooldown, ex.error_type)
+                _set_online_disabled(_online_cooldown_seconds(ex.error_type), ex.error_type)
             if ex.retryable and attempt_idx < max_retries and _remaining() >= 1.0:
                 print(
                     f"[STT] retrying openrouter model={model} "
@@ -480,8 +490,7 @@ def transcribe(
                 attempts=list(attempts),
             )
             if ex.error_type in _CHAIN_STOP_ERROR_TYPES:
-                cooldown = _env_float("STT_ONLINE_COOLDOWN_SECONDS", 300.0)
-                _set_online_disabled(cooldown, ex.error_type)
+                _set_online_disabled(_online_cooldown_seconds(ex.error_type), ex.error_type)
                 stop_openrouter = True
                 # Continue so local fallback can still run when in the chain.
                 continue

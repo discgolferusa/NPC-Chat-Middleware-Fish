@@ -84,6 +84,29 @@ def test_attach_timing_headers_includes_stt_attribution():
         assert phases["stt_cost_usd"] == 0.00012
 
 
+def test_compact_phases_json_drops_bulky_fields_before_omitting():
+    phases = {
+        "stt_ms": 100,
+        "pre_llm_ms": 50,
+        "llm_ms": 200,
+        "tts_ms": 80,
+        "stt_model_id": "openrouter-assemblyai-universal-3-5-pro",
+        "stt_provider": "openrouter",
+        "model_id": "openrouter-gpt-oss-20b",
+        "cumulative_ms": {"note": "y" * 2000},
+        "unaccounted_ms": 12,
+        "other_ms": 0,
+        "tracked_ms": 430,
+    }
+    assert len(json.dumps(phases, separators=(",", ":"))) > 1800
+    compact = request_timing._compact_phases_json(phases, max_len=1800)
+    assert compact is not None
+    parsed = json.loads(compact)
+    assert parsed["stt_model_id"] == "openrouter-assemblyai-universal-3-5-pro"
+    assert "cumulative_ms" not in parsed
+    assert len(compact) <= 1800
+
+
 def test_attach_timing_headers_voice_phases_only_when_requested():
     app = Flask(__name__)
     with app.test_request_context("/npc-voice-turn", method="POST"):

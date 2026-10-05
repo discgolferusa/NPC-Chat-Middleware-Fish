@@ -2298,14 +2298,16 @@ def transcribe_audio(
         hallucination_fn=_is_stt_hallucination,
     )
     text = (result.text or "").strip()
-    note_request_stt(
-        model_id=result.model_id or None,
-        model=result.model or None,
-        provider=result.provider or None,
-        transcription_ms=result.transcription_ms,
-        cost=result.cost,
-        used_fallback=result.used_fallback,
-    )
+    # Only attribute successful transcripts so failed/empty STT does not pollute metrics.
+    if text and result.ok:
+        note_request_stt(
+            model_id=result.model_id or None,
+            model=result.model or None,
+            provider=result.provider or None,
+            transcription_ms=result.transcription_ms,
+            cost=result.cost,
+            used_fallback=result.used_fallback,
+        )
     print(
         f"[PLAYER-AUDIO] stt_done ok={result.ok} provider={result.provider} "
         f"model={result.model} model_id={result.model_id} "
@@ -5689,10 +5691,13 @@ def transcribe_only():
 
     request_id = f"transcribe-{uuid.uuid4().hex}"
     begin_request_timing()
+    step_start = time.perf_counter()
     try:
         # Same normalize path as /npc-voice-turn (webm/ogg/opus → WAV).
         wav_path = save_uploaded_audio(upload, request_id)
+        step_start = log_timing(request_id, "save uploaded audio", step_start)
         transcript = (transcribe_audio(wav_path) or "").strip()
+        log_timing(request_id, "speech-to-text", step_start)
         payload: dict[str, Any] = {"transcript": transcript}
         for key, attr in (
             ("stt_model_id", "_timing_stt_model_id"),
@@ -5706,11 +5711,11 @@ def transcribe_only():
             if value is not None:
                 payload[key] = value
         response = jsonify(payload)
-        return attach_timing_headers(response, request_id)
+        return attach_timing_headers(response, request_id, include_voice_phases=True)
     except Exception as ex:
         print(f"[TRANSCRIBE] failed: {ex!r}", flush=True)
-        err = jsonify({"error": f"Transcription failed: {ex}"})
-        return attach_timing_headers(err, request_id), 500
+        err = jsonify({"error": "Transcription failed."})
+        return attach_timing_headers(err, request_id, include_voice_phases=True), 500
     finally:
         for leftover in UPLOAD_DIR.glob(f"{request_id}*"):
             leftover.unlink(missing_ok=True)

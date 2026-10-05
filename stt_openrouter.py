@@ -324,7 +324,11 @@ def call_openrouter_transcription(
             and ex.error_type != "malformed_audio"
             and (
                 ex.error_type == "unsupported_keyterms"
-                or ex.status_code == 400
+                or (
+                    ex.status_code == 400
+                    and ex.error_type
+                    in {"unsupported_keyterms", "unsupported_model", "invalid_response"}
+                )
             )
         )
         if should_retry_plain:
