@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import time
 from pathlib import Path
 from types import SimpleNamespace
 import pytest
@@ -11,7 +12,7 @@ import pytest
 import stt_catalog
 import stt_service
 from stt_capabilities import get_capabilities
-from stt_context import apply_context_to_request, build_stt_context
+from stt_context import STTContext, apply_context_to_request, build_stt_context
 from stt_openrouter import STTProviderError, call_openrouter_transcription
 
 
@@ -383,10 +384,10 @@ def test_deepgram_uses_top_level_keyterms():
 
 def test_stt_select_api(api, stt_tmp):
     client, server, headers = api
-    # Point server module's catalog at tmp files already configured by stt_tmp.
+    admin_headers = {**headers, "X-NPCNarrator-Admin": "1"}
     response = client.post(
         "/stt/select",
-        headers=headers,
+        headers=admin_headers,
         json={
             "model_order": [
                 "openrouter-deepgram-nova-3",
@@ -404,3 +405,192 @@ def test_stt_select_api(api, stt_tmp):
     assert models.status_code == 200
     payload = models.get_json()
     assert payload["current_model_id"] == "openrouter-deepgram-nova-3"
+
+
+def test_stt_select_requires_admin_header(api, stt_tmp):
+    client, server, headers = api
+    response = client.post(
+        "/stt/select",
+        headers=headers,
+        json={"model_id": "local-whisper-lite", "provider_mode": "local"},
+    )
+    assert response.status_code == 403
+    assert "Admin header" in (response.get_json() or {}).get("error", "")
+
+
+def test_local_reserve_shortens_openrouter_deadline(stt_tmp, monkeypatch, tmp_path):
+    wav = tmp_path / "a.wav"
+    wav.write_bytes(b"RIFF....")
+    monkeypatch.setenv("STT_CHAIN_BUDGET_SECONDS", "20")
+    monkeypatch.setenv("STT_LOCAL_RESERVE_SECONDS", "6")
+    stt_catalog.set_model_order(
+        [
+            "openrouter-assemblyai-universal-3-5-pro",
+            "local-whisper-lite",
+        ],
+        provider_mode="openrouter_with_local_fallback",
+    )
+    seen: dict = {}
+
+    def _fail(*a, budget_deadline=None, **k):
+        seen["deadline"] = budget_deadline
+        seen["now"] = time.perf_counter()
+        raise STTProviderError("timeout", error_type="timeout", retryable=False, fallbackable=True)
+
+    class _FakeModel:
+        def transcribe(self, *a, **k):
+            return [SimpleNamespace(text=" Local after reserve.")], SimpleNamespace(duration=1.0)
+
+    monkeypatch.setattr(stt_service, "_attempt_openrouter", _fail)
+    monkeypatch.setattr(stt_service, "ensure_local_whisper", lambda **kw: _FakeModel())
+    result = stt_service.transcribe(wav, pad_fn=lambda p: p, duration_fn=lambda p: 1.0)
+    assert result.ok
+    assert result.provider == "local"
+    assert "deadline" in seen
+    # OpenRouter budget should be ~14s (20 - 6 reserve), not the full 20s.
+    assert 13.0 <= (seen["deadline"] - seen["now"]) <= 15.0
+
+
+def test_max_openrouter_attempts_skips_extra_models(stt_tmp, monkeypatch, tmp_path):
+    wav = tmp_path / "a.wav"
+    wav.write_bytes(b"RIFF....")
+    monkeypatch.setenv("STT_MAX_OPENROUTER_ATTEMPTS", "1")
+    stt_catalog.set_model_order(
+        [
+            "openrouter-assemblyai-universal-3-5-pro",
+            "openrouter-deepgram-nova-3",
+            "local-whisper-lite",
+        ],
+        provider_mode="openrouter_with_local_fallback",
+    )
+    calls = {"n": 0}
+
+    def _fail(*a, **k):
+        calls["n"] += 1
+        raise STTProviderError("timeout", error_type="timeout", retryable=False, fallbackable=True)
+
+    class _FakeModel:
+        def transcribe(self, *a, **k):
+            return [SimpleNamespace(text=" Local after cap.")], SimpleNamespace(duration=1.0)
+
+    monkeypatch.setattr(stt_service, "_attempt_openrouter", _fail)
+    monkeypatch.setattr(stt_service, "ensure_local_whisper", lambda **kw: _FakeModel())
+    result = stt_service.transcribe(wav, pad_fn=lambda p: p, duration_fn=lambda p: 1.0)
+    assert result.ok
+    assert result.provider == "local"
+    assert calls["n"] == 1
+
+
+def test_auth_cooldown_skips_openrouter_on_next_call(stt_tmp, monkeypatch, tmp_path):
+    wav = tmp_path / "a.wav"
+    wav.write_bytes(b"RIFF....")
+    monkeypatch.setenv("STT_ONLINE_COOLDOWN_SECONDS", "60")
+    stt_catalog.set_model_order(
+        [
+            "openrouter-assemblyai-universal-3-5-pro",
+            "local-whisper-lite",
+        ],
+        provider_mode="openrouter_with_local_fallback",
+    )
+    openrouter_calls = {"n": 0}
+
+    def _fail(*a, **k):
+        openrouter_calls["n"] += 1
+        raise STTProviderError(
+            "bad key",
+            error_type="authentication",
+            retryable=False,
+            fallbackable=True,
+        )
+
+    class _FakeModel:
+        def transcribe(self, *a, **k):
+            return [SimpleNamespace(text=" Local cooldown.")], SimpleNamespace(duration=1.0)
+
+    monkeypatch.setattr(stt_service, "_attempt_openrouter", _fail)
+    monkeypatch.setattr(stt_service, "ensure_local_whisper", lambda **kw: _FakeModel())
+    first = stt_service.transcribe(wav, pad_fn=lambda p: p, duration_fn=lambda p: 1.0)
+    assert first.ok and first.provider == "local"
+    assert openrouter_calls["n"] == 1
+
+    second = stt_service.transcribe(wav, pad_fn=lambda p: p, duration_fn=lambda p: 1.0)
+    assert second.ok and second.provider == "local"
+    assert openrouter_calls["n"] == 1  # cooldown skipped openrouter
+
+
+def test_keyterm_400_retries_without_keyterms(stt_tmp, monkeypatch, tmp_path):
+    wav = tmp_path / "a.wav"
+    wav.write_bytes(b"RIFF....WAVEfmt ")
+    posts = {"n": 0}
+
+    class _Resp:
+        def __init__(self, status_code, body, headers=None):
+            self.status_code = status_code
+            self._body = body
+            self.headers = headers or {}
+            self.text = body if isinstance(body, str) else json.dumps(body)
+
+        def json(self):
+            if isinstance(self._body, dict):
+                return self._body
+            return json.loads(self._body)
+
+    def _post(*a, **k):
+        posts["n"] += 1
+        payload = k.get("json") or {}
+        if posts["n"] == 1:
+            assert payload.get("keyterms") or payload.get("provider")
+            return _Resp(400, {"error": {"message": "Invalid request parameters"}})
+        assert "keyterms" not in payload
+        assert "provider" not in payload
+        return _Resp(200, {"text": "Recovered plain", "usage": {"seconds": 1.0}}, {"X-Generation-Id": "g1"})
+
+    monkeypatch.setattr("stt_openrouter.requests.post", _post)
+    monkeypatch.setattr("llm_router.OPENROUTER_API_KEY", "test-key", raising=False)
+    monkeypatch.setattr(
+        "llm_router._openrouter_api_root",
+        lambda: "https://openrouter.ai/api/v1",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "llm_router._openrouter_auth_headers",
+        lambda: {"Authorization": "Bearer test-key", "Content-Type": "application/json"},
+        raising=False,
+    )
+    from stt_context import STTContext
+
+    raw = call_openrouter_transcription(
+        wav,
+        model="assemblyai/universal-3-5-pro",
+        context=STTContext(keyterms=["Komiskey"], prompt="RPG", language="en"),
+    )
+    assert raw.text == "Recovered plain"
+    assert posts["n"] == 2
+
+
+def test_stt_language_env_overrides_context(stt_tmp, monkeypatch, tmp_path):
+    wav = tmp_path / "a.wav"
+    wav.write_bytes(b"RIFF....")
+    monkeypatch.setenv("STT_LANGUAGE", "es")
+    captured: dict = {}
+
+    def _call(audio_path, **kwargs):
+        captured["language"] = kwargs.get("language")
+        return SimpleNamespace(
+            text="hola",
+            model="assemblyai/universal-3-5-pro",
+            transcription_ms=5,
+            audio_duration_ms=1000,
+            request_id="x",
+            usage={},
+            cost=None,
+        )
+
+    stt_catalog.set_model_order(
+        ["openrouter-assemblyai-universal-3-5-pro"],
+        provider_mode="openrouter",
+    )
+    monkeypatch.setattr(stt_service, "call_openrouter_transcription", _call)
+    result = stt_service.transcribe(wav)
+    assert result.ok
+    assert captured.get("language") == "es"

@@ -4255,6 +4255,17 @@ def npc_preload():
         }), 500
 
 
+def _require_stt_admin_header():
+    """Mutating /stt/* should come from the Yaml Editor admin proxy."""
+    raw = (os.environ.get("STT_REQUIRE_ADMIN_HEADER") or "true").strip().lower()
+    if raw in {"0", "false", "no", "off"}:
+        return None
+    marker = (request.headers.get("X-NPCNarrator-Admin") or "").strip().lower()
+    if marker in {"1", "true", "yes", "admin"}:
+        return None
+    return jsonify({"error": "Admin header required for STT catalog mutations"}), 403
+
+
 @app.get("/stt/models")
 def stt_models():
     return jsonify(stt_catalog.get_models_payload())
@@ -4269,6 +4280,9 @@ def stt_status():
 
 @app.post("/stt/select")
 def stt_select():
+    denied = _require_stt_admin_header()
+    if denied is not None:
+        return denied
     body = request.get_json(force=True, silent=True) or {}
     model_id = body.get("model_id") or body.get("model")
     provider_mode = body.get("provider_mode")
@@ -4311,6 +4325,9 @@ def stt_select():
 @app.put("/stt/catalog/order")
 @app.post("/stt/catalog/order")
 def stt_catalog_order():
+    denied = _require_stt_admin_header()
+    if denied is not None:
+        return denied
     body = request.get_json(force=True, silent=True) or {}
     model_ids = body.get("model_order") or body.get("model_ids")
     provider_mode = body.get("provider_mode")
@@ -4341,6 +4358,9 @@ def stt_catalog_order():
 @app.put("/stt/catalog/entries")
 @app.post("/stt/catalog/entries")
 def stt_catalog_upsert():
+    denied = _require_stt_admin_header()
+    if denied is not None:
+        return denied
     body = request.get_json(force=True, silent=True) or {}
     if not isinstance(body, dict):
         return jsonify({"error": "Expected a catalog entry object."}), 400
@@ -4358,6 +4378,9 @@ def stt_catalog_upsert():
 
 @app.delete("/stt/catalog/entries/<entry_id>")
 def stt_catalog_delete(entry_id: str):
+    denied = _require_stt_admin_header()
+    if denied is not None:
+        return denied
     try:
         stt_catalog.delete_entry(entry_id)
         return jsonify(

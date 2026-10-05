@@ -235,6 +235,7 @@ def call_openrouter_transcription(
     model: str,
     context: STTContext | None = None,
     timeout_seconds: float | None = None,
+    timeout_deadline: float | None = None,
     enable_keyterms: bool = True,
     enable_context: bool = True,
     language: str | None = None,
@@ -263,11 +264,25 @@ def call_openrouter_transcription(
         )
 
     fmt = _audio_format_from_path(audio_path)
-    timeout = float(
+    configured_timeout = float(
         timeout_seconds
         if timeout_seconds is not None
-        else os.environ.get("STT_TIMEOUT_SECONDS", "15")
+        else os.environ.get("STT_TIMEOUT_SECONDS", "10")
     )
+
+    def _effective_timeout() -> float:
+        if timeout_deadline is None:
+            return configured_timeout
+        remaining = timeout_deadline - time.monotonic()
+        if remaining < 1.0:
+            raise STTProviderError(
+                "STT OpenRouter budget exhausted before HTTP call",
+                error_type="budget_exhausted",
+                retryable=False,
+                fallbackable=True,
+            )
+        return min(configured_timeout, max(1.0, remaining))
+
     audio_b64 = base64.b64encode(audio_bytes).decode("ascii")
 
     # Explicit language (env) overrides builder default when provided.
@@ -290,22 +305,29 @@ def call_openrouter_transcription(
         enable_keyterms=enable_keyterms,
         enable_context=enable_context,
     )
+    had_keyterm_options = bool(payload.get("keyterms") or payload.get("provider"))
 
     try:
         return _post_transcription(
             url=url,
             headers=headers,
             payload=payload,
-            timeout=timeout,
+            timeout=_effective_timeout(),
             model=model,
         )
     except STTProviderError as ex:
-        # One recovery: drop keyterms/context options if the provider rejected them.
-        if (
-            ex.error_type == "unsupported_keyterms"
-            and (enable_keyterms or enable_context)
-            and ("keyterms" in payload or "provider" in payload)
-        ):
+        # Recover once when keyterms/context options are rejected. Providers often
+        # return a generic 400 without mentioning keyterms in the body.
+        should_retry_plain = (
+            (enable_keyterms or enable_context)
+            and had_keyterm_options
+            and ex.error_type != "malformed_audio"
+            and (
+                ex.error_type == "unsupported_keyterms"
+                or ex.status_code == 400
+            )
+        )
+        if should_retry_plain:
             print(
                 f"[STT] retrying model={model} without keyterms/context after "
                 f"{ex.error_type}",
@@ -325,7 +347,7 @@ def call_openrouter_transcription(
                 url=url,
                 headers=headers,
                 payload=plain,
-                timeout=timeout,
+                timeout=_effective_timeout(),
                 model=model,
             )
         raise

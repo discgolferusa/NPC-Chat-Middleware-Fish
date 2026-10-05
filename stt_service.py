@@ -16,12 +16,18 @@ from stt_openrouter import STTProviderError, call_openrouter_transcription
 _LOCAL_MODEL = None
 _LOCAL_MODEL_KEY: tuple[str, str, str] | None = None
 _LOCAL_MODEL_LOCK = threading.Lock()
+_LOCAL_TRANSCRIBE_LOCK = threading.Lock()
 
 # Account-wide OpenRouter failures should not retry every catalog entry.
 _CHAIN_STOP_ERROR_TYPES = frozenset({"authentication", "credits_exhausted"})
 _ONLINE_DISABLED_UNTIL = 0.0
 _ONLINE_DISABLED_REASON = ""
 _ONLINE_DISABLED_LOCK = threading.Lock()
+
+# Keep a slice of the chain budget for local Whisper when it is still in the chain.
+_DEFAULT_LOCAL_RESERVE_SECONDS = 6.0
+_DEFAULT_CHAIN_BUDGET_SECONDS = 20.0
+_DEFAULT_TIMEOUT_SECONDS = 10.0
 
 
 @dataclass
@@ -153,16 +159,17 @@ def _transcribe_local(
     judge_peak = peak_fn(audio_path) if peak_fn else None
 
     def _run(*, vad_filter: bool, beam_size: int, no_speech_threshold: float) -> str:
-        segments, _info = model.transcribe(
-            str(stt_path),
-            language="en",
-            beam_size=beam_size,
-            best_of=max(1, beam_size),
-            vad_filter=vad_filter,
-            condition_on_previous_text=False,
-            no_speech_threshold=no_speech_threshold,
-            compression_ratio_threshold=2.4,
-        )
+        with _LOCAL_TRANSCRIBE_LOCK:
+            segments, _info = model.transcribe(
+                str(stt_path),
+                language="en",
+                beam_size=beam_size,
+                best_of=max(1, beam_size),
+                vad_filter=vad_filter,
+                condition_on_previous_text=False,
+                no_speech_threshold=no_speech_threshold,
+                compression_ratio_threshold=2.4,
+            )
         parts = []
         for segment in segments:
             text = (segment.text or "").strip()
@@ -223,24 +230,36 @@ def _attempt_openrouter(
     *,
     entry: dict[str, Any],
     context: STTContext | None,
-    remaining_budget_s: float,
+    budget_deadline: float,
 ) -> STTResult:
     model = str(entry.get("model") or "")
     max_retries = max(0, _env_int("STT_MAX_RETRIES", 0))
-    configured_timeout = _env_float("STT_TIMEOUT_SECONDS", 15.0)
-    timeout = min(configured_timeout, max(1.0, remaining_budget_s))
+    configured_timeout = _env_float("STT_TIMEOUT_SECONDS", _DEFAULT_TIMEOUT_SECONDS)
     enable_keyterms = _env_bool("STT_ENABLE_KEYTERMS", True)
     enable_context = _env_bool("STT_ENABLE_CONTEXT", True)
     language = (os.environ.get("STT_LANGUAGE") or "").strip() or None
 
+    def _remaining() -> float:
+        return budget_deadline - time.monotonic()
+
     last_error: STTProviderError | None = None
     for attempt_idx in range(max_retries + 1):
+        remaining = _remaining()
+        if remaining < 1.0:
+            raise STTProviderError(
+                "STT OpenRouter budget exhausted before attempt",
+                error_type="budget_exhausted",
+                retryable=False,
+                fallbackable=True,
+            )
+        timeout = min(configured_timeout, max(1.0, remaining))
         try:
             raw = call_openrouter_transcription(
                 audio_path,
                 model=model,
                 context=context,
                 timeout_seconds=timeout,
+                timeout_deadline=budget_deadline,
                 enable_keyterms=enable_keyterms,
                 enable_context=enable_context,
                 language=language,
@@ -269,7 +288,7 @@ def _attempt_openrouter(
             if ex.error_type in _CHAIN_STOP_ERROR_TYPES:
                 cooldown = _env_float("STT_ONLINE_COOLDOWN_SECONDS", 300.0)
                 _set_online_disabled(cooldown, ex.error_type)
-            if ex.retryable and attempt_idx < max_retries:
+            if ex.retryable and attempt_idx < max_retries and _remaining() >= 1.0:
                 print(
                     f"[STT] retrying openrouter model={model} "
                     f"attempt={attempt_idx + 2}/{max_retries + 1} error={ex.error_type}",
@@ -312,13 +331,22 @@ def transcribe(
         )
 
     # Prefer a short interactive budget over walking every catalog entry.
+    # Reserve time for local Whisper so OpenRouter timeouts cannot skip it.
     max_openrouter_attempts = max(1, _env_int("STT_MAX_OPENROUTER_ATTEMPTS", 2))
-    chain_budget_s = max(3.0, _env_float("STT_CHAIN_BUDGET_SECONDS", 12.0))
+    chain_budget_s = max(3.0, _env_float("STT_CHAIN_BUDGET_SECONDS", _DEFAULT_CHAIN_BUDGET_SECONDS))
+    local_reserve_s = max(0.0, _env_float("STT_LOCAL_RESERVE_SECONDS", _DEFAULT_LOCAL_RESERVE_SECONDS))
+    has_local_in_chain = any(
+        (stt_catalog.get_entry(mid) or {}).get("provider") == "local" for mid in chain
+    )
+    openrouter_budget_s = (
+        max(3.0, chain_budget_s - local_reserve_s) if has_local_in_chain else chain_budget_s
+    )
     disabled_remaining, disabled_reason = _online_disabled_remaining()
 
     print(
         f"[STT] hierarchy start chain={chain} audio_bytes={audio_bytes} "
         f"audio_duration_ms={audio_duration_ms} budget_s={chain_budget_s} "
+        f"openrouter_budget_s={openrouter_budget_s} local_reserve_s={local_reserve_s} "
         f"max_openrouter_attempts={max_openrouter_attempts}",
         flush=True,
     )
@@ -328,6 +356,7 @@ def transcribe(
     primary_id = chain[0]
     openrouter_attempts = 0
     chain_started = time.perf_counter()
+    openrouter_deadline = chain_started + openrouter_budget_s
     stop_openrouter = disabled_remaining > 0
     if stop_openrouter:
         print(
@@ -337,15 +366,6 @@ def transcribe(
         )
 
     for index, entry_id in enumerate(chain):
-        elapsed_chain = time.perf_counter() - chain_started
-        remaining_budget = chain_budget_s - elapsed_chain
-        if remaining_budget <= 0.5:
-            print(
-                f"[STT] chain budget exhausted after {elapsed_chain:.2f}s",
-                flush=True,
-            )
-            break
-
         entry = stt_catalog.get_entry(entry_id)
         if not entry:
             continue
@@ -353,6 +373,15 @@ def transcribe(
         model = str(entry.get("model") or "")
 
         if provider != "local":
+            remaining_openrouter = openrouter_deadline - time.perf_counter()
+            if remaining_openrouter <= 0.5:
+                print(
+                    f"[STT] openrouter budget exhausted; continuing to local if present "
+                    f"elapsed={time.perf_counter() - chain_started:.2f}s",
+                    flush=True,
+                )
+                stop_openrouter = True
+                continue
             if stop_openrouter:
                 continue
             if openrouter_attempts >= max_openrouter_attempts:
@@ -396,7 +425,7 @@ def transcribe(
                     path,
                     entry=entry,
                     context=context,
-                    remaining_budget_s=remaining_budget,
+                    budget_deadline=openrouter_deadline,
                 )
                 result.used_fallback = entry_id != primary_id
                 if result.audio_duration_ms is None:
@@ -451,6 +480,8 @@ def transcribe(
                 attempts=list(attempts),
             )
             if ex.error_type in _CHAIN_STOP_ERROR_TYPES:
+                cooldown = _env_float("STT_ONLINE_COOLDOWN_SECONDS", 300.0)
+                _set_online_disabled(cooldown, ex.error_type)
                 stop_openrouter = True
                 # Continue so local fallback can still run when in the chain.
                 continue
