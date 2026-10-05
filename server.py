@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, send_file, make_response
+from flask import Flask, request, jsonify, send_file, make_response, g
 import os
 import hashlib
 import secrets
@@ -25,6 +25,7 @@ from request_timing import (
     begin_request_timing,
     log_timing,
     note_first_audio_ms,
+    note_request_stt,
 )
 import stt_catalog
 import stt_service
@@ -2297,6 +2298,14 @@ def transcribe_audio(
         hallucination_fn=_is_stt_hallucination,
     )
     text = (result.text or "").strip()
+    note_request_stt(
+        model_id=result.model_id or None,
+        model=result.model or None,
+        provider=result.provider or None,
+        transcription_ms=result.transcription_ms,
+        cost=result.cost,
+        used_fallback=result.used_fallback,
+    )
     print(
         f"[PLAYER-AUDIO] stt_done ok={result.ok} provider={result.provider} "
         f"model={result.model} model_id={result.model_id} "
@@ -5679,14 +5688,29 @@ def transcribe_only():
         return jsonify({"error": "audio is required."}), 400
 
     request_id = f"transcribe-{uuid.uuid4().hex}"
+    begin_request_timing()
     try:
         # Same normalize path as /npc-voice-turn (webm/ogg/opus → WAV).
         wav_path = save_uploaded_audio(upload, request_id)
         transcript = (transcribe_audio(wav_path) or "").strip()
-        return jsonify({"transcript": transcript})
+        payload: dict[str, Any] = {"transcript": transcript}
+        for key, attr in (
+            ("stt_model_id", "_timing_stt_model_id"),
+            ("stt_model", "_timing_stt_model"),
+            ("stt_provider", "_timing_stt_provider"),
+            ("stt_transcription_ms", "_timing_stt_transcription_ms"),
+            ("stt_cost_usd", "_timing_stt_cost"),
+            ("stt_used_fallback", "_timing_stt_used_fallback"),
+        ):
+            value = getattr(g, attr, None)
+            if value is not None:
+                payload[key] = value
+        response = jsonify(payload)
+        return attach_timing_headers(response, request_id)
     except Exception as ex:
         print(f"[TRANSCRIBE] failed: {ex!r}", flush=True)
-        return jsonify({"error": f"Transcription failed: {ex}"}), 500
+        err = jsonify({"error": f"Transcription failed: {ex}"})
+        return attach_timing_headers(err, request_id), 500
     finally:
         for leftover in UPLOAD_DIR.glob(f"{request_id}*"):
             leftover.unlink(missing_ok=True)
