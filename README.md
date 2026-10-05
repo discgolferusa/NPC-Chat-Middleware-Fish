@@ -202,6 +202,33 @@ names: `voice_model`, `length_scale`, `noise_scale`, `noise_w`, `sentence_silenc
 
 Env: `VOICES_DIR` overrides the scan root for `/voices`. By default the server scans **`../Voices`** (sibling of the middleware repo folder), then falls back to the `Voices` segment in the default Ryan model path (e.g. `C:\AI\Voices`).
 
+### Speech-to-text (OpenRouter)
+
+Voice turns (`/npc-voice-turn`, `/transcribe`) use a configurable STT attempt hierarchy, managed like LLM routing:
+
+- Catalog + order: `stt_catalog.json` (auto-seeded; gitignored)
+- Runtime selection: `stt_runtime_config.json` (gitignored)
+- Admin UI: Yaml Editor **Admin → STT** (`/admin-stt.html`)
+- Middleware APIs: `GET /stt/models`, `GET /stt/status`, `POST /stt/select`, `PUT /stt/catalog/order`, `PUT /stt/catalog/entries`
+
+Default seed order:
+
+1. `assemblyai/universal-3-5-pro` (OpenRouter)
+2. `deepgram/nova-3`
+3. `openai/whisper-large-v3-turbo`
+4. `openai/gpt-transcribe`
+5. Local Whisper Lite (`base.en` via faster-whisper)
+
+External STT calls use the same `OPENROUTER_API_KEY` as chat (`POST /api/v1/audio/transcriptions`). Optional bootstrap env keys are documented in `game_api.env.example` (`STT_PROVIDER_MODE`, `STT_TIMEOUT_SECONDS`, `STT_CHAIN_BUDGET_SECONDS`, `STT_LOCAL_RESERVE_SECONDS`, `STT_REQUIRE_ADMIN_HEADER`, …). Mutating `/stt/*` routes require `X-NPCNarrator-Admin` from the Yaml Editor admin proxy. Day-to-day model changes belong in the Admin STT drag list, not env.
+
+RPG keyterms/context are built from the active NPC, location, and co-located NPC names (no secrets). Models without keyterm/prompt support skip those fields via the capability registry in `stt_capabilities.py`.
+
+Benchmark the same WAV across models (live OpenRouter; not part of CI):
+
+```powershell
+python scripts/benchmark_stt.py path\to\clip.wav --json out.json --csv out.csv
+```
+
 ### Streaming voice turns
 
 Browser player turns may send form field ``stream_clips=1``. Middleware then returns HTTP after the **first** Piper clip (header ``X-Turn-Streaming: 1``) and finishes remaining clips in the background while ``/turn/progress`` publishes them for SignalR. Without the flag, behavior is unchanged (wait for all clips).

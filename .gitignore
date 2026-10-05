@@ -84,6 +84,8 @@ npc_memory.db
 llm_usage.json
 llm_runtime_config.json
 llm_catalog.json
+stt_runtime_config.json
+stt_catalog.json
 scene_runtime_config.json
 session_runtime_config.json
 *_runtime_config.json

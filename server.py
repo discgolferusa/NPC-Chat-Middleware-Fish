@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, send_file, make_response
+from flask import Flask, request, jsonify, send_file, make_response, g
 import os
 import hashlib
 import secrets
@@ -25,8 +25,11 @@ from request_timing import (
     begin_request_timing,
     log_timing,
     note_first_audio_ms,
+    note_request_stt,
 )
-from faster_whisper import WhisperModel
+import stt_catalog
+import stt_service
+from stt_context import STTContext, build_stt_context
 
 from llm_router import (
     delete_llm_catalog_entry,
@@ -143,7 +146,7 @@ from turn_progress import (
 from server_settings import format_llm_rules, get_narrator_tts_settings, load_global_llm_rules
 from prompt_caps import get_prompt_caps, save_prompt_caps, DEFAULT_PROMPT_CAPS
 from npc_pronouns import get_npc_pronoun_context
-from peer_context import build_peer_location_prompt_sections
+from peer_context import build_peer_location_prompt_sections, list_colocated_npcs
 from tts_processing import (
     DEFAULT_DENOISE_NF,
     DEFAULT_DENOISE_NR,
@@ -234,10 +237,6 @@ NPC_CONTEXT_EXECUTOR = ThreadPoolExecutor(
     thread_name_prefix="npc-context",
 )
 
-# Good first choice. If accuracy is poor, change to "small.en".
-# If latency is too high, change to "tiny.en".
-STT_MODEL = WhisperModel("base.en", device="cpu", compute_type="int8")
-
 app = Flask(__name__)
 # Cap uploads / JSON bodies (STT audio, content packs) to reduce DoS risk.
 app.config["MAX_CONTENT_LENGTH"] = int(os.environ.get("MAX_CONTENT_LENGTH_BYTES", str(16 * 1024 * 1024)))
@@ -288,6 +287,9 @@ def _load_game_api_env_file() -> None:
 
 
 _load_game_api_env_file()
+
+# STT catalog/runtime after env load so STT_* bootstrap keys apply.
+stt_service.init_stt(base_dir=BASE_DIR)
 
 # Re-bind after game_api.env so MEMORY_MYSQL_* / MEMORY_DB apply to NPC + DM tables.
 MEMORY_DB_CONFIG = refresh_memory_db_config()
@@ -2239,10 +2241,45 @@ def _is_stt_hallucination(
     return False
 
 
-def transcribe_audio(audio_path: Path) -> str:
+def build_voice_stt_context(npc_id: str, campaign_id: str = "") -> STTContext | None:
+    """Load lightweight scene vocabulary for STT (no DB writes, no secrets)."""
+    try:
+        npc = load_npc(npc_id)
+    except Exception as ex:
+        print(f"[STT] context npc_load_failed npc_id={npc_id} error={ex!r}", flush=True)
+        return None
+    location = {}
+    location_id = str(npc.get("location_id") or "").strip()
+    if location_id:
+        try:
+            location = load_location(location_id) or {}
+        except Exception as ex:
+            print(
+                f"[STT] context location_load_failed location_id={location_id} error={ex!r}",
+                flush=True,
+            )
+            location = {}
+    colocated = []
+    try:
+        colocated = list_colocated_npcs(location_id, exclude_npc_id=npc_id)
+    except Exception as ex:
+        print(f"[STT] context peers_failed error={ex!r}", flush=True)
+    return build_stt_context(
+        npc=npc,
+        location=location if isinstance(location, dict) else {},
+        colocated_npcs=colocated,
+        campaign_id=campaign_id or str(npc.get("campaign_id") or ""),
+    )
+
+
+def transcribe_audio(
+    audio_path: Path,
+    *,
+    stt_context: STTContext | None = None,
+) -> str:
     """
-    Transcribe player/DM mic audio, optimized for short replies (yes/ok/go).
-    Skips VAD on short clips, pads brief audio, and retries with looser thresholds.
+    Transcribe player/DM mic audio via the configured STT attempt hierarchy.
+    Local Whisper Lite pads short clips; OpenRouter uses the saved WAV as-is.
     """
     raw_duration = _wav_duration_seconds(audio_path)
     raw_peak = _wav_peak_value(audio_path)
@@ -2250,75 +2287,36 @@ def transcribe_audio(audio_path: Path) -> str:
         f"[PLAYER-AUDIO] stt_raw duration={raw_duration:.2f}s peak={raw_peak} path={audio_path}",
         flush=True,
     )
-    stt_path = _pad_wav_for_short_speech(audio_path)
-    stats = _wav_peak_stats(stt_path)
-    duration = _wav_duration_seconds(stt_path)
-    peak = _wav_peak_value(stt_path)
-    print(f"[PLAYER-AUDIO] stt_input path={stt_path} {stats}", flush=True)
+    print(f"[PLAYER-AUDIO] stt_input path={audio_path} {_wav_peak_stats(audio_path)}", flush=True)
 
-    def _run(*, vad_filter: bool, beam_size: int, no_speech_threshold: float) -> str:
-        segments, info = STT_MODEL.transcribe(
-            str(stt_path),
-            language="en",
-            beam_size=beam_size,
-            best_of=max(1, beam_size),
-            vad_filter=vad_filter,
-            condition_on_previous_text=False,
-            no_speech_threshold=no_speech_threshold,
-            compression_ratio_threshold=2.4,
+    result = stt_service.transcribe(
+        audio_path,
+        context=stt_context,
+        pad_fn=_pad_wav_for_short_speech,
+        duration_fn=_wav_duration_seconds,
+        peak_fn=_wav_peak_value,
+        hallucination_fn=_is_stt_hallucination,
+    )
+    text = (result.text or "").strip()
+    # Only attribute successful transcripts so failed/empty STT does not pollute metrics.
+    if text and result.ok:
+        note_request_stt(
+            model_id=result.model_id or None,
+            model=result.model or None,
+            provider=result.provider or None,
+            transcription_ms=result.transcription_ms,
+            cost=result.cost,
+            used_fallback=result.used_fallback,
         )
-        text_parts = []
-        for segment in segments:
-            text = segment.text.strip()
-            if text:
-                text_parts.append(text)
-        info_duration = getattr(info, "duration", None)
-        joined = " ".join(text_parts).strip()
-        print(
-            f"[PLAYER-AUDIO] stt_pass vad={vad_filter} beam={beam_size} "
-            f"no_speech={no_speech_threshold} duration={info_duration} "
-            f"parts={len(text_parts)} text={joined[:120]!r}",
-            flush=True,
-        )
-        return joined
-
-    # Short clips: skip VAD first — Silero often eats one-word replies.
-    prefer_no_vad = (raw_duration or duration) < 3.0
-    attempts = []
-    if prefer_no_vad:
-        attempts.append(dict(vad_filter=False, beam_size=5, no_speech_threshold=0.35))
-        attempts.append(dict(vad_filter=False, beam_size=5, no_speech_threshold=0.2))
-        attempts.append(dict(vad_filter=True, beam_size=5, no_speech_threshold=0.35))
-    else:
-        attempts.append(dict(vad_filter=True, beam_size=1, no_speech_threshold=0.6))
-        attempts.append(dict(vad_filter=False, beam_size=5, no_speech_threshold=0.35))
-        attempts.append(dict(vad_filter=False, beam_size=5, no_speech_threshold=0.2))
-
-    # Judge hallucinations against the unpadded clip — padding can hide how short it was.
-    judge_duration = raw_duration if raw_duration > 0 else duration
-    judge_peak = raw_peak if raw_peak is not None else peak
-
-    text = ""
-    for attempt in attempts:
-        text = _run(**attempt)
-        if text and not _is_stt_hallucination(
-            text,
-            duration_seconds=judge_duration,
-            peak=judge_peak,
-        ):
-            break
-        if text and _is_stt_hallucination(
-            text,
-            duration_seconds=judge_duration,
-            peak=judge_peak,
-        ):
-            print(
-                f"[PLAYER-AUDIO] stt_hallucination rejected text={text[:120]!r} "
-                f"raw_duration={judge_duration:.2f}s peak={judge_peak}",
-                flush=True,
-            )
-            text = ""
-
+    print(
+        f"[PLAYER-AUDIO] stt_done ok={result.ok} provider={result.provider} "
+        f"model={result.model} model_id={result.model_id} "
+        f"transcription_ms={result.transcription_ms} "
+        f"used_fallback={result.used_fallback} "
+        f"error_type={result.error_type or '-'} "
+        f"text={text[:120]!r}",
+        flush=True,
+    )
     return text
 
 
@@ -3609,7 +3607,10 @@ def npc_voice_turn():
         step_start = log_timing(request_id, "schedule piper warm-up", step_start)
 
         set_turn_progress(request_id, "transcribing")
-        player_text = transcribe_audio(input_path)
+        player_text = transcribe_audio(
+            input_path,
+            stt_context=build_voice_stt_context(npc_id, campaign_id),
+        )
         step_start = log_timing(request_id, "speech-to-text", step_start)
 
         if not player_text:
@@ -3968,7 +3969,10 @@ def npc_voice_turn_debug():
     step_start = log_timing(request_id, "debug schedule piper warm-up", step_start)
 
     try:
-        player_text = transcribe_audio(input_path)
+        player_text = transcribe_audio(
+            input_path,
+            stt_context=build_voice_stt_context(npc_id, campaign_id),
+        )
         step_start = log_timing(request_id, "debug speech-to-text", step_start)
 
         if not player_text:
@@ -4260,6 +4264,148 @@ def npc_preload():
             "player_id": player_id,
             "error": "Internal server error"
         }), 500
+
+
+def _require_stt_admin_header():
+    """Mutating /stt/* should come from the Yaml Editor admin proxy."""
+    raw = (os.environ.get("STT_REQUIRE_ADMIN_HEADER") or "true").strip().lower()
+    if raw in {"0", "false", "no", "off"}:
+        return None
+    marker = (request.headers.get("X-NPCNarrator-Admin") or "").strip().lower()
+    if marker in {"1", "true", "yes", "admin"}:
+        return None
+    return jsonify({"error": "Admin header required for STT catalog mutations"}), 403
+
+
+@app.get("/stt/models")
+def stt_models():
+    return jsonify(stt_catalog.get_models_payload())
+
+
+@app.get("/stt/status")
+def stt_status():
+    return jsonify(
+        stt_catalog.get_status_payload(local_loaded=stt_service.local_whisper_loaded())
+    )
+
+
+@app.post("/stt/select")
+def stt_select():
+    denied = _require_stt_admin_header()
+    if denied is not None:
+        return denied
+    body = request.get_json(force=True, silent=True) or {}
+    model_id = body.get("model_id") or body.get("model")
+    provider_mode = body.get("provider_mode")
+    model_order = body.get("model_order")
+    try:
+        if model_order is not None:
+            ordered = stt_catalog.set_model_order(model_order, provider_mode=provider_mode)
+            return jsonify(
+                {
+                    "ok": True,
+                    "model_id": ordered[0] if ordered else "",
+                    "model_order": ordered,
+                    "provider_mode": stt_catalog.PROVIDER_MODE,
+                    "fallback_model_ids": list(stt_catalog.FALLBACK_MODEL_IDS),
+                    "status": stt_catalog.get_status_payload(
+                        local_loaded=stt_service.local_whisper_loaded()
+                    ),
+                    "models": stt_catalog.get_models_payload(),
+                }
+            )
+        if not model_id:
+            return jsonify({"error": "Missing model_id"}), 400
+        select_kwargs = {"provider_mode": provider_mode}
+        if "fallback_model_ids" in body:
+            select_kwargs["fallback_model_ids"] = body.get("fallback_model_ids")
+        result = stt_catalog.select_model(str(model_id), **select_kwargs)
+        result["ok"] = True
+        result["status"] = stt_catalog.get_status_payload(
+            local_loaded=stt_service.local_whisper_loaded()
+        )
+        result["models"] = stt_catalog.get_models_payload()
+        return jsonify(result)
+    except ValueError as ex:
+        return _client_error(ex, 400)
+    except Exception as ex:
+        print(f"[STT] select failed: {ex}", flush=True)
+        return _client_error(ex, 500)
+
+
+@app.put("/stt/catalog/order")
+@app.post("/stt/catalog/order")
+def stt_catalog_order():
+    denied = _require_stt_admin_header()
+    if denied is not None:
+        return denied
+    body = request.get_json(force=True, silent=True) or {}
+    model_ids = body.get("model_order") or body.get("model_ids")
+    provider_mode = body.get("provider_mode")
+    if model_ids is None:
+        return jsonify({"error": "model_order is required"}), 400
+    try:
+        ordered = stt_catalog.set_model_order(model_ids, provider_mode=provider_mode)
+        return jsonify(
+            {
+                "ok": True,
+                "model_id": ordered[0] if ordered else "",
+                "model_order": ordered,
+                "provider_mode": stt_catalog.PROVIDER_MODE,
+                "fallback_model_ids": list(stt_catalog.FALLBACK_MODEL_IDS),
+                "status": stt_catalog.get_status_payload(
+                    local_loaded=stt_service.local_whisper_loaded()
+                ),
+                "models": stt_catalog.get_models_payload(),
+            }
+        )
+    except ValueError as ex:
+        return _client_error(ex, 400)
+    except Exception as ex:
+        print(f"[STT] catalog order failed: {ex}", flush=True)
+        return _client_error(ex, 500)
+
+
+@app.put("/stt/catalog/entries")
+@app.post("/stt/catalog/entries")
+def stt_catalog_upsert():
+    denied = _require_stt_admin_header()
+    if denied is not None:
+        return denied
+    body = request.get_json(force=True, silent=True) or {}
+    if not isinstance(body, dict):
+        return jsonify({"error": "Expected a catalog entry object."}), 400
+    try:
+        entry = stt_catalog.upsert_entry(body)
+        return jsonify(
+            {"ok": True, "entry": entry, "models": stt_catalog.get_models_payload()}
+        )
+    except ValueError as ex:
+        return _client_error(ex, 400)
+    except Exception as ex:
+        print(f"[STT] catalog upsert failed: {ex}", flush=True)
+        return _client_error(ex, 500)
+
+
+@app.delete("/stt/catalog/entries/<entry_id>")
+def stt_catalog_delete(entry_id: str):
+    denied = _require_stt_admin_header()
+    if denied is not None:
+        return denied
+    try:
+        stt_catalog.delete_entry(entry_id)
+        return jsonify(
+            {
+                "ok": True,
+                "deleted": entry_id,
+                "models": stt_catalog.get_models_payload(),
+            }
+        )
+    except ValueError as ex:
+        return _client_error(ex, 400)
+    except Exception as ex:
+        print(f"[STT] catalog delete failed: {ex}", flush=True)
+        return _client_error(ex, 500)
 
 
 @app.get("/llm/models")
@@ -5544,14 +5690,32 @@ def transcribe_only():
         return jsonify({"error": "audio is required."}), 400
 
     request_id = f"transcribe-{uuid.uuid4().hex}"
+    begin_request_timing()
+    step_start = time.perf_counter()
     try:
         # Same normalize path as /npc-voice-turn (webm/ogg/opus → WAV).
         wav_path = save_uploaded_audio(upload, request_id)
+        step_start = log_timing(request_id, "save uploaded audio", step_start)
         transcript = (transcribe_audio(wav_path) or "").strip()
-        return jsonify({"transcript": transcript})
+        log_timing(request_id, "speech-to-text", step_start)
+        payload: dict[str, Any] = {"transcript": transcript}
+        for key, attr in (
+            ("stt_model_id", "_timing_stt_model_id"),
+            ("stt_model", "_timing_stt_model"),
+            ("stt_provider", "_timing_stt_provider"),
+            ("stt_transcription_ms", "_timing_stt_transcription_ms"),
+            ("stt_cost_usd", "_timing_stt_cost"),
+            ("stt_used_fallback", "_timing_stt_used_fallback"),
+        ):
+            value = getattr(g, attr, None)
+            if value is not None:
+                payload[key] = value
+        response = jsonify(payload)
+        return attach_timing_headers(response, request_id, include_voice_phases=True)
     except Exception as ex:
         print(f"[TRANSCRIBE] failed: {ex!r}", flush=True)
-        return jsonify({"error": f"Transcription failed: {ex}"}), 500
+        err = jsonify({"error": "Transcription failed."})
+        return attach_timing_headers(err, request_id, include_voice_phases=True), 500
     finally:
         for leftover in UPLOAD_DIR.glob(f"{request_id}*"):
             leftover.unlink(missing_ok=True)

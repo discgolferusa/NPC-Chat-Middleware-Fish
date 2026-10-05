@@ -43,14 +43,68 @@ def test_build_voice_timing_phases_groups_steps_and_cumulative():
         "piper segmented tts=800",
     ]
     phases = request_timing.build_voice_timing_phases(steps)
-    assert phases["pre_llm_ms"] == 550
+    assert phases["stt_ms"] == 400
+    assert phases["pre_llm_ms"] == 150
     assert phases["llm_ms"] == 2000
     assert phases["post_llm_ms"] == 10
     assert phases["tts_ms"] == 800
+    assert phases["cumulative_ms"]["stt"] == 400
     assert phases["cumulative_ms"]["pre_llm"] == 550
     assert phases["cumulative_ms"]["llm"] == 2550
     assert phases["cumulative_ms"]["post_llm"] == 2560
     assert phases["cumulative_ms"]["tts"] == 3360
+
+
+def test_attach_timing_headers_includes_stt_attribution():
+    app = Flask(__name__)
+    with app.test_request_context("/npc-voice-turn", method="POST"):
+        request_timing.begin_request_timing()
+        request_timing.note_request_stt(
+            model_id="openrouter-assemblyai-universal-3-5-pro",
+            model="assemblyai/universal-3-5-pro",
+            provider="openrouter",
+            transcription_ms=321,
+            cost=0.00012,
+            used_fallback=False,
+        )
+        step = time.perf_counter()
+        step = request_timing.log_timing("rid", "speech-to-text", step)
+        step = request_timing.log_timing("rid", "llm npc response", step)
+        resp = Response(response=b"RIFF", status=200, mimetype="audio/wav")
+        request_timing.attach_timing_headers(resp, "rid", include_voice_phases=True)
+        assert resp.headers.get("X-Stt-Model-Id") == "openrouter-assemblyai-universal-3-5-pro"
+        assert resp.headers.get("X-Stt-Provider") == "openrouter"
+        assert resp.headers.get("X-Stt-Model") == "assemblyai/universal-3-5-pro"
+        assert resp.headers.get("X-Stt-Transcription-Ms") == "321"
+        assert resp.headers.get("X-Stt-Used-Fallback") == "0"
+        phases = json.loads(resp.headers["X-Timing-Phases"])
+        assert phases["stt_model_id"] == "openrouter-assemblyai-universal-3-5-pro"
+        assert phases["stt_provider"] == "openrouter"
+        assert phases["stt_ms"] >= 0
+        assert phases["stt_cost_usd"] == 0.00012
+
+
+def test_compact_phases_json_drops_bulky_fields_before_omitting():
+    phases = {
+        "stt_ms": 100,
+        "pre_llm_ms": 50,
+        "llm_ms": 200,
+        "tts_ms": 80,
+        "stt_model_id": "openrouter-assemblyai-universal-3-5-pro",
+        "stt_provider": "openrouter",
+        "model_id": "openrouter-gpt-oss-20b",
+        "cumulative_ms": {"note": "y" * 2000},
+        "unaccounted_ms": 12,
+        "other_ms": 0,
+        "tracked_ms": 430,
+    }
+    assert len(json.dumps(phases, separators=(",", ":"))) > 1800
+    compact = request_timing._compact_phases_json(phases, max_len=1800)
+    assert compact is not None
+    parsed = json.loads(compact)
+    assert parsed["stt_model_id"] == "openrouter-assemblyai-universal-3-5-pro"
+    assert "cumulative_ms" not in parsed
+    assert len(compact) <= 1800
 
 
 def test_attach_timing_headers_voice_phases_only_when_requested():

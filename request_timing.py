@@ -15,11 +15,22 @@ HeaderFirstAudioMs = "X-First-Audio-Ms"
 HeaderLlmModelId = "X-Llm-Model-Id"
 HeaderLlmSelectedModelId = "X-Llm-Selected-Model-Id"
 HeaderLlmProvider = "X-Llm-Provider"
+HeaderSttModelId = "X-Stt-Model-Id"
+HeaderSttProvider = "X-Stt-Provider"
+HeaderSttModel = "X-Stt-Model"
+HeaderSttTranscriptionMs = "X-Stt-Transcription-Ms"
+HeaderSttCostUsd = "X-Stt-Cost-Usd"
+HeaderSttUsedFallback = "X-Stt-Used-Fallback"
 
+VOICE_STT_LABELS = frozenset(
+    {
+        "speech-to-text",
+        "debug speech-to-text",
+    }
+)
 VOICE_PRE_LLM_LABELS = frozenset(
     {
         "save uploaded audio",
-        "speech-to-text",
         "load npc/location/memory/recent turns",
         "build prompt/messages",
         "load npc context",
@@ -56,6 +67,12 @@ def begin_request_timing() -> None:
     g._timing_llm_model_id = None
     g._timing_llm_selected_model_id = None
     g._timing_llm_provider = None
+    g._timing_stt_model_id = None
+    g._timing_stt_model = None
+    g._timing_stt_provider = None
+    g._timing_stt_transcription_ms = None
+    g._timing_stt_cost = None
+    g._timing_stt_used_fallback = None
 
 
 def note_first_audio_ms() -> None:
@@ -122,6 +139,48 @@ def note_request_llm_model(
         g._timing_llm_selected_model_id = selected
 
 
+def note_request_stt(
+    *,
+    model_id: str | None = None,
+    model: str | None = None,
+    provider: str | None = None,
+    transcription_ms: int | None = None,
+    cost: float | None = None,
+    used_fallback: bool | None = None,
+) -> None:
+    """Bind the STT attempt that produced the transcript for this request."""
+    try:
+        from flask import has_request_context
+
+        if not has_request_context():
+            return
+    except Exception:
+        return
+
+    mid = str(model_id or "").strip() or None
+    model_name = str(model or "").strip() or None
+    provider_name = str(provider or "").strip() or None
+    if mid or model_name or provider_name:
+        if mid and not getattr(g, "_timing_stt_model_id", None):
+            g._timing_stt_model_id = mid
+        if model_name and not getattr(g, "_timing_stt_model", None):
+            g._timing_stt_model = model_name
+        if provider_name and not getattr(g, "_timing_stt_provider", None):
+            g._timing_stt_provider = provider_name
+    if transcription_ms is not None and getattr(g, "_timing_stt_transcription_ms", None) is None:
+        try:
+            g._timing_stt_transcription_ms = max(0, int(transcription_ms))
+        except (TypeError, ValueError):
+            pass
+    if cost is not None and getattr(g, "_timing_stt_cost", None) is None:
+        try:
+            g._timing_stt_cost = float(cost)
+        except (TypeError, ValueError):
+            pass
+    if used_fallback is not None and getattr(g, "_timing_stt_used_fallback", None) is None:
+        g._timing_stt_used_fallback = bool(used_fallback)
+
+
 def _parse_step_entry(step: str) -> tuple[str, int]:
     if "=" not in step:
         return "", 0
@@ -134,12 +193,14 @@ def _parse_step_entry(step: str) -> tuple[str, int]:
 
 def build_voice_timing_phases(steps: list[str]) -> dict[str, Any]:
     """Roll middleware step timings into voice-turn phases with cumulative totals."""
-    pre_llm = llm = post_llm = tts = other = 0
+    stt = pre_llm = llm = post_llm = tts = other = 0
     for step in steps:
         label, ms = _parse_step_entry(step)
         if not label:
             continue
-        if label in VOICE_PRE_LLM_LABELS:
+        if label in VOICE_STT_LABELS:
+            stt += ms
+        elif label in VOICE_PRE_LLM_LABELS:
             pre_llm += ms
         elif label in VOICE_LLM_LABELS:
             llm += ms
@@ -150,13 +211,15 @@ def build_voice_timing_phases(steps: list[str]) -> dict[str, Any]:
         else:
             other += ms
 
-    cum_pre = pre_llm
+    cum_stt = stt
+    cum_pre = cum_stt + pre_llm
     cum_llm = cum_pre + llm
     cum_post = cum_llm + post_llm
     cum_tts = cum_post + tts
     middleware_total = cum_tts + other
 
     return {
+        "stt_ms": stt,
         "pre_llm_ms": pre_llm,
         "llm_ms": llm,
         "post_llm_ms": post_llm,
@@ -168,6 +231,7 @@ def build_voice_timing_phases(steps: list[str]) -> dict[str, Any]:
         "tracked_ms": middleware_total,
         "middleware_total_ms": middleware_total,
         "cumulative_ms": {
+            "stt": cum_stt,
             "pre_llm": cum_pre,
             "llm": cum_llm,
             "post_llm": cum_post,
@@ -198,6 +262,33 @@ def _request_llm_model_headers() -> tuple[str | None, str | None, str | None]:
         return None, None, None
 
 
+def _request_stt_attrs() -> dict[str, Any]:
+    """Return STT attribution fields recorded for this request."""
+    try:
+        attrs: dict[str, Any] = {}
+        model_id = str(getattr(g, "_timing_stt_model_id", None) or "").strip() or None
+        model = str(getattr(g, "_timing_stt_model", None) or "").strip() or None
+        provider = str(getattr(g, "_timing_stt_provider", None) or "").strip() or None
+        if model_id:
+            attrs["stt_model_id"] = model_id
+        if model:
+            attrs["stt_model"] = model
+        if provider:
+            attrs["stt_provider"] = provider
+        transcription_ms = getattr(g, "_timing_stt_transcription_ms", None)
+        if transcription_ms is not None:
+            attrs["stt_transcription_ms"] = int(transcription_ms)
+        cost = getattr(g, "_timing_stt_cost", None)
+        if cost is not None:
+            attrs["stt_cost_usd"] = float(cost)
+        used_fallback = getattr(g, "_timing_stt_used_fallback", None)
+        if used_fallback is not None:
+            attrs["stt_used_fallback"] = bool(used_fallback)
+        return attrs
+    except Exception:
+        return {}
+
+
 def attach_timing_headers(
     response: Any,
     request_id: str | None = None,
@@ -213,12 +304,27 @@ def attach_timing_headers(
 
     steps = getattr(g, "_timing_steps", None)
     active_model_id, selected_model_id, provider = _request_llm_model_headers()
+    stt_attrs = _request_stt_attrs()
     if active_model_id:
         response.headers[HeaderLlmModelId] = active_model_id
     if selected_model_id:
         response.headers[HeaderLlmSelectedModelId] = selected_model_id
     if provider:
         response.headers[HeaderLlmProvider] = provider
+    if stt_attrs.get("stt_model_id"):
+        response.headers[HeaderSttModelId] = str(stt_attrs["stt_model_id"])
+    if stt_attrs.get("stt_provider"):
+        response.headers[HeaderSttProvider] = str(stt_attrs["stt_provider"])
+    if stt_attrs.get("stt_model"):
+        response.headers[HeaderSttModel] = str(stt_attrs["stt_model"])
+    if stt_attrs.get("stt_transcription_ms") is not None:
+        response.headers[HeaderSttTranscriptionMs] = str(stt_attrs["stt_transcription_ms"])
+    if stt_attrs.get("stt_cost_usd") is not None:
+        response.headers[HeaderSttCostUsd] = f"{float(stt_attrs['stt_cost_usd']):.8f}".rstrip("0").rstrip(".")
+    if stt_attrs.get("stt_used_fallback") is not None:
+        response.headers[HeaderSttUsedFallback] = (
+            "1" if stt_attrs["stt_used_fallback"] else "0"
+        )
 
     if isinstance(steps, list) and steps:
         compact = "|".join(steps[:24])
@@ -248,12 +354,42 @@ def attach_timing_headers(
                 phases["selected_model_id"] = selected_model_id
             if provider:
                 phases["provider"] = provider
-            phases_json = json.dumps(phases, separators=(",", ":"))
-            if len(phases_json) <= 1800:
+            phases.update(stt_attrs)
+            phases_json = _compact_phases_json(phases)
+            if phases_json:
                 response.headers[HeaderPhases] = phases_json
             if request_id:
-                print(f"[TIMING] {request_id} phases: {phases_json}", flush=True)
+                print(
+                    f"[TIMING] {request_id} phases: {phases_json or json.dumps(phases, separators=(',', ':'))}",
+                    flush=True,
+                )
 
     if request_id:
         response.headers.setdefault("X-Turn-Request-Id", str(request_id))
     return response
+
+
+def _compact_phases_json(phases: dict[str, Any], *, max_len: int = 1800) -> str | None:
+    """Serialize voice phases for the header, dropping bulky fields before giving up.
+
+    STT/LLM attribution and core ``*_ms`` fields are kept so client_turn_latency
+    still gets model timing when the full cumulative map would overflow.
+    """
+    phases_json = json.dumps(phases, separators=(",", ":"))
+    if len(phases_json) <= max_len:
+        return phases_json
+
+    slim = dict(phases)
+    slim.pop("cumulative_ms", None)
+    phases_json = json.dumps(slim, separators=(",", ":"))
+    if len(phases_json) <= max_len:
+        return phases_json
+
+    for key in ("unaccounted_ms", "other_ms", "tracked_ms", "post_llm_ms"):
+        slim.pop(key, None)
+        phases_json = json.dumps(slim, separators=(",", ":"))
+        if len(phases_json) <= max_len:
+            return phases_json
+
+    # Headers still carry X-Stt-* / X-Llm-*; omit phases rather than send truncated JSON.
+    return None

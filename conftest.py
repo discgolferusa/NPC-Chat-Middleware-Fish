@@ -105,8 +105,17 @@ def api(monkeypatch, tmp_path):
     with turn_progress._PROGRESS_LOCK:
         turn_progress._PROGRESS.clear()
 
+    # Isolate STT catalog/runtime so API tests do not mutate repo JSON.
+    import stt_catalog
+
+    stt_catalog_file = tmp_path / "stt_catalog.json"
+    stt_runtime_file = tmp_path / "stt_runtime_config.json"
+    stt_catalog.configure(catalog_file=stt_catalog_file, runtime_file=stt_runtime_file)
+    stt_catalog.load_or_seed()
+    stt_catalog.set_model_order(["local-whisper-lite"], provider_mode="local")
+
     monkeypatch.setattr(server, "ask_llm", lambda messages: "The watch holds firm tonight.")
-    monkeypatch.setattr(server, "transcribe_audio", lambda path: "Hello captain.")
+    monkeypatch.setattr(server, "transcribe_audio", lambda path, stt_context=None: "Hello captain.")
 
     def _fake_tts(**kwargs):
         request_id = kwargs.get("request_id") or "test"
@@ -142,11 +151,12 @@ def api(monkeypatch, tmp_path):
         "analyze_campaign_document",
         lambda *a, **k: {"campaign": {"id": "test_campaign", "name": "Test"}, "locations": [], "npcs": []},
     )
-    monkeypatch.setattr(
-        server,
-        "outline_campaign_document",
-        lambda *a, **k: {"campaign": {"id": "test_campaign", "name": "Test"}, "locations": [], "npcs": []},
-    )
+    if hasattr(server, "outline_campaign_document"):
+        monkeypatch.setattr(
+            server,
+            "outline_campaign_document",
+            lambda *a, **k: {"campaign": {"id": "test_campaign", "name": "Test"}, "locations": [], "npcs": []},
+        )
     monkeypatch.setattr(
         server,
         "detail_location_batch",
