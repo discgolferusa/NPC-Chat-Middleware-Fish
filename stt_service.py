@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -14,7 +15,13 @@ from stt_openrouter import STTProviderError, call_openrouter_transcription
 
 _LOCAL_MODEL = None
 _LOCAL_MODEL_KEY: tuple[str, str, str] | None = None
-_LOCAL_LOCK_INIT = False
+_LOCAL_MODEL_LOCK = threading.Lock()
+
+# Account-wide OpenRouter failures should not retry every catalog entry.
+_CHAIN_STOP_ERROR_TYPES = frozenset({"authentication", "credits_exhausted"})
+_ONLINE_DISABLED_UNTIL = 0.0
+_ONLINE_DISABLED_REASON = ""
+_ONLINE_DISABLED_LOCK = threading.Lock()
 
 
 @dataclass
@@ -82,6 +89,26 @@ def local_whisper_loaded() -> bool:
     return _LOCAL_MODEL is not None
 
 
+def _set_online_disabled(seconds: float, reason: str) -> None:
+    global _ONLINE_DISABLED_UNTIL, _ONLINE_DISABLED_REASON
+    retry = max(5.0, float(seconds or 0.0))
+    with _ONLINE_DISABLED_LOCK:
+        _ONLINE_DISABLED_UNTIL = time.monotonic() + retry
+        _ONLINE_DISABLED_REASON = reason
+    print(
+        f"[STT] openrouter disabled for {retry:.0f}s reason={reason}",
+        flush=True,
+    )
+
+
+def _online_disabled_remaining() -> tuple[float, str]:
+    with _ONLINE_DISABLED_LOCK:
+        remaining = _ONLINE_DISABLED_UNTIL - time.monotonic()
+        if remaining <= 0:
+            return 0.0, ""
+        return remaining, _ONLINE_DISABLED_REASON
+
+
 def ensure_local_whisper(
     *,
     model_size: str = "base.en",
@@ -89,21 +116,21 @@ def ensure_local_whisper(
     compute_type: str = "int8",
 ) -> Any:
     """Lazy-load faster-whisper so OpenRouter-primary hosts skip startup cost."""
-    global _LOCAL_MODEL, _LOCAL_MODEL_KEY, _LOCAL_LOCK_INIT
+    global _LOCAL_MODEL, _LOCAL_MODEL_KEY
     key = (model_size, device, compute_type)
-    if _LOCAL_MODEL is not None and _LOCAL_MODEL_KEY == key:
-        return _LOCAL_MODEL
-    from faster_whisper import WhisperModel
+    with _LOCAL_MODEL_LOCK:
+        if _LOCAL_MODEL is not None and _LOCAL_MODEL_KEY == key:
+            return _LOCAL_MODEL
+        from faster_whisper import WhisperModel
 
-    print(
-        f"[STT] loading local whisper model={model_size} device={device} "
-        f"compute_type={compute_type}",
-        flush=True,
-    )
-    _LOCAL_MODEL = WhisperModel(model_size, device=device, compute_type=compute_type)
-    _LOCAL_MODEL_KEY = key
-    _LOCAL_LOCK_INIT = True
-    return _LOCAL_MODEL
+        print(
+            f"[STT] loading local whisper model={model_size} device={device} "
+            f"compute_type={compute_type}",
+            flush=True,
+        )
+        _LOCAL_MODEL = WhisperModel(model_size, device=device, compute_type=compute_type)
+        _LOCAL_MODEL_KEY = key
+        return _LOCAL_MODEL
 
 
 def _transcribe_local(
@@ -113,6 +140,7 @@ def _transcribe_local(
     pad_fn: Callable[[Path], Path] | None = None,
     duration_fn: Callable[[Path], float] | None = None,
     peak_fn: Callable[[Path], int | None] | None = None,
+    hallucination_fn: Callable[..., bool] | None = None,
 ) -> tuple[str, int]:
     model = ensure_local_whisper(
         model_size=str(entry.get("model") or "base.en"),
@@ -122,6 +150,7 @@ def _transcribe_local(
     started = time.perf_counter()
     stt_path = pad_fn(audio_path) if pad_fn else audio_path
     raw_duration = duration_fn(audio_path) if duration_fn else 0.0
+    judge_peak = peak_fn(audio_path) if peak_fn else None
 
     def _run(*, vad_filter: bool, beam_size: int, no_speech_threshold: float) -> str:
         segments, _info = model.transcribe(
@@ -157,9 +186,29 @@ def _transcribe_local(
 
     text = ""
     for attempt in attempts:
-        text = _run(**attempt)
-        if text:
-            break
+        candidate = _run(**attempt)
+        print(
+            f"[STT] local_pass vad={attempt['vad_filter']} beam={attempt['beam_size']} "
+            f"no_speech={attempt['no_speech_threshold']} text={candidate[:120]!r}",
+            flush=True,
+        )
+        if not candidate:
+            continue
+        if hallucination_fn and hallucination_fn(
+            candidate,
+            duration_seconds=raw_duration or 0.0,
+            peak=judge_peak,
+        ):
+            print(
+                f"[STT] local_hallucination rejected text={candidate[:120]!r} "
+                f"duration={raw_duration:.2f}s peak={judge_peak}",
+                flush=True,
+            )
+            text = ""
+            continue
+        text = candidate
+        break
+
     elapsed_ms = int((time.perf_counter() - started) * 1000)
     print(
         f"[STT] request complete provider=local model={entry.get('model')} "
@@ -174,13 +223,15 @@ def _attempt_openrouter(
     *,
     entry: dict[str, Any],
     context: STTContext | None,
+    remaining_budget_s: float,
 ) -> STTResult:
     model = str(entry.get("model") or "")
     max_retries = max(0, _env_int("STT_MAX_RETRIES", 0))
-    timeout = _env_float("STT_TIMEOUT_SECONDS", 15.0)
+    configured_timeout = _env_float("STT_TIMEOUT_SECONDS", 15.0)
+    timeout = min(configured_timeout, max(1.0, remaining_budget_s))
     enable_keyterms = _env_bool("STT_ENABLE_KEYTERMS", True)
     enable_context = _env_bool("STT_ENABLE_CONTEXT", True)
-    language = (os.environ.get("STT_LANGUAGE") or "en").strip() or "en"
+    language = (os.environ.get("STT_LANGUAGE") or "").strip() or None
 
     last_error: STTProviderError | None = None
     for attempt_idx in range(max_retries + 1):
@@ -215,6 +266,9 @@ def _attempt_openrouter(
             )
         except STTProviderError as ex:
             last_error = ex
+            if ex.error_type in _CHAIN_STOP_ERROR_TYPES:
+                cooldown = _env_float("STT_ONLINE_COOLDOWN_SECONDS", 300.0)
+                _set_online_disabled(cooldown, ex.error_type)
             if ex.retryable and attempt_idx < max_retries:
                 print(
                     f"[STT] retrying openrouter model={model} "
@@ -257,22 +311,58 @@ def transcribe(
             audio_duration_ms=audio_duration_ms,
         )
 
+    # Prefer a short interactive budget over walking every catalog entry.
+    max_openrouter_attempts = max(1, _env_int("STT_MAX_OPENROUTER_ATTEMPTS", 2))
+    chain_budget_s = max(3.0, _env_float("STT_CHAIN_BUDGET_SECONDS", 12.0))
+    disabled_remaining, disabled_reason = _online_disabled_remaining()
+
     print(
         f"[STT] hierarchy start chain={chain} audio_bytes={audio_bytes} "
-        f"audio_duration_ms={audio_duration_ms}",
+        f"audio_duration_ms={audio_duration_ms} budget_s={chain_budget_s} "
+        f"max_openrouter_attempts={max_openrouter_attempts}",
         flush=True,
     )
 
     attempts: list[dict[str, Any]] = []
     last_failure: STTResult | None = None
     primary_id = chain[0]
+    openrouter_attempts = 0
+    chain_started = time.perf_counter()
+    stop_openrouter = disabled_remaining > 0
+    if stop_openrouter:
+        print(
+            f"[STT] skipping openrouter entries cooldown_remaining={disabled_remaining:.0f}s "
+            f"reason={disabled_reason}",
+            flush=True,
+        )
 
     for index, entry_id in enumerate(chain):
+        elapsed_chain = time.perf_counter() - chain_started
+        remaining_budget = chain_budget_s - elapsed_chain
+        if remaining_budget <= 0.5:
+            print(
+                f"[STT] chain budget exhausted after {elapsed_chain:.2f}s",
+                flush=True,
+            )
+            break
+
         entry = stt_catalog.get_entry(entry_id)
         if not entry:
             continue
         provider = str(entry.get("provider") or "")
         model = str(entry.get("model") or "")
+
+        if provider != "local":
+            if stop_openrouter:
+                continue
+            if openrouter_attempts >= max_openrouter_attempts:
+                print(
+                    f"[STT] skipping further openrouter models "
+                    f"(max_openrouter_attempts={max_openrouter_attempts})",
+                    flush=True,
+                )
+                continue
+
         print(
             f"[STT] attempt index={index} model_id={entry_id} provider={provider} "
             f"model={model}",
@@ -287,6 +377,7 @@ def transcribe(
                     pad_fn=pad_fn,
                     duration_fn=duration_fn,
                     peak_fn=peak_fn,
+                    hallucination_fn=hallucination_fn,
                 )
                 result = STTResult(
                     text=text,
@@ -300,30 +391,16 @@ def transcribe(
                     used_fallback=entry_id != primary_id,
                 )
             else:
-                result = _attempt_openrouter(path, entry=entry, context=context)
+                openrouter_attempts += 1
+                result = _attempt_openrouter(
+                    path,
+                    entry=entry,
+                    context=context,
+                    remaining_budget_s=remaining_budget,
+                )
                 result.used_fallback = entry_id != primary_id
                 if result.audio_duration_ms is None:
                     result.audio_duration_ms = audio_duration_ms
-
-            if hallucination_fn and result.text:
-                peak = peak_fn(path) if peak_fn else None
-                duration_s = (result.audio_duration_ms or 0) / 1000.0
-                if hallucination_fn(
-                    result.text,
-                    duration_seconds=duration_s,
-                    peak=peak,
-                ):
-                    print(
-                        f"[STT] hallucination rejected model_id={entry_id} "
-                        f"text={result.text[:120]!r}",
-                        flush=True,
-                    )
-                    raise STTProviderError(
-                        "Transcript rejected as likely hallucination",
-                        error_type="empty_transcript",
-                        retryable=False,
-                        fallbackable=True,
-                    )
 
             if not result.text:
                 raise STTProviderError(
@@ -373,6 +450,10 @@ def transcribe(
                 used_fallback=entry_id != primary_id,
                 attempts=list(attempts),
             )
+            if ex.error_type in _CHAIN_STOP_ERROR_TYPES:
+                stop_openrouter = True
+                # Continue so local fallback can still run when in the chain.
+                continue
             if not ex.fallbackable:
                 return last_failure
             continue

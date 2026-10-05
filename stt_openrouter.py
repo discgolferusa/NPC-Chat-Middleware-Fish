@@ -51,79 +51,101 @@ def _audio_format_from_path(audio_path: Path) -> str:
     return "wav"
 
 
-def call_openrouter_transcription(
-    audio_path: Path,
+def _build_payload(
     *,
     model: str,
-    context: STTContext | None = None,
-    timeout_seconds: float | None = None,
-    enable_keyterms: bool = True,
-    enable_context: bool = True,
-    language: str | None = None,
-) -> OpenRouterSTTRawResult:
-    """POST base64 audio to OpenRouter transcriptions endpoint."""
-    import llm_router
-
-    api_key = (llm_router.OPENROUTER_API_KEY or "").strip()
-    if not api_key:
-        raise STTProviderError(
-            "OPENROUTER_API_KEY is not configured",
-            error_type="authentication",
-            status_code=401,
-            retryable=False,
-            fallbackable=True,
-        )
-
-    audio_bytes = audio_path.read_bytes()
-    if not audio_bytes:
-        raise STTProviderError(
-            "Audio file is empty",
-            error_type="malformed_audio",
-            status_code=400,
-            retryable=False,
-            fallbackable=False,
-        )
-
-    fmt = _audio_format_from_path(audio_path)
+    audio_b64: str,
+    fmt: str,
+    context: STTContext | None,
+    enable_keyterms: bool,
+    enable_context: bool,
+) -> dict[str, Any]:
     caps = get_capabilities(model)
-    timeout = float(
-        timeout_seconds
-        if timeout_seconds is not None
-        else os.environ.get("STT_TIMEOUT_SECONDS", "15")
-    )
-
     payload: dict[str, Any] = {
         "model": model,
         "input_audio": {
-            "data": base64.b64encode(audio_bytes).decode("ascii"),
+            "data": audio_b64,
             "format": fmt,
         },
     }
-    effective_context = context
-    if language and (context is None or not context.language):
-        effective_context = STTContext(
-            keyterms=list(context.keyterms) if context else [],
-            prompt=(context.prompt if context else ""),
-            language=language,
-        )
     apply_context_to_request(
         payload,
-        effective_context,
+        context,
         caps,
         enable_keyterms=enable_keyterms,
         enable_context=enable_context,
     )
+    return payload
 
-    url = f"{llm_router._openrouter_api_root().rstrip('/')}/audio/transcriptions"
-    headers = llm_router._openrouter_auth_headers()
 
-    print(
-        f"[STT] request started provider=openrouter model={model} "
-        f"audio_bytes={len(audio_bytes)} format={fmt} timeout={timeout}s "
-        f"keyterms={len(payload.get('keyterms') or [])}",
-        flush=True,
+def _classify_http_error(status_code: int, body_text: str) -> STTProviderError:
+    if status_code in (401, 403):
+        return STTProviderError(
+            f"OpenRouter authentication failed ({status_code})",
+            error_type="authentication",
+            status_code=status_code,
+            retryable=False,
+            fallbackable=True,  # allow local fallback; openrouter chain stops in orchestrator
+        )
+    if status_code == 429:
+        return STTProviderError(
+            "OpenRouter rate limited",
+            error_type="rate_limit",
+            status_code=429,
+            retryable=False,
+            fallbackable=True,
+        )
+    if status_code == 402:
+        return STTProviderError(
+            "OpenRouter credits exhausted",
+            error_type="credits_exhausted",
+            status_code=402,
+            retryable=False,
+            fallbackable=True,
+        )
+    if status_code in (500, 502, 503, 504):
+        return STTProviderError(
+            f"OpenRouter upstream error ({status_code})",
+            error_type="openrouter_unavailable",
+            status_code=status_code,
+            retryable=True,
+            fallbackable=True,
+        )
+
+    error_type = "invalid_response"
+    fallbackable = True
+    lower = (body_text or "").casefold()
+    if "keyterm" in lower or "keyword" in lower:
+        error_type = "unsupported_keyterms"
+    elif "unsupported" in lower or "not supported" in lower:
+        error_type = "unsupported_model"
+    if "audio" in lower and ("invalid" in lower or "malformed" in lower):
+        error_type = "malformed_audio"
+        fallbackable = False
+    return STTProviderError(
+        f"OpenRouter STT error ({status_code}): {(body_text or '')[:300]}",
+        error_type=error_type,
+        status_code=status_code,
+        retryable=False,
+        fallbackable=fallbackable,
     )
 
+
+def _post_transcription(
+    *,
+    url: str,
+    headers: dict[str, str],
+    payload: dict[str, Any],
+    timeout: float,
+    model: str,
+) -> OpenRouterSTTRawResult:
+    print(
+        f"[STT] request started provider=openrouter model={model} "
+        f"audio_bytes_b64={len((payload.get('input_audio') or {}).get('data') or '')} "
+        f"format={(payload.get('input_audio') or {}).get('format')} "
+        f"timeout={timeout}s keyterms={len(payload.get('keyterms') or [])}",
+        flush=True,
+    )
     started = time.perf_counter()
     try:
         response = requests.post(url, headers=headers, json=payload, timeout=timeout)
@@ -147,56 +169,8 @@ def call_openrouter_transcription(
         "x-generation-id"
     )
 
-    if response.status_code in (401, 403):
-        raise STTProviderError(
-            f"OpenRouter authentication failed ({response.status_code})",
-            error_type="authentication",
-            status_code=response.status_code,
-            retryable=False,
-            fallbackable=True,
-        )
-    if response.status_code == 429:
-        raise STTProviderError(
-            "OpenRouter rate limited",
-            error_type="rate_limit",
-            status_code=429,
-            retryable=False,
-            fallbackable=True,
-        )
-    if response.status_code == 402:
-        raise STTProviderError(
-            "OpenRouter credits exhausted",
-            error_type="credits_exhausted",
-            status_code=402,
-            retryable=False,
-            fallbackable=True,
-        )
-    if response.status_code in (500, 502, 503, 504):
-        raise STTProviderError(
-            f"OpenRouter upstream error ({response.status_code})",
-            error_type="openrouter_unavailable",
-            status_code=response.status_code,
-            retryable=True,
-            fallbackable=True,
-        )
     if response.status_code >= 400:
-        # Try to distinguish unsupported model vs bad audio.
-        body_text = (response.text or "")[:300]
-        error_type = "invalid_response"
-        fallbackable = True
-        lower = body_text.casefold()
-        if "keyterm" in lower or "unsupported" in lower or "not supported" in lower:
-            error_type = "unsupported_model"
-        if "audio" in lower and ("invalid" in lower or "malformed" in lower):
-            error_type = "malformed_audio"
-            fallbackable = False
-        raise STTProviderError(
-            f"OpenRouter STT error ({response.status_code}): {body_text}",
-            error_type=error_type,
-            status_code=response.status_code,
-            retryable=False,
-            fallbackable=fallbackable,
-        )
+        raise _classify_http_error(response.status_code, response.text or "")
 
     try:
         data = response.json()
@@ -253,3 +227,105 @@ def call_openrouter_transcription(
         audio_duration_ms=audio_duration_ms,
         raw=data,
     )
+
+
+def call_openrouter_transcription(
+    audio_path: Path,
+    *,
+    model: str,
+    context: STTContext | None = None,
+    timeout_seconds: float | None = None,
+    enable_keyterms: bool = True,
+    enable_context: bool = True,
+    language: str | None = None,
+) -> OpenRouterSTTRawResult:
+    """POST base64 audio to OpenRouter transcriptions endpoint."""
+    import llm_router
+
+    api_key = (llm_router.OPENROUTER_API_KEY or "").strip()
+    if not api_key:
+        raise STTProviderError(
+            "OPENROUTER_API_KEY is not configured",
+            error_type="authentication",
+            status_code=401,
+            retryable=False,
+            fallbackable=True,
+        )
+
+    audio_bytes = audio_path.read_bytes()
+    if not audio_bytes:
+        raise STTProviderError(
+            "Audio file is empty",
+            error_type="malformed_audio",
+            status_code=400,
+            retryable=False,
+            fallbackable=False,
+        )
+
+    fmt = _audio_format_from_path(audio_path)
+    timeout = float(
+        timeout_seconds
+        if timeout_seconds is not None
+        else os.environ.get("STT_TIMEOUT_SECONDS", "15")
+    )
+    audio_b64 = base64.b64encode(audio_bytes).decode("ascii")
+
+    # Explicit language (env) overrides builder default when provided.
+    if language:
+        effective_context = STTContext(
+            keyterms=list(context.keyterms) if context else [],
+            prompt=(context.prompt if context else ""),
+            language=language,
+        )
+    else:
+        effective_context = context
+
+    url = f"{llm_router._openrouter_api_root().rstrip('/')}/audio/transcriptions"
+    headers = llm_router._openrouter_auth_headers()
+    payload = _build_payload(
+        model=model,
+        audio_b64=audio_b64,
+        fmt=fmt,
+        context=effective_context,
+        enable_keyterms=enable_keyterms,
+        enable_context=enable_context,
+    )
+
+    try:
+        return _post_transcription(
+            url=url,
+            headers=headers,
+            payload=payload,
+            timeout=timeout,
+            model=model,
+        )
+    except STTProviderError as ex:
+        # One recovery: drop keyterms/context options if the provider rejected them.
+        if (
+            ex.error_type == "unsupported_keyterms"
+            and (enable_keyterms or enable_context)
+            and ("keyterms" in payload or "provider" in payload)
+        ):
+            print(
+                f"[STT] retrying model={model} without keyterms/context after "
+                f"{ex.error_type}",
+                flush=True,
+            )
+            plain = _build_payload(
+                model=model,
+                audio_b64=audio_b64,
+                fmt=fmt,
+                context=effective_context,
+                enable_keyterms=False,
+                enable_context=False,
+            )
+            if effective_context and effective_context.language:
+                plain["language"] = effective_context.language
+            return _post_transcription(
+                url=url,
+                headers=headers,
+                payload=plain,
+                timeout=timeout,
+                model=model,
+            )
+        raise

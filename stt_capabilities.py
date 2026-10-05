@@ -42,9 +42,9 @@ _CAPABILITIES: dict[str, STTModelCapabilities] = {
         supports_keyterms=True,
         supports_context_prompt=False,
         max_keyterms=100,
-        provider_options_slug="deepgram",
-        keywords_option_key="keywords",
-        use_top_level_keyterms=False,
+        # OpenRouter documents top-level keyterms; Deepgram provider.options
+        # only forward a small allowlist and may drop custom keyword fields.
+        use_top_level_keyterms=True,
     ),
     "openai/whisper-large-v3-turbo": STTModelCapabilities(
         supports_keyterms=False,
@@ -97,9 +97,7 @@ def get_capabilities(model: str) -> STTModelCapabilities:
             supports_keyterms=True,
             supports_context_prompt=False,
             max_keyterms=100,
-            provider_options_slug="deepgram",
-            keywords_option_key="keywords",
-            use_top_level_keyterms=False,
+            use_top_level_keyterms=True,
         )
     if vendor == "openai" and "whisper" not in key.casefold():
         return STTModelCapabilities(

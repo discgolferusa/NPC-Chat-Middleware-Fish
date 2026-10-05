@@ -20,6 +20,7 @@ _DEFAULT_CONTEXT_PROMPT = (
 )
 
 _MIN_TERM_LEN = 3
+_MAX_TERM_CHARS = 100
 _DEFAULT_MAX_TERMS = 80
 
 
@@ -32,6 +33,10 @@ class STTContext:
 
 def _add_term(terms: list[str], seen: set[str], value: Any) -> None:
     text = str(value or "").strip()
+    if len(text) < _MIN_TERM_LEN:
+        return
+    if len(text) > _MAX_TERM_CHARS:
+        text = text[:_MAX_TERM_CHARS].rstrip()
     if len(text) < _MIN_TERM_LEN:
         return
     key = text.casefold()
@@ -171,10 +176,20 @@ def apply_context_to_request(
 
     keyterms = list(context.keyterms or [])
     if enable_keyterms and caps.supports_keyterms and keyterms:
-        clipped = keyterms[: max(1, caps.max_keyterms)]
-        if caps.use_top_level_keyterms:
+        clipped = []
+        for term in keyterms:
+            text = str(term or "").strip()
+            if len(text) < 1:
+                continue
+            if len(text) > _MAX_TERM_CHARS:
+                text = text[:_MAX_TERM_CHARS].rstrip()
+            if text:
+                clipped.append(text)
+            if len(clipped) >= max(1, caps.max_keyterms):
+                break
+        if clipped and caps.use_top_level_keyterms:
             payload["keyterms"] = clipped
-        elif caps.provider_options_slug and caps.keywords_option_key:
+        elif clipped and caps.provider_options_slug and caps.keywords_option_key:
             provider = payload.setdefault("provider", {})
             options = provider.setdefault("options", {})
             slug_opts = options.setdefault(caps.provider_options_slug, {})

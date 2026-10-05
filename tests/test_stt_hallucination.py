@@ -114,7 +114,32 @@ def test_transcribe_audio_rejects_short_you(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "_pad_wav_for_short_speech", lambda path: path)
 
     assert transcribe_audio(wav) == ""
-    assert model.calls >= 1
+    # Local multi-pass must keep trying thresholds after a hallucination reject.
+    assert model.calls >= 3
+
+
+def test_transcribe_audio_local_recovers_after_hallucination_pass(tmp_path, monkeypatch):
+    """First local decode may hallucinate; a later pass with real speech should win."""
+    import server
+
+    class _SequenceModel:
+        def __init__(self):
+            self.calls = 0
+            self._texts = [" You", " Okay."]
+
+        def transcribe(self, *args, **kwargs):
+            text = self._texts[min(self.calls, len(self._texts) - 1)]
+            self.calls += 1
+            return [SimpleNamespace(text=text)], SimpleNamespace(duration=1.0)
+
+    wav = tmp_path / "recover.wav"
+    _write_short_weak_wav(wav)
+    model = _SequenceModel()
+    _force_local_stt(tmp_path, monkeypatch, model)
+    monkeypatch.setattr(server, "_pad_wav_for_short_speech", lambda path: path)
+
+    assert transcribe_audio(wav) == "Okay."
+    assert model.calls >= 2
 
 
 def test_npc_voice_turn_accepts_allowlisted_ok(api, tmp_path, monkeypatch):
