@@ -359,3 +359,98 @@ def test_adding_purpose_restores_model_to_that_order(isolated_selection):
     # Only the newly gained purpose list is restored — chat exclusion is preserved.
     assert "openrouter-gpt-oss-20b" not in llm_catalog.get_model_order("chat")
     assert "openrouter-gpt-oss-20b" in llm_catalog.get_model_order("content_creation")
+
+
+def test_upsert_by_id_corrects_bad_model_and_host(isolated_selection):
+    """Admin can fix a bad catalog row in place without changing its id."""
+    bad = llm_router.upsert_llm_catalog_entry(
+        {
+            "id": "openrouter-typo-entry-novita",
+            "model": "openai/typo-model-slug",
+            "host_provider": "novita",
+            "label": "Broken entry",
+            "purposes": ["chat"],
+            "enabled": True,
+        },
+        fetch_pricing=False,
+    )
+    assert bad["id"] == "openrouter-typo-entry-novita"
+    assert bad["model"] == "openai/typo-model-slug"
+
+    llm_catalog.set_model_order(
+        "chat",
+        ["openrouter-typo-entry-novita", "local"],
+        llm_models=llm_router.LLM_MODELS,
+        prices=llm_router.ONLINE_ON_DEMAND_PRICES_USD,
+    )
+
+    fixed = llm_router.upsert_llm_catalog_entry(
+        {
+            "id": "openrouter-typo-entry-novita",
+            "model": "openai/gpt-oss-20b",
+            "host_provider": "amazon-bedrock",
+            "label": "GPT-OSS 20B (fixed)",
+            "purposes": ["chat"],
+            "enabled": True,
+        },
+        fetch_pricing=False,
+    )
+    assert fixed["id"] == "openrouter-typo-entry-novita"
+    assert fixed["model"] == "openai/gpt-oss-20b"
+    assert fixed["host_provider"] == "amazon-bedrock"
+    assert fixed["label"] == "GPT-OSS 20B (fixed)"
+    assert fixed["provider_order"] == ["amazon-bedrock"]
+    assert llm_router.LLM_MODELS["openrouter-typo-entry-novita"]["model"] == "openai/gpt-oss-20b"
+    # Precedence keeps the same catalog id after the correction.
+    assert llm_catalog.get_model_order("chat")[0] == "openrouter-typo-entry-novita"
+
+
+def test_llm_catalog_entries_api_updates_bad_entry(api, isolated_selection):
+    """Functional: PUT /llm/catalog/entries corrects model/host by id."""
+    client, server, headers = api
+    entry_id = "openrouter-api-typo-novita"
+
+    create = client.put(
+        "/llm/catalog/entries",
+        headers=headers,
+        json={
+            "id": entry_id,
+            "model": "openai/typo-model",
+            "host_provider": "novita",
+            "label": "Typo LLM",
+            "purposes": ["chat"],
+            "enabled": True,
+            "fetch_pricing": False,
+        },
+    )
+    assert create.status_code == 200
+    created = create.get_json()
+    assert created["ok"] is True
+    assert created["entry"]["model"] == "openai/typo-model"
+
+    update = client.put(
+        "/llm/catalog/entries",
+        headers=headers,
+        json={
+            "id": entry_id,
+            "model": "openai/gpt-oss-20b",
+            "host_provider": "amazon-bedrock",
+            "label": "GPT-OSS fixed",
+            "purposes": ["chat"],
+            "enabled": True,
+            "fetch_pricing": False,
+        },
+    )
+    assert update.status_code == 200
+    body = update.get_json()
+    assert body["entry"]["id"] == entry_id
+    assert body["entry"]["model"] == "openai/gpt-oss-20b"
+    assert body["entry"]["host_provider"] == "amazon-bedrock"
+
+    models = client.get("/llm/models", headers=headers)
+    assert models.status_code == 200
+    catalog = models.get_json().get("catalog") or []
+    match = next((e for e in catalog if e.get("id") == entry_id), None)
+    assert match is not None
+    assert match["model"] == "openai/gpt-oss-20b"
+    assert match["host_provider"] == "amazon-bedrock"
