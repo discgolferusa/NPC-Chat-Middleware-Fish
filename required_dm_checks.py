@@ -8,10 +8,11 @@ Enforcement is intentionally narrow:
 3. Do not regex-guess player intent to invent server-side checks — global llm_rules
    tell the model when to emit tags.
 
-Authored Success/Failure instructions may be tied to a specific check by:
-- listing ``[DM Ruling: Success|Failure]`` immediately after that check, or
-- matching ``:id=<slug>`` on both the CHECK and Ruling tags
-  (``[DM CHECK:id=language: …]`` / ``[DM Ruling: Failure:id=language] …``).
+Authored Success/Failure instructions should use matching ``:id=<slug>`` tags
+(``[DM CHECK:id=language: …]`` / ``[DM Ruling: Failure:id=language] …``) so each
+check stays editable without relying on adjacent freeform rule order.
+Positional Success/Failure (immediately after a check) remains supported for
+legacy single-check NPCs.
 """
 
 from __future__ import annotations

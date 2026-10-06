@@ -63,15 +63,16 @@ llm_rules:
   If NPC-specific rules already define a literal [DM CHECK: …] template, use that exact tag
   text when that situation applies (do not invent a different claim wording for the same check).
 - >-
-  NPC rules may define multiple [DM CHECK: …] templates. Each check may have its own
-  [DM Ruling: Success] / [DM Ruling: Failure] instructions. Tie them by listing Success and
-  Failure immediately after that check, or with matching ids:
-  [DM CHECK:id=language: …] with [DM Ruling: Success:id=language] / [DM Ruling: Failure:id=language].
+  Prefer id-linked DM checks when an NPC has more than one check. Author each check as
+  [DM CHECK:id=<slug>: …] with matching [DM Ruling: Success:id=<slug>] /
+  [DM Ruling: Failure:id=<slug>] instructions. Ids stay correct when rules are reordered or
+  edited one line at a time — do not rely on Success/Failure sitting immediately under a check.
   After a confirmed/denied ruling, follow ONLY the Success/Failure instructions for the claim
   that was ruled — never apply another check's outcomes.
 - >-
-  If NPC-specific rules define [DM Ruling: Success] / [DM Ruling: Failure] (or equivalent),
-  after a matching confirmed/denied DM ruling follow those instructions for how to reply.
+  If NPC-specific rules define [DM Ruling: Success] / [DM Ruling: Failure] (or equivalent)
+  without ids on a single-check NPC, after a matching confirmed/denied DM ruling follow those
+  instructions for how to reply.
 - >-
   If both a global DM CHECK and an NPC-authored [DM CHECK: …] apply on the same turn, prefer
   the NPC-authored tag(s). Only add an extra global [DM CHECK] if it is a clearly different
