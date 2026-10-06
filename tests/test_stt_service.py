@@ -418,6 +418,88 @@ def test_stt_select_requires_admin_header(api, stt_tmp):
     assert "Admin header" in (response.get_json() or {}).get("error", "")
 
 
+def test_upsert_by_id_corrects_bad_model_and_label(stt_tmp):
+    """Admin can fix a bad STT catalog row in place without changing its id."""
+    entry_id = "openrouter-bad-stt-entry"
+    bad = stt_catalog.upsert_entry(
+        {
+            "id": entry_id,
+            "model": "vendor/wrong-slug",
+            "label": "Broken STT",
+            "provider": "openrouter",
+            "enabled": True,
+        }
+    )
+    assert bad["id"] == entry_id
+    assert bad["model"] == "vendor/wrong-slug"
+
+    stt_catalog.set_model_order(
+        [entry_id, "local-whisper-lite"],
+        provider_mode="openrouter_with_local_fallback",
+    )
+    assert stt_catalog.CURRENT_MODEL_ID == entry_id
+
+    fixed = stt_catalog.upsert_entry(
+        {
+            "id": entry_id,
+            "model": "assemblyai/universal-3-5-pro",
+            "label": "AssemblyAI (fixed)",
+            "provider": "openrouter",
+            "enabled": True,
+        }
+    )
+    assert fixed["id"] == entry_id
+    assert fixed["model"] == "assemblyai/universal-3-5-pro"
+    assert fixed["label"] == "AssemblyAI (fixed)"
+    stored = stt_catalog.get_entry(entry_id)
+    assert stored is not None
+    assert stored["model"] == "assemblyai/universal-3-5-pro"
+    assert stt_catalog.get_model_order()[0] == entry_id
+
+
+def test_stt_catalog_entries_api_updates_bad_entry(api, stt_tmp):
+    client, server, headers = api
+    admin_headers = {**headers, "X-NPCNarrator-Admin": "1"}
+    entry_id = "openrouter-api-fix-entry"
+
+    create = client.put(
+        "/stt/catalog/entries",
+        headers=admin_headers,
+        json={
+            "id": entry_id,
+            "model": "vendor/typo-slug",
+            "label": "Typo",
+            "provider": "openrouter",
+            "enabled": True,
+        },
+    )
+    assert create.status_code == 200
+    assert create.get_json()["entry"]["model"] == "vendor/typo-slug"
+
+    update = client.put(
+        "/stt/catalog/entries",
+        headers=admin_headers,
+        json={
+            "id": entry_id,
+            "model": "deepgram/nova-3",
+            "label": "Deepgram Nova-3 (fixed)",
+            "provider": "openrouter",
+            "enabled": True,
+        },
+    )
+    assert update.status_code == 200
+    body = update.get_json()
+    assert body["entry"]["id"] == entry_id
+    assert body["entry"]["model"] == "deepgram/nova-3"
+    assert body["entry"]["label"] == "Deepgram Nova-3 (fixed)"
+    models = client.get("/stt/models", headers=headers)
+    assert models.status_code == 200
+    catalog = models.get_json().get("catalog") or []
+    match = next((e for e in catalog if e.get("id") == entry_id), None)
+    assert match is not None
+    assert match["model"] == "deepgram/nova-3"
+
+
 def test_local_reserve_shortens_openrouter_deadline(stt_tmp, monkeypatch, tmp_path):
     wav = tmp_path / "a.wav"
     wav.write_bytes(b"RIFF....")
