@@ -7,6 +7,11 @@ Enforcement is intentionally narrow:
    DM ruling exists yet, ensure that exact tag is present on the reply.
 3. Do not regex-guess player intent to invent server-side checks — global llm_rules
    tell the model when to emit tags.
+
+Authored Success/Failure instructions may be tied to a specific check by:
+- listing ``[DM Ruling: Success|Failure]`` immediately after that check, or
+- matching ``:id=<slug>`` on both the CHECK and Ruling tags
+  (``[DM CHECK:id=language: …]`` / ``[DM Ruling: Failure:id=language] …``).
 """
 
 from __future__ import annotations
@@ -18,19 +23,31 @@ from typing import Any, Callable
 from sanitize_npc_reply import sanitize_npc_reply_text
 from stage_directions import normalize_stage_directions
 
+# Optional :id=<slug> ties a check to matching Success/Failure ruling tags.
+# Examples:
+#   [DM CHECK: Does the speaker know …]
+#   [DM CHECK:id=language: Does the speaker know …]
+#   [DM Ruling: Success] Respond in English.
+#   [DM Ruling: Failure:id=language] Fantasy-language only.
 DM_CHECK_IN_RULES_PATTERN = re.compile(
-    r"\[DM CHECK:\s*([^\]]+?)\]",
+    r"\[DM\s*CHECK(?:\s*:id=([A-Za-z0-9_-]+))?\s*:\s*([^\]]+?)\]",
     re.IGNORECASE,
 )
 
 # YAML colon-split can leave fragments like: [DM CHECK': 'claim text]
 DM_CHECK_MANGLED_IN_RULES_PATTERN = re.compile(
-    r"\[DM\s*CHECK['\"\s]*:\s*['\"]?\s*([^\]]+?)\s*['\"]?\s*\]",
+    r"\[DM\s*CHECK(?:\s*:id=([A-Za-z0-9_-]+))?['\"\s]*:\s*['\"]?\s*([^\]]+?)\s*['\"]?\s*\]",
     re.IGNORECASE,
 )
 
+DM_RULING_TAG_PATTERN = re.compile(
+    r"\[DM\s*Ruling:\s*(Success|Failure)(?:\s*:id=([A-Za-z0-9_-]+))?\]\s*(.+)",
+    re.IGNORECASE,
+)
+
+# Legacy single-outcome scrape (kept for callers that only need Failure prose).
 DM_RULING_FAILURE_PATTERN = re.compile(
-    r"\[DM\s*Ruling:\s*Failure\]\s*(.+)",
+    r"\[DM\s*Ruling:\s*Failure(?:\s*:id=[A-Za-z0-9_-]+)?\]\s*(.+)",
     re.IGNORECASE,
 )
 
@@ -136,31 +153,161 @@ def _normalize_claim(text: str) -> str:
     return re.sub(r"\s+", " ", cleaned).strip()
 
 
-def extract_dm_check_templates_from_rules(npc: dict[str, Any] | None) -> list[str]:
-    """Unique DM CHECK claim strings authored inside NPC llm_rules."""
-    blob = _npc_rules_blob(npc)
-    claims: list[str] = []
-    seen: set[str] = set()
+def extract_dm_check_bindings(npc: dict[str, Any] | None) -> list[dict[str, str]]:
+    """
+    Parse authored DM CHECK templates and their Success/Failure ruling instructions.
 
-    def _add_claim(claim: str) -> None:
+    Linking rules (first match wins per field):
+    1. Explicit ``:id=<slug>`` on both the CHECK and the Ruling tag.
+    2. Positional: a Success/Failure line without an id attaches to the nearest
+       preceding CHECK that still lacks that outcome.
+    3. Orphan Success/Failure lines (before any CHECK, or with an unknown id) act
+       as globals and fill any binding still missing that outcome — preserves
+       single-check NPCs that list Success/Failure after one CHECK.
+
+    Each binding is ``{"id", "claim", "success", "failure"}`` (empty strings when
+    unset). ``id`` is "" when the author omitted ``:id=``.
+    """
+    blob = _npc_rules_blob(npc)
+    if not blob.strip():
+        return []
+
+    check_events: list[tuple[int, str, str]] = []
+    seen_claims: set[str] = set()
+
+    def _add_check(start: int, check_id: str, claim: str, *, strip_edge_quotes: bool) -> None:
         claim = (claim or "").strip()
+        if strip_edge_quotes:
+            # Only mangled YAML fragments may wrap the claim in leftover ' / " chars.
+            claim = claim.strip("'\"")
         if not claim:
             return
         key = _normalize_claim(claim)
-        if not key or key in seen:
+        if not key or key in seen_claims:
             return
-        seen.add(key)
-        claims.append(claim)
+        seen_claims.add(key)
+        check_events.append((start, (check_id or "").strip(), claim))
 
     for match in DM_CHECK_IN_RULES_PATTERN.finditer(blob):
         # Preserve authored punctuation (possessives, trailing quotes in the claim).
-        _add_claim(match.group(1))
+        _add_check(
+            match.start(),
+            match.group(1) or "",
+            match.group(2) or "",
+            strip_edge_quotes=False,
+        )
 
     for match in DM_CHECK_MANGLED_IN_RULES_PATTERN.finditer(blob):
-        # Only mangled YAML fragments may wrap the claim in leftover ' / " chars.
-        _add_claim(match.group(1).strip().strip("'\""))
+        # Mangled YAML may re-match a normal tag; skip duplicates via seen_claims.
+        _add_check(
+            match.start(),
+            match.group(1) or "",
+            match.group(2) or "",
+            strip_edge_quotes=True,
+        )
 
-    return claims
+    bindings: list[dict[str, str]] = []
+    by_id: dict[str, dict[str, str]] = {}
+    for start, check_id, claim in sorted(check_events, key=lambda item: item[0]):
+        binding = {
+            "id": check_id,
+            "claim": claim,
+            "success": "",
+            "failure": "",
+            "_start": str(start),
+        }
+        bindings.append(binding)
+        if check_id:
+            by_id[check_id.lower()] = binding
+
+    global_success = ""
+    global_failure = ""
+
+    for match in DM_RULING_TAG_PATTERN.finditer(blob):
+        outcome = (match.group(1) or "").strip().lower()
+        if outcome not in ("success", "failure"):
+            continue
+        ruling_id = (match.group(2) or "").strip()
+        instruction = (match.group(3) or "").strip().strip("'\"")
+        if not instruction:
+            continue
+
+        target: dict[str, str] | None = None
+        if ruling_id:
+            target = by_id.get(ruling_id.lower())
+        if target is None:
+            # Nearest preceding CHECK that still lacks this outcome.
+            for binding in reversed(bindings):
+                if int(binding["_start"]) > match.start():
+                    continue
+                if not binding.get(outcome):
+                    target = binding
+                    break
+            if target is None and bindings:
+                # All preceding bindings already have this outcome — attach to
+                # the nearest preceding CHECK anyway (overwrite only if empty).
+                for binding in reversed(bindings):
+                    if int(binding["_start"]) <= match.start():
+                        target = binding
+                        break
+
+        if target is not None:
+            if not target.get(outcome):
+                target[outcome] = instruction
+        elif outcome == "success":
+            if not global_success:
+                global_success = instruction
+        elif not global_failure:
+            global_failure = instruction
+
+    for binding in bindings:
+        if not binding["success"] and global_success:
+            binding["success"] = global_success
+        if not binding["failure"] and global_failure:
+            binding["failure"] = global_failure
+        binding.pop("_start", None)
+
+    return bindings
+
+
+def extract_dm_check_templates_from_rules(npc: dict[str, Any] | None) -> list[str]:
+    """Unique DM CHECK claim strings authored inside NPC llm_rules."""
+    return [binding["claim"] for binding in extract_dm_check_bindings(npc)]
+
+
+def resolve_dm_check_binding(
+    npc: dict[str, Any] | None,
+    claim: str | None,
+) -> dict[str, str] | None:
+    """Return the authored binding whose claim matches ``claim``, if any."""
+    claim = (claim or "").strip()
+    if not claim:
+        return None
+    for binding in extract_dm_check_bindings(npc):
+        if _claim_matches(binding["claim"], claim):
+            return binding
+    return None
+
+
+def ruling_instruction_for_claim(
+    npc: dict[str, Any] | None,
+    claim: str | None,
+    verdict: str | None,
+) -> str:
+    """
+    NPC-authored Success/Failure instruction for a ruled claim.
+
+    ``verdict`` may be confirmed/denied (runtime) or success/failure (authored).
+    """
+    binding = resolve_dm_check_binding(npc, claim)
+    if not binding:
+        return ""
+    normalized = (verdict or "").strip().lower()
+    if normalized in ("confirmed", "success"):
+        return (binding.get("success") or "").strip()
+    if normalized in ("denied", "failure"):
+        return (binding.get("failure") or "").strip()
+    return ""
 
 
 _CLAIM_STOPWORDS = frozenset(
@@ -438,6 +585,18 @@ def _npc_has_language_barrier_rules(npc: dict[str, Any] | None) -> bool:
     )
     if any(marker in blob for marker in prose_markers):
         return True
+    # Any language-barrier binding's Failure (or a global Failure) may mark barrier rules.
+    for binding in extract_dm_check_bindings(npc):
+        if not _is_language_comprehension_claim(binding["claim"]):
+            continue
+        failure_hint = (binding.get("failure") or "").lower()
+        if failure_hint and (
+            "fantasy-language" in failure_hint
+            or "do not understand them" in failure_hint
+            or "cannot understand them" in failure_hint
+            or "show you cannot understand" in failure_hint
+        ):
+            return True
     failure_hint = _extract_failure_ruling_hint(npc).lower()
     return bool(
         failure_hint
@@ -450,7 +609,25 @@ def _npc_has_language_barrier_rules(npc: dict[str, Any] | None) -> bool:
     )
 
 
-def _extract_failure_ruling_hint(npc: dict[str, Any] | None) -> str:
+def _extract_failure_ruling_hint(
+    npc: dict[str, Any] | None,
+    *,
+    claim: str | None = None,
+) -> str:
+    """
+    Authored Failure instruction for a claim (or the first Failure if unscoped).
+
+    Prefer the binding that matches ``claim`` so multi-check NPCs do not reuse
+    the wrong Failure prose (e.g. language gibberish for a secrets deny).
+    """
+    if claim:
+        specific = ruling_instruction_for_claim(npc, claim, "failure")
+        if specific:
+            return specific
+    for binding in extract_dm_check_bindings(npc):
+        failure = (binding.get("failure") or "").strip()
+        if failure:
+            return failure
     for line in _npc_rules_blob(npc).splitlines():
         match = DM_RULING_FAILURE_PATTERN.search(line)
         if match:
@@ -637,14 +814,15 @@ def format_required_dm_checks_prompt_block(
     language_waiting = any(_is_language_comprehension_claim(claim) for claim in pending)
     language_block = ""
     if language_waiting and _npc_has_language_barrier_rules(npc):
-        failure_hint = _extract_failure_ruling_hint(npc)
+        language_claim = next(
+            (claim for claim in pending if _is_language_comprehension_claim(claim)),
+            "",
+        )
+        failure_hint = _extract_failure_ruling_hint(npc, claim=language_claim)
         failure_line = failure_hint or "Use a short fantasy-language line only; do not reply in English."
         native_language = resolve_npc_native_language(
             npc,
-            language_claim=next(
-                (claim for claim in pending if _is_language_comprehension_claim(claim)),
-                "",
-            ),
+            language_claim=language_claim,
         )
         native_line = (
             f"This NPC's native language is {native_language}. Reply ONLY in {native_language}, never English."
@@ -657,7 +835,7 @@ LANGUAGE BARRIER (still waiting on DM ruling):
 Until a matching confirmed Success ruling exists, do NOT treat the speaker as understood.
 {native_line} {failure_line}"""
     elif failure_templates and _npc_has_language_barrier_rules(npc):
-        failure_hint = _extract_failure_ruling_hint(npc)
+        failure_hint = _extract_failure_ruling_hint(npc, claim=failure_templates[0])
         failure_line = failure_hint or "Use a short fantasy-language line only; do not reply in English."
         native_language = resolve_npc_native_language(
             npc,
@@ -677,7 +855,22 @@ The DM already ruled the speaker does NOT know this NPC's language.
     if not pending and not language_block:
         return ""
 
-    lines = "\n".join(f"- [DM CHECK: {claim}]" for claim in pending)
+    binding_lines: list[str] = []
+    for claim in pending:
+        binding = resolve_dm_check_binding(npc, claim)
+        line = f"- [DM CHECK: {claim}]"
+        if binding and binding.get("id"):
+            line = f"- [DM CHECK:id={binding['id']}: {claim}]"
+        extras: list[str] = []
+        if binding:
+            if binding.get("success"):
+                extras.append(f"Success → {binding['success']}")
+            if binding.get("failure"):
+                extras.append(f"Failure → {binding['failure']}")
+        if extras:
+            line += " (" + "; ".join(extras) + ")"
+        binding_lines.append(line)
+    lines = "\n".join(binding_lines)
     tags_intro = ""
     if pending:
         tags_intro = f"""
@@ -686,8 +879,9 @@ NPC-AUTHORED DM CHECK TAGS (still required until the DM rules):
 This NPC's llm_rules declare the exact checks below. Prefer these tag wordings over a
 global paraphrase for the same situation. Until DM channel context shows a matching
 confirmed (Success) or denied (Failure) ruling for each claim, end your reply with
-those exact tags (one per line, after spoken dialogue / stage directions). Follow any
-NPC [DM Ruling: Success] / [DM Ruling: Failure] instructions after a matching ruling.
+those exact tags (one per line, after spoken dialogue / stage directions).
+Each check may list its own Success / Failure instructions — after a matching ruling,
+follow ONLY that check's Success or Failure line (not another check's).
 Do not invent DM rulings yourself."""
     return f"{tags_intro}{language_block}\n{lines}".rstrip()
 
@@ -713,8 +907,9 @@ def ensure_required_dm_check_tags(
 
     text = (raw_text or "").rstrip()
     existing = {
-        _normalize_claim(m.group(1))
+        _normalize_claim(m.group(2))
         for m in DM_CHECK_IN_RULES_PATTERN.finditer(text)
+        if m.group(2)
     }
 
     missing = [
@@ -725,7 +920,14 @@ def ensure_required_dm_check_tags(
     if not missing:
         return text
 
-    suffix = "\n".join(f"[DM CHECK: {claim}]" for claim in missing)
+    tag_lines: list[str] = []
+    for claim in missing:
+        binding = resolve_dm_check_binding(npc, claim)
+        if binding and binding.get("id"):
+            tag_lines.append(f"[DM CHECK:id={binding['id']}: {claim}]")
+        else:
+            tag_lines.append(f"[DM CHECK: {claim}]")
+    suffix = "\n".join(tag_lines)
     if text:
         return f"{text}\n{suffix}"
     return suffix

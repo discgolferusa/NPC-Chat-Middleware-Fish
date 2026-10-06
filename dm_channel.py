@@ -87,12 +87,13 @@ def ensure_campaign_id_column(
 
 # Prefer an end-anchored tag; fall back to the last tag anywhere in the reply so
 # trailing punctuation / stage notes do not silently drop pending DM checks.
+# Optional ``:id=<slug>`` is stripped for claim matching (authoring aid only).
 DM_CHECK_TAG_PATTERN = re.compile(
-    r"\[DM CHECK:\s*(.+?)\]\s*$",
+    r"\[DM CHECK(?:\s*:id=[A-Za-z0-9_-]+)?\s*:\s*(.+?)\]\s*$",
     re.IGNORECASE | re.DOTALL,
 )
 DM_CHECK_TAG_ANYWHERE_PATTERN = re.compile(
-    r"\[DM CHECK:\s*([^\]]+?)\]",
+    r"\[DM CHECK(?:\s*:id=[A-Za-z0-9_-]+)?\s*:\s*([^\]]+?)\]",
     re.IGNORECASE,
 )
 

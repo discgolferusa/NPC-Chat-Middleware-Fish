@@ -57,6 +57,7 @@ from required_dm_checks import (
     generate_npc_reply_text,
     is_language_comprehension_claim,
     resolve_npc_native_language,
+    ruling_instruction_for_claim,
 )
 from dm_channel import (
     build_dm_injection_messages,
@@ -1746,11 +1747,23 @@ def build_dm_followup_messages(
             "The DM confirmed the claim. Accept any proof the party already presented "
             "and let them proceed in character."
         )
+        authored = ruling_instruction_for_claim(npc, claim_summary, "confirmed")
+        if authored:
+            action_hint += (
+                f" Follow this NPC's authored Success instruction for THIS claim only: "
+                f"{authored}"
+            )
     elif verdict == "DENIED":
         action_hint = (
             "The DM denied the claim. Refuse the request in character without granting "
             "access or benefit."
         )
+        authored = ruling_instruction_for_claim(npc, claim_summary, "denied")
+        if authored:
+            action_hint += (
+                f" Follow this NPC's authored Failure instruction for THIS claim only: "
+                f"{authored}"
+            )
         if is_language_comprehension_claim(claim_summary):
             native = resolve_npc_native_language(npc, language_claim=claim_summary)
             if native:

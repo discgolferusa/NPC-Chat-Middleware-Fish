@@ -731,3 +731,177 @@ def test_language_barrier_uses_latest_ruling_when_claim_ruled_multiple_times():
         USER_PROSE_SLAAD_NPC,
         success_then_failure,
     )
+
+
+MULTI_CHECK_NPC = {
+    "id": "complex",
+    "name": "Complex Guard",
+    "role": "gate guard",
+    "llm_rules": [
+        "Until the DM rules language, do not treat the speaker as understood.",
+        "End unsettled language replies with "
+        "[DM CHECK:id=language: Does the speaker know the necessary language to talk to the NPC]",
+        "[DM Ruling: Success:id=language] Respond to the speaker in English.",
+        "[DM Ruling: Failure:id=language] You do not understand the speaker; answer only by "
+        "showing you cannot understand them, using a short fantasy-language line.",
+        "If asked about secrets, end with "
+        "[DM CHECK:id=secrets: the player is probing one of this NPC's secrets]",
+        "[DM Ruling: Success:id=secrets] Reveal the secret they asked about.",
+        "[DM Ruling: Failure:id=secrets] Deflect; do not reveal any secret.",
+    ],
+    "known_facts": ["Native language: Slaadi"],
+}
+
+
+POSITIONAL_MULTI_CHECK_NPC = {
+    "id": "positional",
+    "name": "Positional Guard",
+    "llm_rules": [
+        "[DM CHECK: Does the speaker know the necessary language to talk to the NPC]",
+        "[DM Ruling: Success] Respond to the speaker in English.",
+        "[DM Ruling: Failure] Use a short fantasy-language line only.",
+        "[DM CHECK: the player is probing one of this NPC's secrets]",
+        "[DM Ruling: Success] Reveal the secret they asked about.",
+        "[DM Ruling: Failure] Deflect; do not reveal any secret.",
+    ],
+}
+
+
+def test_extract_bindings_tie_success_failure_by_id():
+    from required_dm_checks import extract_dm_check_bindings, ruling_instruction_for_claim
+
+    bindings = extract_dm_check_bindings(MULTI_CHECK_NPC)
+    assert len(bindings) == 2
+    by_id = {b["id"]: b for b in bindings}
+    assert "language" in by_id and "secrets" in by_id
+    assert "Respond to the speaker in English" in by_id["language"]["success"]
+    assert "fantasy-language" in by_id["language"]["failure"]
+    assert "Reveal the secret" in by_id["secrets"]["success"]
+    assert "Deflect" in by_id["secrets"]["failure"]
+
+    assert "Respond to the speaker in English." == ruling_instruction_for_claim(
+        MULTI_CHECK_NPC,
+        "Does the speaker know the necessary language to talk to the NPC",
+        "confirmed",
+    )
+    assert "Deflect; do not reveal any secret." == ruling_instruction_for_claim(
+        MULTI_CHECK_NPC,
+        "the player is probing one of this NPC's secrets",
+        "denied",
+    )
+    # Language deny must not return the secrets Failure instruction.
+    language_fail = ruling_instruction_for_claim(
+        MULTI_CHECK_NPC,
+        "Does the speaker know the necessary language to talk to the NPC",
+        "denied",
+    )
+    assert "fantasy-language" in language_fail
+    assert "Deflect" not in language_fail
+
+
+def test_extract_bindings_tie_success_failure_by_position():
+    from required_dm_checks import extract_dm_check_bindings, ruling_instruction_for_claim
+
+    bindings = extract_dm_check_bindings(POSITIONAL_MULTI_CHECK_NPC)
+    assert len(bindings) == 2
+    assert bindings[0]["success"].startswith("Respond to the speaker")
+    assert "fantasy-language" in bindings[0]["failure"]
+    assert "Reveal the secret" in bindings[1]["success"]
+    assert "Deflect" in bindings[1]["failure"]
+
+    assert "Deflect" in ruling_instruction_for_claim(
+        POSITIONAL_MULTI_CHECK_NPC,
+        "the player is probing one of this NPC's secrets",
+        "failure",
+    )
+    assert "fantasy-language" in ruling_instruction_for_claim(
+        POSITIONAL_MULTI_CHECK_NPC,
+        "Does the speaker know the necessary language to talk to the NPC",
+        "failure",
+    )
+
+
+def test_legacy_single_check_still_binds_trailing_success_failure():
+    from required_dm_checks import extract_dm_check_bindings
+
+    bindings = extract_dm_check_bindings({"llm_rules": LANGUAGE_RULES})
+    assert len(bindings) == 1
+    assert "Respond to the speaker in English" in bindings[0]["success"]
+    assert "fantasy-language" in bindings[0]["failure"]
+
+
+def test_format_prompt_lists_per_check_success_failure():
+    block = format_required_dm_checks_prompt_block(MULTI_CHECK_NPC, {"rulings": []})
+    assert "id=language" in block
+    assert "id=secrets" in block
+    assert "Success → Respond to the speaker in English" in block
+    assert "Failure → Deflect" in block
+    assert "follow ONLY that check's Success or Failure" in block
+
+
+def test_failure_hint_is_claim_specific_for_multi_check():
+    from required_dm_checks import _extract_failure_ruling_hint
+
+    language = "Does the speaker know the necessary language to talk to the NPC"
+    secrets = "the player is probing one of this NPC's secrets"
+    assert "fantasy-language" in _extract_failure_ruling_hint(
+        MULTI_CHECK_NPC, claim=language
+    ).lower()
+    assert "deflect" in _extract_failure_ruling_hint(
+        MULTI_CHECK_NPC, claim=secrets
+    ).lower()
+
+
+def test_build_dm_followup_injects_matching_success_instruction():
+    from server import build_dm_followup_messages
+
+    messages = build_dm_followup_messages(
+        MULTI_CHECK_NPC,
+        {"description": ""},
+        [],
+        None,
+        [],
+        {"rulings": []},
+        {
+            "verdict": "confirmed",
+            "claim_summary": "the player is probing one of this NPC's secrets",
+            "ruling_text": "Yes, tell them.",
+        },
+    )
+    followup = messages[-1]["content"]
+    assert "authored Success instruction for THIS claim only" in followup
+    assert "Reveal the secret they asked about" in followup
+    assert "Respond to the speaker in English" not in followup
+
+
+def test_build_dm_followup_injects_matching_failure_instruction():
+    from server import build_dm_followup_messages
+
+    messages = build_dm_followup_messages(
+        MULTI_CHECK_NPC,
+        {"description": ""},
+        [],
+        None,
+        [],
+        {"rulings": []},
+        {
+            "verdict": "denied",
+            "claim_summary": "the player is probing one of this NPC's secrets",
+            "ruling_text": "No.",
+        },
+    )
+    followup = messages[-1]["content"]
+    assert "authored Failure instruction for THIS claim only" in followup
+    assert "Deflect; do not reveal any secret" in followup
+    assert "fantasy-language" not in followup.lower()
+
+
+def test_extract_dm_check_tags_strips_optional_id():
+    from dm_channel import extract_dm_check_tags
+
+    spoken, claims = extract_dm_check_tags(
+        "Hold.\n[DM CHECK:id=language: Does the speaker know the necessary language]"
+    )
+    assert spoken == "Hold."
+    assert claims == ["Does the speaker know the necessary language"]
+

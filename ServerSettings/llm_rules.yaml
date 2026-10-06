@@ -63,6 +63,13 @@ llm_rules:
   If NPC-specific rules already define a literal [DM CHECK: …] template, use that exact tag
   text when that situation applies (do not invent a different claim wording for the same check).
 - >-
+  NPC rules may define multiple [DM CHECK: …] templates. Each check may have its own
+  [DM Ruling: Success] / [DM Ruling: Failure] instructions. Tie them by listing Success and
+  Failure immediately after that check, or with matching ids:
+  [DM CHECK:id=language: …] with [DM Ruling: Success:id=language] / [DM Ruling: Failure:id=language].
+  After a confirmed/denied ruling, follow ONLY the Success/Failure instructions for the claim
+  that was ruled — never apply another check's outcomes.
+- >-
   If NPC-specific rules define [DM Ruling: Success] / [DM Ruling: Failure] (or equivalent),
   after a matching confirmed/denied DM ruling follow those instructions for how to reply.
 - >-
