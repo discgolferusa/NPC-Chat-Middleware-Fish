@@ -13,6 +13,13 @@ from typing import Any
 _POOL_LOCK = threading.Lock()
 _DEFAULT_SLOT_BUDGET = 10
 
+# Instrumentation gauges (do not affect scheduling). Protected by _METRICS_LOCK
+# except thread-local last-call fields.
+_METRICS_LOCK = threading.Lock()
+_waiting_acquires = 0
+_checked_out = 0
+_tls = threading.local()
+
 
 class _VoiceInstance:
     __slots__ = ("voice", "model_key")
@@ -280,6 +287,60 @@ def pool_status() -> dict[str, dict[str, Any]]:
         }
 
 
+def pool_runtime_metrics() -> dict[str, Any]:
+    """
+    Instrumentation snapshot: active slots, waiting acquires, per-model status.
+
+    Does not change pool behavior. Values are gauges observed at call time.
+    """
+    with _METRICS_LOCK:
+        waiting = int(_waiting_acquires)
+        active = int(_checked_out)
+    status = pool_status()
+    return {
+        "active_slots": active,
+        "waiting_requests": waiting,
+        "slot_budget": pool_slot_budget(),
+        "models": status,
+    }
+
+
+def last_call_metrics() -> dict[str, Any]:
+    """
+    Per-thread metrics from the most recent synthesize_wav_file on this thread.
+
+    Missing fields are omitted (caller should treat as unavailable).
+    """
+    out: dict[str, Any] = {}
+    acquire_ms = getattr(_tls, "last_acquire_wait_ms", None)
+    synth_ms = getattr(_tls, "last_synth_ms", None)
+    if acquire_ms is not None:
+        out["acquire_wait_ms"] = int(acquire_ms)
+    if synth_ms is not None:
+        out["synth_ms"] = int(synth_ms)
+    return out
+
+
+def _metrics_enter_acquire() -> None:
+    global _waiting_acquires
+    with _METRICS_LOCK:
+        _waiting_acquires += 1
+
+
+def _metrics_leave_acquire(*, acquired: bool) -> None:
+    global _waiting_acquires, _checked_out
+    with _METRICS_LOCK:
+        _waiting_acquires = max(0, _waiting_acquires - 1)
+        if acquired:
+            _checked_out += 1
+
+
+def _metrics_release_checkout() -> None:
+    global _checked_out
+    with _METRICS_LOCK:
+        _checked_out = max(0, _checked_out - 1)
+
+
 def wait_until_ready(*, timeout_seconds: float = 300.0) -> dict[str, dict[str, Any]]:
     """Block until every registered model has reached its replica target.
 
@@ -406,28 +467,17 @@ def _acquire_instance(model_path: Path) -> _VoiceInstance:
     key = _voice_key(model_path)
     deadline = time.perf_counter() + 120.0
     retried_error = False
+    wait_started = time.perf_counter()
+    acquired = False
+    _metrics_enter_acquire()
+    try:
+        while True:
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                raise TimeoutError(f"Timed out waiting for Piper voice load: {model_path}")
 
-    while True:
-        remaining = deadline - time.perf_counter()
-        if remaining <= 0:
-            raise TimeoutError(f"Timed out waiting for Piper voice load: {model_path}")
+            entry = _kick_loaders(model_path)
 
-        entry = _kick_loaders(model_path)
-
-        snap = _snapshot_acquire_state(key)
-        if snap is None:
-            continue
-        has_instances, err, inflight, ready_event = snap
-        if not has_instances and err is not None and inflight == 0:
-            if retried_error:
-                raise err
-            retried_error = True
-            # Must not hold _POOL_LOCK here — _kick_loaders takes it (non-reentrant).
-            entry = _kick_loaders(model_path, clear_error=True)
-
-        try:
-            return entry.free.get(timeout=min(0.5, remaining))
-        except queue.Empty:
             snap = _snapshot_acquire_state(key)
             if snap is None:
                 continue
@@ -436,23 +486,47 @@ def _acquire_instance(model_path: Path) -> _VoiceInstance:
                 if retried_error:
                     raise err
                 retried_error = True
-                _kick_loaders(model_path, clear_error=True)
+                # Must not hold _POOL_LOCK here — _kick_loaders takes it (non-reentrant).
+                entry = _kick_loaders(model_path, clear_error=True)
+
+            try:
+                instance = entry.free.get(timeout=min(0.5, remaining))
+                acquired = True
+                _tls.last_acquire_wait_ms = max(
+                    0, int(round((time.perf_counter() - wait_started) * 1000))
+                )
+                return instance
+            except queue.Empty:
+                snap = _snapshot_acquire_state(key)
+                if snap is None:
+                    continue
+                has_instances, err, inflight, ready_event = snap
+                if not has_instances and err is not None and inflight == 0:
+                    if retried_error:
+                        raise err
+                    retried_error = True
+                    _kick_loaders(model_path, clear_error=True)
+                    continue
+                if not has_instances:
+                    # Wait outside _POOL_LOCK so loaders can store replicas / set ready.
+                    ready_event.wait(timeout=min(0.5, remaining))
                 continue
-            if not has_instances:
-                # Wait outside _POOL_LOCK so loaders can store replicas / set ready.
-                ready_event.wait(timeout=min(0.5, remaining))
-            continue
+    finally:
+        _metrics_leave_acquire(acquired=acquired)
 
 
 def _release_instance(instance: _VoiceInstance) -> None:
-    with _POOL_LOCK:
-        entry = _MODELS.get(instance.model_key)
-        if entry is None:
-            return
-        if len(entry.instances) > entry.target_count and instance in entry.instances:
-            entry.instances.remove(instance)
-            return
-    entry.free.put(instance)
+    try:
+        with _POOL_LOCK:
+            entry = _MODELS.get(instance.model_key)
+            if entry is None:
+                return
+            if len(entry.instances) > entry.target_count and instance in entry.instances:
+                entry.instances.remove(instance)
+                return
+        entry.free.put(instance)
+    finally:
+        _metrics_release_checkout()
 
 
 def synthesize_wav_file(
@@ -469,6 +543,8 @@ def synthesize_wav_file(
     """Synthesize text to a WAV file using a pooled in-process Piper voice replica."""
     from piper import SynthesisConfig
 
+    _tls.last_acquire_wait_ms = None
+    _tls.last_synth_ms = None
     instance = _acquire_instance(model_path)
     voice = instance.voice
     try:
@@ -481,6 +557,7 @@ def synthesize_wav_file(
         )
         silence_bytes = bytes(int(voice.config.sample_rate * sentence_silence * 2))
 
+        synth_started = time.perf_counter()
         with wave.open(str(output_path), "wb") as wav_file:
             wav_params_set = False
             for chunk_index, audio_chunk in enumerate(voice.synthesize(text, syn_config)):
@@ -494,14 +571,23 @@ def synthesize_wav_file(
                     wav_file.writeframes(silence_bytes)
 
                 wav_file.writeframes(audio_chunk.audio_int16_bytes)
+        _tls.last_synth_ms = max(
+            0, int(round((time.perf_counter() - synth_started) * 1000))
+        )
     finally:
         _release_instance(instance)
 
 
 def clear_pool_for_tests() -> None:
     """Reset module state (tests only)."""
+    global _waiting_acquires, _checked_out
     with _POOL_LOCK:
         _MODELS.clear()
+    with _METRICS_LOCK:
+        _waiting_acquires = 0
+        _checked_out = 0
+    _tls.last_acquire_wait_ms = None
+    _tls.last_synth_ms = None
 
 
 def model_replica_counts_for_tests() -> dict[str, int]:

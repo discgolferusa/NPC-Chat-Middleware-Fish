@@ -56,6 +56,8 @@ VOICE_TTS_LABELS = frozenset(
         "piper segmented tts",
         "piper tts",
         "synthesize speech",
+        "preview piper synthesize",
+        "preview ffmpeg normalize",
     }
 )
 
