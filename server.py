@@ -5629,17 +5629,45 @@ def list_voice_attributions():
     })
 
 
+def _attach_piper_pool_headers(response: Any) -> Any:
+    """Attach instrumentation-only Piper pool metrics to an HTTP response."""
+    try:
+        call = piper_pool.last_call_metrics()
+        runtime = piper_pool.pool_runtime_metrics()
+        if "acquire_wait_ms" in call:
+            response.headers["X-Piper-Acquire-Wait-Ms"] = str(call["acquire_wait_ms"])
+        if "synth_ms" in call:
+            response.headers["X-Piper-Synth-Ms"] = str(call["synth_ms"])
+        response.headers["X-Piper-Active-Slots"] = str(int(runtime.get("active_slots") or 0))
+        response.headers["X-Piper-Waiting-Requests"] = str(
+            int(runtime.get("waiting_requests") or 0)
+        )
+    except Exception as ex:
+        print(f"[PIPER-POOL] metrics_header_failed error={ex!r}", flush=True)
+    return response
+
+
+@app.get("/piper-pool/metrics")
+def piper_pool_metrics():
+    """Read-only Piper pool gauges for performance harnesses."""
+    return jsonify(piper_pool.pool_runtime_metrics())
+
+
 @app.post("/voices/preview")
 def preview_voice():
-    started = time.perf_counter()
+    request_id = f"voice-preview-{uuid.uuid4().hex}"
+    begin_request_timing()
+    step_start = time.perf_counter()
     body = request.get_json(force=True, silent=True) or {}
     voice_path = (body.get("voice_path") or body.get("voice_model") or "").strip()
     if not voice_path:
-        return jsonify({"error": "Missing voice_path"}), 400
+        err = jsonify({"error": "Missing voice_path"})
+        return attach_timing_headers(err, request_id, include_voice_phases=True), 400
 
     text = (body.get("text") or VOICE_PREVIEW_TEXT).strip()
     if not text:
-        return jsonify({"error": "Missing text"}), 400
+        err = jsonify({"error": "Missing text"})
+        return attach_timing_headers(err, request_id, include_voice_phases=True), 400
 
     opts = options_from_request_and_npc(
         _tts_request_values_from_mapping(body),
@@ -5650,10 +5678,8 @@ def preview_voice():
     raw_path = OUTPUT_DIR / f"{uuid.uuid4().hex}_voice_preview_raw.wav"
     output_path = OUTPUT_DIR / f"{uuid.uuid4().hex}_voice_preview.wav"
     try:
-        resolve_started = time.perf_counter()
         model_path = resolve_voice_model_path(voice_path)
-        resolve_elapsed = time.perf_counter() - resolve_started
-        synth_started = time.perf_counter()
+        step_start = log_timing(request_id, "preview resolve voice model", step_start)
         synthesize_speech(
             spoken,
             str(model_path),
@@ -5664,6 +5690,7 @@ def preview_voice():
             sentence_silence=opts["sentence_silence"],
             speaker_id=opts.get("speaker_id"),
         )
+        step_start = log_timing(request_id, "preview piper synthesize", step_start)
         convert_wav_to_standard_format(
             raw_path,
             output_path,
@@ -5672,25 +5699,41 @@ def preview_voice():
             denoise_nr=opts.get("denoise_nr"),
             denoise_nf=opts.get("denoise_nf"),
         )
-        print(
-            f"[VOICE] preview ok resolve={resolve_elapsed:.3f}s "
-            f"synth+fx={time.perf_counter() - synth_started:.3f}s "
-            f"total={time.perf_counter() - started:.3f}s path={voice_path}",
-            flush=True,
-        )
-        return send_file(
+        log_timing(request_id, "preview ffmpeg normalize", step_start)
+        note_first_audio_ms()
+        response = send_file(
             output_path,
             mimetype="audio/wav",
             as_attachment=False,
             download_name="voice_preview.wav",
         )
+        attach_timing_headers(response, request_id, include_voice_phases=True)
+        return _attach_piper_pool_headers(response)
     except FileNotFoundError as ex:
-        return _client_error(ex, 404, not_found=True)
+        body_resp, status = _client_error(ex, 404, not_found=True)
+        return (
+            _attach_piper_pool_headers(
+                attach_timing_headers(body_resp, request_id, include_voice_phases=True)
+            ),
+            status,
+        )
     except subprocess.CalledProcessError as ex:
-        return jsonify({"error": f"Piper synthesis failed: {ex}"}), 500
+        err = jsonify({"error": f"Piper synthesis failed: {ex}"})
+        return (
+            _attach_piper_pool_headers(
+                attach_timing_headers(err, request_id, include_voice_phases=True)
+            ),
+            500,
+        )
     except Exception as ex:
         print(f"[VOICE] preview failed: {ex!r}", flush=True)
-        return _client_error(ex, 500)
+        body_resp, status = _client_error(ex, 500)
+        return (
+            _attach_piper_pool_headers(
+                attach_timing_headers(body_resp, request_id, include_voice_phases=True)
+            ),
+            status,
+        )
     finally:
         raw_path.unlink(missing_ok=True)
 

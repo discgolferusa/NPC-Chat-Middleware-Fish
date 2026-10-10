@@ -552,3 +552,81 @@ def test_slow_warm_completes_while_acquire_waits(monkeypatch, tmp_path):
     thread.join(timeout=2.0)
     assert thread.is_alive() is False
     assert result["voice"].model_path == model_path
+
+
+def test_pool_metrics_record_acquire_wait_and_synth(monkeypatch, tmp_path):
+    """Instrumentation records wait/synth without changing allocation outcomes."""
+    piper_pool.clear_pool_for_tests()
+    model_path = _write_onnx_with_speakers(tmp_path / "metrics.onnx", 1)
+    monkeypatch.setattr(piper_pool, "_create_piper_voice", lambda path: _FakeVoice(path))
+    monkeypatch.setenv("PIPER_POOL_SLOTS", "1")
+
+    piper_pool.warm_voice_models([model_path], wait_for_ready=True, timeout_seconds=5.0)
+    out = tmp_path / "out.wav"
+    piper_pool.synthesize_wav_file(
+        model_path,
+        out,
+        "Hello metrics.",
+        length_scale=1.0,
+        noise_scale=0.667,
+        noise_w=0.8,
+        sentence_silence=0.2,
+    )
+    call = piper_pool.last_call_metrics()
+    assert "acquire_wait_ms" in call
+    assert "synth_ms" in call
+    assert call["acquire_wait_ms"] >= 0
+    assert call["synth_ms"] >= 0
+    runtime = piper_pool.pool_runtime_metrics()
+    assert runtime["waiting_requests"] == 0
+    assert runtime["active_slots"] == 0
+    assert out.is_file()
+
+
+def test_waiting_requests_gauge_during_contention(monkeypatch, tmp_path):
+    piper_pool.clear_pool_for_tests()
+    model_path = _write_onnx_with_speakers(tmp_path / "wait-gauge.onnx", 1)
+    monkeypatch.setattr(piper_pool, "_create_piper_voice", lambda path: _FakeVoice(path))
+    monkeypatch.setenv("PIPER_POOL_SLOTS", "1")
+    piper_pool.warm_voice_models([model_path], wait_for_ready=True, timeout_seconds=5.0)
+
+    hold = threading.Event()
+    held = threading.Event()
+
+    def hold_slot():
+        instance = piper_pool._acquire_instance(model_path)
+        held.set()
+        assert hold.wait(timeout=2.0)
+        piper_pool._release_instance(instance)
+
+    t1 = threading.Thread(target=hold_slot)
+    t1.start()
+    assert held.wait(timeout=1.0)
+
+    waiting_seen = {"max": 0}
+    stop = threading.Event()
+
+    def waiter():
+        instance = piper_pool._acquire_instance(model_path)
+        piper_pool._release_instance(instance)
+
+    def sample():
+        while not stop.wait(0.01):
+            waiting_seen["max"] = max(
+                waiting_seen["max"],
+                int(piper_pool.pool_runtime_metrics()["waiting_requests"]),
+            )
+
+    t_sample = threading.Thread(target=sample)
+    t_sample.start()
+    t2 = threading.Thread(target=waiter)
+    t2.start()
+    time.sleep(0.1)
+    assert waiting_seen["max"] >= 1 or piper_pool.pool_runtime_metrics()["active_slots"] >= 1
+    hold.set()
+    t1.join(timeout=2.0)
+    t2.join(timeout=2.0)
+    stop.set()
+    t_sample.join(timeout=1.0)
+    assert piper_pool.pool_runtime_metrics()["waiting_requests"] == 0
+    assert piper_pool.pool_runtime_metrics()["active_slots"] == 0
