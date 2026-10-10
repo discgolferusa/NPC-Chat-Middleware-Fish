@@ -93,9 +93,110 @@ def first_chunk_reserved_slots() -> int:
     return min(reserved, budget - 1)
 
 
+def parse_model_slot_budgets(raw: str | None = None) -> dict[str, int]:
+    """
+    Parse ``PIPER_MODEL_SLOT_BUDGETS`` like ``en_US-libritts-high:8,lessac:2``.
+
+    Keys are matched case-insensitively against model file stems (and full stem
+    prefixes). Values are replica counts (>= 1).
+    """
+    text = str(raw if raw is not None else os.environ.get("PIPER_MODEL_SLOT_BUDGETS", "")).strip()
+    if not text:
+        return {}
+    out: dict[str, int] = {}
+    for part in text.split(","):
+        piece = part.strip()
+        if not piece or ":" not in piece:
+            continue
+        name, _, count_s = piece.partition(":")
+        key = name.strip().lower()
+        if not key:
+            continue
+        try:
+            count = max(1, int(count_s.strip()))
+        except ValueError:
+            continue
+        out[key] = count
+    return out
+
+
+def _match_budget_key(model_path: Path, budgets: dict[str, int]) -> int | None:
+    if not budgets:
+        return None
+    stem = model_path.stem.lower()
+    if stem in budgets:
+        return budgets[stem]
+    # Allow partial keys (e.g. "libritts" → en_US-libritts-high).
+    for key, count in budgets.items():
+        if key in stem:
+            return count
+    return None
+
+
+def apply_explicit_slot_budgets(
+    model_keys: list[str],
+    total_slots: int,
+    budgets: dict[str, int] | None = None,
+) -> dict[str, int] | None:
+    """
+    Build per-model targets from explicit budgets.
+
+    Returns None when no budgets apply (caller should use speaker-weight allocation).
+    Unlisted models get at least 1 if slots remain; excess budget is clamped to
+    ``total_slots``.
+    """
+    parsed = budgets if budgets is not None else parse_model_slot_budgets()
+    if not parsed or not model_keys:
+        return None
+
+    budget = max(1, int(total_slots))
+    assigned: dict[str, int] = {}
+    matched = 0
+    for key in model_keys:
+        hit = _match_budget_key(Path(key), parsed)
+        if hit is not None:
+            assigned[key] = hit
+            matched += 1
+        else:
+            assigned[key] = 0
+
+    if matched == 0:
+        return None
+
+    # Ensure every model has at least 1 when possible.
+    for key in model_keys:
+        if assigned[key] < 1:
+            assigned[key] = 1
+
+    used = sum(assigned.values())
+    if used > budget:
+        # Scale down largest first until within budget, never below 1.
+        while used > budget:
+            donor = max(model_keys, key=lambda k: assigned[k])
+            if assigned[donor] <= 1:
+                break
+            assigned[donor] -= 1
+            used -= 1
+    elif used < budget:
+        # Give remainder to models that appeared in the explicit map (prefer those).
+        prefer = [k for k in model_keys if _match_budget_key(Path(k), parsed) is not None]
+        order = prefer + [k for k in model_keys if k not in prefer]
+        rem = budget - used
+        i = 0
+        while rem > 0 and order:
+            assigned[order[i % len(order)]] += 1
+            rem -= 1
+            i += 1
+
+    return assigned
+
+
 def allocate_replicas(weights: dict[str, int], total_slots: int) -> dict[str, int]:
     """
     Largest-remainder share of ``total_slots`` by speaker weight.
+
+    When ``PIPER_MODEL_SLOT_BUDGETS`` matches registered models, those explicit
+    targets win (see ``apply_explicit_slot_budgets``).
 
     Each registered model gets at least 1 when ``len(weights) <= total_slots``.
     If more models than slots, each still gets 1 (soft over-budget) so none starve.
@@ -103,6 +204,9 @@ def allocate_replicas(weights: dict[str, int], total_slots: int) -> dict[str, in
     if not weights:
         return {}
     keys = list(weights.keys())
+    explicit = apply_explicit_slot_budgets(keys, total_slots)
+    if explicit is not None:
+        return explicit
     n = len(keys)
     cleaned = {k: max(1, int(weights[k] or 1)) for k in keys}
     budget = max(1, int(total_slots))

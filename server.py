@@ -165,6 +165,7 @@ from tts_processing import (
     options_from_request_and_npc,
     resolve_tts_options,
     split_text_for_streaming,
+    ttfa_fast_ffmpeg_enabled,
 )
 from piper_paths import LEGACY_WINDOWS_PIPER_EXE, resolve_piper_exe
 import piper_pool
@@ -2461,12 +2462,16 @@ def convert_wav_to_standard_format(
     trim_silence: bool = True,
     denoise_nr: float | None = None,
     denoise_nf: float | None = None,
+    ttfa_fast: bool = False,
 ) -> None:
     """
     Convert a WAV file to standard Piper-friendly PCM with clarity post-processing.
 
     Output is 22.05 kHz mono 16-bit PCM WAV. Applies loudness/EQ/dynamics,
     optional pitch shift, silence trim, and character FX presets.
+
+    ``ttfa_fast`` uses a shorter FFmpeg chain for first-chunk TTFA (see
+    ``tts_processing.build_af_filter``).
     """
     ffmpeg_exe = find_ffmpeg_exe()
     af = build_af_filter(
@@ -2476,6 +2481,7 @@ def convert_wav_to_standard_format(
         sample_rate=STANDARD_WAV_SAMPLE_RATE,
         denoise_nr=DEFAULT_DENOISE_NR if denoise_nr is None else denoise_nr,
         denoise_nf=DEFAULT_DENOISE_NF if denoise_nf is None else denoise_nf,
+        ttfa_fast=ttfa_fast,
     )
 
     subprocess.run(
@@ -2801,6 +2807,7 @@ def synthesize_segmented_speech_clips(
                 fx_preset=str(opts.get("fx_preset") or DEFAULT_FX_PRESET),
                 denoise_nr=opts.get("denoise_nr"),
                 denoise_nf=opts.get("denoise_nf"),
+                ttfa_fast=(index == 0 and ttfa_fast_ffmpeg_enabled()),
             )
             _emit(
                 "segment_postprocess_complete",
