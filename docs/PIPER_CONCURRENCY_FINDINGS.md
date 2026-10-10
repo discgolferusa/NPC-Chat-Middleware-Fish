@@ -100,6 +100,13 @@ site-packages. Production default remains unchanged (automatic ORT threading).
 
 Pool weighting uses `num_speakers` from `.onnx.json` (`allocate_replicas`). A high-speaker LibriTTS model can claim most/all of `PIPER_POOL_SLOTS` (default 10), matching “eight loaded instances” when other models take remaining slots or budget is 8.
 
+**P1 — explicit budgets:** set `PIPER_MODEL_SLOT_BUDGETS=en_US-libritts-high:8,lessac:2`
+(stem/substring match) to stop LibriTTS speaker-count from starving narrator/Clean voices.
+
+**P1 — TTFA-fast FFmpeg:** first streaming clip uses a lighter `-af` chain when
+`PIPER_TTFA_FAST_FFMPEG` is unset/`1` (skip afftdn/dynaudnorm/full reverse trim).
+Follow-up clips keep the full clarity chain. Set `0` to disable.
+
 ## Diagnostic benchmark
 
 Script (no production lock changes):

@@ -851,6 +851,21 @@ def resolve_tts_options(
     }
 
 
+def ttfa_fast_ffmpeg_enabled() -> bool:
+    """
+    Lighter first-clip FFmpeg chain for server-side TTFA.
+
+    ``PIPER_TTFA_FAST_FFMPEG`` unset or truthy → enabled; ``0``/``false``/``no`` → off.
+    Follow-up clips should keep the full clarity chain.
+    """
+    import os
+
+    raw = str(os.environ.get("PIPER_TTFA_FAST_FFMPEG", "1")).strip().lower()
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return True
+
+
 def build_af_filter(
     *,
     pitch_semitones: float = 0.0,
@@ -859,10 +874,14 @@ def build_af_filter(
     sample_rate: int = 22050,
     denoise_nr: float = DEFAULT_DENOISE_NR,
     denoise_nf: float = DEFAULT_DENOISE_NF,
+    ttfa_fast: bool = False,
 ) -> str:
     """
     Build an FFmpeg -af chain: optional silence trim, clarity EQ/dynamics,
     pitch shift, and character FX presets.
+
+    When ``ttfa_fast`` is true, skip denoise / heavy dynamics / trailing silence
+    reverse-trim so first-chunk packaging stays short for TTFA.
     """
     filters: list[str] = []
 
@@ -873,24 +892,30 @@ def build_af_filter(
         filters.append(
             "silenceremove=start_periods=1:start_silence=0.05:start_threshold=-45dB"
         )
-        filters.append("areverse")
-        filters.append(
-            "silenceremove=start_periods=1:start_silence=0.05:start_threshold=-45dB"
-        )
-        filters.append("areverse")
-        filters.append("apad=pad_dur=0.04")
+        if not ttfa_fast:
+            filters.append("areverse")
+            filters.append(
+                "silenceremove=start_periods=1:start_silence=0.05:start_threshold=-45dB"
+            )
+            filters.append("areverse")
+            filters.append("apad=pad_dur=0.04")
+        else:
+            filters.append("apad=pad_dur=0.02")
 
     # Always-on clarity baseline (ElevenLabs-ish speaker boost / loudness feel).
     filters.append("highpass=f=80")
-    nr = _clamp(float(denoise_nr if denoise_nr is not None else DEFAULT_DENOISE_NR), DENOISE_NR_MIN, DENOISE_NR_MAX)
-    nf = _clamp(float(denoise_nf if denoise_nf is not None else DEFAULT_DENOISE_NF), DENOISE_NF_MIN, DENOISE_NF_MAX)
-    # nr=0 disables spectral denoise (useful when comparing or if speech dulls).
-    if nr > 0.05:
-        filters.append(f"afftdn=nr={nr:.2f}:nf={nf:.2f}")
-    filters.append("equalizer=f=3000:t=q:w=1.2:g=2.5")
-    filters.append("acompressor=threshold=-18dB:ratio=2.5:attack=10:release=80:makeup=2")
-    filters.append("alimiter=limit=0.95")
-    filters.append("dynaudnorm=f=150:g=10:p=0.85")
+    if not ttfa_fast:
+        nr = _clamp(float(denoise_nr if denoise_nr is not None else DEFAULT_DENOISE_NR), DENOISE_NR_MIN, DENOISE_NR_MAX)
+        nf = _clamp(float(denoise_nf if denoise_nf is not None else DEFAULT_DENOISE_NF), DENOISE_NF_MIN, DENOISE_NF_MAX)
+        # nr=0 disables spectral denoise (useful when comparing or if speech dulls).
+        if nr > 0.05:
+            filters.append(f"afftdn=nr={nr:.2f}:nf={nf:.2f}")
+        filters.append("equalizer=f=3000:t=q:w=1.2:g=2.5")
+        filters.append("acompressor=threshold=-18dB:ratio=2.5:attack=10:release=80:makeup=2")
+        filters.append("alimiter=limit=0.95")
+        filters.append("dynaudnorm=f=150:g=10:p=0.85")
+    else:
+        filters.append("alimiter=limit=0.95")
 
     preset = _as_fx_preset(fx_preset)
     if preset == "cave":
