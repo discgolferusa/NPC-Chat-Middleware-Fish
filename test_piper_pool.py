@@ -245,7 +245,9 @@ def test_synthesize_wav_file_uses_pooled_voice(monkeypatch, tmp_path):
 
     fake_voice = _FakeVoice(model_path)
     instance = piper_pool._VoiceInstance(fake_voice, str(model_path))
-    monkeypatch.setattr(piper_pool, "_acquire_instance", lambda path: instance)
+    monkeypatch.setattr(
+        piper_pool, "_acquire_instance", lambda path, **kwargs: instance
+    )
     monkeypatch.setattr(piper_pool, "_release_instance", lambda inst: None)
 
     piper_pool.synthesize_wav_file(
