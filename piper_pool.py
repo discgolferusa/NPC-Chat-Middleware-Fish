@@ -133,14 +133,79 @@ def _speaker_weight(model_path: Path) -> int:
     return max(1, int(meta.get("num_speakers") or 1))
 
 
+def onnx_intra_op_threads() -> int:
+    """
+    Optional ORT intra-op thread cap for each Piper InferenceSession.
+
+    ``PIPER_ONNX_INTRA_OP_THREADS`` unset or ``0`` → Piper/ORT automatic behavior
+    (same as stock ``PiperVoice.load`` / default ``SessionOptions``).
+    Values ``>= 1`` pin ``SessionOptions.intra_op_num_threads`` at session create.
+    """
+    raw = str(os.environ.get("PIPER_ONNX_INTRA_OP_THREADS", "")).strip()
+    if not raw:
+        return 0
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 0
+
+
 def _create_piper_voice(model_path: Path) -> Any:
+    """
+    Load a Piper voice for the pool.
+
+    ``PiperVoice.load()`` does not expose ONNX ``SessionOptions``. When
+    ``PIPER_ONNX_INTRA_OP_THREADS`` is 0/unset we call ``load()`` unchanged.
+    When set to a positive integer we construct the same ``PiperVoice`` shape
+    as upstream load, but with a custom ``InferenceSession`` so the thread
+    setting takes effect on a newly created session (no installed-package edits).
+    """
     from piper import PiperVoice
+    from piper.config import PiperConfig
+    from piper.phonemize_espeak import ESPEAK_DATA_DIR
 
     if not model_path.is_file():
         raise FileNotFoundError(f"Piper voice model not found: {model_path}")
 
     use_cuda = str(os.environ.get("PIPER_USE_CUDA", "")).strip().lower() in ("1", "true", "yes")
-    return PiperVoice.load(model_path, use_cuda=use_cuda)
+    intra = onnx_intra_op_threads()
+    if intra <= 0:
+        return PiperVoice.load(model_path, use_cuda=use_cuda)
+
+    import json
+
+    import onnxruntime
+
+    config_path = Path(str(model_path) + ".json")
+    if not config_path.is_file():
+        raise FileNotFoundError(f"Piper voice config not found: {config_path}")
+    with open(config_path, "r", encoding="utf-8") as config_file:
+        config_dict = json.load(config_file)
+
+    if use_cuda:
+        providers: list[Any] = [
+            ("CUDAExecutionProvider", {"cudnn_conv_algo_search": "HEURISTIC"}),
+        ]
+    else:
+        providers = ["CPUExecutionProvider"]
+
+    sess_options = onnxruntime.SessionOptions()
+    sess_options.intra_op_num_threads = int(intra)
+    session = onnxruntime.InferenceSession(
+        str(model_path),
+        sess_options=sess_options,
+        providers=providers,
+    )
+    print(
+        f"[PIPER-POOL] onnx_intra_op_threads={intra} model={model_path.name}",
+        flush=True,
+    )
+    return PiperVoice(
+        config=PiperConfig.from_dict(config_dict),
+        session=session,
+        espeak_data_dir=Path(ESPEAK_DATA_DIR),
+        download_dir=Path.cwd(),
+    )
 
 
 def _trim_idle_surplus_locked(entry: _ModelEntry) -> None:
