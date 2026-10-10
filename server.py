@@ -2772,6 +2772,7 @@ def synthesize_segmented_speech_clips(
                 noise_w=opts["noise_w"],
                 sentence_silence=opts["sentence_silence"],
                 speaker_id=opts.get("speaker_id"),
+                first_chunk=(index == 0),
             )
             from piper_pool import last_call_metrics
 
@@ -3251,6 +3252,8 @@ def synthesize_speech(
     noise_w: float = DEFAULT_NOISE_W,
     sentence_silence: float = DEFAULT_SENTENCE_SILENCE,
     speaker_id: int | None = None,
+    *,
+    first_chunk: bool = True,
 ) -> None:
     # Same resolution as /voices/preview so UNC/partial/editor paths work at runtime.
     model_path = resolve_voice_model_path(voice_model)
@@ -3273,6 +3276,7 @@ def synthesize_speech(
             noise_w=noise_w,
             sentence_silence=sentence_silence,
             speaker_id=speaker_id,
+            first_chunk=first_chunk,
         )
         return
 

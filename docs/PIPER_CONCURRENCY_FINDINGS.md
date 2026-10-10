@@ -94,7 +94,18 @@ Opt-in cap: set `PIPER_ONNX_INTRA_OP_THREADS` (default unset/`0` = stock automat
 When `>= 1`, [`piper_pool._create_piper_voice`](../piper_pool.py) builds the
 `InferenceSession` with `SessionOptions.intra_op_num_threads` set — `PiperVoice.load()`
 does not expose session options, so we mirror its constructor path without editing
-site-packages. Production default remains unchanged (automatic ORT threading).
+site-packages.
+
+**Multi-table hosts:** prefer `PIPER_ONNX_INTRA_OP_THREADS=2` or `4` (S1 v2 on Ryzen:
+auto/`0` collapses under concurrency; 2–4 win on TTFA/CPU). Solo-dev may keep unset/`0`.
+
+### First-chunk reservation (P0)
+
+`PIPER_FIRST_CHUNK_RESERVED` (default **2**, `0` = off) keeps free replicas preferentially
+for `first_chunk=True` acquires (clip 0 / preview). Follow-up segments
+(`synthesize_speech(..., first_chunk=False)` from segmented TTS) yield when first-chunk
+waiters exist and only `reserved` free replicas remain. Does **not** change within-response
+sequential synth ordering.
 
 ## LibriTTS High × 8 replicas
 
