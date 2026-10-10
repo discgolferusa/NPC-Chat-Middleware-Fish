@@ -2645,6 +2645,7 @@ def synthesize_segmented_speech_clips(
     *,
     return_after_first_clip: bool = False,
     on_stream_complete: Any = None,
+    on_timing_event: Any = None,
 ) -> dict[str, Any]:
     """
     Synthesize ordered narrator/NPC segments as separate WAV files (no concatenation).
@@ -2655,16 +2656,38 @@ def synthesize_segmented_speech_clips(
     When ``return_after_first_clip`` is true and more segments remain, returns after the
     first clip with ``pending=True`` and continues remaining segments on a background
     thread (progress + ``on_stream_complete``).
+
+    Optional ``on_timing_event(event: str, **payload)`` is for benchmarks only; when
+    omitted, production behavior is unchanged.
     """
+    def _emit(event: str, **payload: Any) -> None:
+        if not callable(on_timing_event):
+            return
+        try:
+            on_timing_event(event, **payload)
+        except Exception as ex:
+            print(f"[PLAYER-AUDIO] on_timing_event failed event={event} error={ex!r}", flush=True)
+
+    _emit("tts_request_start", t=time.perf_counter())
     npc_opts = npc_tts_options or resolve_tts_options(
         {},
         length_scale=npc_length_scale,
     )
     pronunciation = npc_opts.get("pronunciation") if isinstance(npc_opts.get("pronunciation"), dict) else None
 
+    _emit("segmentation_start", t=time.perf_counter())
     segments = split_into_ordered_tts_segments(npc_text, pronunciation=pronunciation)
     if not segments:
         segments = [{"type": "npc", "text": "I have nothing more to say."}]
+    _emit(
+        "segmentation_complete",
+        t=time.perf_counter(),
+        segment_count=len(segments),
+        segments=[
+            {"type": s.get("type"), "chars": len(s.get("text") or ""), "text": s.get("text")}
+            for s in segments
+        ],
+    )
 
     narration_text = " ".join(s["text"] for s in segments if s["type"] == "narrator").strip()
     dialogue_text = " ".join(s["text"] for s in segments if s["type"] == "npc").strip()
@@ -2723,6 +2746,16 @@ def synthesize_segmented_speech_clips(
             else npc_voice_model
         )
 
+        _emit(
+            "segment_synth_start",
+            t=time.perf_counter(),
+            index=index,
+            segment_type=segment["type"],
+            chars=len(segment["text"] or ""),
+            is_first_chunk=(index == 0),
+        )
+        if index == 0:
+            _emit("first_pool_acquire_start", t=time.perf_counter(), index=0)
         try:
             synthesize_speech(
                 segment["text"],
@@ -2734,7 +2767,32 @@ def synthesize_segmented_speech_clips(
                 sentence_silence=opts["sentence_silence"],
                 speaker_id=opts.get("speaker_id"),
             )
+            from piper_pool import last_call_metrics
 
+            call_metrics = last_call_metrics()
+            if index == 0:
+                _emit(
+                    "first_pool_acquire_complete",
+                    t=time.perf_counter(),
+                    index=0,
+                    acquire_wait_ms=call_metrics.get("acquire_wait_ms"),
+                )
+                _emit(
+                    "first_inference_complete",
+                    t=time.perf_counter(),
+                    index=0,
+                    synth_ms=call_metrics.get("synth_ms"),
+                )
+            _emit(
+                "segment_pool_metrics",
+                t=time.perf_counter(),
+                index=index,
+                is_first_chunk=(index == 0),
+                acquire_wait_ms=call_metrics.get("acquire_wait_ms"),
+                synth_ms=call_metrics.get("synth_ms"),
+            )
+
+            post_started = time.perf_counter()
             convert_wav_to_standard_format(
                 raw_path,
                 out_path,
@@ -2742,6 +2800,12 @@ def synthesize_segmented_speech_clips(
                 fx_preset=str(opts.get("fx_preset") or DEFAULT_FX_PRESET),
                 denoise_nr=opts.get("denoise_nr"),
                 denoise_nf=opts.get("denoise_nf"),
+            )
+            _emit(
+                "segment_postprocess_complete",
+                t=time.perf_counter(),
+                index=index,
+                postprocess_ms=max(0, int(round((time.perf_counter() - post_started) * 1000))),
             )
         finally:
             try:
@@ -2771,6 +2835,16 @@ def synthesize_segmented_speech_clips(
 
         if index == 0:
             note_first_audio_ms()
+            _emit("first_audio_ready", t=time.perf_counter(), index=0, path=str(out_path))
+
+        _emit(
+            "segment_ready",
+            t=time.perf_counter(),
+            index=index,
+            path=str(out_path),
+            clip_type=clip_type,
+            chars=len(segment["text"] or ""),
+        )
 
         print(
             f"[PLAYER-AUDIO] clip_ready request_id={request_id} index={index} "
@@ -2825,6 +2899,11 @@ def synthesize_segmented_speech_clips(
                     flush=True,
                 )
             finally:
+                _emit(
+                    "remaining_audio_complete",
+                    t=time.perf_counter(),
+                    error=repr(error) if error is not None else None,
+                )
                 if callable(on_stream_complete):
                     try:
                         on_stream_complete(_result(pending=False), error)
@@ -2851,6 +2930,7 @@ def synthesize_segmented_speech_clips(
         if _synthesize_one(index, segment) is None:
             break
 
+    _emit("remaining_audio_complete", t=time.perf_counter(), error=None)
     return _result(pending=False)
 
 
