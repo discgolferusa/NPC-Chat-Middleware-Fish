@@ -2883,15 +2883,55 @@ def synthesize_segmented_speech_clips(
         progress = get_turn_progress(request_id)
         raise TurnSupersededError(progress)
 
+    def _followup_parallelism() -> int:
+        """Max concurrent follow-up clip synths within one response (default 1)."""
+        raw = str(os.environ.get("PIPER_FOLLOWUP_PARALLEL", "")).strip()
+        if not raw:
+            return 1
+        try:
+            return max(1, min(4, int(raw)))
+        except ValueError:
+            return 1
+
+    def _synthesize_remaining(remaining: list[tuple[int, dict[str, Any]]]) -> None:
+        """
+        Synthesize follow-up clips. Default sequential; ``PIPER_FOLLOWUP_PARALLEL>1``
+        runs a limited thread pool. Consumers must key clips by ``index`` (may finish
+        out of order when parallel > 1).
+        """
+        if not remaining:
+            return
+        parallel = _followup_parallelism()
+        if parallel <= 1 or len(remaining) == 1:
+            for index, segment in remaining:
+                if _synthesize_one(index, segment) is None:
+                    break
+            return
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        print(
+            f"[PLAYER-AUDIO] followup_parallel={parallel} "
+            f"remaining={len(remaining)} request_id={request_id}",
+            flush=True,
+        )
+        with ThreadPoolExecutor(
+            max_workers=min(parallel, len(remaining)),
+            thread_name_prefix=f"tts-fu-{request_id[:6]}",
+        ) as pool:
+            futs = [
+                pool.submit(_synthesize_one, index, segment)
+                for index, segment in remaining
+            ]
+            for fut in as_completed(futs):
+                fut.result()
+
     if return_after_first_clip and len(segments) > 1:
         remaining = list(enumerate(segments[1:], start=1))
 
         def _continue_remaining() -> None:
             error: BaseException | None = None
             try:
-                for index, segment in remaining:
-                    if _synthesize_one(index, segment) is None:
-                        break
+                _synthesize_remaining(remaining)
             except BaseException as ex:
                 error = ex
                 print(
@@ -2926,9 +2966,7 @@ def synthesize_segmented_speech_clips(
         )
         return _result(pending=True)
 
-    for index, segment in enumerate(segments[1:], start=1):
-        if _synthesize_one(index, segment) is None:
-            break
+    _synthesize_remaining(list(enumerate(segments[1:], start=1)))
 
     _emit("remaining_audio_complete", t=time.perf_counter(), error=None)
     return _result(pending=False)
