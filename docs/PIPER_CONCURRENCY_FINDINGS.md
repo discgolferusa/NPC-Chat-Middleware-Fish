@@ -90,7 +90,11 @@ Observed defaults on this toolchain:
 - `inter_op_num_threads = 0` → auto
 - `execution_mode = ORT_SEQUENTIAL`
 
-We do **not** set per-session thread caps. With 8 LibriTTS replicas, concurrent synth can launch many ORT threads → oversubscription.
+Opt-in cap: set `PIPER_ONNX_INTRA_OP_THREADS` (default unset/`0` = stock automatic).
+When `>= 1`, [`piper_pool._create_piper_voice`](../piper_pool.py) builds the
+`InferenceSession` with `SessionOptions.intra_op_num_threads` set — `PiperVoice.load()`
+does not expose session options, so we mirror its constructor path without editing
+site-packages. Production default remains unchanged (automatic ORT threading).
 
 ## LibriTTS High × 8 replicas
 
@@ -127,9 +131,27 @@ Interpretation:
 | Wall ≈ sum of singles | Effective serialization (lock and/or CPU oversubscription) |
 | Wall ≈ max of singles | True parallel speedup |
 
-## Recommended next steps (not done yet)
+## ORT intra-op threading matrix
 
-1. Run the diagnostic on Ryzen with LibriTTS High; attach `piper-diag.json`.
-2. If phonemize is a large fraction of wall time: consider espeak isolation (process pool) or phonemize once / cache — **separate design**.
-3. If inference overlaps but wall still ~serial: cap `SessionOptions.intra_op_num_threads` per replica (e.g. 1–2) so N concurrent sessions fit the machine.
-4. Do **not** change pool locking until diag confirms the bottleneck.
+Script (pool allocation / speaker / synth logic unchanged; rebuilds sessions per config):
+
+[`scripts/benchmark_piper_ort_threads.py`](../scripts/benchmark_piper_ort_threads.py)
+
+Uses Platform fixtures `perf/fixtures/dialogue_{short,medium,long}.txt` and fail-closed
+safety from `NPC-Platform/perf` (no OpenRouter / Discord).
+
+```powershell
+cd C:\Users\jayhi\source\repos\NPC-Chat-Middleware
+.\.venv\Scripts\python.exe scripts\benchmark_piper_ort_threads.py `
+  --model C:\AI\Voices\en_US-libritts-high.onnx `
+  --platform-root C:\Users\jayhi\source\repos\NPC-Platform `
+  --slots 8 --repeats 3 `
+  --json-out reports\ort-threads.json
+```
+
+## Recommended next steps
+
+1. Run the ORT thread matrix on Ryzen; review `ort-threads.md` recommendations for c=1/4/8.
+2. If a capped setting wins under concurrency, set `PIPER_ONNX_INTRA_OP_THREADS` on the host (optional; default 0 preserves today’s behavior).
+3. If phonemize remains a large fraction of wall: consider espeak isolation — **separate design**.
+4. Do **not** change pool locking; diag already confirmed overlapping inference.
