@@ -13,12 +13,14 @@ from typing import Any
 
 _POOL_LOCK = threading.Lock()
 _DEFAULT_SLOT_BUDGET = 10
+_DEFAULT_FIRST_CHUNK_RESERVED = 2
 _DEFAULT_PHONEME_CACHE_SIZE = 256
 
 # Instrumentation gauges (do not affect scheduling). Protected by _METRICS_LOCK
 # except thread-local last-call fields.
 _METRICS_LOCK = threading.Lock()
 _waiting_acquires = 0
+_waiting_first_chunk = 0
 _checked_out = 0
 _tls = threading.local()
 
@@ -77,9 +79,132 @@ def pool_slot_budget() -> int:
         return _DEFAULT_SLOT_BUDGET
 
 
+def first_chunk_reserved_slots() -> int:
+    """
+    Replicas kept preferentially for first-chunk (TTFA) acquires.
+
+    ``PIPER_FIRST_CHUNK_RESERVED`` unset → default 2.
+    ``0`` disables reservation (legacy equal scheduling).
+    Capped so at least one replica remains usable for follow-ups when budget > 1.
+    """
+    raw = str(os.environ.get("PIPER_FIRST_CHUNK_RESERVED", "")).strip()
+    if not raw:
+        reserved = _DEFAULT_FIRST_CHUNK_RESERVED
+    else:
+        try:
+            reserved = max(0, int(raw))
+        except ValueError:
+            reserved = _DEFAULT_FIRST_CHUNK_RESERVED
+    budget = pool_slot_budget()
+    if budget <= 1:
+        return 0
+    return min(reserved, budget - 1)
+
+
+def parse_model_slot_budgets(raw: str | None = None) -> dict[str, int]:
+    """
+    Parse ``PIPER_MODEL_SLOT_BUDGETS`` like ``en_US-libritts-high:8,lessac:2``.
+
+    Keys are matched case-insensitively against model file stems (and full stem
+    prefixes). Values are replica counts (>= 1).
+    """
+    text = str(raw if raw is not None else os.environ.get("PIPER_MODEL_SLOT_BUDGETS", "")).strip()
+    if not text:
+        return {}
+    out: dict[str, int] = {}
+    for part in text.split(","):
+        piece = part.strip()
+        if not piece or ":" not in piece:
+            continue
+        name, _, count_s = piece.partition(":")
+        key = name.strip().lower()
+        if not key:
+            continue
+        try:
+            count = max(1, int(count_s.strip()))
+        except ValueError:
+            continue
+        out[key] = count
+    return out
+
+
+def _match_budget_key(model_path: Path, budgets: dict[str, int]) -> int | None:
+    if not budgets:
+        return None
+    stem = model_path.stem.lower()
+    if stem in budgets:
+        return budgets[stem]
+    # Allow partial keys (e.g. "libritts" → en_US-libritts-high).
+    for key, count in budgets.items():
+        if key in stem:
+            return count
+    return None
+
+
+def apply_explicit_slot_budgets(
+    model_keys: list[str],
+    total_slots: int,
+    budgets: dict[str, int] | None = None,
+) -> dict[str, int] | None:
+    """
+    Build per-model targets from explicit budgets.
+
+    Returns None when no budgets apply (caller should use speaker-weight allocation).
+    Unlisted models get at least 1 if slots remain; excess budget is clamped to
+    ``total_slots``.
+    """
+    parsed = budgets if budgets is not None else parse_model_slot_budgets()
+    if not parsed or not model_keys:
+        return None
+
+    budget = max(1, int(total_slots))
+    assigned: dict[str, int] = {}
+    matched = 0
+    for key in model_keys:
+        hit = _match_budget_key(Path(key), parsed)
+        if hit is not None:
+            assigned[key] = hit
+            matched += 1
+        else:
+            assigned[key] = 0
+
+    if matched == 0:
+        return None
+
+    # Ensure every model has at least 1 when possible.
+    for key in model_keys:
+        if assigned[key] < 1:
+            assigned[key] = 1
+
+    used = sum(assigned.values())
+    if used > budget:
+        # Scale down largest first until within budget, never below 1.
+        while used > budget:
+            donor = max(model_keys, key=lambda k: assigned[k])
+            if assigned[donor] <= 1:
+                break
+            assigned[donor] -= 1
+            used -= 1
+    elif used < budget:
+        # Give remainder to models that appeared in the explicit map (prefer those).
+        prefer = [k for k in model_keys if _match_budget_key(Path(k), parsed) is not None]
+        order = prefer + [k for k in model_keys if k not in prefer]
+        rem = budget - used
+        i = 0
+        while rem > 0 and order:
+            assigned[order[i % len(order)]] += 1
+            rem -= 1
+            i += 1
+
+    return assigned
+
+
 def allocate_replicas(weights: dict[str, int], total_slots: int) -> dict[str, int]:
     """
     Largest-remainder share of ``total_slots`` by speaker weight.
+
+    When ``PIPER_MODEL_SLOT_BUDGETS`` matches registered models, those explicit
+    targets win (see ``apply_explicit_slot_budgets``).
 
     Each registered model gets at least 1 when ``len(weights) <= total_slots``.
     If more models than slots, each still gets 1 (soft over-budget) so none starve.
@@ -87,6 +212,9 @@ def allocate_replicas(weights: dict[str, int], total_slots: int) -> dict[str, in
     if not weights:
         return {}
     keys = list(weights.keys())
+    explicit = apply_explicit_slot_budgets(keys, total_slots)
+    if explicit is not None:
+        return explicit
     n = len(keys)
     cleaned = {k: max(1, int(weights[k] or 1)) for k in keys}
     budget = max(1, int(total_slots))
@@ -426,15 +554,19 @@ def pool_runtime_metrics() -> dict[str, Any]:
     """
     Instrumentation snapshot: active slots, waiting acquires, per-model status.
 
-    Does not change pool behavior. Values are gauges observed at call time.
+    Gauge fields do not change scheduling by themselves; reservation policy uses
+    ``first_chunk_reserved_slots`` + ``waiting_first_chunk``.
     """
     with _METRICS_LOCK:
         waiting = int(_waiting_acquires)
+        waiting_first = int(_waiting_first_chunk)
         active = int(_checked_out)
     status = pool_status()
     return {
         "active_slots": active,
         "waiting_requests": waiting,
+        "waiting_first_chunk": waiting_first,
+        "first_chunk_reserved": first_chunk_reserved_slots(),
         "slot_budget": pool_slot_budget(),
         "phoneme_cache": phoneme_cache_stats(),
         "models": status,
@@ -454,19 +586,26 @@ def last_call_metrics() -> dict[str, Any]:
         out["acquire_wait_ms"] = int(acquire_ms)
     if synth_ms is not None:
         out["synth_ms"] = int(synth_ms)
+    first = getattr(_tls, "last_first_chunk", None)
+    if first is not None:
+        out["first_chunk"] = bool(first)
     return out
 
 
-def _metrics_enter_acquire() -> None:
-    global _waiting_acquires
+def _metrics_enter_acquire(*, first_chunk: bool) -> None:
+    global _waiting_acquires, _waiting_first_chunk
     with _METRICS_LOCK:
         _waiting_acquires += 1
+        if first_chunk:
+            _waiting_first_chunk += 1
 
 
-def _metrics_leave_acquire(*, acquired: bool) -> None:
-    global _waiting_acquires, _checked_out
+def _metrics_leave_acquire(*, acquired: bool, first_chunk: bool) -> None:
+    global _waiting_acquires, _waiting_first_chunk, _checked_out
     with _METRICS_LOCK:
         _waiting_acquires = max(0, _waiting_acquires - 1)
+        if first_chunk:
+            _waiting_first_chunk = max(0, _waiting_first_chunk - 1)
         if acquired:
             _checked_out += 1
 
@@ -560,6 +699,8 @@ def warm_voice_models(
     if request_id == "startup":
         print(
             f"[PIPER-POOL] allocation slot_budget={pool_slot_budget()} "
+            f"first_chunk_reserved={first_chunk_reserved_slots()} "
+            f"onnx_intra_op_threads={onnx_intra_op_threads()} "
             f"models={model_count} plan={allocation_plan}",
             flush=True,
         )
@@ -599,13 +740,40 @@ def _snapshot_acquire_state(key: str) -> tuple[bool, BaseException | None, int, 
         )
 
 
-def _acquire_instance(model_path: Path) -> _VoiceInstance:
+def _followup_may_take(entry: _ModelEntry) -> bool:
+    """
+    Best-effort reservation: follow-ups leave free replicas for first-chunk TTFA.
+
+    When ``PIPER_FIRST_CHUNK_RESERVED`` is 0, follow-ups compete equally.
+    When first-chunk waiters exist, follow-ups only take if free count exceeds the
+    reserved floor. If nobody is waiting for a first chunk, follow-ups may use
+    any free replica (avoid idle waste).
+    """
+    reserved = first_chunk_reserved_slots()
+    if reserved <= 0:
+        return True
+    with _METRICS_LOCK:
+        waiting_first = int(_waiting_first_chunk)
+    free_n = entry.free.qsize()
+    if waiting_first <= 0:
+        return free_n > 0
+    return free_n > reserved
+
+
+def _acquire_instance(model_path: Path, *, first_chunk: bool = True) -> _VoiceInstance:
+    """
+    Check out a warm replica.
+
+    ``first_chunk=True`` (default): TTFA / single-utterance path — may use any free
+    replica, including those held in reserve for first audio.
+    ``first_chunk=False``: follow-up segments — respect ``PIPER_FIRST_CHUNK_RESERVED``.
+    """
     key = _voice_key(model_path)
     deadline = time.perf_counter() + 120.0
     retried_error = False
     wait_started = time.perf_counter()
     acquired = False
-    _metrics_enter_acquire()
+    _metrics_enter_acquire(first_chunk=first_chunk)
     try:
         while True:
             remaining = deadline - time.perf_counter()
@@ -625,12 +793,27 @@ def _acquire_instance(model_path: Path) -> _VoiceInstance:
                 # Must not hold _POOL_LOCK here — _kick_loaders takes it (non-reentrant).
                 entry = _kick_loaders(model_path, clear_error=True)
 
+            if not first_chunk and not _followup_may_take(entry):
+                # Yield so first-chunk waiters can drain reserved free replicas.
+                time.sleep(min(0.05, remaining))
+                continue
+
             try:
                 instance = entry.free.get(timeout=min(0.5, remaining))
+                # Re-check reservation after get: if a follow-up raced a first-chunk
+                # waiter, put back when the free floor would be violated.
+                if not first_chunk and first_chunk_reserved_slots() > 0:
+                    with _METRICS_LOCK:
+                        waiting_first = int(_waiting_first_chunk)
+                    if waiting_first > 0 and entry.free.qsize() < first_chunk_reserved_slots():
+                        entry.free.put(instance)
+                        time.sleep(min(0.05, remaining))
+                        continue
                 acquired = True
                 _tls.last_acquire_wait_ms = max(
                     0, int(round((time.perf_counter() - wait_started) * 1000))
                 )
+                _tls.last_first_chunk = bool(first_chunk)
                 return instance
             except queue.Empty:
                 snap = _snapshot_acquire_state(key)
@@ -648,7 +831,7 @@ def _acquire_instance(model_path: Path) -> _VoiceInstance:
                     ready_event.wait(timeout=min(0.5, remaining))
                 continue
     finally:
-        _metrics_leave_acquire(acquired=acquired)
+        _metrics_leave_acquire(acquired=acquired, first_chunk=first_chunk)
 
 
 def _release_instance(instance: _VoiceInstance) -> None:
@@ -675,13 +858,19 @@ def synthesize_wav_file(
     noise_w: float,
     sentence_silence: float,
     speaker_id: int | None = None,
+    first_chunk: bool = True,
 ) -> None:
-    """Synthesize text to a WAV file using a pooled in-process Piper voice replica."""
+    """Synthesize text to a WAV file using a pooled in-process Piper voice replica.
+
+    ``first_chunk`` defaults True so preview / single-utterance callers keep TTFA
+    priority. Segmented follow-ups should pass ``first_chunk=False``.
+    """
     from piper import SynthesisConfig
 
     _tls.last_acquire_wait_ms = None
     _tls.last_synth_ms = None
-    instance = _acquire_instance(model_path)
+    _tls.last_first_chunk = None
+    instance = _acquire_instance(model_path, first_chunk=first_chunk)
     voice = instance.voice
     try:
         syn_config = SynthesisConfig(
@@ -716,14 +905,16 @@ def synthesize_wav_file(
 
 def clear_pool_for_tests() -> None:
     """Reset module state (tests only)."""
-    global _waiting_acquires, _checked_out
+    global _waiting_acquires, _waiting_first_chunk, _checked_out
     with _POOL_LOCK:
         _MODELS.clear()
     with _METRICS_LOCK:
         _waiting_acquires = 0
+        _waiting_first_chunk = 0
         _checked_out = 0
     _tls.last_acquire_wait_ms = None
     _tls.last_synth_ms = None
+    _tls.last_first_chunk = None
     clear_phoneme_cache_for_tests()
 
 

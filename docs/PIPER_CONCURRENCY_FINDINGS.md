@@ -94,11 +94,29 @@ Opt-in cap: set `PIPER_ONNX_INTRA_OP_THREADS` (default unset/`0` = stock automat
 When `>= 1`, [`piper_pool._create_piper_voice`](../piper_pool.py) builds the
 `InferenceSession` with `SessionOptions.intra_op_num_threads` set — `PiperVoice.load()`
 does not expose session options, so we mirror its constructor path without editing
-site-packages. Production default remains unchanged (automatic ORT threading).
+site-packages.
+
+**Multi-table hosts:** prefer `PIPER_ONNX_INTRA_OP_THREADS=2` or `4` (S1 v2 on Ryzen:
+auto/`0` collapses under concurrency; 2–4 win on TTFA/CPU). Solo-dev may keep unset/`0`.
+
+### First-chunk reservation (P0)
+
+`PIPER_FIRST_CHUNK_RESERVED` (default **2**, `0` = off) keeps free replicas preferentially
+for `first_chunk=True` acquires (clip 0 / preview). Follow-up segments
+(`synthesize_speech(..., first_chunk=False)` from segmented TTS) yield when first-chunk
+waiters exist and only `reserved` free replicas remain. Does **not** change within-response
+sequential synth ordering.
 
 ## LibriTTS High × 8 replicas
 
 Pool weighting uses `num_speakers` from `.onnx.json` (`allocate_replicas`). A high-speaker LibriTTS model can claim most/all of `PIPER_POOL_SLOTS` (default 10), matching “eight loaded instances” when other models take remaining slots or budget is 8.
+
+**P1 — explicit budgets:** set `PIPER_MODEL_SLOT_BUDGETS=en_US-libritts-high:8,lessac:2`
+(stem/substring match) to stop LibriTTS speaker-count from starving narrator/Clean voices.
+
+**P1 — TTFA-fast FFmpeg:** first streaming clip uses a lighter `-af` chain when
+`PIPER_TTFA_FAST_FFMPEG` is unset/`1` (skip afftdn/dynaudnorm/full reverse trim).
+Follow-up clips keep the full clarity chain. Set `0` to disable.
 
 ## Diagnostic benchmark
 
