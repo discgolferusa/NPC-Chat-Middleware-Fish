@@ -776,6 +776,88 @@ def ensure_campaign_id_column(
         )
 
 
+def ensure_nullable_column(
+    conn: DbConnection,
+    table: str,
+    column: str,
+    allowed: frozenset[str],
+    *,
+    mysql_type: str,
+    sqlite_type: str = "TEXT",
+) -> None:
+    """Add a nullable column when missing. Existing rows stay NULL (legacy)."""
+    if table not in allowed:
+        raise ValueError(f"Refusing unsafe SQL table name: {table}")
+    if not column.replace("_", "").isalnum():
+        raise ValueError(f"Refusing unsafe SQL column name: {column}")
+    columns = table_columns(conn, table, allowed)
+    if column in columns:
+        return
+    if conn.config.is_mysql:
+        conn.execute(
+            f"ALTER TABLE {table} ADD COLUMN {column} {mysql_type} NULL"
+        )
+    else:
+        conn.execute(
+            f"ALTER TABLE {table} ADD COLUMN {column} {sqlite_type}"
+        )
+
+
+_ENCOUNTER_TABLES = frozenset({
+    "conversation_turns",
+    "npc_memories",
+    "dm_rulings",
+})
+
+
+def _existing_tables(conn: DbConnection) -> set[str]:
+    if conn.config.is_mysql:
+        rows = conn.execute(
+            """
+            SELECT TABLE_NAME AS name
+            FROM INFORMATION_SCHEMA.TABLES
+            WHERE TABLE_SCHEMA = DATABASE()
+            """
+        ).fetchall()
+        return {str(row["name"]) for row in rows}
+    rows = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table'"
+    ).fetchall()
+    return {row[0] for row in rows}
+
+
+def ensure_encounter_columns(conn: DbConnection) -> None:
+    """Additive encounter columns. NULL means a legacy player-scoped row."""
+    present = _existing_tables(conn)
+    text_cols = {
+        "conversation_turns": (
+            ("visibility", "VARCHAR(32)"),
+            ("audience_player_ids", "TEXT"),
+            ("scene_ref", "TEXT"),
+            ("event_kind", "VARCHAR(32)"),
+        ),
+        "npc_memories": (
+            ("visibility", "VARCHAR(32)"),
+        ),
+        "dm_rulings": (
+            ("consequence_text", "TEXT"),
+            ("visibility", "VARCHAR(32)"),
+            ("audience_player_ids", "TEXT"),
+        ),
+    }
+    for table, columns in text_cols.items():
+        if table not in present:
+            continue
+        for column, mysql_type in columns:
+            ensure_nullable_column(
+                conn,
+                table,
+                column,
+                _ENCOUNTER_TABLES,
+                mysql_type=mysql_type,
+            )
+
+
 def init_npc_memory_tables(conn: DbConnection) -> None:
     """Create conversation_turns + npc_memories if missing."""
     if conn.config.is_mysql:
@@ -822,6 +904,7 @@ def init_npc_memory_tables(conn: DbConnection) -> None:
                 created_at TEXT NOT NULL
             )
         """)
+    ensure_encounter_columns(conn)
 
 
 def init_dm_schema_tables(conn: DbConnection) -> None:
@@ -914,3 +997,4 @@ def init_dm_schema_tables(conn: DbConnection) -> None:
                 created_at TEXT NOT NULL
             )
         """)
+    ensure_encounter_columns(conn)

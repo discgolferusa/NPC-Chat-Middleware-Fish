@@ -4,6 +4,7 @@ Dedicated DM channel: messages, pending verification checks, and automatic rulin
 
 from __future__ import annotations
 
+import json
 import re
 from contextlib import nullcontext
 from datetime import datetime, timezone
@@ -835,6 +836,9 @@ def save_ruling(
     campaign_id: str = "",
     connection: memory_db.DbConnection | None = None,
     pending_check_locked: bool = False,
+    consequence_text: str | None = None,
+    visibility: str | None = None,
+    audience_player_ids: list[str] | None = None,
 ) -> int:
     campaign_id = normalize_campaign_id(campaign_id)
     created_at = _utc_now_iso()
@@ -853,9 +857,10 @@ def save_ruling(
 
         cur = conn.execute("""
             INSERT INTO dm_rulings
-                (campaign_id, npc_id, player_id, claim_summary, verdict, ruling_text, source, pending_check_id, created_at)
+                (campaign_id, npc_id, player_id, claim_summary, verdict, ruling_text, source, pending_check_id, created_at,
+                 consequence_text, visibility, audience_player_ids)
             VALUES
-                (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             campaign_id,
             npc_id,
@@ -866,6 +871,9 @@ def save_ruling(
             source,
             pending_check_id,
             created_at,
+            (consequence_text or "").strip() or None,
+            (visibility or "").strip().lower() or None,
+            json.dumps(audience_player_ids) if audience_player_ids else None,
         ))
         ruling_id = cur.lastrowid
         if pending_check_id:
@@ -936,6 +944,34 @@ def save_dm_message(
             if not claim_summary:
                 claim_summary = _summarize_claim(content)
 
+            from encounter_context import (
+                EVENT_RESOLUTION,
+                insert_turn,
+                latest_turn_scope,
+                present_player_ids,
+            )
+            from party_campaign import build_party_context
+
+            private_visibility, private_audience = latest_turn_scope(
+                npc_id,
+                player_id,
+                campaign_id,
+                connection=conn,
+            )
+            if private_visibility == "private":
+                ruling_visibility = "private"
+                ruling_audience = private_audience or [player_id]
+            else:
+                ruling_visibility = "scene"
+                try:
+                    ruling_audience = present_player_ids(
+                        build_party_context(player_id=player_id)
+                    )
+                except Exception:
+                    ruling_audience = [player_id]
+                if player_id and player_id not in ruling_audience:
+                    ruling_audience = [player_id, *ruling_audience]
+
             ruling_id = save_ruling(
                 npc_id=npc_id,
                 player_id=player_id,
@@ -947,6 +983,20 @@ def save_dm_message(
                 campaign_id=campaign_id,
                 connection=conn,
                 pending_check_locked=pending is not None,
+                consequence_text=content,
+                visibility=ruling_visibility,
+                audience_player_ids=ruling_audience,
+            )
+            insert_turn(
+                npc_id,
+                player_id,
+                "gm",
+                f"{claim_summary}. Outcome: {verdict}. Consequence: {content}",
+                campaign_id,
+                visibility=ruling_visibility,
+                audience_player_ids=ruling_audience,
+                event_kind=EVENT_RESOLUTION,
+                connection=conn,
             )
 
     return {
@@ -1107,7 +1157,8 @@ def load_rulings(
     with (nullcontext(connection) if connection is not None else get_db()) as conn:
         rows = conn.execute("""
             SELECT id, campaign_id, npc_id, player_id, claim_summary, verdict, ruling_text,
-                   source, pending_check_id, created_at
+                   source, pending_check_id, created_at,
+                   consequence_text, visibility, audience_player_ids
             FROM dm_rulings
             WHERE campaign_id = ?
               AND npc_id = ?
@@ -1129,7 +1180,8 @@ def load_rulings_for_dm(
     campaign_id = normalize_campaign_id(campaign_id)
     query = """
         SELECT id, campaign_id, npc_id, player_id, claim_summary, verdict, ruling_text,
-               source, pending_check_id, created_at
+               source, pending_check_id, created_at,
+               consequence_text, visibility, audience_player_ids
         FROM dm_rulings
         WHERE campaign_id = ?
     """
@@ -1146,6 +1198,32 @@ def load_rulings_for_dm(
     return [_ruling_row_to_dict(row) for row in reversed(rows)]
 
 
+def _row_optional(row: Any, key: str, default: Any = "") -> Any:
+    try:
+        keys = row.keys()
+    except AttributeError:
+        return default
+    if key not in keys or row[key] is None:
+        return default
+    return row[key]
+
+
+def _audience_from_row(row: Any) -> list[str]:
+    raw = _row_optional(row, "audience_player_ids", "")
+    if isinstance(raw, list):
+        return [str(item).strip() for item in raw if str(item).strip()]
+    text = str(raw or "").strip()
+    if not text:
+        return []
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [str(item).strip() for item in parsed if str(item).strip()]
+
+
 def _ruling_row_to_dict(row: Any) -> dict[str, Any]:
     return {
         "id": row["id"],
@@ -1158,13 +1236,64 @@ def _ruling_row_to_dict(row: Any) -> dict[str, Any]:
         "source": row["source"],
         "pending_check_id": row["pending_check_id"],
         "created_at": row["created_at"],
+        "consequence_text": _row_optional(row, "consequence_text", ""),
+        "visibility": (_row_optional(row, "visibility", "") or "").strip().lower(),
+        "audience_player_ids": _audience_from_row(row),
     }
+
+
+def load_encounter_rulings(
+    npc_id: str,
+    player_id: str,
+    limit: int = 12,
+    *,
+    campaign_id: str = "",
+    connection: memory_db.DbConnection | None = None,
+) -> list[dict[str, Any]]:
+    """Rulings this NPC should apply for the character now speaking.
+
+    Scene-visible rulings apply to later speakers. Private rulings stay with
+    their audience. Legacy NULL rows stay with the original player_id.
+    """
+    campaign_id = normalize_campaign_id(campaign_id)
+    player_id = (player_id or "").strip()
+    sql = """
+        SELECT id, campaign_id, npc_id, player_id, claim_summary, verdict, ruling_text,
+               source, pending_check_id, created_at,
+               consequence_text, visibility, audience_player_ids
+        FROM dm_rulings
+        WHERE campaign_id = ?
+          AND npc_id = ?
+        ORDER BY id DESC
+        LIMIT ?
+    """
+    params = (campaign_id, npc_id, max(limit * 4, 20))
+    with (nullcontext(connection) if connection is not None else get_db()) as conn:
+        rows = conn.execute(sql, params).fetchall()
+
+    selected: list[dict[str, Any]] = []
+    for row in reversed(rows):
+        item = _ruling_row_to_dict(row)
+        visibility = item.get("visibility") or ""
+        if not visibility:
+            if item.get("player_id") == player_id:
+                selected.append(item)
+            continue
+        if visibility == "private":
+            audience = item.get("audience_player_ids") or []
+            if player_id and (player_id in audience or item.get("player_id") == player_id):
+                selected.append(item)
+            continue
+        selected.append(item)
+    return selected[-limit:]
 
 
 def load_ruling_by_id(ruling_id: int) -> dict[str, Any] | None:
     with get_db() as conn:
         row = conn.execute("""
-            SELECT id, campaign_id, npc_id, player_id, claim_summary, verdict, ruling_text, source, pending_check_id, created_at
+            SELECT id, campaign_id, npc_id, player_id, claim_summary, verdict, ruling_text,
+                   source, pending_check_id, created_at,
+                   consequence_text, visibility, audience_player_ids
             FROM dm_rulings
             WHERE id = ?
         """, (ruling_id,)).fetchone()
@@ -1172,18 +1301,7 @@ def load_ruling_by_id(ruling_id: int) -> dict[str, Any] | None:
     if not row:
         return None
 
-    return {
-        "id": row["id"],
-        "campaign_id": row["campaign_id"] if "campaign_id" in row.keys() else "",
-        "npc_id": row["npc_id"],
-        "player_id": row["player_id"],
-        "claim_summary": row["claim_summary"],
-        "verdict": row["verdict"],
-        "ruling_text": row["ruling_text"],
-        "source": row["source"],
-        "pending_check_id": row["pending_check_id"],
-        "created_at": row["created_at"],
-    }
+    return _ruling_row_to_dict(row)
 
 
 def get_dm_context(npc_id: str, player_id: str, campaign_id: str = "") -> dict[str, Any]:
@@ -1228,9 +1346,15 @@ def format_dm_context_for_prompt(dm_context: dict[str, Any] | None) -> str:
         lines = []
         for ruling in rulings[-8:]:
             label = ruling["verdict"].upper()
-            lines.append(
-                f"- [{label}] {ruling['claim_summary']} — DM said: {ruling['ruling_text']}"
+            actor = (ruling.get("player_id") or "unknown").strip()
+            consequence = (ruling.get("consequence_text") or "").strip()
+            line = (
+                f"- [{label}] actor={actor} {ruling['claim_summary']} — "
+                f"DM said: {ruling['ruling_text']}"
             )
+            if consequence:
+                line += f" Consequence: {consequence}"
+            lines.append(line)
         sections.append("Active DM rulings (authoritative; the NPC must obey these):\n" + "\n".join(lines))
 
     pending = dm_context.get("pending_checks") or []
@@ -1262,11 +1386,16 @@ def build_dm_injection_messages(dm_context: dict[str, Any] | None) -> list[dict[
 
     for ruling in (dm_context.get("rulings") or [])[-6:]:
         verdict = ruling["verdict"].upper()
+        actor = (ruling.get("player_id") or "").strip()
+        consequence = (ruling.get("consequence_text") or "").strip()
+        consequence_bit = f" Consequence: {consequence}." if consequence else ""
         injections.append({
             "role": "user",
             "content": (
-                f"[DM RULING - {verdict}] {ruling['claim_summary']}. "
-                f"DM said: {ruling['ruling_text']}"
+                f"[DM RULING - {verdict}] actor={actor} {ruling['claim_summary']}. "
+                f"DM said: {ruling['ruling_text']}.{consequence_bit} "
+                "This is an authoritative GM resolution, distinct from player dialogue. "
+                "Apply only the recorded consequence."
             ),
         })
 
@@ -1519,6 +1648,9 @@ def create_manual_ruling(
     notes: str = "",
     pending_check_id: int | None = None,
     campaign_id: str = "",
+    npc: dict[str, Any] | None = None,
+    party_context: dict[str, Any] | None = None,
+    scene_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     campaign_id = normalize_campaign_id(campaign_id)
     verdict = verdict.strip().lower()
@@ -1530,6 +1662,23 @@ def create_manual_ruling(
         raise ValueError("Missing claim_summary")
 
     ruling_text = (notes or "").strip() or f"DM ruling: {verdict} for {claim_summary}"
+    from required_dm_checks import ruling_instruction_for_claim
+    from encounter_context import (
+        EVENT_RESOLUTION,
+        format_scene_ref,
+        insert_turn,
+        latest_turn_scope,
+        present_player_ids,
+    )
+
+    notes_text = (notes or "").strip()
+    authored = ruling_instruction_for_claim(npc, claim_summary, verdict) if npc else ""
+    if notes_text:
+        consequence_text = notes_text
+    elif (authored or "").strip():
+        consequence_text = authored.strip()
+    else:
+        consequence_text = "No further consequence was recorded."
 
     created_at = _utc_now_iso()
     # Matching, ruling, pending resolution, and audit message commit together.
@@ -1547,6 +1696,21 @@ def create_manual_ruling(
                 pending_check_id = pending["id"]
                 pending_check_locked = True
 
+        private_visibility, private_audience = latest_turn_scope(
+            npc_id,
+            player_id,
+            campaign_id,
+            connection=conn,
+        )
+        if private_visibility == "private":
+            ruling_visibility = "private"
+            ruling_audience = private_audience or [player_id]
+        else:
+            ruling_visibility = "scene"
+            ruling_audience = present_player_ids(party_context)
+            if player_id and player_id not in ruling_audience:
+                ruling_audience = [player_id, *ruling_audience]
+
         ruling_id = save_ruling(
             npc_id=npc_id,
             player_id=player_id,
@@ -1558,6 +1722,21 @@ def create_manual_ruling(
             campaign_id=campaign_id,
             connection=conn,
             pending_check_locked=pending_check_locked,
+            consequence_text=consequence_text,
+            visibility=ruling_visibility,
+            audience_player_ids=ruling_audience,
+        )
+        insert_turn(
+            npc_id,
+            player_id,
+            "gm",
+            f"{claim_summary}. Outcome: {verdict}. Consequence: {consequence_text}",
+            campaign_id,
+            visibility=ruling_visibility,
+            audience_player_ids=ruling_audience,
+            scene_ref=format_scene_ref(scene_context),
+            event_kind=EVENT_RESOLUTION,
+            connection=conn,
         )
 
         cur = conn.execute("""
@@ -1584,6 +1763,8 @@ def create_manual_ruling(
         "claim_summary": claim_summary,
         "verdict": verdict,
         "ruling_text": ruling_text,
+        "consequence_text": consequence_text,
+        "visibility": ruling_visibility,
         "pending_check_id": pending_check_id,
         "created_at": created_at,
     }

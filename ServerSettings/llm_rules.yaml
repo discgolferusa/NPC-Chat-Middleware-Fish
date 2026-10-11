@@ -80,3 +80,14 @@ llm_rules:
 - >-
   Until a matching DM ruling exists for an NPC-authored [DM CHECK: …], keep applying that
   NPC's waiting/failure behavior from its other rules.
+- >-
+  Encounter context lists what this NPC heard and what the character now speaking heard.
+  Do not ask again for something a person who is still in the audience already answered.
+- >-
+  Do not tell a character something they were not in the audience for. A Discord or Foundry
+  whisper was heard only by the speaking character.
+- Keep a promise, debt, or item with the named actor even if other people heard it said.
+- Something a character reports is not something this NPC saw.
+- >-
+  A GM RESOLUTION authorizes only the recorded consequence. Do not treat a successful
+  check as unconditional obedience beyond that consequence.
