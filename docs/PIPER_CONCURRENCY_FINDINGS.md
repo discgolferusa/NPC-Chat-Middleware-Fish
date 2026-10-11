@@ -167,9 +167,20 @@ cd C:\Users\jayhi\source\repos\NPC-Chat-Middleware
   --json-out reports\ort-threads.json
 ```
 
-## Recommended next steps
+## P2 — phoneme cache + follow-up pipeline
 
-1. Run the ORT thread matrix on Ryzen; review `ort-threads.md` recommendations for c=1/4/8.
-2. If a capped setting wins under concurrency, set `PIPER_ONNX_INTRA_OP_THREADS` on the host (optional; default 0 preserves today’s behavior).
-3. If phonemize remains a large fraction of wall: consider espeak isolation — **separate design**.
-4. Do **not** change pool locking; diag already confirmed overlapping inference.
+- `PIPER_PHONEME_CACHE_SIZE` (default **256**, `0` = off): LRU around `PiperVoice.phonemize`
+  per model key. Reduces repeat espeak work (espeak lock still serializes misses).
+- `PIPER_FOLLOWUP_PARALLEL` (default **1**, max **4**): limited concurrent synth of
+  remaining clips within one response after first-audio return. Clients must use clip
+  ``index`` (completion order may vary when parallel > 1). Prefer 2 when long-utterance
+  stall rates are high and first-chunk reservation (P0) is enabled.
+
+## Recommended ops knobs
+
+1. Multi-table: `PIPER_ONNX_INTRA_OP_THREADS=2` (or 4).
+2. TTFA under overlap: `PIPER_FIRST_CHUNK_RESERVED=2` (P0).
+3. Fair multi-voice pools: `PIPER_MODEL_SLOT_BUDGETS=...` (P1).
+4. First-clip packaging: `PIPER_TTFA_FAST_FFMPEG=1` (P1).
+5. Repeat lines / long replies: phoneme cache + `PIPER_FOLLOWUP_PARALLEL=2` (P2).
+6. Do **not** change pool locking during inference; diag confirmed overlapping `session.run`.

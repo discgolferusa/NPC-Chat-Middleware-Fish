@@ -7,12 +7,14 @@ import queue
 import threading
 import time
 import wave
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
 _POOL_LOCK = threading.Lock()
 _DEFAULT_SLOT_BUDGET = 10
 _DEFAULT_FIRST_CHUNK_RESERVED = 2
+_DEFAULT_PHONEME_CACHE_SIZE = 256
 
 # Instrumentation gauges (do not affect scheduling). Protected by _METRICS_LOCK
 # except thread-local last-call fields.
@@ -21,6 +23,12 @@ _waiting_acquires = 0
 _waiting_first_chunk = 0
 _checked_out = 0
 _tls = threading.local()
+
+# Process-wide phoneme LRU (espeak is process-serialized; cache avoids repeat work).
+_PHONEME_CACHE_LOCK = threading.Lock()
+_PHONEME_CACHE: OrderedDict[tuple[str, str], list] = OrderedDict()
+_phoneme_cache_hits = 0
+_phoneme_cache_misses = 0
 
 
 class _VoiceInstance:
@@ -261,6 +269,65 @@ def _speaker_weight(model_path: Path) -> int:
     return max(1, int(meta.get("num_speakers") or 1))
 
 
+def phoneme_cache_max_size() -> int:
+    """``PIPER_PHONEME_CACHE_SIZE`` (default 256). ``0`` disables caching."""
+    raw = str(os.environ.get("PIPER_PHONEME_CACHE_SIZE", "")).strip()
+    if not raw:
+        return _DEFAULT_PHONEME_CACHE_SIZE
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return _DEFAULT_PHONEME_CACHE_SIZE
+
+
+def phoneme_cache_stats() -> dict[str, int]:
+    with _PHONEME_CACHE_LOCK:
+        return {
+            "size": len(_PHONEME_CACHE),
+            "max_size": phoneme_cache_max_size(),
+            "hits": int(_phoneme_cache_hits),
+            "misses": int(_phoneme_cache_misses),
+        }
+
+
+def clear_phoneme_cache_for_tests() -> None:
+    global _phoneme_cache_hits, _phoneme_cache_misses
+    with _PHONEME_CACHE_LOCK:
+        _PHONEME_CACHE.clear()
+        _phoneme_cache_hits = 0
+        _phoneme_cache_misses = 0
+
+
+def _wrap_voice_phonemize_cache(voice: Any, model_key: str) -> Any:
+    """Attach an LRU cache around ``voice.phonemize`` when cache size > 0."""
+    max_size = phoneme_cache_max_size()
+    if max_size <= 0:
+        return voice
+    original = voice.phonemize
+
+    def cached_phonemize(text: str):
+        global _phoneme_cache_hits, _phoneme_cache_misses
+        key = (model_key, str(text))
+        with _PHONEME_CACHE_LOCK:
+            hit = _PHONEME_CACHE.get(key)
+            if hit is not None:
+                _PHONEME_CACHE.move_to_end(key)
+                _phoneme_cache_hits += 1
+                # Return a shallow copy of the outer list to avoid caller mutation.
+                return [list(part) for part in hit]
+            _phoneme_cache_misses += 1
+        phonemes = original(text)
+        with _PHONEME_CACHE_LOCK:
+            _PHONEME_CACHE[key] = [list(part) for part in phonemes]
+            _PHONEME_CACHE.move_to_end(key)
+            while len(_PHONEME_CACHE) > max_size:
+                _PHONEME_CACHE.popitem(last=False)
+        return phonemes
+
+    voice.phonemize = cached_phonemize  # type: ignore[method-assign]
+    return voice
+
+
 def onnx_intra_op_threads() -> int:
     """
     Optional ORT intra-op thread cap for each Piper InferenceSession.
@@ -297,8 +364,10 @@ def _create_piper_voice(model_path: Path) -> Any:
 
     use_cuda = str(os.environ.get("PIPER_USE_CUDA", "")).strip().lower() in ("1", "true", "yes")
     intra = onnx_intra_op_threads()
+    model_key = _voice_key(model_path)
     if intra <= 0:
-        return PiperVoice.load(model_path, use_cuda=use_cuda)
+        voice = PiperVoice.load(model_path, use_cuda=use_cuda)
+        return _wrap_voice_phonemize_cache(voice, model_key)
 
     import json
 
@@ -328,12 +397,13 @@ def _create_piper_voice(model_path: Path) -> Any:
         f"[PIPER-POOL] onnx_intra_op_threads={intra} model={model_path.name}",
         flush=True,
     )
-    return PiperVoice(
+    voice = PiperVoice(
         config=PiperConfig.from_dict(config_dict),
         session=session,
         espeak_data_dir=Path(ESPEAK_DATA_DIR),
         download_dir=Path.cwd(),
     )
+    return _wrap_voice_phonemize_cache(voice, model_key)
 
 
 def _trim_idle_surplus_locked(entry: _ModelEntry) -> None:
@@ -498,6 +568,7 @@ def pool_runtime_metrics() -> dict[str, Any]:
         "waiting_first_chunk": waiting_first,
         "first_chunk_reserved": first_chunk_reserved_slots(),
         "slot_budget": pool_slot_budget(),
+        "phoneme_cache": phoneme_cache_stats(),
         "models": status,
     }
 
@@ -844,6 +915,7 @@ def clear_pool_for_tests() -> None:
     _tls.last_acquire_wait_ms = None
     _tls.last_synth_ms = None
     _tls.last_first_chunk = None
+    clear_phoneme_cache_for_tests()
 
 
 def model_replica_counts_for_tests() -> dict[str, int]:
