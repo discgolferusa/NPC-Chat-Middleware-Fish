@@ -671,9 +671,20 @@ def format_party_context_for_prompt(party_context: dict[str, Any] | None) -> str
     lines.append(f"Party: {party_label} ({party_context.get('party_id') or 'unknown'})")
 
     if members:
-        lines.append("Party members present:")
+        from scene_state import get_absent_player_ids
+
+        absent = set(get_absent_player_ids())
+        lines.append("Party members:")
         for member in members:
-            suffix = " — speaking now" if member.get("is_speaking") else " — present"
+            player_id = str(member.get("player_id") or "").strip()
+            if member.get("is_speaking") and player_id in absent:
+                suffix = " — speaking now (marked absent; they did not hear lines spoken while they were away)"
+            elif member.get("is_speaking"):
+                suffix = " — speaking now"
+            elif player_id in absent:
+                suffix = " — absent (did not hear lines spoken while they were away)"
+            else:
+                suffix = " — present"
             lines.append(
                 f"- {member.get('name')} ({member.get('race')} {member.get('class')}){suffix}"
             )

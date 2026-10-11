@@ -75,6 +75,7 @@ from dm_channel import (
     load_pending_checks_for_dm,
     load_ruling_by_id,
     load_rulings,
+    load_encounter_rulings,
     load_rulings_for_dm,
     log_dm_turn,
     normalize_campaign_id,
@@ -126,6 +127,7 @@ from scene_state import (
     format_scene_context_for_prompt,
     get_scene_status,
     list_sub_location_options,
+    set_player_presence,
     set_sub_location,
     set_time_of_day,
 )
@@ -148,6 +150,14 @@ from server_settings import format_llm_rules, get_narrator_tts_settings, load_gl
 from prompt_caps import get_prompt_caps, save_prompt_caps, DEFAULT_PROMPT_CAPS
 from npc_pronouns import get_npc_pronoun_context
 from peer_context import build_peer_location_prompt_sections, list_colocated_npcs
+from encounter_context import (
+    attribute_memory,
+    build_turn_record,
+    format_encounter_prompt,
+    insert_turn,
+    load_encounter_memories,
+    load_encounter_turns,
+)
 from tts_processing import (
     DEFAULT_DENOISE_NF,
     DEFAULT_DENOISE_NR,
@@ -219,6 +229,8 @@ AUTO_MEMORY_EXTRACTION_ENABLED = True
 AUTO_MEMORY_EXTRACTION_ASYNC = True
 MEMORY_PROMPT_LIMIT = 8
 RECENT_TURN_LIMIT = 4
+# Shared encounter window (scene + private lines this NPC took part in).
+# Kept beside RECENT_TURN_LIMIT, which still bounds the legacy per-character loader.
 
 # Lightweight in-process caches for YAML/static context.
 # YAML file loading is not the biggest bottleneck, but this avoids repeated disk reads
@@ -671,26 +683,34 @@ def save_turn(
     campaign_id: str = "",
     *,
     connection: memory_db.DbConnection | None = None,
+    visibility: str | None = None,
+    audience_player_ids: list[str] | None = None,
+    scene_ref: str | None = None,
+    event_kind: str | None = None,
 ):
     campaign_id = normalize_campaign_id(campaign_id)
-    content = (content or "").strip()
-    if not content:
-        return
+    insert_turn(
+        npc_id,
+        player_id,
+        role,
+        content,
+        campaign_id,
+        visibility=visibility,
+        audience_player_ids=audience_player_ids,
+        scene_ref=scene_ref,
+        event_kind=event_kind,
+        connection=connection,
+    )
 
-    with (nullcontext(connection) if connection is not None else get_db()) as conn:
-        conn.execute("""
-            INSERT INTO conversation_turns
-                (campaign_id, npc_id, player_id, role, content, created_at)
-            VALUES
-                (?, ?, ?, ?, ?, ?)
-        """, (
-            campaign_id,
-            npc_id,
-            player_id,
-            role,
-            content,
-            datetime.utcnow().isoformat()
-        ))
+
+def _turn_save_kwargs(turn_record: dict | None) -> dict:
+    record = turn_record or {}
+    return {
+        "visibility": record.get("visibility"),
+        "audience_player_ids": record.get("audience_player_ids"),
+        "scene_ref": record.get("scene_ref"),
+        "event_kind": record.get("event_kind"),
+    }
 
 
 def save_player_npc_conversation_turns(
@@ -702,6 +722,7 @@ def save_player_npc_conversation_turns(
     campaign_id: str = "",
     save_user: bool = True,
     connection: memory_db.DbConnection | None = None,
+    turn_record: dict | None = None,
 ) -> str:
     """Persist the player line and in-character NPC draft, never wait-narration.
 
@@ -709,6 +730,7 @@ def save_player_npc_conversation_turns(
     ``save_user=False`` so a force-displaced turn still leaves the player line in
     history for DM auto-response follow-ups.
     """
+    save_kwargs = _turn_save_kwargs(turn_record)
     if save_user:
         save_turn(
             npc_id,
@@ -717,6 +739,7 @@ def save_player_npc_conversation_turns(
             player_text,
             campaign_id=campaign_id,
             connection=connection,
+            **save_kwargs,
         )
     history_text = assistant_history_text(npc_response)
     if history_text:
@@ -727,6 +750,7 @@ def save_player_npc_conversation_turns(
             history_text,
             campaign_id=campaign_id,
             connection=connection,
+            **save_kwargs,
         )
     return history_text
 
@@ -759,43 +783,70 @@ def load_recent_turns(
     return filtered[-limit:]
 
 
-def save_memory(npc_id: str, player_id: str, memory: str, campaign_id: str = ""):
+def save_memory(
+    npc_id: str,
+    player_id: str,
+    memory: str,
+    campaign_id: str = "",
+    *,
+    visibility: str | None = None,
+):
     campaign_id = normalize_campaign_id(campaign_id)
     memory = (memory or "").strip()
     if not memory:
         return
+    visibility = (visibility or "").strip().lower() or None
+    if visibility not in (None, "scene", "private"):
+        visibility = None
 
     with get_db() as conn:
         conn.execute("""
             INSERT INTO npc_memories
-                (campaign_id, npc_id, player_id, memory, created_at)
+                (campaign_id, npc_id, player_id, memory, created_at, visibility)
             VALUES
-                (?, ?, ?, ?, ?)
+                (?, ?, ?, ?, ?, ?)
         """, (
             campaign_id,
             npc_id,
             player_id,
             memory,
-            datetime.utcnow().isoformat()
+            datetime.utcnow().isoformat(),
+            visibility,
         ))
         conn.commit()
 
 
-def memory_exists(npc_id: str, player_id: str, memory: str, campaign_id: str = "") -> bool:
+def memory_exists(
+    npc_id: str,
+    player_id: str,
+    memory: str,
+    campaign_id: str = "",
+    *,
+    visibility: str | None = None,
+) -> bool:
     campaign_id = normalize_campaign_id(campaign_id)
     normalized = (memory or "").strip().lower()
 
     if not normalized:
         return True
 
+    visibility = (visibility or "").strip().lower()
     with get_db() as conn:
-        rows = conn.execute("""
-            SELECT memory
-            FROM npc_memories
-            WHERE campaign_id = ?
-              AND npc_id = ?
-              AND player_id = ?
-        """, (campaign_id, npc_id, player_id)).fetchall()
+        if visibility == "scene":
+            rows = conn.execute("""
+                SELECT memory
+                FROM npc_memories
+                WHERE campaign_id = ?
+                  AND npc_id = ?
+            """, (campaign_id, npc_id)).fetchall()
+        else:
+            rows = conn.execute("""
+                SELECT memory
+                FROM npc_memories
+                WHERE campaign_id = ?
+                  AND npc_id = ?
+                  AND player_id = ?
+            """, (campaign_id, npc_id, player_id)).fetchall()
 
     for row in rows:
         if row["memory"].strip().lower() == normalized:
@@ -804,16 +855,23 @@ def memory_exists(npc_id: str, player_id: str, memory: str, campaign_id: str = "
     return False
 
 
-def save_memory_if_new(npc_id: str, player_id: str, memory: str, campaign_id: str = ""):
+def save_memory_if_new(
+    npc_id: str,
+    player_id: str,
+    memory: str,
+    campaign_id: str = "",
+    *,
+    visibility: str | None = None,
+):
     memory = (memory or "").strip()
 
     if not memory:
         return
 
-    if memory_exists(npc_id, player_id, memory, campaign_id=campaign_id):
+    if memory_exists(npc_id, player_id, memory, campaign_id=campaign_id, visibility=visibility):
         return
 
-    save_memory(npc_id, player_id, memory, campaign_id=campaign_id)
+    save_memory(npc_id, player_id, memory, campaign_id=campaign_id, visibility=visibility)
 
 
 def load_memories(
@@ -847,6 +905,7 @@ def prepare_turn_database_phase(
     campaign_id: str = "",
     save_player_turn: bool = True,
     detect_player_claim: bool = True,
+    turn_record: dict | None = None,
 ) -> dict[str, Any]:
     """Run all mutable pre-LLM database work in one short transaction.
 
@@ -855,11 +914,11 @@ def prepare_turn_database_phase(
     """
     campaign_id = normalize_campaign_id(campaign_id)
     with get_db() as conn:
-        memories = load_memories(
+        memories = load_encounter_memories(
             npc_id,
             player_id,
+            campaign_id,
             limit=MEMORY_PROMPT_LIMIT,
-            campaign_id=campaign_id,
             connection=conn,
         )
         recent_turns = load_recent_turns(
@@ -867,6 +926,11 @@ def prepare_turn_database_phase(
             player_id,
             limit=RECENT_TURN_LIMIT,
             campaign_id=campaign_id,
+            connection=conn,
+        )
+        encounter_turns = load_encounter_turns(
+            npc_id,
+            campaign_id,
             connection=conn,
         )
         dm_messages = load_dm_messages(
@@ -892,6 +956,13 @@ def prepare_turn_database_phase(
             campaign_id=campaign_id,
             connection=conn,
         )
+        encounter_rulings = load_encounter_rulings(
+            npc_id,
+            player_id,
+            limit=12,
+            campaign_id=campaign_id,
+            connection=conn,
+        )
 
         player_claim = None
         if detect_player_claim and player_text:
@@ -913,17 +984,19 @@ def prepare_turn_database_phase(
                 player_text,
                 campaign_id=campaign_id,
                 connection=conn,
+                **_turn_save_kwargs(turn_record),
             )
 
     return {
         "memories": memories,
         "recent_turns": recent_turns,
+        "encounter_turns": encounter_turns,
         "player_claim": player_claim,
         "dm_context": {
             "campaign_id": campaign_id,
             "messages": dm_messages[-10:],
             "pending_checks": pending_checks[-10:],
-            "rulings": rulings[-10:],
+            "rulings": encounter_rulings,
         },
     }
 
@@ -939,6 +1012,7 @@ def finalize_turn_database_phase(
     npc: dict[str, Any] | None = None,
     create_pending_checks: bool = True,
     fallback_spoken_text: str = "",
+    turn_record: dict | None = None,
 ) -> dict[str, Any]:
     """Process and persist an NPC reply, returning one pending snapshot.
 
@@ -981,6 +1055,7 @@ def finalize_turn_database_phase(
                 history_npc_text,
                 campaign_id=campaign_id,
                 connection=conn,
+                **_turn_save_kwargs(turn_record),
             )
 
     return {
@@ -1376,6 +1451,8 @@ def load_turn_pre_llm_context(
     campaign_id: str,
     save_player_turn: bool = True,
     detect_player_claim: bool = True,
+    visibility: str | None = None,
+    explicit_audience: Any = None,
 ) -> dict[str, Any]:
     """Validate static context before starting the mutating pre-LLM phase.
 
@@ -1391,6 +1468,13 @@ def load_turn_pre_llm_context(
         include_dm_context=False,
         include_database_context=False,
     )
+    turn_record = build_turn_record(
+        visibility=visibility,
+        explicit_audience=explicit_audience,
+        speaker_id=player_id,
+        party_context=static_context.get("party_context") or party_context,
+        scene_context=static_context.get("scene_context"),
+    )
     database_context = prepare_turn_database_phase(
         npc_id,
         player_id,
@@ -1398,10 +1482,32 @@ def load_turn_pre_llm_context(
         campaign_id=campaign_id,
         save_player_turn=save_player_turn,
         detect_player_claim=detect_player_claim,
+        turn_record=turn_record,
+    )
+    encounter_prompt = format_encounter_prompt(
+        database_context.get("encounter_turns"),
+        current_player_id=player_id,
+        party_context=static_context.get("party_context") or party_context,
     )
 
     # Do not mutate the static-only entry stored in PRELOADED_CONTEXTS.
-    return {**static_context, **database_context}
+    return {
+        **static_context,
+        **database_context,
+        "turn_record": turn_record,
+        "encounter_prompt": encounter_prompt,
+    }
+
+
+def _memory_save_kwargs(context: dict | None, player_id: str) -> dict[str, str]:
+    party = (context or {}).get("party_context") or {}
+    speaking = party.get("speaking_member") or {}
+    actor_name = (speaking.get("name") or player_id or "").strip()
+    record = (context or {}).get("turn_record") or {}
+    visibility = (record.get("visibility") or "scene").strip().lower()
+    if visibility not in ("scene", "private"):
+        visibility = "scene"
+    return {"actor_name": actor_name, "visibility": visibility}
 
 
 def run_memory_extraction_background(
@@ -1411,6 +1517,9 @@ def run_memory_extraction_background(
     player_text: str,
     npc_text: str,
     campaign_id: str = "",
+    *,
+    actor_name: str = "",
+    visibility: str | None = None,
 ) -> None:
     if not AUTO_MEMORY_EXTRACTION_ENABLED:
         return
@@ -1424,6 +1533,8 @@ def run_memory_extraction_background(
                 player_text=player_text,
                 npc_text=npc_text,
                 campaign_id=campaign_id,
+                actor_name=actor_name,
+                visibility=visibility,
             )
         except Exception:
             # Memory extraction must never break live play.
@@ -1516,6 +1627,7 @@ def build_system_prompt(
     scene_context: dict | None = None,
     player_text: str | None = None,
     about_npc_id: str | None = None,
+    encounter_text: str | None = None,
 ) -> str:
     caps = get_prompt_caps()
     public_facts = "\n".join(f"- {x}" for x in npc.get("public_facts", []))
@@ -1537,6 +1649,7 @@ def build_system_prompt(
     pronoun_context = get_npc_pronoun_context(npc)
     dm_context_text = format_dm_context_for_prompt(dm_context)
     party_context_text = format_party_context_for_prompt(party_context)
+    encounter_block = (encounter_text or "").strip() or "No encounter lines are on record for this NPC yet."
     if scene_context is None:
         scene_context = build_scene_context(npc.get("location_id"))
     scene_context_text = format_scene_context_for_prompt(scene_context)
@@ -1591,6 +1704,9 @@ Optional scene notes from request:
 Party and campaign context:
 {party_context_text}
 
+Encounter context:
+{encounter_block}
+
 DM channel context:
 {dm_context_text}
 {required_checks_block}
@@ -1611,6 +1727,7 @@ def build_npc_llm_messages(
     party_context: dict | None = None,
     scene_context: dict | None = None,
     about_npc_id: str | None = None,
+    encounter_text: str | None = None,
 ) -> list[dict]:
     messages = [
         {
@@ -1625,6 +1742,7 @@ def build_npc_llm_messages(
                 scene_context=scene_context,
                 player_text=player_text,
                 about_npc_id=about_npc_id,
+                encounter_text=encounter_text,
             ),
         }
     ]
@@ -1632,7 +1750,9 @@ def build_npc_llm_messages(
     for dm_message in build_dm_injection_messages(dm_context):
         messages.append(dm_message)
 
-    if history:
+    if encounter_text is not None:
+        pass
+    elif history:
         for entry in history[-8:]:
             messages.append({
                 "role": entry["role"],
@@ -1727,6 +1847,7 @@ def build_dm_followup_messages(
     ruling: dict,
     party_context: dict | None = None,
     scene_context: dict | None = None,
+    encounter_text: str | None = None,
 ) -> list[dict]:
     messages = build_npc_llm_messages(
         npc,
@@ -1737,27 +1858,31 @@ def build_dm_followup_messages(
         dm_context=dm_context,
         party_context=party_context,
         scene_context=scene_context,
+        encounter_text=encounter_text if encounter_text is not None else "",
     )
 
     verdict = (ruling.get("verdict") or "unclear").strip().upper()
     claim_summary = (ruling.get("claim_summary") or "the party's claim").strip()
     ruling_text = (ruling.get("ruling_text") or "").strip()
+    consequence = (ruling.get("consequence_text") or "").strip() or ruling_text
+    actor = (ruling.get("player_id") or "").strip()
 
     if verdict == "CONFIRMED":
         action_hint = (
-            "The DM confirmed the claim. Accept any proof the party already presented "
-            "and let them proceed in character."
+            f"The DM confirmed this claim for {actor or 'the named actor'}. "
+            f"Apply only this recorded consequence, and do not grant anything beyond it: "
+            f"{consequence}"
         )
         authored = ruling_instruction_for_claim(npc, claim_summary, "confirmed")
-        if authored:
+        if authored and authored not in consequence:
             action_hint += (
                 f" Follow this NPC's authored Success instruction for THIS claim only: "
                 f"{authored}"
             )
     elif verdict == "DENIED":
         action_hint = (
-            "The DM denied the claim. Refuse the request in character without granting "
-            "access or benefit."
+            f"The DM denied this claim for {actor or 'the named actor'}. "
+            f"Apply only this recorded consequence: {consequence}"
         )
         authored = ruling_instruction_for_claim(npc, claim_summary, "denied")
         if authored:
@@ -1871,6 +1996,7 @@ def run_dm_ruling_auto_response(
             ruling,
             party_context=party_context,
             scene_context=scene_context,
+            encounter_text=context.get("encounter_prompt") or "",
         )
 
         npc_text_raw = generate_npc_reply_text(
@@ -1892,6 +2018,7 @@ def run_dm_ruling_auto_response(
             create_pending_checks=False,
             npc=npc,
             fallback_spoken_text="Very well.",
+            turn_record=context.get("turn_record"),
         )
         npc_response = post_llm_db["npc_response"]
         npc_text = npc_response["spoken_text"]
@@ -3345,23 +3472,34 @@ def extract_memories_from_exchange(
     npc_id: str,
     player_id: str,
     player_text: str,
-    npc_text: str
+    npc_text: str,
+    *,
+    actor_name: str = "",
+    private: bool = False,
 ) -> list[str]:
+    who = (actor_name or player_id or "the speaking character").strip()
+    privacy = (
+        "This exchange was private to that character. Attribute facts to them, not to the party."
+        if private
+        else "Name the character who acted. Do not say the party did it unless everyone present shared the act."
+    )
     prompt = f"""
 You are maintaining long-term memory for a tabletop RPG NPC.
 
 NPC name: {npc.get("name", npc_id)}
 NPC role: {npc.get("role", "")}
+Speaking character: {who}
 
 Extract only durable facts this NPC should remember for future sessions.
+{privacy}
 
 Good memories:
 - promises, deals, debts, threats, favors, betrayals
 - items bought, sold, given, stolen, lost, or repaired
-- important facts learned about the party
+- important facts learned from this character
 - names, relationships, loyalties, suspicions
 - unresolved tasks or quests
-- emotional changes in the relationship between this NPC and the party
+- emotional changes in the relationship between this NPC and that character
 
 Bad memories:
 - temporary greetings
@@ -3377,8 +3515,8 @@ Return an empty JSON array if nothing should be remembered.
 
 Format:
 [
-  "The party bought a silvered sword from Torin Ashhand.",
-  "The party promised Captain Varra they would investigate the old aqueduct."
+  "{who} bought a silvered sword from Torin Ashhand.",
+  "{who} promised Captain Varra they would investigate the old aqueduct."
 ]
 
 Player said:
@@ -3440,21 +3578,40 @@ def save_extracted_memories(
     player_text: str,
     npc_text: str,
     campaign_id: str = "",
+    *,
+    actor_name: str = "",
+    visibility: str | None = None,
 ) -> list[str]:
     campaign_id = normalize_campaign_id(campaign_id)
+    visibility = (visibility or "").strip().lower() or None
     memories = extract_memories_from_exchange(
         npc=npc,
         npc_id=npc_id,
         player_id=player_id,
         player_text=player_text,
-        npc_text=npc_text
+        npc_text=npc_text,
+        actor_name=actor_name,
+        private=visibility == "private",
     )
 
     saved = []
 
     for memory in memories:
-        if not memory_exists(npc_id, player_id, memory, campaign_id=campaign_id):
-            save_memory(npc_id, player_id, memory, campaign_id=campaign_id)
+        memory = attribute_memory(memory, actor_name)
+        if not memory_exists(
+            npc_id,
+            player_id,
+            memory,
+            campaign_id=campaign_id,
+            visibility=visibility,
+        ):
+            save_memory(
+                npc_id,
+                player_id,
+                memory,
+                campaign_id=campaign_id,
+                visibility=visibility,
+            )
             saved.append(memory)
 
     return saved
@@ -3509,6 +3666,8 @@ def npc_turn():
             player_text=player_text,
             party_context=party_context,
             campaign_id=campaign_id,
+            visibility=body.get("visibility"),
+            explicit_audience=body.get("audience_player_ids"),
         )
         npc = context["npc"]
         location = context["location"]
@@ -3530,6 +3689,7 @@ def npc_turn():
             party_context=party_context,
             scene_context=scene_context,
             about_npc_id=about_npc_id,
+            encounter_text=context.get("encounter_prompt") or "",
         )
 
         prompt_chars = sum(len(m.get("content", "")) for m in messages)
@@ -3555,6 +3715,7 @@ def npc_turn():
             player_pending_id=player_claim.get("pending_check_id") if player_claim else None,
             campaign_id=campaign_id,
             npc=npc,
+            turn_record=context.get("turn_record"),
         )
         npc_response = post_llm_db["npc_response"]
         npc_text = npc_response["spoken_text"]
@@ -3575,6 +3736,7 @@ def npc_turn():
                 player_text=player_text,
                 npc_text=history_npc_text,
                 campaign_id=campaign_id,
+                **_memory_save_kwargs(context, player_id),
             )
         elif history_npc_text and AUTO_MEMORY_EXTRACTION_ENABLED:
             memory_extraction_mode = "sync"
@@ -3585,6 +3747,7 @@ def npc_turn():
                 player_text=player_text,
                 npc_text=history_npc_text,
                 campaign_id=campaign_id,
+                **_memory_save_kwargs(context, player_id),
             )
             step_start = log_timing(request_id, "sync text memory extraction/save", step_start)
 
@@ -3784,6 +3947,8 @@ def npc_voice_turn():
             player_text=player_text,
             party_context=party_context,
             campaign_id=campaign_id,
+            visibility=request.form.get("visibility"),
+            explicit_audience=request.form.get("audience_player_ids"),
         )
         npc = context["npc"]
         location = context["location"]
@@ -3806,6 +3971,7 @@ def npc_voice_turn():
             party_context=party_context,
             scene_context=scene_context,
             about_npc_id=about_npc_id,
+            encounter_text=context.get("encounter_prompt") or "",
         )
 
         prompt_chars = sum(len(m.get("content", "")) for m in messages)
@@ -3831,6 +3997,7 @@ def npc_voice_turn():
             player_pending_id=player_claim.get("pending_check_id") if player_claim else None,
             campaign_id=campaign_id,
             npc=npc,
+            turn_record=context.get("turn_record"),
         )
         npc_response = post_llm_db["npc_response"]
         npc_text = npc_response["spoken_text"]
@@ -3878,6 +4045,7 @@ def npc_voice_turn():
                 player_text=player_text,
                 npc_text=history_npc_text,
                 campaign_id=campaign_id,
+                **_memory_save_kwargs(context, player_id),
             )
             step_start = log_timing(request_id, "schedule async memory extraction", step_start)
         elif history_npc_text and AUTO_MEMORY_EXTRACTION_ENABLED:
@@ -3889,6 +4057,7 @@ def npc_voice_turn():
                 player_text=player_text,
                 npc_text=history_npc_text,
                 campaign_id=campaign_id,
+                **_memory_save_kwargs(context, player_id),
             )
             step_start = log_timing(request_id, "sync memory extraction/save", step_start)
 
@@ -4137,6 +4306,8 @@ def npc_voice_turn_debug():
             player_text=player_text,
             party_context=party_context,
             campaign_id=campaign_id,
+            visibility=request.form.get("visibility"),
+            explicit_audience=request.form.get("audience_player_ids"),
         )
         npc = context["npc"]
         location = context["location"]
@@ -4157,6 +4328,7 @@ def npc_voice_turn_debug():
             dm_context=dm_context,
             party_context=party_context,
             scene_context=scene_context,
+            encounter_text=context.get("encounter_prompt") or "",
         )
 
         prompt_chars = sum(len(m.get("content", "")) for m in messages)
@@ -4179,6 +4351,7 @@ def npc_voice_turn_debug():
             player_pending_id=player_claim.get("pending_check_id") if player_claim else None,
             campaign_id=campaign_id,
             npc=npc,
+            turn_record=context.get("turn_record"),
         )
         npc_response = post_llm_db["npc_response"]
         npc_text = npc_response["spoken_text"]
@@ -4213,6 +4386,7 @@ def npc_voice_turn_debug():
                 player_text=player_text,
                 npc_text=history_npc_text,
                 campaign_id=campaign_id,
+                **_memory_save_kwargs(context, player_id),
             )
             step_start = log_timing(request_id, "debug schedule async memory extraction", step_start)
         elif history_npc_text and AUTO_MEMORY_EXTRACTION_ENABLED:
@@ -4224,6 +4398,7 @@ def npc_voice_turn_debug():
                 player_text=player_text,
                 npc_text=history_npc_text,
                 campaign_id=campaign_id,
+                **_memory_save_kwargs(context, player_id),
             )
             step_start = log_timing(request_id, "debug sync memory extraction/save", step_start)
 
@@ -5007,6 +5182,23 @@ def scene_sub_location_clear():
     return jsonify(clear_sub_location())
 
 
+@app.post("/scene/presence")
+def scene_presence_set():
+    body = request.get_json(force=True, silent=True) or {}
+    player_id = (body.get("player_id") or "").strip()
+    present = body.get("present")
+    if isinstance(present, str):
+        present = present.strip().lower() in ("1", "true", "yes", "on", "present")
+    elif present is None:
+        return jsonify({"error": "Missing present"}), 400
+    else:
+        present = bool(present)
+    try:
+        return jsonify(set_player_presence(player_id, present))
+    except ValueError as ex:
+        return _client_error(ex, 400)
+
+
 @app.get("/turn/progress/steps")
 def turn_progress_steps():
     return jsonify(get_turn_progress_catalog())
@@ -5519,6 +5711,10 @@ def dm_ruling_post():
         return jsonify({"error": "verdict must be confirmed or denied"}), 400
 
     try:
+        try:
+            ruling_npc = load_npc(npc_id)
+        except Exception:
+            ruling_npc = None
         result = create_manual_ruling(
             npc_id=npc_id,
             player_id=player_id,
@@ -5527,6 +5723,11 @@ def dm_ruling_post():
             notes=notes,
             pending_check_id=pending_check_id,
             campaign_id=campaign_id,
+            npc=ruling_npc,
+            party_context=party_context,
+            scene_context=build_scene_context(
+                (ruling_npc or {}).get("location_id") if ruling_npc else ""
+            ),
         )
 
         auto_response = None

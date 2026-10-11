@@ -94,6 +94,7 @@ def api(monkeypatch, tmp_path):
         scene_state._SCENE_SESSIONS.clear()
     scene_state._FALLBACK_TIME_OF_DAY = ""
     scene_state._FALLBACK_SUB_LOCATION = None
+    scene_state._FALLBACK_ABSENT = []
 
     with party_campaign._STATE_LOCK:
         party_campaign._PLAY_SESSIONS.clear()

@@ -37,6 +37,7 @@ _MAX_SCENE_SESSIONS = 2000
 # Local/dev fallback when no owner+campaign context is present.
 _FALLBACK_TIME_OF_DAY = ""
 _FALLBACK_SUB_LOCATION: dict[str, Any] | None = None
+_FALLBACK_ABSENT: list[str] = []
 
 
 def _utc_now_iso() -> str:
@@ -108,6 +109,7 @@ def _scene_bucket() -> dict[str, Any]:
         return {
             "time_of_day": _FALLBACK_TIME_OF_DAY,
             "sub_location": deepcopy(_FALLBACK_SUB_LOCATION),
+            "absent_player_ids": list(_FALLBACK_ABSENT),
             "updated_at": None,
             "touched_at": 0.0,
             "_fallback": True,
@@ -119,6 +121,7 @@ def _scene_bucket() -> dict[str, Any]:
             bucket = {
                 "time_of_day": "",
                 "sub_location": None,
+                "absent_player_ids": [],
                 "updated_at": None,
                 "touched_at": datetime.now(timezone.utc).timestamp(),
             }
@@ -299,6 +302,40 @@ def set_sub_location(
     return get_scene_status()
 
 
+def get_absent_player_ids() -> list[str]:
+    bucket = _scene_bucket()
+    if bucket.get("_fallback"):
+        return list(_FALLBACK_ABSENT)
+    return [str(item).strip() for item in (bucket.get("absent_player_ids") or []) if str(item).strip()]
+
+
+def set_player_presence(player_id: str, present: bool) -> dict[str, Any]:
+    """Mark a party character absent or back at the scene. Absent characters miss new lines."""
+    player_id = (player_id or "").strip()
+    if not player_id:
+        raise ValueError("Missing player_id")
+
+    bucket = _scene_bucket()
+    if bucket.get("_fallback"):
+        global _FALLBACK_ABSENT
+        current = [item for item in _FALLBACK_ABSENT if item != player_id]
+        if not present:
+            current.append(player_id)
+        _FALLBACK_ABSENT = current
+    else:
+        with _STATE_LOCK:
+            current = [
+                str(item).strip()
+                for item in (bucket.get("absent_player_ids") or [])
+                if str(item).strip() and str(item).strip() != player_id
+            ]
+            if not present:
+                current.append(player_id)
+            bucket["absent_player_ids"] = current
+            bucket["updated_at"] = _utc_now_iso()
+    return get_scene_status()
+
+
 def clear_sub_location() -> dict[str, Any]:
     bucket = _scene_bucket()
     if bucket.get("_fallback"):
@@ -420,6 +457,7 @@ def get_scene_status(*, include_options: bool = True) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "time_of_day": time_of_day or None,
         "sub_location": sub_location,
+        "absent_player_ids": get_absent_player_ids(),
         "updated_at": bucket.get("updated_at"),
     }
 
@@ -432,6 +470,7 @@ def get_scene_status(*, include_options: bool = True) -> dict[str, Any]:
             "scene_sub_location": "/scene/sub-location",
             "scene_sub_location_clear": "/scene/sub-location/clear",
             "scene_sub_location_options": "/scene/sub-locations",
+            "scene_presence": "/scene/presence",
         }
 
     return payload
