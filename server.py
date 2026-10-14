@@ -85,6 +85,7 @@ from dm_channel import (
     strip_dm_check_tag,
     assistant_history_text,
     is_dm_wait_narration,
+    neutralize_spent_secret_disclosure,
 )
 import dm_channel
 from party_campaign import (
@@ -1628,11 +1629,22 @@ def build_system_prompt(
     player_text: str | None = None,
     about_npc_id: str | None = None,
     encounter_text: str | None = None,
+    allow_secret_disclosure: bool = False,
 ) -> str:
     caps = get_prompt_caps()
     public_facts = "\n".join(f"- {x}" for x in npc.get("public_facts", []))
     known_facts = "\n".join(f"- {x}" for x in npc.get("known_facts", []))
-    secrets = "\n".join(f"- {x}" for x in npc.get("secrets", []))
+    secret_lines = [str(x).strip() for x in npc.get("secrets", []) if str(x or "").strip()]
+    if allow_secret_disclosure:
+        secrets = "\n".join(f"- {x}" for x in secret_lines)
+    elif secret_lines:
+        secrets = (
+            "- (withheld) Do not reveal hidden or secret facts, and do not confirm a rumor "
+            "that states one. A later question does not earn a secret. Share one only in the "
+            "reply immediately after a newly confirmed DM check whose consequence says to."
+        )
+    else:
+        secrets = ""
     memories_text = "\n".join(f"- {x}" for x in (memories or []))
     location_context = format_location_context(location or {}, caps=caps)
     directory_block, peer_facts_block = build_peer_location_prompt_sections(
@@ -1648,8 +1660,13 @@ def build_system_prompt(
         peer_sections += f"\n\n{peer_facts_block}"
     pronoun_context = get_npc_pronoun_context(npc)
     dm_context_text = format_dm_context_for_prompt(dm_context)
+    if not allow_secret_disclosure:
+        dm_context_text = neutralize_spent_secret_disclosure(dm_context_text)
+        encounter_block_source = neutralize_spent_secret_disclosure(encounter_text or "")
+    else:
+        encounter_block_source = encounter_text or ""
     party_context_text = format_party_context_for_prompt(party_context)
-    encounter_block = (encounter_text or "").strip() or "No encounter lines are on record for this NPC yet."
+    encounter_block = (encounter_block_source or "").strip() or "No encounter lines are on record for this NPC yet."
     if scene_context is None:
         scene_context = build_scene_context(npc.get("location_id"))
     scene_context_text = format_scene_context_for_prompt(scene_context)
@@ -1657,6 +1674,8 @@ def build_system_prompt(
     optional_scene_block = optional_scene_notes or "None."
     global_rules_text = load_global_llm_rules()
     npc_rules_text = format_npc_llm_rules(npc)
+    if not allow_secret_disclosure:
+        npc_rules_text = neutralize_spent_secret_disclosure(npc_rules_text)
     npc_rules_block = ""
     if npc_rules_text:
         npc_rules_block = f"""
@@ -1728,6 +1747,7 @@ def build_npc_llm_messages(
     scene_context: dict | None = None,
     about_npc_id: str | None = None,
     encounter_text: str | None = None,
+    allow_secret_disclosure: bool = False,
 ) -> list[dict]:
     messages = [
         {
@@ -1743,11 +1763,17 @@ def build_npc_llm_messages(
                 player_text=player_text,
                 about_npc_id=about_npc_id,
                 encounter_text=encounter_text,
+                allow_secret_disclosure=allow_secret_disclosure,
             ),
         }
     ]
 
     for dm_message in build_dm_injection_messages(dm_context):
+        if not allow_secret_disclosure:
+            dm_message = {
+                **dm_message,
+                "content": neutralize_spent_secret_disclosure(dm_message.get("content") or ""),
+            }
         messages.append(dm_message)
 
     if encounter_text is not None:
@@ -1849,6 +1875,12 @@ def build_dm_followup_messages(
     scene_context: dict | None = None,
     encounter_text: str | None = None,
 ) -> list[dict]:
+    verdict_preview = (ruling.get("verdict") or "").strip().lower()
+    consequence_preview = (ruling.get("consequence_text") or "").strip()
+    allow_secret_disclosure = (
+        verdict_preview == "confirmed"
+        and "share exactly one secret" in consequence_preview.lower()
+    )
     messages = build_npc_llm_messages(
         npc,
         scene,
@@ -1859,6 +1891,7 @@ def build_dm_followup_messages(
         party_context=party_context,
         scene_context=scene_context,
         encounter_text=encounter_text if encounter_text is not None else "",
+        allow_secret_disclosure=allow_secret_disclosure,
     )
 
     verdict = (ruling.get("verdict") or "unclear").strip().upper()

@@ -1447,13 +1447,39 @@ def process_player_message(
 _SECRET_WORD_RE = re.compile(r"[a-z0-9']+")
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 _SECRET_WITHHELD_LINE = "I'd rather not say more about that."
+_SPENT_SECRET_DISCLOSURE = (
+    "Already applied. Do not reveal another secret. A later question does not earn one. "
+    "Another secret requires a new confirmed DM check."
+)
+_SHARE_ONE_SECRET_RE = re.compile(
+    r"(?is)\bshare exactly one secret\b.{0,700}?do not invent one\.?"
+)
+_SECRET_FILLER = frozenset({
+    "knows", "believes", "that", "this", "with", "from", "were", "been", "have",
+    "has", "into", "about", "their", "there", "they", "them", "then", "than",
+    "actually", "trying", "appear", "would", "could", "should", "over",
+})
 
 
 def _normalize_match_text(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").strip().lower())
 
 
-def _text_discloses_secret(text: str, secret: str) -> bool:
+def _content_words(text: str) -> list[str]:
+    return [
+        word for word in _SECRET_WORD_RE.findall(_normalize_match_text(text))
+        if len(word) >= 4 and word not in _SECRET_FILLER
+    ]
+
+
+def _bigram_in_order(words: list[str], first: str, second: str) -> bool:
+    for index, word in enumerate(words):
+        if word == first and second in words[index + 1:index + 3]:
+            return True
+    return False
+
+
+def _text_discloses_secret(text: str, secret: str, public_text: str = "") -> bool:
     """True when spoken text repeats a secret phrase, not a single shared word."""
     secret_norm = _normalize_match_text(secret)
     text_norm = _normalize_match_text(text)
@@ -1461,11 +1487,24 @@ def _text_discloses_secret(text: str, secret: str) -> bool:
         return False
     if secret_norm in text_norm:
         return True
-    tokens = [word for word in _SECRET_WORD_RE.findall(secret_norm) if len(word) >= 4]
-    if len(tokens) < 2:
+    secret_words = _content_words(secret)
+    if len(secret_words) < 2:
         return False
-    text_words = set(_SECRET_WORD_RE.findall(text_norm))
-    return all(token in text_words for token in tokens)
+    reply_words = _content_words(text)
+    public_words = set(_content_words(public_text))
+    for first, second in zip(secret_words, secret_words[1:]):
+        if first in public_words and second in public_words:
+            continue
+        if _bigram_in_order(reply_words, first, second):
+            return True
+    return False
+
+
+def neutralize_spent_secret_disclosure(text: str) -> str:
+    """Replace a one-time 'share one secret' consequence so later turns do not replay it."""
+    if not text or "secret" not in text.lower():
+        return text
+    return _SHARE_ONE_SECRET_RE.sub(_SPENT_SECRET_DISCLOSURE, text)
 
 
 def unshared_secrets_in_reply(
@@ -1477,7 +1516,7 @@ def unshared_secrets_in_reply(
     found: list[str] = []
     for raw in secrets or []:
         secret = str(raw or "").strip()
-        if not secret or not _text_discloses_secret(text, secret):
+        if not secret or not _text_discloses_secret(text, secret, prior_text):
             continue
         if prior_text and _text_discloses_secret(prior_text, secret):
             continue
@@ -1707,45 +1746,14 @@ def process_npc_response(
     )
     if disclosed_secrets and not safe_spoken:
         safe_spoken = _SECRET_WITHHELD_LINE
-
-    if disclosed_secrets and not pending_ids and connection is not None:
-        from required_dm_checks import _ruling_covers_claim
-
-        claim = fresh_unshared_secret_claim(player_text)
-        if rulings is None:
-            rulings = load_rulings(
-                npc_id,
-                player_id,
-                limit=50,
-                campaign_id=campaign_id,
-                connection=connection,
-            )
-        if not _ruling_covers_claim({"rulings": rulings}, claim):
-            created_id = save_pending_check(
-                npc_id=npc_id,
-                player_id=player_id,
-                claim_summary=claim,
-                player_text=player_text,
-                npc_text=safe_spoken,
-                source="unshared_secret",
-                campaign_id=campaign_id,
-                connection=connection,
-                pending_checks=pending_checks,
-                rulings=rulings,
-            )
-            if created_id is not None:
-                pending_ids.append(created_id)
-                pending_id = created_id
-                all_claims.append(claim)
-                if pending_source is None:
-                    pending_source = "unshared_secret"
-                elif "unshared_secret" not in pending_source:
-                    pending_source = f"{pending_source}+unshared_secret"
-                print(
-                    f"[DM] withhold unshared secret npc={npc_id} player={player_id} "
-                    f"campaign={campaign_id or '(none)'} claim={claim[:120]!r}",
-                    flush=True,
-                )
+    if disclosed_secrets:
+        # A question is not a new flattery check. Strip the secret and leave
+        # the DM check to the authored compliment or threat trigger.
+        print(
+            f"[DM] withhold unshared secret npc={npc_id} player={player_id} "
+            f"campaign={campaign_id or '(none)'}",
+            flush=True,
+        )
 
     held_spoken_text = ""
     if create_pending_checks and _should_hold_spoken_for_dm(
