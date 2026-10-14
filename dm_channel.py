@@ -4,6 +4,7 @@ Dedicated DM channel: messages, pending verification checks, and automatic rulin
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from contextlib import nullcontext
@@ -1443,6 +1444,104 @@ def process_player_message(
     }
 
 
+_SECRET_WORD_RE = re.compile(r"[a-z0-9']+")
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+_SECRET_WITHHELD_LINE = "I'd rather not say more about that."
+
+
+def _normalize_match_text(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip().lower())
+
+
+def _text_discloses_secret(text: str, secret: str) -> bool:
+    """True when spoken text repeats a secret phrase, not a single shared word."""
+    secret_norm = _normalize_match_text(secret)
+    text_norm = _normalize_match_text(text)
+    if len(secret_norm) < 8 or not text_norm:
+        return False
+    if secret_norm in text_norm:
+        return True
+    tokens = [word for word in _SECRET_WORD_RE.findall(secret_norm) if len(word) >= 4]
+    if len(tokens) < 2:
+        return False
+    text_words = set(_SECRET_WORD_RE.findall(text_norm))
+    return all(token in text_words for token in tokens)
+
+
+def unshared_secrets_in_reply(
+    text: str,
+    secrets: list[str] | None,
+    prior_text: str = "",
+) -> list[str]:
+    """Secrets this reply would reveal that earlier NPC lines have not already spoken."""
+    found: list[str] = []
+    for raw in secrets or []:
+        secret = str(raw or "").strip()
+        if not secret or not _text_discloses_secret(text, secret):
+            continue
+        if prior_text and _text_discloses_secret(prior_text, secret):
+            continue
+        found.append(secret)
+    return found
+
+
+def redact_unshared_secrets(text: str, secrets: list[str]) -> str:
+    """Drop sentences that disclose one of ``secrets``."""
+    parts = _SENTENCE_SPLIT_RE.split((text or "").strip())
+    kept = [
+        part
+        for part in parts
+        if part and not any(_text_discloses_secret(part, secret) for secret in secrets)
+    ]
+    return " ".join(kept).strip()
+
+
+def fresh_unshared_secret_claim(player_text: str) -> str:
+    """
+    Claim identity for one player attempt.
+
+    The same player wording keeps the same claim, so a repeated compliment stays
+    covered by its earlier ruling. Different wording gets a different claim.
+    """
+    normalized = _normalize_match_text(player_text)
+    digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:8]
+    excerpt = re.sub(r"\s+", " ", (player_text or "").strip())[:80]
+    if excerpt:
+        return f"Unshared secret attempt {digest}: {excerpt}"
+    return f"Unshared secret attempt {digest}"
+
+
+def _prior_npc_assistant_text(
+    connection: memory_db.DbConnection,
+    npc_id: str,
+    campaign_id: str,
+) -> str:
+    """Assistant lines already stored for this NPC in the campaign."""
+    if "content" not in memory_db.table_columns(
+        connection, "conversation_turns", _ALLOWED_SQL_TABLES
+    ):
+        return ""
+    rows = connection.execute(
+        """
+        SELECT content
+        FROM conversation_turns
+        WHERE campaign_id = ?
+          AND npc_id = ?
+          AND role = 'assistant'
+        ORDER BY id DESC
+        LIMIT 40
+        """,
+        (normalize_campaign_id(campaign_id), npc_id),
+    ).fetchall()
+    parts: list[str] = []
+    for row in reversed(rows):
+        content = row["content"] if row["content"] is not None else ""
+        text = str(content).strip()
+        if text and not is_dm_wait_narration(text):
+            parts.append(text)
+    return "\n".join(parts)
+
+
 def _should_hold_spoken_for_dm(
     npc_id: str,
     player_id: str,
@@ -1589,6 +1688,65 @@ def process_npc_response(
                     elif "deferral" not in pending_source:
                         pending_source = f"{pending_source}+npc_deferral"
 
+    disclosed_secrets: list[str] = []
+    if create_pending_checks and npc and connection is not None:
+        secret_list = [
+            str(item).strip()
+            for item in (npc.get("secrets") or [])
+            if str(item or "").strip()
+        ]
+        if secret_list:
+            prior_text = _prior_npc_assistant_text(connection, npc_id, campaign_id)
+            disclosed_secrets = unshared_secrets_in_reply(
+                spoken_text, secret_list, prior_text
+            )
+    safe_spoken = (
+        redact_unshared_secrets(spoken_text, disclosed_secrets)
+        if disclosed_secrets
+        else spoken_text
+    )
+    if disclosed_secrets and not safe_spoken:
+        safe_spoken = _SECRET_WITHHELD_LINE
+
+    if disclosed_secrets and not pending_ids and connection is not None:
+        from required_dm_checks import _ruling_covers_claim
+
+        claim = fresh_unshared_secret_claim(player_text)
+        if rulings is None:
+            rulings = load_rulings(
+                npc_id,
+                player_id,
+                limit=50,
+                campaign_id=campaign_id,
+                connection=connection,
+            )
+        if not _ruling_covers_claim({"rulings": rulings}, claim):
+            created_id = save_pending_check(
+                npc_id=npc_id,
+                player_id=player_id,
+                claim_summary=claim,
+                player_text=player_text,
+                npc_text=safe_spoken,
+                source="unshared_secret",
+                campaign_id=campaign_id,
+                connection=connection,
+                pending_checks=pending_checks,
+                rulings=rulings,
+            )
+            if created_id is not None:
+                pending_ids.append(created_id)
+                pending_id = created_id
+                all_claims.append(claim)
+                if pending_source is None:
+                    pending_source = "unshared_secret"
+                elif "unshared_secret" not in pending_source:
+                    pending_source = f"{pending_source}+unshared_secret"
+                print(
+                    f"[DM] withhold unshared secret npc={npc_id} player={player_id} "
+                    f"campaign={campaign_id or '(none)'} claim={claim[:120]!r}",
+                    flush=True,
+                )
+
     held_spoken_text = ""
     if create_pending_checks and _should_hold_spoken_for_dm(
         npc_id,
@@ -1598,8 +1756,12 @@ def process_npc_response(
         connection=connection,
         pending_checks=pending_checks,
     ):
-        held_spoken_text = spoken_text
+        # Persist the line without an unshared secret. The secret is spoken only
+        # on the post-ruling reply, which does not create a new check.
+        held_spoken_text = safe_spoken
         spoken_text = DM_PENDING_WAIT_NARRATION
+    elif disclosed_secrets:
+        spoken_text = safe_spoken
 
     return {
         "spoken_text": spoken_text,
