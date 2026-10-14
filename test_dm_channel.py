@@ -619,3 +619,126 @@ def test_clear_dm_data_all_players_removes_other_speakers_rulings(dm_sqlite):
     assert dm_channel.load_pending_checks(
         npc, "player_alden", status=None, campaign_id=campaign
     ) == []
+
+
+def test_unshared_secret_detection_ignores_an_already_spoken_secret():
+    from dm_channel import unshared_secrets_in_reply
+
+    secrets = [
+        "The vault combination is 12-24-36.",
+        "The smuggler meets at the north pier.",
+    ]
+    reply = "You already know the vault combination is 12-24-36."
+    prior = "The vault combination is 12-24-36."
+    assert unshared_secrets_in_reply(reply, secrets, prior) == []
+    assert unshared_secrets_in_reply(
+        "The smuggler meets at the north pier tonight.",
+        secrets,
+        prior,
+    ) == ["The smuggler meets at the north pier."]
+    assert unshared_secrets_in_reply("Good day to you.", secrets, "") == []
+
+
+def test_fresh_secret_claim_changes_with_player_wording():
+    from dm_channel import fresh_unshared_secret_claim
+
+    first = fresh_unshared_secret_claim("Your cloak is magnificent")
+    repeat = fresh_unshared_secret_claim("Your cloak is magnificent")
+    other = fresh_unshared_secret_claim("You are the wisest person in the city")
+    assert first == repeat
+    assert first != other
+
+
+def test_process_npc_response_holds_unshared_secret_without_a_check(dm_sqlite):
+    """A player turn must not speak a new secret unless a check is opened and held."""
+    dm_channel, _mem_db = dm_sqlite
+    npc = {
+        "id": "keeper",
+        "name": "Keeper",
+        "secrets": ["The vault combination is 12-24-36."],
+    }
+
+    result = dm_channel.process_npc_response(
+        "keeper",
+        "player_alden",
+        "Your cloak is magnificent",
+        "You are too kind. The vault combination is 12-24-36.",
+        campaign_id="camp_1",
+        npc=npc,
+    )
+
+    assert result["spoken_text"] == dm_channel.DM_PENDING_WAIT_NARRATION
+    assert "12-24-36" not in result["held_spoken_text"]
+    assert "12-24-36" not in result["spoken_text"]
+    assert result["pending_check_ids"]
+    pending = dm_channel.load_pending_checks(
+        "keeper", "player_alden", status="pending", campaign_id="camp_1"
+    )
+    assert len(pending) == 1
+    assert "12-24-36" not in (pending[0].get("npc_text") or "")
+    assert pending[0]["claim_summary"].startswith("Unshared secret attempt ")
+
+
+def test_process_npc_response_repeat_compliment_does_not_release_another_secret(dm_sqlite):
+    """After that attempt is ruled, the same compliment must not speak a second secret."""
+    dm_channel, _mem_db = dm_sqlite
+    npc = {
+        "id": "keeper",
+        "name": "Keeper",
+        "secrets": [
+            "The vault combination is 12-24-36.",
+            "The smuggler meets at the north pier.",
+        ],
+    }
+    player_text = "Your cloak is magnificent"
+    first = dm_channel.process_npc_response(
+        "keeper",
+        "player_alden",
+        player_text,
+        "The vault combination is 12-24-36.",
+        campaign_id="camp_1",
+        npc=npc,
+    )
+    claim = next(
+        item["claim_summary"]
+        for item in dm_channel.load_pending_checks(
+            "keeper", "player_alden", status="pending", campaign_id="camp_1"
+        )
+    )
+    dm_channel.create_manual_ruling(
+        npc_id="keeper",
+        player_id="player_alden",
+        claim_summary=claim,
+        verdict="confirmed",
+        notes="Share one secret.",
+        pending_check_id=first["pending_check_id"],
+        campaign_id="camp_1",
+        npc=npc,
+    )
+
+    # The confirmed follow-up is allowed to speak the secret. A later player turn is not.
+    followup = dm_channel.process_npc_response(
+        "keeper",
+        "player_alden",
+        "",
+        "The vault combination is 12-24-36.",
+        campaign_id="camp_1",
+        npc=npc,
+        create_pending_checks=False,
+    )
+    assert "12-24-36" in followup["spoken_text"]
+
+    second = dm_channel.process_npc_response(
+        "keeper",
+        "player_alden",
+        player_text,
+        "Since you asked again, the smuggler meets at the north pier.",
+        campaign_id="camp_1",
+        npc=npc,
+    )
+    assert "north pier" not in second["spoken_text"].lower()
+    assert "12-24-36" not in second["spoken_text"]
+    assert second["pending_check_ids"] == []
+    assert dm_channel.load_pending_checks(
+        "keeper", "player_alden", status="pending", campaign_id="camp_1"
+    ) == []
