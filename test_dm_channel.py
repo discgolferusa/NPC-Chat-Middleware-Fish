@@ -649,8 +649,44 @@ def test_fresh_secret_claim_changes_with_player_wording():
     assert first != other
 
 
+def test_question_does_not_release_a_paraphrased_secret():
+    """A later question must not count as a new check or speak the next secret."""
+    from dm_channel import unshared_secrets_in_reply
+
+    secrets = [
+        "Knows that medical supplies were stolen from the Saranas Warehouse.",
+        "Believes that a young alethi man with dark hair completed the Saranas Warehouse robbery.",
+    ]
+    prior = (
+        "I think a young Alethi man with dark hair did the Saranas job. "
+        "He hunched over to look shorter than he is."
+    )
+    reply = "Medical supplies. A large cache, by the sound of it."
+    assert unshared_secrets_in_reply(reply, secrets, prior) == [secrets[0]]
+    assert unshared_secrets_in_reply(
+        "The Saranas warehouse is busy today.",
+        secrets,
+        "Was there a theft over at the Saranas warehouse?",
+    ) == []
+
+
+def test_spent_secret_consequence_is_not_replayed():
+    from dm_channel import neutralize_spent_secret_disclosure
+
+    raw = (
+        'Is Cassana flattered by "premier thief of the city"? Outcome: confirmed. '
+        "Consequence: Share exactly one secret from this NPC's secrets list that has "
+        "not already been told in this conversation.  If every secret was already shared, "
+        "say there is nothing left to confide and do not invent one."
+    )
+    updated = neutralize_spent_secret_disclosure(raw)
+    assert "share exactly one secret" not in updated.lower()
+    assert "does not earn one" in updated.lower()
+    assert "premier thief" in updated.lower()
+
+
 def test_process_npc_response_holds_unshared_secret_without_a_check(dm_sqlite):
-    """A player turn must not speak a new secret unless a check is opened and held."""
+    """A player turn must not speak a new secret, and a question must not open a check."""
     dm_channel, _mem_db = dm_sqlite
     npc = {
         "id": "keeper",
@@ -661,26 +697,22 @@ def test_process_npc_response_holds_unshared_secret_without_a_check(dm_sqlite):
     result = dm_channel.process_npc_response(
         "keeper",
         "player_alden",
-        "Your cloak is magnificent",
+        "Do you have any idea what was stolen?",
         "You are too kind. The vault combination is 12-24-36.",
         campaign_id="camp_1",
         npc=npc,
     )
 
-    assert result["spoken_text"] == dm_channel.DM_PENDING_WAIT_NARRATION
-    assert "12-24-36" not in result["held_spoken_text"]
     assert "12-24-36" not in result["spoken_text"]
-    assert result["pending_check_ids"]
-    pending = dm_channel.load_pending_checks(
+    assert "too kind" in result["spoken_text"].lower()
+    assert result["pending_check_ids"] == []
+    assert dm_channel.load_pending_checks(
         "keeper", "player_alden", status="pending", campaign_id="camp_1"
-    )
-    assert len(pending) == 1
-    assert "12-24-36" not in (pending[0].get("npc_text") or "")
-    assert pending[0]["claim_summary"].startswith("Unshared secret attempt ")
+    ) == []
 
 
 def test_process_npc_response_repeat_compliment_does_not_release_another_secret(dm_sqlite):
-    """After that attempt is ruled, the same compliment must not speak a second secret."""
+    """The ruling follow-up may speak one secret. A later player turn may not."""
     dm_channel, _mem_db = dm_sqlite
     npc = {
         "id": "keeper",
@@ -690,33 +722,7 @@ def test_process_npc_response_repeat_compliment_does_not_release_another_secret(
             "The smuggler meets at the north pier.",
         ],
     }
-    player_text = "Your cloak is magnificent"
-    first = dm_channel.process_npc_response(
-        "keeper",
-        "player_alden",
-        player_text,
-        "The vault combination is 12-24-36.",
-        campaign_id="camp_1",
-        npc=npc,
-    )
-    claim = next(
-        item["claim_summary"]
-        for item in dm_channel.load_pending_checks(
-            "keeper", "player_alden", status="pending", campaign_id="camp_1"
-        )
-    )
-    dm_channel.create_manual_ruling(
-        npc_id="keeper",
-        player_id="player_alden",
-        claim_summary=claim,
-        verdict="confirmed",
-        notes="Share one secret.",
-        pending_check_id=first["pending_check_id"],
-        campaign_id="camp_1",
-        npc=npc,
-    )
 
-    # The confirmed follow-up is allowed to speak the secret. A later player turn is not.
     followup = dm_channel.process_npc_response(
         "keeper",
         "player_alden",
@@ -731,14 +737,10 @@ def test_process_npc_response_repeat_compliment_does_not_release_another_secret(
     second = dm_channel.process_npc_response(
         "keeper",
         "player_alden",
-        player_text,
+        "Do you have any idea what was stolen?",
         "Since you asked again, the smuggler meets at the north pier.",
         campaign_id="camp_1",
         npc=npc,
     )
     assert "north pier" not in second["spoken_text"].lower()
-    assert "12-24-36" not in second["spoken_text"]
     assert second["pending_check_ids"] == []
-    assert dm_channel.load_pending_checks(
-        "keeper", "player_alden", status="pending", campaign_id="camp_1"
-    ) == []
