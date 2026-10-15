@@ -226,19 +226,25 @@ def build_gm_assistant_messages(
     yaml_documents: list[dict[str, Any]] | None,
     followup: str | None,
     history: list[dict[str, Any]] | None,
+    instruction: str | None = None,
 ) -> list[dict[str, str]]:
     """Prompt for the diagnosis model. Roles are only system, user, and assistant."""
     normalized = (mode or "explain").strip().lower()
     if normalized not in {"explain", "suggest"}:
         raise ValueError("mode must be explain or suggest.")
 
-    system = _SUGGEST_SYSTEM if normalized == "suggest" else _EXPLAIN_SYSTEM
-    case_lines = [
-        "NPC prompt messages the game would send right now:",
-        _format_preview_messages(preview_messages),
-        "",
-        f"Player question:\n{(question or '').strip() or '(not provided)'}",
-    ]
+    custom = (instruction or "").strip()
+    system = custom[:8000] if custom else (
+        _SUGGEST_SYSTEM if normalized == "suggest" else _EXPLAIN_SYSTEM
+    )
+    case_lines: list[str] = []
+    if preview_messages:
+        case_lines.extend([
+            "NPC prompt messages the game would send right now:",
+            _format_preview_messages(preview_messages),
+            "",
+        ])
+    case_lines.append(f"Player question:\n{(question or '').strip() or '(not provided)'}")
     reply = (npc_reply or "").strip()
     mismatch = (mismatch_note or "").strip()
     if reply:
@@ -335,15 +341,20 @@ def handle_diagnose():
         return jsonify({"error": "JSON object required."}), 400
 
     preview_messages = body.get("messages")
-    if not isinstance(preview_messages, list) or not preview_messages:
-        return jsonify({"error": "messages from the prompt preview are required."}), 400
+    if preview_messages is None:
+        preview_messages = []
+    if not isinstance(preview_messages, list):
+        return jsonify({"error": "messages must be a list."}), 400
 
+    instruction = str(body.get("instruction") or "").strip()
     question = str(body.get("question") or "").strip()
     npc_reply = str(body.get("npc_reply") or "").strip()
     mismatch = str(body.get("mismatch_note") or "").strip()
     if not question:
         return jsonify({"error": "question is required."}), 400
-    if not npc_reply and not mismatch:
+    if not instruction and not preview_messages:
+        return jsonify({"error": "messages from the prompt preview are required."}), 400
+    if not instruction and not npc_reply and not mismatch:
         return jsonify({"error": "npc_reply or mismatch_note is required."}), 400
 
     mode = str(body.get("mode") or "explain").strip().lower()
@@ -368,6 +379,7 @@ def handle_diagnose():
             yaml_documents=documents,
             followup=str(body.get("followup") or ""),
             history=history,
+            instruction=instruction,
         )
         text, usage = complete_diagnosis(messages)
     except ValueError as ex:

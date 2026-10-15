@@ -129,6 +129,30 @@ def test_diagnose_prompt_explain_vs_suggest_includes_yaml_and_no_tools():
         assert not any(item["role"] in {"tool", "function"} for item in batch)
 
 
+def test_instruction_replaces_the_system_prompt_without_a_live_preview():
+    messages = gm_assistant.build_gm_assistant_messages(
+        mode="explain",
+        preview_messages=[],
+        question="What is wrong with the well?",
+        npc_reply="",
+        mismatch_note="",
+        yaml_documents=[{
+            "kind": "location",
+            "id": "taproom",
+            "filename": "taproom.yaml",
+            "text": "name: Taproom\n",
+        }],
+        followup="",
+        history=[],
+        instruction="Help the GM with this location. Do not edit files.",
+    )
+
+    assert messages[0]["content"].startswith("Help the GM with this location.")
+    assert "taproom.yaml" in messages[1]["content"]
+    assert "NPC prompt messages" not in messages[1]["content"]
+    assert "invented or inferred" not in messages[0]["content"]
+
+
 def test_gm_assistant_inherits_content_creation_model(monkeypatch):
     monkeypatch.setattr(llm_router, "GM_ASSISTANT_MODEL_ID", "")
     monkeypatch.setattr(llm_router, "CONTENT_CREATION_MODEL_ID", llm_router.CURRENT_LLM_MODEL_ID)
