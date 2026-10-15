@@ -4560,6 +4560,20 @@ def list_locations():
     })
 
 
+@app.post("/npc-prompt-preview")
+def npc_prompt_preview():
+    from gm_assistant import handle_prompt_preview
+
+    return handle_prompt_preview()
+
+
+@app.post("/gm-assistant/diagnose")
+def gm_assistant_diagnose():
+    from gm_assistant import handle_diagnose
+
+    return handle_diagnose()
+
+
 @app.post("/npc-preload")
 def npc_preload():
     body = request.get_json(force=True, silent=True) or {}
