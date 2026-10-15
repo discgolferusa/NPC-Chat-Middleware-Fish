@@ -120,6 +120,7 @@ PURPOSE_CONTENT_CAMPAIGN = "content_campaign"
 PURPOSE_CONTENT_LOCATION = "content_location"
 PURPOSE_CONTENT_NPC = "content_npc"
 PURPOSE_CONTENT_REPAIR = "content_repair"
+PURPOSE_GM_ASSISTANT = "gm_assistant"
 IMPORT_PURPOSES = frozenset(
     {
         PURPOSE_CONTENT_DISCOVERY,
@@ -129,11 +130,11 @@ IMPORT_PURPOSES = frozenset(
         PURPOSE_CONTENT_REPAIR,
     }
 )
-VALID_PURPOSES = frozenset({PURPOSE_CHAT, PURPOSE_CONTENT_CREATION}) | IMPORT_PURPOSES
+VALID_PURPOSES = frozenset({PURPOSE_CHAT, PURPOSE_CONTENT_CREATION, PURPOSE_GM_ASSISTANT}) | IMPORT_PURPOSES
 DEFAULT_PURPOSE = PURPOSE_CHAT
 
-# All content-family purposes (legacy + staged import).
-CONTENT_FAMILY_PURPOSES = frozenset({PURPOSE_CONTENT_CREATION}) | IMPORT_PURPOSES
+# All content-family purposes (legacy + staged import + GM diagnosis).
+CONTENT_FAMILY_PURPOSES = frozenset({PURPOSE_CONTENT_CREATION, PURPOSE_GM_ASSISTANT}) | IMPORT_PURPOSES
 
 _ALL_CONTENT_PURPOSES_LIST = [
     PURPOSE_CHAT,
@@ -143,6 +144,7 @@ _ALL_CONTENT_PURPOSES_LIST = [
     PURPOSE_CONTENT_LOCATION,
     PURPOSE_CONTENT_NPC,
     PURPOSE_CONTENT_REPAIR,
+    PURPOSE_GM_ASSISTANT,
 ]
 
 # OpenRouter catalog. Credit budget (not RPM/TPM) gates online vs local fallback.
@@ -264,6 +266,9 @@ IMPORT_PURPOSE_MODEL_IDS: dict[str, str] = {
     purpose: _env_import_model_id(purpose) for purpose in IMPORT_PURPOSES
 }
 
+# Optional. Empty → inherit content_creation, same as an unset import-stage override.
+GM_ASSISTANT_MODEL_ID = str(os.getenv("CONTENT_GM_ASSISTANT_LLM_MODEL_ID", "") or "").strip()
+
 IMPORT_MAX_SCHEMA_RETRIES = max(0, int(os.getenv("IMPORT_MAX_SCHEMA_RETRIES", "2")))
 IMPORT_MAX_REPAIR_ATTEMPTS = max(0, int(os.getenv("IMPORT_MAX_REPAIR_ATTEMPTS", "2")))
 IMPORT_LOCATION_BATCH_SIZE = max(1, int(os.getenv("IMPORT_LOCATION_BATCH_SIZE", "1")))
@@ -275,6 +280,7 @@ def _empty_purpose_status(default: str | None = "local") -> dict[str, str | None
     out: dict[str, str | None] = {PURPOSE_CHAT: default, PURPOSE_CONTENT_CREATION: default}
     for purpose in IMPORT_PURPOSES:
         out[purpose] = default
+    out[PURPOSE_GM_ASSISTANT] = default
     return out
 
 
@@ -397,6 +403,14 @@ def _get_purpose_model_id(purpose: str) -> str:
         override = str(IMPORT_PURPOSE_MODEL_IDS.get(purpose) or "").strip()
         if override:
             # Resolve against content_creation eligibility (catalog rarely lists import purposes).
+            return _resolve_model_id(
+                override,
+                default=CONTENT_CREATION_MODEL_ID,
+                purpose=PURPOSE_CONTENT_CREATION,
+            )
+    if purpose == PURPOSE_GM_ASSISTANT:
+        override = str(GM_ASSISTANT_MODEL_ID or "").strip()
+        if override:
             return _resolve_model_id(
                 override,
                 default=CONTENT_CREATION_MODEL_ID,
@@ -536,7 +550,7 @@ def model_supports_purpose(model_id: str, purpose: str) -> bool:
     normalized = _normalize_purpose(purpose)
     if normalized in allowed:
         return True
-    if normalized in IMPORT_PURPOSES and PURPOSE_CONTENT_CREATION in allowed:
+    if normalized in IMPORT_PURPOSES | {PURPOSE_GM_ASSISTANT} and PURPOSE_CONTENT_CREATION in allowed:
         return True
     return False
 
@@ -2795,7 +2809,7 @@ def get_llm_status() -> dict[str, Any]:
         PURPOSE_CHAT: _usage_by_purpose_summary(PURPOSE_CHAT),
         PURPOSE_CONTENT_CREATION: _usage_by_purpose_summary(PURPOSE_CONTENT_CREATION),
     }
-    for purpose in IMPORT_PURPOSES:
+    for purpose in IMPORT_PURPOSES | {PURPOSE_GM_ASSISTANT}:
         purposes[purpose] = _purpose_status(purpose)
         usage_by_purpose[purpose] = _usage_by_purpose_summary(purpose)
 
