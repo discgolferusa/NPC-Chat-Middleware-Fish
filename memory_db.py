@@ -123,6 +123,26 @@ def _qmark_to_percent(sql: str) -> str:
     return sql.replace("?", "%s")
 
 
+# PyMySQL reports a server-closed or timed-out socket as these codes.
+# 2006 server has gone away, 2013 lost connection during query,
+# 2014 commands out of sync, 2055 lost connection at handshake.
+_MYSQL_DISCONNECT_CODES = frozenset({2006, 2013, 2014, 2055})
+
+
+def _is_mysql_disconnect(exc: BaseException) -> bool:
+    if pymysql is None:
+        return False
+    errors = getattr(pymysql, "err", None)
+    if errors is None or not isinstance(
+        exc, (errors.OperationalError, errors.InterfaceError)
+    ):
+        return False
+    code = exc.args[0] if exc.args else None
+    if code in _MYSQL_DISCONNECT_CODES:
+        return True
+    return isinstance(exc, errors.InterfaceError)
+
+
 class _CursorResult:
     """Thin wrapper so callers can use ``cur.lastrowid`` / ``.fetchall()``."""
 
@@ -248,6 +268,8 @@ class _MySqlConnectionPool:
         self,
         entry: _PoolEntry,
         now: float,
+        *,
+        checkout: bool = False,
     ) -> tuple[bool, str | None, bool]:
         if self.recycle_seconds and now - entry.created_at >= self.recycle_seconds:
             return False, "recycle-age", False
@@ -255,11 +277,14 @@ class _MySqlConnectionPool:
             return False, "socket-closed", False
         idle_seconds = now - entry.returned_at
         ping = getattr(entry.raw, "ping", None)
-        if (
-            callable(ping)
-            and self.ping_interval_seconds
-            and idle_seconds >= self.ping_interval_seconds
-        ):
+        # Checkout always pings. PyMySQL keeps .open true after the server or a
+        # proxy has already closed the socket, so an idle-time threshold hands
+        # that connection to the next DM check or NPC turn and the query dies
+        # with "Lost connection to MySQL server during query".
+        should_ping = callable(ping) and self.ping_interval_seconds and (
+            checkout or idle_seconds >= self.ping_interval_seconds
+        )
+        if should_ping:
             try:
                 # Reconnect is deliberately disabled so the pool retains an exact
                 # count and can discard/recreate failed connections itself.
@@ -414,7 +439,9 @@ class _MySqlConnectionPool:
 
             assert entry is not None
             now = time.monotonic()
-            usable, reason, reason_logged = self._entry_is_usable(entry, now)
+            usable, reason, reason_logged = self._entry_is_usable(
+                entry, now, checkout=True
+            )
             if usable:
                 return entry
             self._discard(
@@ -567,6 +594,8 @@ class DbConnection:
         self._pool_entry = pool_entry
         self._closed = False
         self._results: set[_CursorResult] = set()
+        self._statements_done = False
+        self._disconnect_retried = False
 
     def _ensure_open(self) -> None:
         if self._closed:
@@ -593,15 +622,58 @@ class DbConnection:
         else:
             self._raw.close()
 
+    def _replace_after_disconnect(self, exc: BaseException) -> None:
+        """Drop the dead socket and check out a new one for a single retry."""
+        code = exc.args[0] if getattr(exc, "args", None) else ""
+        print(
+            "[MEMORY-DB] retrying MySQL statement after disconnect "
+            f"code={code}",
+            flush=True,
+        )
+        self._disconnect_retried = True
+        self._close_results()
+        entry = self._pool_entry
+        self._pool_entry = None
+        if self._pool is not None and entry is not None:
+            self._pool.release(entry, invalid=True)
+        if self._pool is None:
+            self._raw = None
+            raise RuntimeError("MySQL connection cannot be retried") from exc
+        try:
+            fresh = self._pool.acquire()
+        except Exception:
+            self._raw = None
+            raise
+        self._pool_entry = fresh
+        self._raw = fresh.raw
+
+    def _run_mysql(self, sql: str, params: Sequence[Any], *, many: bool) -> _CursorResult:
+        bound = list(params) if many else tuple(params)
+        try:
+            cursor = self._raw.cursor()
+            if many:
+                cursor.executemany(_qmark_to_percent(sql), bound)
+            else:
+                cursor.execute(_qmark_to_percent(sql), bound)
+        except Exception as exc:
+            if not _is_mysql_disconnect(exc) or self._statements_done or self._disconnect_retried:
+                raise
+            self._replace_after_disconnect(exc)
+            cursor = self._raw.cursor()
+            if many:
+                cursor.executemany(_qmark_to_percent(sql), bound)
+            else:
+                cursor.execute(_qmark_to_percent(sql), bound)
+        self._statements_done = True
+        result = _CursorResult(cursor, self._forget_result)
+        self._results.add(result)
+        return result
+
     def execute(self, sql: str, params: Sequence[Any] | None = None) -> _CursorResult:
         self._ensure_open()
         params = params or ()
         if self.config.is_mysql:
-            cursor = self._raw.cursor()
-            cursor.execute(_qmark_to_percent(sql), tuple(params))
-            result = _CursorResult(cursor, self._forget_result)
-            self._results.add(result)
-            return result
+            return self._run_mysql(sql, params, many=False)
         cursor = self._raw.execute(sql, params)
         result = _CursorResult(cursor, self._forget_result)
         self._results.add(result)
@@ -610,11 +682,7 @@ class DbConnection:
     def executemany(self, sql: str, seq_of_params: Iterable[Sequence[Any]]) -> _CursorResult:
         self._ensure_open()
         if self.config.is_mysql:
-            cursor = self._raw.cursor()
-            cursor.executemany(_qmark_to_percent(sql), list(seq_of_params))
-            result = _CursorResult(cursor, self._forget_result)
-            self._results.add(result)
-            return result
+            return self._run_mysql(sql, seq_of_params, many=True)
         cursor = self._raw.executemany(sql, seq_of_params)
         result = _CursorResult(cursor, self._forget_result)
         self._results.add(result)
@@ -643,7 +711,8 @@ class DbConnection:
     def __exit__(self, exc_type, exc, tb) -> None:
         # close() may already have returned this raw connection to the pool. Never
         # touch it again: another WSGI request may have checked it out meanwhile.
-        if self._closed:
+        if self._closed or self._raw is None:
+            self._closed = True
             return
         invalid = False
         try:

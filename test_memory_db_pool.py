@@ -10,7 +10,8 @@ import pytest
 
 
 class _FakeCursor:
-    def __init__(self) -> None:
+    def __init__(self, raw: "_FakeRawConnection | None" = None) -> None:
+        self.raw = raw
         self.lastrowid = 1
         self.rowcount = 1
         self.closed = False
@@ -20,6 +21,12 @@ class _FakeCursor:
     def execute(self, sql, params=()):
         self.sql = sql
         self.params = params
+        if self.raw is not None and self.raw.fail_execute_remaining:
+            self.raw.fail_execute_remaining -= 1
+            self.raw.open = False
+            raise memory_db.pymysql.err.OperationalError(
+                2013, "Lost connection to MySQL server during query"
+            )
 
     def executemany(self, sql, params):
         self.sql = sql
@@ -42,10 +49,11 @@ class _FakeRawConnection:
         self.commits = 0
         self.rollbacks = 0
         self.pings = 0
+        self.fail_execute_remaining = 0
         self.cursors: list[_FakeCursor] = []
 
     def cursor(self):
-        cursor = _FakeCursor()
+        cursor = _FakeCursor(self)
         self.cursors.append(cursor)
         return cursor
 
@@ -370,3 +378,50 @@ def test_steady_state_acquire_opens_no_new_connection(
     assert entry.raw is fake_connect[0]
     assert len(fake_connect) == 1
     pool.release(entry)
+
+
+def test_checkout_replaces_a_dead_socket_before_the_query(
+    mysql_config,
+    fake_connect,
+    capsys,
+):
+    with memory_db.connect(mysql_config):
+        pass
+
+    fake_connect[0].fail_ping = True
+    with memory_db.connect(mysql_config) as conn:
+        conn.execute("SELECT ?", (1,)).fetchall()
+
+    assert fake_connect[0].open is False
+    assert len(fake_connect) == 2
+    assert fake_connect[1].cursors[0].sql == "SELECT %s"
+    assert "reason=ping-failed" in capsys.readouterr().out
+
+
+def test_first_statement_retries_once_after_lost_connection(
+    mysql_config,
+    fake_connect,
+    capsys,
+):
+    with memory_db.connect(mysql_config) as conn:
+        conn._raw.fail_execute_remaining = 1
+        conn.execute("INSERT INTO dm_rulings (verdict) VALUES (?)", ("confirmed",)).fetchall()
+
+    assert len(fake_connect) == 2
+    assert fake_connect[0].open is False
+    assert fake_connect[1].cursors[0].params == ("confirmed",)
+    assert fake_connect[1].commits == 1
+    output = capsys.readouterr().out
+    assert "retrying MySQL statement after disconnect code=2013" in output
+    assert "reason=socket-closed" in output
+
+
+def test_later_statement_does_not_retry_a_lost_connection(mysql_config, fake_connect):
+    with pytest.raises(memory_db.pymysql.err.OperationalError):
+        with memory_db.connect(mysql_config) as conn:
+            conn.execute("SELECT 1").fetchall()
+            conn._raw.fail_execute_remaining = 1
+            conn.execute("INSERT INTO dm_rulings (verdict) VALUES (?)", ("confirmed",))
+
+    assert len(fake_connect) == 1
+    assert fake_connect[0].open is False
