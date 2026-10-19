@@ -724,11 +724,21 @@ def split_text_for_streaming(
     return chunks or ([text.strip()] if text and text.strip() else [])
 
 
-def clean_for_tts(text: str, pronunciation: dict[str, str] | None = None) -> str:
-    """Normalize LLM output into Piper-friendly spoken text."""
+def clean_for_tts(
+    text: str,
+    pronunciation: dict[str, str] | None = None,
+    *,
+    preserve_brackets: bool = False,
+) -> str:
+    """Normalize LLM output into spoken text.
+
+    Square brackets are unwrapped unless ``preserve_brackets`` is set, which the
+    Fish path uses so allowlisted performance tags survive cleanup.
+    """
     text = re.sub(r"\*([^*]{1,500})\*", r"\1", text)
     text = re.sub(r"_([^_]{1,500})_", r"\1", text)
-    text = re.sub(r"\[([^\]]{1,500})\]", r"\1", text)
+    if not preserve_brackets:
+        text = re.sub(r"\[([^\]]{1,500})\]", r"\1", text)
     text = re.sub(r"\(([^)]{1,500})\)", r"\1", text)
 
     text = text.replace("*", "")
@@ -848,6 +858,7 @@ def resolve_tts_options(
         "denoise_nf": opts_nf,
         "pronunciation": gloss,
         "quality": quality,
+        "fish_voice_id": str(npc.get("fish_voice_id") or "").strip(),
     }
 
 

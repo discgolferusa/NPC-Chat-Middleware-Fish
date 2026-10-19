@@ -120,7 +120,7 @@ def test_scene_time_and_sub_location(api):
     )
 
 
-def test_npcs_and_voices(api):
+def test_npcs_and_voices(api, monkeypatch):
     client, _, headers = api
 
     npcs = client.get("/npcs", headers=headers)
@@ -129,11 +129,20 @@ def test_npcs_and_voices(api):
     assert "npcs" in payload
     assert any(n.get("id") == "captain_varra" for n in payload["npcs"])
 
+    monkeypatch.setattr(
+        "fish_voices.search_voices",
+        lambda **_kwargs: {
+            "provider": "fish-audio",
+            "speech_provider": "fish-audio",
+            "model": "fish-audio/drama-3",
+            "voices": [{"id": "voice-1", "title": "Test"}],
+        },
+    )
     voices = client.get("/voices", headers=headers)
     assert voices.status_code == 200
     body = voices.get_json()
-    assert body.get("voice_enabled") is True
-    assert len(body.get("voices") or []) >= 1
+    assert body.get("provider") == "fish-audio"
+    assert body["voices"][0]["id"] == "voice-1"
 
 
 def test_npc_preload_and_npc_turn(api):

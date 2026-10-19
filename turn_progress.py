@@ -215,6 +215,7 @@ def register_turn_progress(
         "narration_text": "",
         "dialogue_text": "",
         "clips": [],
+        "audio_stream": [],
         "created_at": _utc_now_iso(),
         "updated_at": _utc_now_iso(),
         "expires_at": now + PROGRESS_TTL_SECONDS,
@@ -296,6 +297,21 @@ def _merge_clips(
         merged.values(),
         key=lambda clip: clip.get("index") if isinstance(clip.get("index"), int) else 0,
     )
+
+
+def append_audio_stream(request_id: str, event: dict[str, Any]) -> None:
+    """Append one progressive playback event. Terminal turns keep the list they have."""
+    request_id = normalize_client_request_id(request_id)
+    if not request_id or not isinstance(event, dict):
+        return
+    with _PROGRESS_LOCK:
+        entry = _PROGRESS.get(request_id)
+        if not entry or entry.get("status") in ("complete", "error", "failed"):
+            return
+        events = entry.setdefault("audio_stream", [])
+        events.append(dict(event))
+        entry["updated_at"] = _utc_now_iso()
+        entry["expires_at"] = time.time() + PROGRESS_TTL_SECONDS
 
 
 def set_turn_progress(
@@ -430,6 +446,7 @@ def public_progress(entry: dict[str, Any]) -> dict[str, Any]:
         "narration_text": entry.get("narration_text") or "",
         "dialogue_text": entry.get("dialogue_text") or "",
         "clips": list(entry.get("clips") or []),
+        "audio_stream": list(entry.get("audio_stream") or []),
         "created_at": entry.get("created_at"),
         "updated_at": entry.get("updated_at"),
     }

@@ -277,6 +277,7 @@ def get_narrator_tts_settings(path: Path | None = None) -> dict[str, Any]:
         "denoise_nr": denoise_nr,
         "denoise_nf": denoise_nf,
         "resolved_voice_model": voice_model,
+        "fish_voice_id": str(narrator.get("fish_voice_id") or "").strip(),
     }
 
 
