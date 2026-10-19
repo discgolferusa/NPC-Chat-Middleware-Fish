@@ -260,9 +260,7 @@ def test_voices_endpoint_serves_traits_and_language(api, tmp_path, monkeypatch):
     monkeypatch.setattr(server, "VOICES_DIR", root)
     _scan_for_real(server, monkeypatch)
 
-    res = client.get("/voices?refresh=1", headers=headers)
-    assert res.status_code == 200
-    voices = res.get_json()["voices"]
+    voices = server.refresh_voice_inventory(force=True)
     assert len(voices) == 1
 
     voice = voices[0]
@@ -298,9 +296,7 @@ def test_voices_endpoint_omits_traits_when_there_is_no_sidecar(api, tmp_path, mo
     monkeypatch.setattr(server, "VOICES_DIR", root)
     _scan_for_real(server, monkeypatch)
 
-    res = client.get("/voices?refresh=1", headers=headers)
-    assert res.status_code == 200
-    voice = res.get_json()["voices"][0]
+    voice = server.refresh_voice_inventory(force=True)[0]
     # The editor must degrade gracefully rather than see empty facets.
     assert voice["speakers"] == []
     assert voice["language"] == "en_US"

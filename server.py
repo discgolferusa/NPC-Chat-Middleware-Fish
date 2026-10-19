@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify, send_file, make_response, g
 import os
+import io
 import hashlib
 import secrets
 import yaml
@@ -1047,7 +1048,15 @@ def finalize_turn_database_phase(
         )
         if not npc_response.get("spoken_text") and fallback_spoken_text:
             npc_response["spoken_text"] = fallback_spoken_text
-        history_npc_text = assistant_history_text(npc_response)
+        from fish_tags import strip_all_brackets, tts_markup
+
+        markup_source = str(npc_response.get("spoken_text") or "")
+        npc_response["tts_source_text"] = tts_markup(markup_source)
+        npc_response["spoken_text"] = strip_all_brackets(markup_source)
+        held = str(npc_response.get("held_spoken_text") or "")
+        if held:
+            npc_response["held_spoken_text"] = strip_all_brackets(held)
+        history_npc_text = strip_all_brackets(assistant_history_text(npc_response))
         if history_npc_text:
             save_turn(
                 npc_id,
@@ -2058,7 +2067,7 @@ def run_dm_ruling_auto_response(
 
         ensure_turn_in_progress(request_id)
 
-        tts_segments = split_narration_and_dialogue(npc_text)
+        tts_segments = split_narration_and_dialogue(npc_response.get("tts_source_text") or npc_text)
         tts_text = " ".join(segment["text"] for segment in tts_segments).strip()
 
         audio_url = None
@@ -2528,14 +2537,27 @@ def split_into_ordered_tts_segments(
     last_end = 0
 
     def _append(segment_type: str, body: str) -> None:
-        cleaned = clean_for_tts(body, pronunciation=pronunciation)
+        from fish_tags import canonical_text, tts_markup
+
+        canonical = clean_for_tts(canonical_text(body), pronunciation=pronunciation)
+        spoken = clean_for_tts(
+            tts_markup(body),
+            pronunciation=pronunciation,
+            preserve_brackets=True,
+        )
+        cleaned = canonical or spoken
         if not cleaned:
             return
+        segment = {
+            "type": segment_type,
+            "text": canonical or spoken,
+            "tts_text": spoken or canonical,
+        }
         if not stream_sentences:
-            segments.append({"type": segment_type, "text": cleaned})
+            segments.append(segment)
             return
         for chunk in split_text_for_streaming(cleaned):
-            segments.append({"type": segment_type, "text": chunk})
+            segments.append({**segment, "text": chunk, "tts_text": chunk})
 
     for match in pattern.finditer(raw_text):
         before = raw_text[last_end:match.start()].strip()
@@ -2842,7 +2864,11 @@ def synthesize_segmented_speech_clips(
     pronunciation = npc_opts.get("pronunciation") if isinstance(npc_opts.get("pronunciation"), dict) else None
 
     _emit("segmentation_start", t=time.perf_counter())
-    segments = split_into_ordered_tts_segments(npc_text, pronunciation=pronunciation)
+    segments = split_into_ordered_tts_segments(
+        npc_text,
+        pronunciation=pronunciation,
+        stream_sentences=False,
+    )
     if not segments:
         segments = [{"type": "npc", "text": "I have nothing more to say."}]
     _emit(
@@ -2871,6 +2897,7 @@ def synthesize_segmented_speech_clips(
             "tts_fx": narrator_tts.get("fx_preset"),
             "tts_denoise_nr": narrator_tts.get("denoise_nr"),
             "tts_denoise_nf": narrator_tts.get("denoise_nf"),
+            "fish_voice_id": narrator_tts.get("fish_voice_id"),
         },
         length_scale=narrator_tts.get("length_scale"),
         noise_scale=narrator_tts.get("noise_scale"),
@@ -2923,8 +2950,26 @@ def synthesize_segmented_speech_clips(
         if index == 0:
             _emit("first_pool_acquire_start", t=time.perf_counter(), index=0)
         try:
+            from fish_config import load_settings
+
+            progressive = load_settings().progressive
+        except Exception:
+            progressive = False
+        pcm_parts: list[tuple[bytes, int, int, int]] = []
+
+        def _on_pcm(pcm: bytes, seq: int, rate: int, channels: int) -> None:
+            pcm_parts.append((pcm, rate, channels, seq))
+            if not pcm_parts or len(pcm_parts) == 1:
+                from fish_progressive import publish, start_event
+
+                publish(request_id, start_event(request_id, index, sample_rate=rate, channels=channels))
+            from fish_progressive import chunk_event, publish
+
+            publish(request_id, chunk_event(request_id, index, pcm, seq))
+
+        try:
             synthesize_speech(
-                segment["text"],
+                segment.get("tts_text") or segment["text"],
                 voice,
                 raw_path,
                 length_scale=opts["length_scale"],
@@ -2933,8 +2978,10 @@ def synthesize_segmented_speech_clips(
                 sentence_silence=opts["sentence_silence"],
                 speaker_id=opts.get("speaker_id"),
                 first_chunk=(index == 0),
+                fish_voice_id=opts.get("fish_voice_id"),
+                on_pcm_chunk=_on_pcm if progressive else None,
             )
-            from piper_pool import last_call_metrics
+            from fish_tts import last_call_metrics
 
             call_metrics = last_call_metrics()
             if index == 0:
@@ -2960,21 +3007,43 @@ def synthesize_segmented_speech_clips(
             )
 
             post_started = time.perf_counter()
-            convert_wav_to_standard_format(
-                raw_path,
-                out_path,
-                pitch_semitones=float(opts.get("pitch_semitones") or 0.0),
-                fx_preset=str(opts.get("fx_preset") or DEFAULT_FX_PRESET),
-                denoise_nr=opts.get("denoise_nr"),
-                denoise_nf=opts.get("denoise_nf"),
-                ttfa_fast=(index == 0 and ttfa_fast_ffmpeg_enabled()),
-            )
+            if progressive and pcm_parts:
+                from fish_progressive import end_event, publish
+                from fish_stream_fx import StreamingEffect
+
+                rate = pcm_parts[0][1]
+                effect = StreamingEffect(
+                    sample_rate=rate,
+                    fx_preset=str(opts.get("fx_preset") or DEFAULT_FX_PRESET),
+                    pitch_semitones=float(opts.get("pitch_semitones") or 0.0),
+                    output_path=out_path,
+                )
+                for pcm, _rate, _channels, _seq in pcm_parts:
+                    effect.write(pcm)
+                effect.finish()
+                publish(request_id, end_event(request_id, index))
+            else:
+                convert_wav_to_standard_format(
+                    raw_path,
+                    out_path,
+                    pitch_semitones=float(opts.get("pitch_semitones") or 0.0),
+                    fx_preset=str(opts.get("fx_preset") or DEFAULT_FX_PRESET),
+                    denoise_nr=opts.get("denoise_nr"),
+                    denoise_nf=opts.get("denoise_nf"),
+                    ttfa_fast=(index == 0 and ttfa_fast_ffmpeg_enabled()),
+                )
             _emit(
                 "segment_postprocess_complete",
                 t=time.perf_counter(),
                 index=index,
                 postprocess_ms=max(0, int(round((time.perf_counter() - post_started) * 1000))),
             )
+        except Exception as exc:
+            if progressive:
+                from fish_progressive import error_event, publish
+
+                publish(request_id, error_event(request_id, index, str(exc)))
+            raise
         finally:
             try:
                 raw_path.unlink(missing_ok=True)
@@ -2997,6 +3066,10 @@ def synthesize_segmented_speech_clips(
                 "url": turn_audio_url(request_id, index),
                 "text": segment["text"],
             }
+            if progressive and pcm_parts:
+                from fish_progressive import stream_id as fish_stream_id
+
+                clip["stream_id"] = fish_stream_id(request_id, index)
             state["clips"].append(clip)
             state["clip_paths"].append((index, out_path))
             clips_snapshot = list(state["clips"])
@@ -3380,7 +3453,8 @@ def schedule_piper_warm_for_voice_turn(
     *,
     request_id: str,
 ) -> None:
-    """Load Piper ONNX models in the background while STT/LLM run."""
+    """Piper warmup is not used by the Fish fork."""
+    return
     if str(os.environ.get("PIPER_USE_SUBPROCESS", "")).strip().lower() in ("1", "true", "yes"):
         return
     try:
@@ -3452,52 +3526,18 @@ def synthesize_speech(
     speaker_id: int | None = None,
     *,
     first_chunk: bool = True,
+    fish_voice_id: str | None = None,
+    on_pcm_chunk=None,
 ) -> None:
-    # Same resolution as /voices/preview so UNC/partial/editor paths work at runtime.
-    model_path = resolve_voice_model_path(voice_model)
+    """Synthesize with the configured Fish provider. Piper is not called.
 
-    if not model_path.exists():
-        raise FileNotFoundError(f"Piper voice model not found: {model_path}")
+    ``voice_model`` remains in the signature so existing callers and tests that
+    monkeypatch this function keep working. The Fish voice id is separate.
+    """
+    del voice_model, length_scale, noise_scale, noise_w, sentence_silence, speaker_id, first_chunk
+    from fish_tts import synthesize_wav
 
-    use_subprocess = str(os.environ.get("PIPER_USE_SUBPROCESS", "")).strip().lower() in (
-        "1",
-        "true",
-        "yes",
-    )
-    if not use_subprocess:
-        piper_pool.synthesize_wav_file(
-            model_path,
-            output_path,
-            text,
-            length_scale=length_scale,
-            noise_scale=noise_scale,
-            noise_w=noise_w,
-            sentence_silence=sentence_silence,
-            speaker_id=speaker_id,
-            first_chunk=first_chunk,
-        )
-        return
-
-    piper_exe = resolve_piper_exe()
-    cmd = [
-        str(piper_exe),
-        "--model", str(model_path),
-        "--length_scale", str(length_scale),
-        "--noise_scale", str(noise_scale),
-        "--noise_w", str(noise_w),
-        "--sentence_silence", str(sentence_silence),
-        "--output_file", str(output_path),
-    ]
-    if speaker_id is not None:
-        cmd.extend(["--speaker", str(int(speaker_id))])
-
-    subprocess.run(
-        cmd,
-        input=text,
-        text=True,
-        encoding="utf-8",
-        check=True,
-    )
+    synthesize_wav(text, fish_voice_id, output_path, on_pcm_chunk=on_pcm_chunk)
 
 
 def extract_memories_from_exchange(
@@ -3827,7 +3867,7 @@ def npc_turn():
             step_start = log_timing(request_id, "synthesize text-turn speech clips", step_start)
             set_turn_progress(request_id, "finishing", clips=audio_clips)
         else:
-            tts_segments = split_narration_and_dialogue(npc_text)
+            tts_segments = split_narration_and_dialogue(npc_response.get("tts_source_text") or npc_text)
             narration_text = " ".join(s["text"] for s in tts_segments if s["type"] == "narrator").strip()
             dialogue_text = " ".join(s["text"] for s in tts_segments if s["type"] == "npc").strip()
             set_turn_progress(request_id, "finishing")
@@ -4038,7 +4078,7 @@ def npc_voice_turn():
         pending_count = post_llm_db["pending_count"]
         step_start = log_timing(request_id, "post-llm database phase", step_start)
 
-        tts_segments = split_into_ordered_tts_segments(npc_text)
+        tts_segments = split_into_ordered_tts_segments(npc_response.get("tts_source_text") or npc_text)
         tts_text = " ".join(segment["text"] for segment in tts_segments).strip()
 
         print(
@@ -4393,7 +4433,7 @@ def npc_voice_turn_debug():
         pending_count = post_llm_db["pending_count"]
         step_start = log_timing(request_id, "debug post-llm database phase", step_start)
 
-        tts_segments = split_narration_and_dialogue(npc_text)
+        tts_segments = split_narration_and_dialogue(npc_response.get("tts_source_text") or npc_text)
         tts_text = " ".join(segment["text"] for segment in tts_segments).strip()
 
         if not tts_text:
@@ -5966,22 +6006,106 @@ def dm_followup_audio(filename: str):
     )
 
 
+@app.get("/tts/info")
+def tts_info():
+    """Active speech provider and model from the process environment."""
+    from fish_config import FishConfigError, load_settings
+
+    try:
+        settings = load_settings()
+    except FishConfigError as ex:
+        return jsonify({"error": str(ex)}), 500
+    return jsonify(
+        {
+            "speech_provider": settings.provider,
+            "model": settings.model,
+            "progressive": settings.progressive,
+            "default_voice_configured": bool(settings.default_voice_id),
+            "fish_key_configured": bool(settings.api_key),
+        }
+    )
+
+
 @app.get("/voices")
 def list_voices():
     started = time.perf_counter()
-    force_refresh = (request.args.get("refresh") or "").strip().lower() in ("1", "true", "yes")
-    voices = refresh_voice_inventory(force=force_refresh)
+    from fish_config import load_settings
+    from fish_voices import search_voices
+
+    try:
+        page = int(request.args.get("page") or request.args.get("page_number") or 1)
+    except ValueError:
+        page = 1
+    try:
+        page_size = int(request.args.get("page_size") or 20)
+    except ValueError:
+        page_size = 20
+    try:
+        payload = search_voices(
+            title=request.args.get("title") or "",
+            tag=request.args.get("tag") or "",
+            language=request.args.get("language") or "en",
+            page=page,
+            page_size=page_size,
+            settings=load_settings(),
+        )
+    except Exception as ex:
+        print(f"[VOICES] fish catalog failed error={ex!r}", flush=True)
+        return jsonify({"error": str(ex), "provider": "fish-audio", "voices": []}), 502
     print(
-        f"[VOICES] GET /voices {len(voices)} model(s) in {time.perf_counter() - started:.3f}s "
-        f"(force_refresh={force_refresh})",
+        f"[VOICES] GET /voices fish page={payload.get('page')} "
+        f"count={len(payload.get('voices') or [])} in {time.perf_counter() - started:.3f}s",
         flush=True,
     )
-    return jsonify({
-        "voices": voices,
-        "voice_enabled": True,
-        "voices_dir": str(VOICES_DIR),
-        "cached": not force_refresh,
-    })
+    return jsonify(payload)
+
+
+@app.get("/voices/<voice_id>")
+def get_voice_by_id(voice_id: str):
+    if voice_id in ("attribution", "preview"):
+        return jsonify({"error": "Not found"}), 404
+    from fish_config import load_settings
+    from fish_voices import get_voice
+
+    try:
+        card = get_voice(voice_id, settings=load_settings())
+    except Exception as ex:
+        return jsonify({"error": str(ex), "provider": "fish-audio"}), 502
+    if card is None:
+        return jsonify(
+            {
+                "error": "Fish voice is unavailable. No substitute voice was selected.",
+                "provider": "fish-audio",
+                "id": voice_id,
+            }
+        ), 404
+    return jsonify({"provider": "fish-audio", "voice": card})
+
+
+@app.get("/voices/<voice_id>/sample")
+def get_voice_sample(voice_id: str):
+    """Proxy an existing library sample. Does not run paid synthesis."""
+    from fish_config import load_settings
+    from fish_voices import get_voice
+
+    try:
+        card = get_voice(voice_id, settings=load_settings())
+    except Exception as ex:
+        return jsonify({"error": str(ex)}), 502
+    if not card or not card.get("preview_url"):
+        return jsonify({"error": "No preview sample for this voice."}), 404
+    import requests
+
+    settings = load_settings()
+    sample = requests.get(str(card["preview_url"]), timeout=settings.timeout_seconds)
+    if sample.status_code != 200:
+        return jsonify({"error": "Preview sample could not be fetched."}), 502
+    return send_file(
+        io.BytesIO(sample.content),
+        mimetype=sample.headers.get("Content-Type") or "audio/mpeg",
+        as_attachment=False,
+        download_name="voice-sample",
+    )
 
 
 @app.get("/voices/attribution")
@@ -6283,9 +6407,10 @@ print(
     flush=True,
 )
 
-# WSGI servers import ``app`` rather than executing this module as __main__.
-# Keep the import blocked until every configured Piper replica is actually ready.
-warm_piper_at_startup()
+# Fish fork: validate speech settings instead of warming the Piper pool.
+from fish_config import enforce_startup
+
+enforce_startup()
 
 if __name__ == "__main__":
     # threaded=True keeps /health, /campaigns, etc. responsive during long voice/LLM turns
