@@ -254,6 +254,30 @@ def test_pcm_wrap_roundtrip(tmp_path: Path):
         assert handle.readframes(handle.getnframes()) == pcm
 
 
+def test_voice_card_keeps_language_and_accent():
+    card = to_voice_card({
+        "_id": "933563129e564b19a115bedd57b7406a",
+        "type": "tts",
+        "state": "trained",
+        "title": "Keeper",
+        "tags": ["calm", "British"],
+        "languages": ["en"],
+    })
+    assert card["languages"] == ["en"]
+    assert card["accent"] == "British"
+    explicit = to_voice_card({
+        "_id": "abc",
+        "type": "tts",
+        "state": "trained",
+        "title": "Keeper",
+        "tags": [],
+        "languages": [{"language": "en"}],
+        "accent": "American",
+    })
+    assert explicit["languages"] == ["en"]
+    assert explicit["accent"] == "American"
+
+
 def test_tts_info_reports_env(api, monkeypatch):
     client, _, headers = api
     monkeypatch.setenv("FISH_TTS_PROVIDER", "fish-audio")
