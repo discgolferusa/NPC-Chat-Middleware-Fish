@@ -49,6 +49,49 @@ def _sample_url(item: dict[str, Any]) -> str:
     return ""
 
 
+_ACCENT_TAGS = {
+    "american",
+    "british",
+    "australian",
+    "irish",
+    "scottish",
+    "indian",
+    "canadian",
+    "southern",
+    "welsh",
+    "african",
+    "european",
+    "transatlantic",
+    "cockney",
+    "midwest",
+    "new york",
+    "english rp",
+}
+
+
+def _language_names(item: dict[str, Any]) -> list[str]:
+    names: list[str] = []
+    for lang in item.get("languages") or []:
+        if isinstance(lang, dict):
+            text = str(lang.get("language") or lang.get("code") or "").strip()
+        else:
+            text = str(lang).strip()
+        if text and text not in names:
+            names.append(text)
+    return names
+
+
+def _accent_name(item: dict[str, Any], tags: list[str]) -> str:
+    explicit = str(item.get("accent") or "").strip()
+    if explicit:
+        return explicit
+    for tag in tags:
+        lowered = tag.lower()
+        if lowered in _ACCENT_TAGS or "accent" in lowered:
+            return tag
+    return ""
+
+
 def to_voice_card(item: dict[str, Any]) -> dict[str, Any] | None:
     if not isinstance(item, dict):
         return None
@@ -64,12 +107,14 @@ def to_voice_card(item: dict[str, Any]) -> dict[str, Any] | None:
     if not voice_id or not title:
         return None
     author = item.get("author") if isinstance(item.get("author"), dict) else {}
+    tags = [str(tag) for tag in (item.get("tags") or []) if str(tag).strip()]
     return {
         "id": voice_id,
         "title": title,
         "description": str(item.get("description") or ""),
-        "tags": [str(tag) for tag in (item.get("tags") or []) if str(tag).strip()],
-        "languages": [str(lang) for lang in (item.get("languages") or []) if str(lang).strip()],
+        "tags": tags,
+        "languages": _language_names(item),
+        "accent": _accent_name(item, tags),
         "licensed": bool(item.get("licensed")),
         "preview_url": _sample_url(item),
         "author": str(author.get("nickname") or ""),
